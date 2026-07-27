@@ -1,0 +1,39 @@
+[importlinter]
+root_package = "unified_trading_execution"
+
+[[importlinter.contracts]]
+id = "core-never-imports-adapters"
+name = "Core must never import adapter code"
+type = "forbidden"
+description = """
+Section 4 of the requirements document: core code is platform-agnostic and
+must never import from any adapter package. This mechanically enforces the
+layering rule so it cannot be forgotten under deadline pressure.
+"""
+source_packages = ["unified_trading_execution"]
+forbidden_modules = [
+    "unified_trading_execution.bybit",
+    "unified_trading_execution.ctrader",
+    "unified_trading_execution.mt5",
+    "unified_trading_execution.ibkr",
+]
+
+[[importlinter.contracts]]
+id = "adapters-never-import-each-other"
+name = "Adapters must never import each other"
+type = "forbidden"
+source_packages = ["unified_trading_execution.bybit"]
+forbidden_modules = [
+    "unified_trading_execution.ctrader",
+    "unified_trading_execution.mt5",
+    "unified_trading_execution.ibkr",
+]
+
+[[importlinter.contracts]]
+id = "adapters-only-import-core"
+name = "Adapters may only import from core and stdlib/third-party"
+type = "independence"
+modules = [
+    "unified_trading_execution.bybit",
+    "unified_trading_execution.ctrader",
+]
