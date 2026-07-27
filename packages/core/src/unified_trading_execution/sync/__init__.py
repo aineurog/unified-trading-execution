@@ -147,17 +147,9 @@ class SyncEngine:
         """Read mirrored position (blocking)."""
         return self._run(self._async_engine.get_position(instrument))
 
-    def get_all_positions(self) -> list[Position]:
-        """Read all mirrored positions (blocking)."""
-        return self._run(self._async_engine.get_all_positions())
-
     def get_balance(self, currency: str) -> Balance | None:
         """Read mirrored balance (blocking)."""
         return self._run(self._async_engine.get_balance(currency))
-
-    def get_all_balances(self) -> list[Balance]:
-        """Read all mirrored balances (blocking)."""
-        return self._run(self._async_engine.get_all_balances())
 
     # ---- History accessors ----
 

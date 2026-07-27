@@ -42,8 +42,8 @@ def main() -> None:
     result = engine.place_order(order)
     print(f"Order placed: {result.client_order_id} — {result.status}")
 
-    positions = engine.get_all_positions()
-    print(f"Open positions: {len(positions)}")
+    positions = engine.get_position_history()
+    print(f"Positions: {len(positions)}")
 
     engine.shutdown()
 

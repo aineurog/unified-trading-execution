@@ -194,17 +194,9 @@ class Engine:
         """Read the current mirrored position for an instrument."""
         return await self._state_store.get_position(instrument)
 
-    async def get_all_positions(self) -> list[Position]:
-        """Read all current mirrored positions."""
-        return await self._state_store.get_all_positions()
-
     async def get_balance(self, currency: str) -> Balance | None:
         """Read the current mirrored balance for a currency."""
         return await self._state_store.get_balance(currency)
-
-    async def get_all_balances(self) -> list[Balance]:
-        """Read all current mirrored balances."""
-        return await self._state_store.get_all_balances()
 
     # ---- History accessors ----
 

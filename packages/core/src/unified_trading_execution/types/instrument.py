@@ -35,9 +35,10 @@ class Instrument:
         if not self.symbol or not self.symbol.isupper():
             raise ValueError(f"symbol must be non-empty and uppercase, got {self.symbol!r}")
 
-        if self.asset_class in (AssetClass.FUTURES, AssetClass.OPTION):
+        # expiry is required for OPTION only — FUTURES with expiry=None is a perpetual.
+        if self.asset_class == AssetClass.OPTION:
             if self.expiry is None:
-                raise ValueError(f"expiry is required for {self.asset_class}")
+                raise ValueError("expiry is required for OPTION")
 
         if self.asset_class == AssetClass.OPTION:
             if self.strike is None:

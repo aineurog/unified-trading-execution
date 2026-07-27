@@ -50,8 +50,8 @@ async def main() -> None:
     result = await engine.place_order(order)
     print(f"Order placed: {result.client_order_id} — {result.status}")
 
-    positions = await engine.get_all_positions()
-    print(f"Open positions: {len(positions)}")
+    positions = await engine.get_position_history()
+    print(f"Positions: {len(positions)}")
 
     await engine.ashutdown()
 

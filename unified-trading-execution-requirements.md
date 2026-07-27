@@ -6,6 +6,8 @@
 **Python import:** `import unified_trading_execution as ute`
 **License:** Apache License 2.0
 
+> **Note to any coding agent working from this document:** This document is the single source of truth for this project's architecture. Do not deviate from, reinterpret, simplify, or silently "improve" any decision recorded here — including type shapes, invariants, naming, scope boundaries (v1 vs. v2), and the layering rules in Section 4. If something here appears ambiguous, incomplete, or contradictory, do not resolve it unilaterally: stop and ask before writing code against it. Any new dependency, library, abstraction, or design pattern not named in this document must be proposed and approved before it is added — do not introduce something (e.g., a new data-processing library, a new architectural layer, a new external service) because it seems like good practice in isolation. Every deviation, however small, must be surfaced explicitly rather than folded in quietly.
+
 ---
 
 ## 1. Purpose
@@ -216,6 +218,7 @@ Defined once in core; every adapter translates its platform's native errors into
 - `RateLimitError`
 - `OrderNotFoundError`
 - `UnsupportedOrderTypeError`
+- `DuplicateOrderIdError` — user-supplied `client_order_id` collides with an existing order (Section 9.2)
 - `ConnectionError`
 - `InstrumentHaltedError` / `AccountHaltedError` (Section 6.4)
 - `PlatformError` — catch-all for anything that doesn't map cleanly, must carry the raw platform error as context so nothing is silently swallowed
@@ -442,7 +445,7 @@ This section defines every cross-cutting abstraction the current document names 
 
 - **Single source of truth**: each concept (order, position, event) has exactly one definition, in core, shared by every adapter and every future v2 module — never duplicated or redefined per platform.
 - **No business logic in data types**: these are pure data structures (frozen where possible, hashable where used as keys). Logic lives in the modules that consume them (dispatch, risk, reconciliation, history).
-- **Highly optimised implementation**: the runtime code operating on these types must be written for performance from the start — use vectorised operations (NumPy/Polars) where operating on batches of records; avoid per-row loops over large result sets in the history accessors and reconciliation path; prefer zero-copy slicing over repeated object construction; the risk-check chain must be a tight synchronous call with no allocations on the hot path beyond what the validators themselves require.
+- **Highly optimised implementation**: the runtime code operating on these types must be written for performance from the start — use the state store's own query engine (SQL) for filtering and aggregation rather than pulling unfiltered result sets into Python; the risk-check chain must be a tight synchronous call with no allocations on the hot path beyond what the validators themselves require.
 - **Correctness over convenience**: every type enforces its invariants at construction (no invalid combinations silently accepted); every adapter method must translate all platform-native errors into the common exception hierarchy before they cross the adapter boundary — an untranslated error is a bug; every interface method documents its preconditions and failure modes explicitly.
 
 ### 17.1 Shared enum types
@@ -481,10 +484,10 @@ Frozen, hashable, slots-based — zero per-instance dict overhead, usable as a d
 
 **Invariants enforced at construction:**
 - `symbol` must be non-empty and uppercase.
-- `expiry` is required iff `asset_class in (FUTURES, OPTION)`.
+- `expiry` is required iff `asset_class == OPTION`. For `FUTURES`, `expiry=None` means a perpetual contract (e.g., Bybit BTC/USDT perpetual) — dated futures carry an explicit expiry; perpetuals do not. This is validated by the Section 8.3 examples.
 - `strike` and `option_right` are required iff `asset_class == OPTION`.
 - `multiplier` is required for `FUTURES` and `OPTION`, optional otherwise.
-- `broker_symbol_override` must never be set by user code — it is populated exclusively by the MT5 adapter's alias table (v2). Core validates this at construction: if set and the caller is not an adapter, construction raises.
+- `broker_symbol_override` must never be set by user code — it is populated exclusively by the MT5 adapter's alias table (v2). Rather than attempting to enforce this at runtime via fragile caller-identity checks, `broker_symbol_override` is not exposed on the public `Instrument(...)` constructor at all. The adapter accesses it through a separate module-level factory (`Instrument._with_broker_override(...)`, underscore-convention private) that is used only within adapter packages and never in user-facing examples or docs. Core never reads or branches on this field — it is purely a passthrough for the adapter's own symbol translation.
 
 ### 17.3 InstrumentSpec (restated from Section 8.2)
 
@@ -532,10 +535,10 @@ class UnifiedOrder:
 
     # Idempotency: generated by core (UUID7, time-ordered, DB-friendly) if the
     # user does not supply one. If user-supplied, core validates uniqueness
-    # against the state store before accepting — collision with any existing
-    # (non-terminal) order raises DuplicateOrderIdError. Users who supply their
-    # own IDs gain cross-session idempotency and external-system correlation;
-    # users who omit it get zero-config safety with no risk of accidental reuse.
+    # against ALL orders ever in the state store — collision with any existing
+    # order (active or terminal) raises DuplicateOrderIdError. Users who need
+    # external correlation without permanent uniqueness constraints should use
+    # client_tag instead. The default UUID7 is zero-config safe.
     client_order_id: str | None = None
 
     price: Decimal | None = None          # LIMIT, STOP_LIMIT
@@ -792,9 +795,9 @@ class FillRecord:
 
 ### 17.12 Event bus and event types
 
-The event bus is a simple synchronous pub/sub mechanism within the async event loop — no queueing, no persistence, no cross-process delivery in v1. Subscribers register with `subscribe(event_type: type[E], callback: Callable[[E], None])`. Publishers call `publish(event: Event)` which invokes all matching subscribers synchronously in registration order. Subscribers must not raise — an exception in a subscriber is logged and does not prevent remaining subscribers from running.
+The event bus is a simple synchronous pub/sub mechanism within the async event loop — no queueing, no persistence, no cross-process delivery in v1. Subscribers register with `subscribe(event_type: type[E], callback: Callable[[E], None])`. Publishers call `publish(event: Event)` which invokes all matching subscribers synchronously in registration order. Subscribers must not raise — an exception in a subscriber is logged and does not prevent remaining subscribers from running. Subscriber callbacks are synchronous (`Callable[[E], None]`, not `Awaitable`); this keeps the hot path allocation-free and avoids async fan-out latency.
 
-All events inherit from a common base. Every event emitted on the bus is also written to the audit trail by a dedicated internal subscriber that core registers at startup — this guarantee means no event can be "on the bus but not in the audit trail."
+All events inherit from a common base. Every event emitted on the bus is also written to the audit trail — not by a subscriber (which would require async, breaking the synchronous callback contract), but by the Engine itself: the Engine calls `state_store.write_audit_event()` immediately after `event_bus.publish()` in the same coroutine. This guarantees no event can be "on the bus but not in the audit trail" without introducing async subscribers or an internal queue.
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -879,7 +882,7 @@ The callback is called synchronously within the risk-check chain. If the integra
 
 **Correlation IDs:** A single `correlation_id` (UUID7, time-ordered, DB-friendly) is generated by core at the start of each top-level user action (`place_order`, `modify_order`, `cancel_order`). It is attached to every log line, audit event, and bus event produced by that action's entire lifecycle — including downstream effects like fills, position updates, and reconciliation events triggered by that order. This allows tracing an order from the initial user call through every fill and state change it produces, without the integrator building their own distributed tracing plumbing. The correlation ID is available to the user on the returned `OrderResult` (via `OrderRecord`) but is never set by the user — it is an engine-internal tracing primitive.
 
-**Client order ID generation:** Core generates a UUID7 `client_order_id` for every `place_order` call where the user does not supply one. UUID7 is chosen over UUID4 specifically because its time-ordered prefix makes it index-friendly in both SQLite B-trees and any future Postgres backend — monotonically increasing keys avoid page splits. If the user supplies their own `client_order_id`, core validates it is unique across all non-terminal orders in the state store before accepting it. Duplicate `client_order_id` raises `DuplicateOrderIdError`. The `client_order_id` is the primary key for order identity everywhere — in the state store, in the audit trail, on the event bus, and in the idempotency path (Section 9.2).
+**Client order ID generation:** Core generates a UUID7 `client_order_id` for every `place_order` call where the user does not supply one. UUID7 is chosen over UUID4 specifically because its time-ordered prefix makes it index-friendly in both SQLite B-trees and any future Postgres backend — monotonically increasing keys avoid page splits. **Note:** `uuid.uuid7()` is not available in Python's stdlib before 3.14; the `uuid7` package (a single-file, zero-dependency backport) is declared as a core dependency in `pyproject.toml` to bridge the Python 3.11–3.13 gap. If the user supplies their own `client_order_id`, core validates it is unique across **all orders ever** in the state store before accepting it — not just currently-active ones. Duplicate `client_order_id` raises `DuplicateOrderIdError`. The `client_order_id` is the permanent primary key for order identity everywhere — in the state store, in the audit trail, on the event bus, and in the idempotency path (Section 9.2). Users who need external correlation without permanent uniqueness constraints should use `client_tag` instead of supplying their own `client_order_id`.
 
 **Graceful shutdown:** `engine.shutdown()` (sync) and `engine.ashutdown()` (async) perform an ordered teardown:
 1. Flush all pending audit-trail writes to the state store.
@@ -898,8 +901,8 @@ After shutdown, the engine instance is permanently unusable — calling any meth
 - The audit trail is append-only. Once written, an audit event is never mutated or deleted. The `write_audit_event` method must reject any call that attempts to overwrite or modify an existing event.
 - Timestamps are always generated by core (using `datetime.now(tz=timezone.utc)`), never by adapter code — the engine is the single source of truth for event ordering, not the platform.
 
-**Performance guardrails:** While v1 sets no formal latency targets, the following constraints guide implementation:
+**Performance guardrails:**
 - The risk-check chain is synchronous and must complete in under 1ms on commodity hardware — the network round-trip is the dominant cost, and the risk checks must not add meaningful overhead to it.
 - History accessor queries over large date ranges must use indexed columns and return in constant-ish time regardless of total row count — full table scans in the hot reconciliation path are unacceptable.
 - The event bus dispatch (publish → all subscribers notified) must be O(subscribers) with no allocations beyond the event object itself — no intermediate queues, no async fan-out within a single publish call.
-- Where batch operations on collections of records are performed (reconciliation diffing, history query result processing), the implementation must use vectorised patterns (NumPy/Polars) rather than per-row Python loops — correctness at scale depends on performance at scale.
+- The reconciliation diff and history query result processing must use the state store's own query engine (SQL) for filtering and aggregation — do NOT pull unfiltered result sets into Python and process them in per-row loops. The SQLite implementation with proper indexes and batched inserts is sufficient; no external dataframe/vectorisation library is needed or approved.

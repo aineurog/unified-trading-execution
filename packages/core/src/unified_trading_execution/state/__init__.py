@@ -55,18 +55,8 @@ class StateStore(ABC):
         ...
 
     @abstractmethod
-    async def get_all_positions(self) -> list[Position]:
-        """Read all current position records."""
-        ...
-
-    @abstractmethod
     async def get_balance(self, currency: str) -> Balance | None:
         """Read a single balance record, or None."""
-        ...
-
-    @abstractmethod
-    async def get_all_balances(self) -> list[Balance]:
-        """Read all current balance records."""
         ...
 
     @abstractmethod
@@ -183,13 +173,7 @@ class SQLiteStateStore(StateStore):
     async def get_position(self, instrument: Instrument) -> Position | None:
         raise NotImplementedError
 
-    async def get_all_positions(self) -> list[Position]:
-        raise NotImplementedError
-
     async def get_balance(self, currency: str) -> Balance | None:
-        raise NotImplementedError
-
-    async def get_all_balances(self) -> list[Balance]:
         raise NotImplementedError
 
     async def get_order(self, client_order_id: str) -> OrderRecord | None:

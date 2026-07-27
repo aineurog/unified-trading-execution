@@ -9,7 +9,7 @@ authors = [
 ]
 dependencies = [
     "aiosqlite>=0.20",
-    "uuid7>=0.1",
+    "uuid7>=0.1",  # uuid.uuid7() backport for Python 3.11–3.13 (stdlib in 3.14+)
 ]
 
 [project.optional-dependencies]
