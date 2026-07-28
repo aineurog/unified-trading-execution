@@ -3,8 +3,11 @@
 A simple synchronous pub/sub within the async event loop — no queueing,
 no persistence, no cross-process delivery in v1.
 
-Every event emitted on the bus is also written to the audit trail by a
-dedicated internal subscriber registered at startup.
+The EventBus itself publishes events only. Audit-trail writes happen in the
+Engine: after ``event_bus.publish(event)`` returns, the Engine calls
+``state_store.write_audit_event(...)`` directly in the same coroutine — not
+via a subscriber (which would require async callbacks, breaking the
+synchronous callback contract).
 """
 
 from __future__ import annotations
@@ -132,6 +135,25 @@ class HaltEvent:
     reason: str  # machine-readable, e.g. "position_quantity_mismatch"
     detail: str  # human-readable
     cleared_by: Literal["automatic", "manual"] | None  # None when action="entered"
+
+
+@dataclass(frozen=True, slots=True)
+class AuditEvent:
+    """Audit-trail record for an order lifecycle event — persisted in state store
+    (Section 17.11).
+
+    Distinct from the bus events (OrderPlacedEvent, OrderModifiedEvent,
+    OrderCancelledEvent). This is the immutable, typed audit record written
+    directly by dispatch/ after the bus publish succeeds.
+    """
+
+    event_id: str  # UUID7
+    timestamp: datetime  # UTC
+    adapter_name: str
+    account_id: str
+    correlation_id: str
+    event_type: str  # "order.placed" | "order.modified" | "order.cancelled"
+    payload: dict  # structured metadata, e.g. {"client_order_id": "..."}
 
 
 Subscriber = Callable[[Event], None]

@@ -131,3 +131,26 @@ class OrderRecord:
     correlation_id: str
     created_at: datetime
     updated_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class FillRecord:
+    """A single fill against an order — persisted in the state store (Section 17.11)."""
+
+    client_order_id: str
+    platform_fill_id: str
+    instrument: Instrument
+    fill_quantity: Decimal
+    fill_price: Decimal
+    fill_timestamp: datetime
+    fee_currency: str | None
+    fee_amount: Decimal | None
+    correlation_id: str
+
+    def __post_init__(self) -> None:
+        if self.fill_timestamp.tzinfo is None:
+            raise ValueError("fill_timestamp must be timezone-aware (UTC)")
+        if self.fill_quantity <= 0:
+            raise ValueError(f"fill_quantity must be > 0, got {self.fill_quantity}")
+        if self.fill_price <= 0:
+            raise ValueError(f"fill_price must be > 0, got {self.fill_price}")

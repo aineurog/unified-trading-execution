@@ -22,13 +22,12 @@ from unified_trading_execution.types import (
     OrderRecord,
     OrderResult,
     Position,
-    RateLimits,
     TpSlAttachment,
     UnifiedOrder,
 )
 from unified_trading_execution.errors import (
     AccountHaltedError,
-    ConnectionError,
+    PlatformConnectionError,
     DuplicateOrderIdError,
     EngineShutdownError,
     InstrumentHaltedError,
@@ -40,6 +39,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
+    AuditEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
@@ -56,11 +56,10 @@ from unified_trading_execution.events import (
     ReconciliationEvent,
     ReconciliationMismatch,
 )
-from unified_trading_execution.adapter import Adapter
+from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.state import SQLiteStateStore, StateStore
-from unified_trading_execution.logging import AuditEvent
 
 __all__ = [
     # Enums
@@ -109,7 +108,7 @@ __all__ = [
     "HaltEvent",
     # Errors
     "AccountHaltedError",
-    "ConnectionError",
+    "PlatformConnectionError",
     "DuplicateOrderIdError",
     "EngineShutdownError",
     "InstrumentHaltedError",

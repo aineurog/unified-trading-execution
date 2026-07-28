@@ -34,12 +34,12 @@ class UnsupportedOrderTypeError(UteError):
 
 
 class DuplicateOrderIdError(UteError):
-    """A user-supplied client_order_id collides with an existing non-terminal order."""
+    """A user-supplied client_order_id collides with an existing order (active or terminal)."""
 
 
 # ---- Connection errors ----
 
-class ConnectionError(UteError):
+class PlatformConnectionError(UteError):
     """Connection to the platform failed or was lost."""
 
 

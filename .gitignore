@@ -51,3 +51,6 @@ coverage.xml
 
 # Ruff
 .ruff_cache/
+
+*.claude
+*.commandcode

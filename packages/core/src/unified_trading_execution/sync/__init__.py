@@ -23,7 +23,8 @@ from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import EventBus, HaltEvent, ReconciliationEvent
-from unified_trading_execution.state import StateStore
+from unified_trading_execution.risk import RiskConfig
+from unified_trading_execution.state import HaltConfig, ReconciliationResult, StateStore
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -65,12 +66,16 @@ class SyncEngine:
         *,
         get_reference_price: Callable[[Instrument], Decimal | None] | None = None,
         event_bus: EventBus | None = None,
+        risk_config: RiskConfig | None = None,
+        halt_config: HaltConfig | None = None,
     ) -> None:
         self._async_engine = Engine(
             adapter=adapter,
             state_store=state_store,
             get_reference_price=get_reference_price,
             event_bus=event_bus,
+            risk_config=risk_config,
+            halt_config=halt_config,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -140,6 +145,12 @@ class SyncEngine:
     def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         """Fetch and cache trading rules (blocking)."""
         return self._run(self._async_engine.fetch_instrument_spec(instrument))
+
+    # ---- Reconciliation ----
+
+    def reconcile(self) -> ReconciliationResult:
+        """Run a full reconciliation pass (blocking)."""
+        return self._run(self._async_engine.reconcile())
 
     # ---- State mirror access ----
 

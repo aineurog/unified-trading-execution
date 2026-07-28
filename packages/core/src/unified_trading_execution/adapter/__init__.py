@@ -15,10 +15,13 @@ from decimal import Decimal
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
+    FillRecord,
     OrderModification,
+    OrderRecord,
     OrderResult,
     UnifiedOrder,
 )
+from unified_trading_execution.types.position import Balance, Position
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,3 +148,42 @@ class Adapter(ABC):
         (TTL determined by interval_seconds) rather than calling on every dispatch.
         """
         ...
+
+    # ---- Reconciliation data (optional — not required for basic operation) ----
+
+    async def fetch_positions(self) -> dict[Instrument, Position]:
+        """Fetch all open positions from the platform, keyed by Instrument.
+
+        Optional: raises NotImplementedError by default. Adapters that
+        implement this method enable full reconciliation.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support bulk position fetch"
+        )
+
+    async def fetch_balances(self) -> dict[str, Balance]:
+        """Fetch all account balances from the platform, keyed by currency.
+
+        Optional: raises NotImplementedError by default.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support bulk balance fetch"
+        )
+
+    async def fetch_open_orders(self) -> dict[str, OrderRecord]:
+        """Fetch all open orders from the platform, keyed by client_order_id.
+
+        Optional: raises NotImplementedError by default.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support bulk order fetch"
+        )
+
+    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+        """Fetch recent fills from the platform, keyed by client_order_id.
+
+        Optional: raises NotImplementedError by default.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support bulk fill fetch"
+        )

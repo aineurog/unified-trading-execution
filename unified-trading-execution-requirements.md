@@ -487,7 +487,7 @@ Frozen, hashable, slots-based — zero per-instance dict overhead, usable as a d
 - `expiry` is required iff `asset_class == OPTION`. For `FUTURES`, `expiry=None` means a perpetual contract (e.g., Bybit BTC/USDT perpetual) — dated futures carry an explicit expiry; perpetuals do not. This is validated by the Section 8.3 examples.
 - `strike` and `option_right` are required iff `asset_class == OPTION`.
 - `multiplier` is required for `FUTURES` and `OPTION`, optional otherwise.
-- `broker_symbol_override` must never be set by user code — it is populated exclusively by the MT5 adapter's alias table (v2). Rather than attempting to enforce this at runtime via fragile caller-identity checks, `broker_symbol_override` is not exposed on the public `Instrument(...)` constructor at all. The adapter accesses it through a separate module-level factory (`Instrument._with_broker_override(...)`, underscore-convention private) that is used only within adapter packages and never in user-facing examples or docs. Core never reads or branches on this field — it is purely a passthrough for the adapter's own symbol translation.
+- `broker_symbol_override` must never be set by user code — it is populated exclusively by the MT5 adapter's alias table (v2). Rather than attempting to enforce this at runtime via fragile caller-identity checks, `broker_symbol_override` is not exposed on the public `Instrument(...)` constructor at all. The adapter accesses it through a standalone module-level function `_with_broker_override(instrument, override)` in `unified_trading_execution.types.instrument`. It is underscore-convention private — imported by adapter packages but never present in user-facing examples, docs, or IDE autocomplete on the `Instrument` class. Core never reads or branches on this field — it is purely a passthrough for the adapter's own symbol translation.
 
 ### 17.3 InstrumentSpec (restated from Section 8.2)
 
@@ -711,18 +711,23 @@ class StateStore(ABC):
     async def upsert_position(self, position: Position) -> None: ...
     async def upsert_balance(self, balance: Balance) -> None: ...
     async def upsert_order(self, order: OrderRecord) -> None: ...
+    async def upsert_fill(self, fill: FillRecord) -> None: ...
 
     # ---- Audit trail write (append-only) ----
     async def write_audit_event(self, event: AuditEvent) -> None: ...
+    async def write_reconciliation_event(self, event: ReconciliationEvent) -> None: ...
+    async def write_halt_event(self, event: HaltEvent) -> None: ...
 
     # ---- Single-record read (for runtime dispatch/reconciliation logic) ----
     async def get_position(self, instrument: Instrument) -> Position | None: ...
-    async def get_all_positions(self) -> list[Position]: ...
     async def get_balance(self, currency: str) -> Balance | None: ...
-    async def get_all_balances(self) -> list[Balance]: ...
     async def get_order(self, client_order_id: str) -> OrderRecord | None: ...
 
     # ---- Filtered queries (for history accessors, Section 10.2) ----
+    # Replaces the earlier get_all_positions / get_all_balances with
+    # filterable query_* methods that support instrument, time-range,
+    # and limit parameters — strictly more useful and aligned with the
+    # history-accessor API surface.
     async def query_orders(self, *,
         instrument: Instrument | None = None,
         start: datetime | None = None,
@@ -765,10 +770,8 @@ class StateStore(ABC):
 
     # ---- Lifecycle ----
     async def initialize(self) -> None: ...  # create tables, run pending migrations
-    async def close(self) -> None: ...       # flush writes, close connection
-
-    @property
-    def path(self) -> str: ...               # resolved filesystem path; empty string for non-file backends
+    async def flush(self) -> None: ...       # ensure pending writes are durable (no-op by default)
+    async def close(self) -> None: ...       # close connection
 ```
 
 **Performance requirement for the SQLite implementation:**
@@ -776,7 +779,7 @@ class StateStore(ABC):
 - Bulk reconciliation writes must use batched inserts (`executemany` / a single transaction), not individual writes per record.
 - The SQLite connection must be configured with `WAL` journal mode and `synchronous=NORMAL` for write performance without sacrificing durability.
 
-**`AuditEvent`** is the base type for all audit-trail records. Concrete subtypes include `OrderAuditEvent`, `RiskCheckAuditEvent`, `ReconciliationAuditEvent`, and `HaltAuditEvent`, each carrying the fields relevant to the event being recorded. All audit events carry: `event_id` (UUID7), `timestamp` (UTC, timezone-aware), `adapter_name`, `account_id`, `correlation_id`, and an `event_type` string for indexing/filtering.
+**`AuditEvent`** is a single flat dataclass for order-lifecycle audit records (placed, modified, cancelled). It carries: `event_id` (UUID7), `timestamp` (UTC, timezone-aware), `adapter_name`, `account_id`, `correlation_id`, `event_type` (string: `"order.placed"` / `"order.modified"` / `"order.cancelled"`), and a `payload` dict for structured per-event metadata. Reconciliation and halt events have their own dedicated audit types (`ReconciliationEvent`, `HaltEvent`) and their own `write_reconciliation_event` / `write_halt_event` store methods — they do not go through `write_audit_event`.
 
 **`FillRecord`:**
 ```python
