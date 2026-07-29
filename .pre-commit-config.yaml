@@ -12,12 +12,14 @@ repos:
       - id: mypy
         additional_dependencies:
           - "types-python-dateutil"
+          - "pytest"
         args: [--strict]
 
   - repo: https://github.com/seddonym/import-linter
     rev: v2.0
     hooks:
       - id: import-linter
+        args: ["--contract", "core-never-imports-adapters"]
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0

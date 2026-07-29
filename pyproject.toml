@@ -11,6 +11,9 @@ authors = [
 [tool.uv.workspace]
 members = ["packages/*"]
 
+[tool.uv.sources]
+unified-trading-execution = { workspace = true }
+
 [tool.uv]
 dev-dependencies = [
     "pytest>=8.0",
