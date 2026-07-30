@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
@@ -41,17 +41,31 @@ _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
 
 
+def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
+    raw = headers.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return default
+>>>>>>> main
 
 
 def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
-    limit = int(headers.get("X-Bapi-Limit", _DEFAULT_REQUESTS_PER_INTERVAL))
-    remaining = int(headers.get("X-Bapi-Remaining", _DEFAULT_REQUESTS_PER_INTERVAL))
-    reset_ts = int(headers.get("X-Bapi-Reset-Timestamp", 0))
+    raw_limit = _safe_header_int(headers, "X-Bapi-Limit", _DEFAULT_REQUESTS_PER_INTERVAL)
+    limit = max(raw_limit, 1)
+
+    raw_remaining = _safe_header_int(headers, "X-Bapi-Remaining", _DEFAULT_REQUESTS_PER_INTERVAL)
+    remaining = max(raw_remaining, 0)
+
+    raw_reset_ts = _safe_header_int(headers, "X-Bapi-Reset-Timestamp", 0)
     reset_at = (
-        datetime.fromtimestamp(reset_ts / 1000, tz=timezone.utc)
-        if reset_ts
-        else datetime.now(timezone.utc)
+        datetime.fromtimestamp(raw_reset_ts / 1000, tz=UTC)
+        if raw_reset_ts > 0
+        else datetime.now(UTC)
     )
+
     return RateLimits(
         requests_per_interval=limit,
         interval_seconds=_DEFAULT_INTERVAL_SECONDS,
