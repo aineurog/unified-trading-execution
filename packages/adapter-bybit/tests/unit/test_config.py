@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from unified_trading_execution.bybit.config import BybitConfig
 
 
@@ -47,6 +49,5 @@ class TestBybitConfig:
 
     def test_config_is_frozen(self) -> None:
         config = BybitConfig(api_key="k", api_secret="s")
-        import pytest
         with pytest.raises(AttributeError):
             config.api_key = "new-key"  # type: ignore[misc]

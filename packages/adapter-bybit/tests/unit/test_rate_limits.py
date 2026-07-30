@@ -32,11 +32,13 @@ class TestGetRateLimits:
         assert rl.remaining == 120
 
     async def test_returns_updated_state(self, adapter) -> None:
-        adapter._update_rate_limits({
-            "X-Bapi-Limit": "120",
-            "X-Bapi-Remaining": "72",
-            "X-Bapi-Reset-Timestamp": "2100000000000",
-        })
+        adapter._update_rate_limits(
+            {
+                "X-Bapi-Limit": "120",
+                "X-Bapi-Remaining": "72",
+                "X-Bapi-Reset-Timestamp": "2100000000000",
+            }
+        )
         rl = await adapter.get_rate_limits()
         assert rl.remaining == 72
         assert rl.reset_at == datetime.fromtimestamp(2100000000, tz=timezone.utc)
