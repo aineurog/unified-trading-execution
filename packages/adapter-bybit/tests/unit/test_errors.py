@@ -108,10 +108,10 @@ class TestMapBybitRetCode:
         assert isinstance(exc, PlatformError)
         assert "unknown code" in str(exc)
 
-    def test_unknown_ret_code_never_carries_raw(self) -> None:
+    def test_unknown_ret_code_carries_context(self) -> None:
         exc = map_bybit_error(ret_code=99999, ret_msg="unmapped")
         assert isinstance(exc, PlatformError)
-        assert exc.platform_error is None
+        assert exc.platform_error == {"ret_code": 99999}
 
     def test_10003_falls_to_platform_error(self) -> None:
         exc = map_bybit_error(ret_code=10003, ret_msg="API key is invalid")
@@ -176,7 +176,7 @@ class TestMapBybitEdgeCases:
         exc = map_bybit_error(ret_code=54321)
         assert "54321" in str(exc)
 
-    def test_unmapped_code_never_carries_raw(self) -> None:
+    def test_unmapped_code_carries_context(self) -> None:
         exc = map_bybit_error(ret_code=10001, ret_msg="param error")
         assert isinstance(exc, PlatformError)
-        assert exc.platform_error is None
+        assert exc.platform_error == {"ret_code": 10001}

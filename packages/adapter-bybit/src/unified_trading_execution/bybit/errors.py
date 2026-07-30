@@ -38,10 +38,10 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     110007: InsufficientBalanceError,   # "Available balance is insufficient"
     110012: InsufficientBalanceError,   # "Insufficient available balance"
     110044: InsufficientBalanceError,   # "Available margin is insufficient"
-     110045: InsufficientBalanceError,   # "Wallet balance is insufficient"
-     110051: InsufficientBalanceError,   # "balance cannot cover the lowest price of the current market"
-     110052: InsufficientBalanceError,   # "insufficient balance to set the price"
-     110053: InsufficientBalanceError,   # "balance cannot cover the current market price and upper limit price"
+    110045: InsufficientBalanceError,   # "Wallet balance is insufficient"
+    110051: InsufficientBalanceError,   # "balance cannot cover the lowest price of the current market"
+    110052: InsufficientBalanceError,   # "insufficient balance to set the price"
+    110053: InsufficientBalanceError,   # "balance cannot cover the current market price and upper limit price"
      110131: InsufficientBalanceError,   # "Margin limit exceeded (Perps)"
     30256: InsufficientBalanceError,    # "Margin limit exceeded (Spot)"
     170033: InsufficientBalanceError,   # "margin Insufficient account balance"
@@ -63,9 +63,22 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     170147: PlatformConnectionError, # "Order cancellation timeout"
     170191: PlatformConnectionError, # "Can not cancel order, please try again later"
     170234: PlatformConnectionError, # "System Error"
-     170310: PlatformConnectionError, # "Order modification timeout"
-     3400214: PlatformConnectionError, # "Server error, please try again later"
+    170310: PlatformConnectionError, # "Order modification timeout"
+    3400214: PlatformConnectionError, # "Server error, please try again later"
 }
+
+
+def _platform_error_context(
+    *,
+    ret_code: int | None = None,
+    http_status: int | None = None,
+) -> dict[str, int | None] | None:
+    ctx: dict[str, int | None] = {}
+    if ret_code is not None:
+        ctx["ret_code"] = ret_code
+    if http_status is not None:
+        ctx["http_status"] = http_status
+    return ctx or None
 
 
 def map_bybit_error(
@@ -78,16 +91,25 @@ def map_bybit_error(
         if http_status == 429:
             return RateLimitError(ret_msg or "rate limit exceeded")
         if http_status == 403:
-            return PlatformError(ret_msg or "permission denied")
+            return PlatformError(
+                ret_msg or "permission denied",
+                platform_error=_platform_error_context(http_status=http_status),
+            )
         if 500 <= http_status < 600:
             return PlatformConnectionError(ret_msg or f"HTTP {http_status} server error")
         if http_status >= 400:
-            return PlatformError(ret_msg or f"HTTP {http_status} error")
+            return PlatformError(
+                ret_msg or f"HTTP {http_status} error",
+                platform_error=_platform_error_context(http_status=http_status),
+            )
 
     if ret_code is not None:
         exc_type = _RET_CODE_MAP.get(ret_code)
         if exc_type is not None:
             return exc_type(ret_msg or f"Bybit error {ret_code}")
-        return PlatformError(ret_msg or f"unmapped Bybit error {ret_code}")
+        return PlatformError(
+            ret_msg or f"unmapped Bybit error {ret_code}",
+            platform_error=_platform_error_context(ret_code=ret_code),
+        )
 
     return PlatformError(ret_msg or "unknown Bybit error")
