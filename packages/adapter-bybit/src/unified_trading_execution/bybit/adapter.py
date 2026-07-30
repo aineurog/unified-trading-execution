@@ -49,7 +49,6 @@ def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
         return int(raw)
     except (ValueError, TypeError):
         return default
->>>>>>> main
 
 
 def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
