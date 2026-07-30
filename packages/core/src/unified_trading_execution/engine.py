@@ -551,7 +551,9 @@ class Engine:
             return
 
         for mismatch in result.all_mismatches:
-            scope: Literal["instrument", "account"] = "instrument" if mismatch.instrument else "account"
+            scope: Literal["instrument", "account"] = (
+                "instrument" if mismatch.instrument else "account"
+            )
             inst = mismatch.instrument
             if self._halt_machine.enter_halt(
                 scope=scope,
