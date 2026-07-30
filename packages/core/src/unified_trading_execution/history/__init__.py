@@ -31,7 +31,10 @@ async def query_order_history(
     filters are given, returns the most recent orders up to *limit*.
     """
     return await store.query_orders(
-        instrument=instrument, start=start, end=end, limit=limit,
+        instrument=instrument,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 
@@ -45,7 +48,10 @@ async def query_fill_history(
 ) -> list[FillRecord]:
     """Return fill records filtered by instrument and/or time range."""
     return await store.query_fills(
-        instrument=instrument, start=start, end=end, limit=limit,
+        instrument=instrument,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 
@@ -59,7 +65,10 @@ async def query_position_history(
 ) -> list[Position]:
     """Return position snapshots filtered by instrument and/or time range."""
     return await store.query_positions(
-        instrument=instrument, start=start, end=end, limit=limit,
+        instrument=instrument,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 
@@ -73,7 +82,10 @@ async def query_balance_history(
 ) -> list[Balance]:
     """Return balance snapshots filtered by currency and/or time range."""
     return await store.query_balances(
-        currency=currency, start=start, end=end, limit=limit,
+        currency=currency,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 
@@ -86,7 +98,9 @@ async def query_reconciliation_events(
 ) -> list[ReconciliationEvent]:
     """Return reconciliation events within the given time range."""
     return await store.query_reconciliation_events(
-        start=start, end=end, limit=limit,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 
@@ -99,7 +113,9 @@ async def query_halt_events(
 ) -> list[HaltEvent]:
     """Return halt entry/clear events within the given time range."""
     return await store.query_halt_events(
-        start=start, end=end, limit=limit,
+        start=start,
+        end=end,
+        limit=limit,
     )
 
 

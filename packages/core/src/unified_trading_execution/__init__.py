@@ -3,37 +3,17 @@
 __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 
 # Core top-level re-exports — the public surface of unified_trading_execution.
-from unified_trading_execution.types import (
-    # Enums
-    AssetClass,
-    HaltClearMode,
-    HaltState,
-    OptionRight,
-    OrderSide,
-    OrderStatus,
-    OrderType,
-    TimeInForce,
-    # Data types
-    Balance,
-    FillRecord,
-    Instrument,
-    InstrumentSpec,
-    OrderModification,
-    OrderRecord,
-    OrderResult,
-    Position,
-    TpSlAttachment,
-    UnifiedOrder,
-)
+from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import (
     AccountHaltedError,
-    PlatformConnectionError,
     DuplicateOrderIdError,
     EngineShutdownError,
     InstrumentHaltedError,
     InsufficientBalanceError,
     InvalidSymbolError,
     OrderNotFoundError,
+    PlatformConnectionError,
     PlatformError,
     RateLimitError,
     UnsupportedOrderTypeError,
@@ -56,10 +36,30 @@ from unified_trading_execution.events import (
     ReconciliationEvent,
     ReconciliationMismatch,
 )
-from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.engine import Engine
-from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.state import SQLiteStateStore, StateStore
+from unified_trading_execution.sync import SyncEngine
+from unified_trading_execution.types import (
+    # Enums
+    AssetClass,
+    # Data types
+    Balance,
+    FillRecord,
+    HaltClearMode,
+    HaltState,
+    Instrument,
+    InstrumentSpec,
+    OptionRight,
+    OrderModification,
+    OrderRecord,
+    OrderResult,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    Position,
+    TimeInForce,
+    TpSlAttachment,
+    UnifiedOrder,
+)
 
 __all__ = [
     # Enums

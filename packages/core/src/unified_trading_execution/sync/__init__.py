@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
-from typing import Callable
 
 from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.engine import Engine
@@ -171,9 +171,13 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[OrderRecord]:
         """Query order history (blocking)."""
-        return self._run(self._async_engine.get_order_history(
-            instrument=instrument, start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_order_history(
+                instrument=instrument,
+                start=start,
+                end=end,
+            )
+        )
 
     def get_fill_history(
         self,
@@ -182,9 +186,13 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[FillRecord]:
         """Query fill history (blocking)."""
-        return self._run(self._async_engine.get_fill_history(
-            instrument=instrument, start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_fill_history(
+                instrument=instrument,
+                start=start,
+                end=end,
+            )
+        )
 
     def get_position_history(
         self,
@@ -193,9 +201,13 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[Position]:
         """Query position history (blocking)."""
-        return self._run(self._async_engine.get_position_history(
-            instrument=instrument, start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_position_history(
+                instrument=instrument,
+                start=start,
+                end=end,
+            )
+        )
 
     def get_balance_history(
         self,
@@ -204,9 +216,13 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[Balance]:
         """Query balance history (blocking)."""
-        return self._run(self._async_engine.get_balance_history(
-            currency=currency, start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_balance_history(
+                currency=currency,
+                start=start,
+                end=end,
+            )
+        )
 
     def get_reconciliation_events(
         self,
@@ -214,9 +230,12 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[ReconciliationEvent]:
         """Query reconciliation events (blocking)."""
-        return self._run(self._async_engine.get_reconciliation_events(
-            start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_reconciliation_events(
+                start=start,
+                end=end,
+            )
+        )
 
     def get_halt_events(
         self,
@@ -224,9 +243,12 @@ class SyncEngine:
         end: datetime | None = None,
     ) -> list[HaltEvent]:
         """Query halt entry/clear events (blocking)."""
-        return self._run(self._async_engine.get_halt_events(
-            start=start, end=end,
-        ))
+        return self._run(
+            self._async_engine.get_halt_events(
+                start=start,
+                end=end,
+            )
+        )
 
     # ---- Properties ----
 

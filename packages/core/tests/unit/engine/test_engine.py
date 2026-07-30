@@ -7,7 +7,7 @@ without hitting a real platform.
 from __future__ import annotations
 
 import asyncio
-from datetime import date, datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -24,13 +24,10 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
-    BalanceUpdateEvent,
     EventBus,
-    FillEvent,
     OrderCancelledEvent,
     OrderModifiedEvent,
     OrderPlacedEvent,
-    PositionUpdateEvent,
 )
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import (
@@ -58,8 +55,8 @@ from unified_trading_execution.types.order import (
 )
 from unified_trading_execution.types.position import Balance, Position
 
-
 # ── helpers ──────────────────────────────────────────────────────────
+
 
 def _instrument(symbol: str = "BTCUSDT") -> Instrument:
     return Instrument(
@@ -103,7 +100,7 @@ def _order(**kwargs: object) -> UnifiedOrder:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _ref_price(instrument: Instrument) -> Decimal | None:
@@ -250,10 +247,12 @@ class TestPlaceOrder:
         assert engine._rate_limit_budget == initial - 1
 
     async def test_market_order_works(self, engine):
-        result = await engine.place_order(_order(
-            order_type=OrderType.MARKET,
-            price=None,
-        ))
+        result = await engine.place_order(
+            _order(
+                order_type=OrderType.MARKET,
+                price=None,
+            )
+        )
         assert result.status == OrderStatus.OPEN
 
     async def test_audit_event_persisted_to_db(self, engine):
@@ -437,13 +436,15 @@ class TestRateLimitTracking:
     async def test_rate_limit_exhausted_blocks_dispatch(self, mock_adapter, event_bus):
         store = SQLiteStateStore(":memory:")
         # reset_at in the distant future so the budget doesn't auto-refresh
-        far_future = datetime(2099, 1, 1, tzinfo=timezone.utc)
-        mock_adapter.set_rate_limits(RateLimits(
-            requests_per_interval=1,
-            interval_seconds=60.0,
-            remaining=1,
-            reset_at=far_future,
-        ))
+        far_future = datetime(2099, 1, 1, tzinfo=UTC)
+        mock_adapter.set_rate_limits(
+            RateLimits(
+                requests_per_interval=1,
+                interval_seconds=60.0,
+                remaining=1,
+                reset_at=far_future,
+            )
+        )
         eng = Engine(
             adapter=mock_adapter,
             state_store=store,
@@ -657,7 +658,6 @@ class TestReconcileMismatchCases:
 
     async def test_orphan_on_platform_imported(self, engine, mock_adapter):
         """Case 3: order exists on platform but not locally — import it."""
-        from unified_trading_execution.types.order import OrderRecord
 
         platform_order = OrderRecord(
             instrument=_instrument(),
@@ -681,12 +681,14 @@ class TestReconcileMismatchCases:
             updated_at=_utcnow(),
         )
         mock_adapter.seed_order(platform_order)
-        mock_adapter.seed_position(Position(
-            instrument=_instrument(),
-            quantity=Decimal("0"),
-            average_entry_price=Decimal("0"),
-            updated_at=_utcnow(),
-        ))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
 
         result = await engine.reconcile()
         assert len(result.orphan_orders_on_platform) == 1
@@ -700,7 +702,6 @@ class TestReconcileMismatchCases:
         """Case 4: order exists locally but not on platform."""
         # Seed order directly into the state store — bypassing the adapter
         # so the order only exists locally, not in MockAdapter's internal book.
-        from unified_trading_execution.types.order import OrderRecord
 
         local_order = OrderRecord(
             instrument=_instrument(),
@@ -727,12 +728,14 @@ class TestReconcileMismatchCases:
 
         # Seed an empty platform order book (only the position to avoid
         # position-mismatch noise).
-        mock_adapter.seed_position(Position(
-            instrument=_instrument(),
-            quantity=Decimal("0"),
-            average_entry_price=Decimal("0"),
-            updated_at=_utcnow(),
-        ))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
 
         rec_result = await engine.reconcile()
         assert len(rec_result.orphan_orders_in_local) == 1
@@ -747,12 +750,14 @@ class TestReconcileMismatchCases:
         await engine.place_order(_order(client_order_id="fill-disc"))
 
         # Seed a position so reconcile doesn't halt on position mismatch
-        mock_adapter.seed_position(Position(
-            instrument=_instrument(),
-            quantity=Decimal("0"),
-            average_entry_price=Decimal("0"),
-            updated_at=_utcnow(),
-        ))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
 
         # Seed a local fill
         local_fill = FillRecord(
@@ -808,7 +813,7 @@ class TestTimeoutIdempotency:
     async def test_timeout_with_order_on_platform_returns_existing(self, engine, mock_adapter):
         """When place_order times out but the order was actually placed,
         the engine queries the platform and returns the existing result."""
-        mock_adapter.queue_place_order_response(asyncio.TimeoutError())
+        mock_adapter.queue_place_order_response(TimeoutError())
         platform_result = OrderResult(
             client_order_id="timeout-found",
             platform_order_id="pf-timeout-001",
@@ -829,7 +834,7 @@ class TestTimeoutIdempotency:
     async def test_timeout_without_order_on_platform_propagates(self, engine, mock_adapter):
         """When place_order times out and the order is NOT on the platform,
         the timeout propagates to the caller."""
-        mock_adapter.queue_place_order_response(asyncio.TimeoutError())
+        mock_adapter.queue_place_order_response(TimeoutError())
         # No order on platform
         mock_adapter.queue_get_order_response(None)
 
@@ -839,7 +844,7 @@ class TestTimeoutIdempotency:
     async def test_timeout_does_not_consume_rate_limit_budget(self, engine, mock_adapter):
         """A timeout that finds the order on-platform should not decrement budget twice."""
         budget_before = engine._rate_limit_budget
-        mock_adapter.queue_place_order_response(asyncio.TimeoutError())
+        mock_adapter.queue_place_order_response(TimeoutError())
         platform_result = OrderResult(
             client_order_id="budget-timeout",
             platform_order_id="pf-budget",

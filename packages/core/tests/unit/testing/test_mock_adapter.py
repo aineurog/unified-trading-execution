@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -39,14 +39,20 @@ from unified_trading_execution.types.order import (
 )
 from unified_trading_execution.types.position import Balance, Position
 
-NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 
 
 def make_inst(symbol="BTC"):
     return Instrument(
-        symbol=symbol, quote_currency="USDT", asset_class=AssetClass.SPOT,
-        exchange=None, currency=None, expiry=None, strike=None,
-        option_right=None, multiplier=None,
+        symbol=symbol,
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency=None,
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
     )
 
 
@@ -96,6 +102,7 @@ def make_fill():
 # ABC compliance
 # ============================================================
 
+
 class TestABCCompliance:
     """MockAdapter must implement every abstract member of Adapter."""
 
@@ -128,6 +135,7 @@ class TestABCCompliance:
 # ============================================================
 # Connection lifecycle
 # ============================================================
+
 
 class TestConnectionLifecycle:
     @pytest.mark.asyncio
@@ -178,9 +186,9 @@ class TestConnectionLifecycle:
         mock = MockAdapter(event_bus=bus)
         events: list[ConnectionStateEvent] = []
         bus.subscribe(ConnectionStateEvent, lambda e: events.append(e))  # type: ignore[arg-type]
-        await mock.connect()       # connected=True
-        await mock.disconnect()    # connected=False
-        await mock.connect()       # reconnected=True
+        await mock.connect()  # connected=True
+        await mock.disconnect()  # connected=False
+        await mock.connect()  # reconnected=True
         assert len(events) == 3
         assert [e.connected for e in events] == [True, False, True]
 
@@ -188,6 +196,7 @@ class TestConnectionLifecycle:
 # ============================================================
 # Order operations — scriptable responses
 # ============================================================
+
 
 class TestPlaceOrder:
     @pytest.mark.asyncio
@@ -288,15 +297,29 @@ class TestCancelOrder:
     async def test_queued_response_is_consumed(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        mock.seed_order(OrderRecord(
-            instrument=make_inst(), order_type=OrderType.LIMIT, side=OrderSide.BUY,
-            quantity=Decimal("0.001"), time_in_force=TimeInForce.GTC,
-            client_order_id="abc", price=Decimal("50000"), stop_price=None,
-            reduce_only=False, client_tag=None, take_profit=None, stop_loss=None,
-            platform_order_id="plat-1", status=OrderStatus.OPEN,
-            filled_quantity=Decimal("0"), average_fill_price=None,
-            correlation_id="corr-1", created_at=NOW, updated_at=NOW,
-        ))
+        mock.seed_order(
+            OrderRecord(
+                instrument=make_inst(),
+                order_type=OrderType.LIMIT,
+                side=OrderSide.BUY,
+                quantity=Decimal("0.001"),
+                time_in_force=TimeInForce.GTC,
+                client_order_id="abc",
+                price=Decimal("50000"),
+                stop_price=None,
+                reduce_only=False,
+                client_tag=None,
+                take_profit=None,
+                stop_loss=None,
+                platform_order_id="plat-1",
+                status=OrderStatus.OPEN,
+                filled_quantity=Decimal("0"),
+                average_fill_price=None,
+                correlation_id="corr-1",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         expected = make_result(status=OrderStatus.CANCELLED)
         mock.queue_cancel_order_response(expected)
         result = await mock.cancel_order("abc")
@@ -340,15 +363,29 @@ class TestGetOrderByClientId:
     async def test_default_returns_seeded_order(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        mock.seed_order(OrderRecord(
-            instrument=make_inst(), order_type=OrderType.LIMIT, side=OrderSide.BUY,
-            quantity=Decimal("0.001"), time_in_force=TimeInForce.GTC,
-            client_order_id="seeded", price=Decimal("50000"), stop_price=None,
-            reduce_only=False, client_tag=None, take_profit=None, stop_loss=None,
-            platform_order_id="plat-seed", status=OrderStatus.OPEN,
-            filled_quantity=Decimal("0"), average_fill_price=None,
-            correlation_id="corr-1", created_at=NOW, updated_at=NOW,
-        ))
+        mock.seed_order(
+            OrderRecord(
+                instrument=make_inst(),
+                order_type=OrderType.LIMIT,
+                side=OrderSide.BUY,
+                quantity=Decimal("0.001"),
+                time_in_force=TimeInForce.GTC,
+                client_order_id="seeded",
+                price=Decimal("50000"),
+                stop_price=None,
+                reduce_only=False,
+                client_tag=None,
+                take_profit=None,
+                stop_loss=None,
+                platform_order_id="plat-seed",
+                status=OrderStatus.OPEN,
+                filled_quantity=Decimal("0"),
+                average_fill_price=None,
+                correlation_id="corr-1",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         result = await mock.get_order_by_client_id("seeded")
         assert result is not None
         assert result.client_order_id == "seeded"
@@ -357,15 +394,29 @@ class TestGetOrderByClientId:
     async def test_queued_none_overrides_seeded_order(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        mock.seed_order(OrderRecord(
-            instrument=make_inst(), order_type=OrderType.LIMIT, side=OrderSide.BUY,
-            quantity=Decimal("0.001"), time_in_force=TimeInForce.GTC,
-            client_order_id="seeded", price=Decimal("50000"), stop_price=None,
-            reduce_only=False, client_tag=None, take_profit=None, stop_loss=None,
-            platform_order_id="plat-seed", status=OrderStatus.OPEN,
-            filled_quantity=Decimal("0"), average_fill_price=None,
-            correlation_id="corr-1", created_at=NOW, updated_at=NOW,
-        ))
+        mock.seed_order(
+            OrderRecord(
+                instrument=make_inst(),
+                order_type=OrderType.LIMIT,
+                side=OrderSide.BUY,
+                quantity=Decimal("0.001"),
+                time_in_force=TimeInForce.GTC,
+                client_order_id="seeded",
+                price=Decimal("50000"),
+                stop_price=None,
+                reduce_only=False,
+                client_tag=None,
+                take_profit=None,
+                stop_loss=None,
+                platform_order_id="plat-seed",
+                status=OrderStatus.OPEN,
+                filled_quantity=Decimal("0"),
+                average_fill_price=None,
+                correlation_id="corr-1",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
         mock.queue_get_order_response(None)
         result = await mock.get_order_by_client_id("seeded")
         assert result is None
@@ -374,6 +425,7 @@ class TestGetOrderByClientId:
 # ============================================================
 # Event injection
 # ============================================================
+
 
 class TestEventInjection:
     def test_inject_fill_publishes_fill_event(self):
@@ -392,8 +444,10 @@ class TestEventInjection:
         events: list[PositionUpdateEvent] = []
         bus.subscribe(PositionUpdateEvent, lambda e: events.append(e))  # type: ignore[arg-type]
         pos = Position(
-            instrument=make_inst(), quantity=Decimal("0.5"),
-            average_entry_price=Decimal("50000"), updated_at=NOW,
+            instrument=make_inst(),
+            quantity=Decimal("0.5"),
+            average_entry_price=Decimal("50000"),
+            updated_at=NOW,
         )
         mock.inject_position_update(pos)
         assert len(events) == 1
@@ -405,8 +459,11 @@ class TestEventInjection:
         events: list[BalanceUpdateEvent] = []
         bus.subscribe(BalanceUpdateEvent, lambda e: events.append(e))  # type: ignore[arg-type]
         bal = Balance(
-            currency="USDT", free=Decimal("9000"), used=Decimal("1000"),
-            total=Decimal("10000"), updated_at=NOW,
+            currency="USDT",
+            free=Decimal("9000"),
+            used=Decimal("1000"),
+            total=Decimal("10000"),
+            updated_at=NOW,
         )
         mock.inject_balance_update(bal)
         assert len(events) == 1
@@ -417,6 +474,7 @@ class TestEventInjection:
 # Instrument metadata
 # ============================================================
 
+
 class TestInstrumentSpec:
     @pytest.mark.asyncio
     async def test_seeded_spec_is_returned(self):
@@ -424,9 +482,13 @@ class TestInstrumentSpec:
         mock = MockAdapter(event_bus=bus)
         inst = make_inst()
         spec = InstrumentSpec(
-            tick_size=Decimal("0.01"), lot_size=Decimal("0.001"),
-            min_qty=Decimal("0.001"), max_qty=Decimal("100"),
-            min_notional=Decimal("10"), price_precision=2, qty_precision=3,
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("100"),
+            min_notional=Decimal("10"),
+            price_precision=2,
+            qty_precision=3,
         )
         mock.add_instrument_spec(inst, spec)
         result = await mock.fetch_instrument_spec(inst)
@@ -444,13 +506,15 @@ class TestInstrumentSpec:
 # Capability and rate-limit configuration
 # ============================================================
 
+
 class TestCapabilities:
     def test_default_supported_order_types(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
         types = mock.supported_order_types()
-        assert types == frozenset({OrderType.MARKET, OrderType.LIMIT,
-                                   OrderType.STOP, OrderType.STOP_LIMIT})
+        assert types == frozenset(
+            {OrderType.MARKET, OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT}
+        )
 
     def test_custom_supported_order_types(self):
         bus = EventBus()
@@ -472,8 +536,7 @@ class TestCapabilities:
     async def test_custom_rate_limits(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        rl = RateLimits(requests_per_interval=10, interval_seconds=1.0,
-                        remaining=5, reset_at=NOW)
+        rl = RateLimits(requests_per_interval=10, interval_seconds=1.0, remaining=5, reset_at=NOW)
         mock.set_rate_limits(rl)
         assert await mock.get_rate_limits() is rl
 
@@ -481,6 +544,7 @@ class TestCapabilities:
 # ============================================================
 # Error injection — single-shot, cross-method
 # ============================================================
+
 
 class TestErrorInjection:
     @pytest.mark.asyncio
@@ -503,11 +567,18 @@ class TestErrorInjection:
     async def test_set_next_error_affects_fetch_instrument_spec(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        mock.add_instrument_spec(make_inst(), InstrumentSpec(
-            tick_size=Decimal("0.01"), lot_size=Decimal("0.001"),
-            min_qty=Decimal("0.001"), max_qty=Decimal("100"),
-            min_notional=Decimal("10"), price_precision=2, qty_precision=3,
-        ))
+        mock.add_instrument_spec(
+            make_inst(),
+            InstrumentSpec(
+                tick_size=Decimal("0.01"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("100"),
+                min_notional=Decimal("10"),
+                price_precision=2,
+                qty_precision=3,
+            ),
+        )
         mock.set_next_error(RateLimitError("over limit"))
         with pytest.raises(RateLimitError):
             await mock.fetch_instrument_spec(make_inst())
@@ -524,9 +595,10 @@ class TestErrorInjection:
     async def test_can_simulate_timeout(self):
         """set_next_error accepts TimeoutError for idempotency retry testing."""
         import asyncio
+
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
-        mock.set_next_error(asyncio.TimeoutError("connection timed out"))
+        mock.set_next_error(TimeoutError("connection timed out"))
         with pytest.raises(asyncio.TimeoutError, match="connection timed out"):
             await mock.get_rate_limits()
         # Single-shot — next call succeeds
@@ -538,18 +610,31 @@ class TestErrorInjection:
 # Order book seeding and introspection
 # ============================================================
 
+
 class TestOrderBookSeeding:
     def test_seed_order_adds_to_book(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
         record = OrderRecord(
-            instrument=make_inst(), order_type=OrderType.LIMIT, side=OrderSide.BUY,
-            quantity=Decimal("0.001"), time_in_force=TimeInForce.GTC,
-            client_order_id="seeded", price=Decimal("50000"), stop_price=None,
-            reduce_only=False, client_tag=None, take_profit=None, stop_loss=None,
-            platform_order_id="plat-1", status=OrderStatus.FILLED,
-            filled_quantity=Decimal("0.001"), average_fill_price=Decimal("50000"),
-            correlation_id="corr-1", created_at=NOW, updated_at=NOW,
+            instrument=make_inst(),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.001"),
+            time_in_force=TimeInForce.GTC,
+            client_order_id="seeded",
+            price=Decimal("50000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id="plat-1",
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.001"),
+            average_fill_price=Decimal("50000"),
+            correlation_id="corr-1",
+            created_at=NOW,
+            updated_at=NOW,
         )
         mock.seed_order(record)
         assert "seeded" in mock.orders
@@ -559,13 +644,25 @@ class TestOrderBookSeeding:
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
         record = OrderRecord(
-            instrument=make_inst(), order_type=OrderType.LIMIT, side=OrderSide.BUY,
-            quantity=Decimal("0.001"), time_in_force=TimeInForce.GTC,
-            client_order_id="x", price=Decimal("50000"), stop_price=None,
-            reduce_only=False, client_tag=None, take_profit=None, stop_loss=None,
-            platform_order_id="plat-1", status=OrderStatus.OPEN,
-            filled_quantity=Decimal("0"), average_fill_price=None,
-            correlation_id="corr-1", created_at=NOW, updated_at=NOW,
+            instrument=make_inst(),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.001"),
+            time_in_force=TimeInForce.GTC,
+            client_order_id="x",
+            price=Decimal("50000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id="plat-1",
+            status=OrderStatus.OPEN,
+            filled_quantity=Decimal("0"),
+            average_fill_price=None,
+            correlation_id="corr-1",
+            created_at=NOW,
+            updated_at=NOW,
         )
         mock.seed_order(record)
         copy = mock.orders
@@ -577,15 +674,18 @@ class TestOrderBookSeeding:
 # Layering — MockAdapter is a core testing tool, not an adapter
 # ============================================================
 
+
 class TestLayering:
     def test_mock_adapter_does_not_import_state_store(self):
         import unified_trading_execution.testing as mod
+
         ns = vars(mod)
         assert "StateStore" not in ns
         assert "SQLiteStateStore" not in ns
 
     def test_mock_adapter_does_not_import_engine(self):
         import unified_trading_execution.testing as mod
+
         ns = vars(mod)
         assert "Engine" not in ns
         assert "dispatch" not in ns

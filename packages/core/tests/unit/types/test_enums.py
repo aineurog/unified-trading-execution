@@ -15,8 +15,8 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 
-
 # ---- OrderType ----
+
 
 def test_order_type_values():
     assert OrderType.MARKET == "MARKET"
@@ -32,12 +32,14 @@ def test_order_type_is_str_enum():
 
 # ---- OrderSide ----
 
+
 def test_order_side_values():
     assert OrderSide.BUY == "BUY"
     assert OrderSide.SELL == "SELL"
 
 
 # ---- TimeInForce ----
+
 
 def test_time_in_force_values():
     assert TimeInForce.GTC == "GTC"
@@ -47,6 +49,7 @@ def test_time_in_force_values():
 
 
 # ---- OrderStatus ----
+
 
 def test_order_status_values():
     assert OrderStatus.PENDING == "PENDING"
@@ -59,6 +62,7 @@ def test_order_status_values():
 
 
 # ---- AssetClass ----
+
 
 def test_asset_class_values():
     assert AssetClass.SPOT == "SPOT"
@@ -73,12 +77,14 @@ def test_asset_class_values():
 
 # ---- OptionRight ----
 
+
 def test_option_right_values():
     assert OptionRight.CALL == "CALL"
     assert OptionRight.PUT == "PUT"
 
 
 # ---- HaltState ----
+
 
 def test_halt_state_values():
     assert HaltState.ACTIVE == "ACTIVE"
@@ -87,8 +93,7 @@ def test_halt_state_values():
 
 # ---- HaltClearMode ----
 
+
 def test_halt_clear_mode_values():
     assert HaltClearMode.AUTOMATIC == "AUTOMATIC"
     assert HaltClearMode.MANUAL == "MANUAL"
-
-

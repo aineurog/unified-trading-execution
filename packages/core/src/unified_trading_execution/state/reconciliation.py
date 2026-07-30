@@ -23,13 +23,15 @@ class ReconciliationResult:
 
     @property
     def is_clean(self) -> bool:
-        return not any([
-            self.position_mismatches,
-            self.balance_mismatches,
-            self.orphan_orders_on_platform,
-            self.orphan_orders_in_local,
-            self.partial_fill_discrepancies,
-        ])
+        return not any(
+            [
+                self.position_mismatches,
+                self.balance_mismatches,
+                self.orphan_orders_on_platform,
+                self.orphan_orders_in_local,
+                self.partial_fill_discrepancies,
+            ]
+        )
 
     @property
     def all_mismatches(self) -> tuple[ReconciliationMismatch, ...]:
@@ -94,12 +96,14 @@ def reconcile(
         if local is None or platform is None:
             continue
         if local.quantity != platform.quantity:
-            position_mismatches.append(ReconciliationMismatch(
-                mismatch_type="position_quantity",
-                instrument=inst,
-                local_value=str(local.quantity),
-                platform_value=str(platform.quantity),
-            ))
+            position_mismatches.append(
+                ReconciliationMismatch(
+                    mismatch_type="position_quantity",
+                    instrument=inst,
+                    local_value=str(local.quantity),
+                    platform_value=str(platform.quantity),
+                )
+            )
 
     # Case 2: Balance mismatch
     balance_mismatches: list[ReconciliationMismatch] = []
@@ -110,24 +114,22 @@ def reconcile(
         if local is None or platform is None:
             continue
         if local.free != platform.free or local.total != platform.total:
-            balance_mismatches.append(ReconciliationMismatch(
-                mismatch_type="balance",
-                instrument=None,
-                local_value=f"free={local.free}, total={local.total}",
-                platform_value=f"free={platform.free}, total={platform.total}",
-            ))
+            balance_mismatches.append(
+                ReconciliationMismatch(
+                    mismatch_type="balance",
+                    instrument=None,
+                    local_value=f"free={local.free}, total={local.total}",
+                    platform_value=f"free={platform.free}, total={platform.total}",
+                )
+            )
 
     # Case 3: Orphan order on platform (unknown to local mirror)
     orphan_on_platform = [
-        order for cid, order in platform_orders.items()
-        if cid not in local_orders
+        order for cid, order in platform_orders.items() if cid not in local_orders
     ]
 
     # Case 4: Orphan order in local mirror (not on platform)
-    orphan_in_local = [
-        cid for cid in local_orders
-        if cid not in platform_orders
-    ]
+    orphan_in_local = [cid for cid in local_orders if cid not in platform_orders]
 
     # Case 5: Partial fill discrepancy
     partial_fill_discrepancies: list[ReconciliationMismatch] = []
@@ -141,12 +143,14 @@ def reconcile(
             start=Decimal("0"),
         )
         if local_total != platform_total:
-            partial_fill_discrepancies.append(ReconciliationMismatch(
-                mismatch_type="partial_fill",
-                instrument=None,  # order-id scoped, not instrument scoped
-                local_value=str(local_total),
-                platform_value=str(platform_total),
-            ))
+            partial_fill_discrepancies.append(
+                ReconciliationMismatch(
+                    mismatch_type="partial_fill",
+                    instrument=None,  # order-id scoped, not instrument scoped
+                    local_value=str(local_total),
+                    platform_value=str(platform_total),
+                )
+            )
 
     return ReconciliationResult(
         position_mismatches=position_mismatches,

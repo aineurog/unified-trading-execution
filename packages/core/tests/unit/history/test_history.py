@@ -7,15 +7,14 @@ then assert that only matching records come back.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
-
-from unified_trading_execution.state.store import SQLiteStateStore
 
 # Module under test
 from unified_trading_execution import history
 from unified_trading_execution.events import HaltEvent, ReconciliationEvent
+from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -27,8 +26,8 @@ from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
 from unified_trading_execution.types.position import Balance, Position
 
-
 # ── helpers ──────────────────────────────────────────────────────────
+
 
 def _instrument(symbol: str = "BTCUSDT") -> Instrument:
     return Instrument(
@@ -45,7 +44,7 @@ def _instrument(symbol: str = "BTCUSDT") -> Instrument:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 def _order(
@@ -139,7 +138,9 @@ class TestQueryOrderHistory:
         await store.upsert_order(_order(client_order_id="new", created_at=t3))
 
         results = await history.query_order_history(
-            store, start=t2 - timedelta(minutes=30), end=t2 + timedelta(minutes=30),
+            store,
+            start=t2 - timedelta(minutes=30),
+            end=t2 + timedelta(minutes=30),
         )
         assert len(results) == 1
         assert results[0].client_order_id == "mid"
@@ -151,9 +152,15 @@ class TestQueryOrderHistory:
         t_old = now - timedelta(hours=3)
         t_new = now - timedelta(hours=1)
 
-        await store.upsert_order(_order(client_order_id="btc-old", instrument=btc, created_at=t_old))
-        await store.upsert_order(_order(client_order_id="eth-old", instrument=eth, created_at=t_old))
-        await store.upsert_order(_order(client_order_id="btc-new", instrument=btc, created_at=t_new))
+        await store.upsert_order(
+            _order(client_order_id="btc-old", instrument=btc, created_at=t_old)
+        )
+        await store.upsert_order(
+            _order(client_order_id="eth-old", instrument=eth, created_at=t_old)
+        )
+        await store.upsert_order(
+            _order(client_order_id="btc-new", instrument=btc, created_at=t_new)
+        )
 
         results = await history.query_order_history(
             store,
@@ -189,11 +196,16 @@ class TestQueryFillHistory:
         t1 = now - timedelta(hours=2)
         t2 = now - timedelta(hours=1)
 
-        await store.upsert_fill(_fill(client_order_id="early", platform_fill_id="fe", fill_timestamp=t1))
-        await store.upsert_fill(_fill(client_order_id="late", platform_fill_id="fl", fill_timestamp=t2))
+        await store.upsert_fill(
+            _fill(client_order_id="early", platform_fill_id="fe", fill_timestamp=t1)
+        )
+        await store.upsert_fill(
+            _fill(client_order_id="late", platform_fill_id="fl", fill_timestamp=t2)
+        )
 
         results = await history.query_fill_history(
-            store, start=now - timedelta(minutes=90),
+            store,
+            start=now - timedelta(minutes=90),
         )
         assert len(results) == 1
         assert results[0].client_order_id == "late"
@@ -206,28 +218,44 @@ class TestQueryPositionHistory:
     async def test_instrument_filter(self, store):
         btc = _instrument("BTCUSDT")
         eth = _instrument("ETHUSDT")
-        await store.upsert_position(Position(
-            instrument=btc, quantity=1, average_entry_price=50000,
-            updated_at=_utcnow(),
-        ))
-        await store.upsert_position(Position(
-            instrument=eth, quantity=2, average_entry_price=3000,
-            updated_at=_utcnow(),
-        ))
+        await store.upsert_position(
+            Position(
+                instrument=btc,
+                quantity=1,
+                average_entry_price=50000,
+                updated_at=_utcnow(),
+            )
+        )
+        await store.upsert_position(
+            Position(
+                instrument=eth,
+                quantity=2,
+                average_entry_price=3000,
+                updated_at=_utcnow(),
+            )
+        )
 
         results = await history.query_position_history(store, instrument=btc)
         assert len(results) == 1
         assert results[0].instrument.symbol == "BTCUSDT"
 
     async def test_no_filters_returns_all(self, store):
-        await store.upsert_position(Position(
-            instrument=_instrument("BTCUSDT"), quantity=1,
-            average_entry_price=50000, updated_at=_utcnow(),
-        ))
-        await store.upsert_position(Position(
-            instrument=_instrument("ETHUSDT"), quantity=2,
-            average_entry_price=3000, updated_at=_utcnow(),
-        ))
+        await store.upsert_position(
+            Position(
+                instrument=_instrument("BTCUSDT"),
+                quantity=1,
+                average_entry_price=50000,
+                updated_at=_utcnow(),
+            )
+        )
+        await store.upsert_position(
+            Position(
+                instrument=_instrument("ETHUSDT"),
+                quantity=2,
+                average_entry_price=3000,
+                updated_at=_utcnow(),
+            )
+        )
         results = await history.query_position_history(store)
         assert len(results) >= 2
 
@@ -237,31 +265,61 @@ class TestQueryPositionHistory:
 
 class TestQueryBalanceHistory:
     async def test_currency_filter(self, store):
-        await store.upsert_balance(Balance(
-            currency="USDT", free=1000, used=0, total=1000, updated_at=_utcnow(),
-        ))
-        await store.upsert_balance(Balance(
-            currency="BTC", free=1, used=0, total=1, updated_at=_utcnow(),
-        ))
+        await store.upsert_balance(
+            Balance(
+                currency="USDT",
+                free=1000,
+                used=0,
+                total=1000,
+                updated_at=_utcnow(),
+            )
+        )
+        await store.upsert_balance(
+            Balance(
+                currency="BTC",
+                free=1,
+                used=0,
+                total=1,
+                updated_at=_utcnow(),
+            )
+        )
 
         results = await history.query_balance_history(store, currency="USDT")
         assert len(results) == 1
         assert results[0].currency == "USDT"
 
     async def test_no_filter_returns_all(self, store):
-        await store.upsert_balance(Balance(
-            currency="USDT", free=1000, used=0, total=1000, updated_at=_utcnow(),
-        ))
-        await store.upsert_balance(Balance(
-            currency="BTC", free=1, used=0, total=1, updated_at=_utcnow(),
-        ))
+        await store.upsert_balance(
+            Balance(
+                currency="USDT",
+                free=1000,
+                used=0,
+                total=1000,
+                updated_at=_utcnow(),
+            )
+        )
+        await store.upsert_balance(
+            Balance(
+                currency="BTC",
+                free=1,
+                used=0,
+                total=1,
+                updated_at=_utcnow(),
+            )
+        )
         results = await history.query_balance_history(store)
         assert len(results) >= 2
 
     async def test_wrong_currency_returns_empty(self, store):
-        await store.upsert_balance(Balance(
-            currency="USDT", free=1000, used=0, total=1000, updated_at=_utcnow(),
-        ))
+        await store.upsert_balance(
+            Balance(
+                currency="USDT",
+                free=1000,
+                used=0,
+                total=1000,
+                updated_at=_utcnow(),
+            )
+        )
         results = await history.query_balance_history(store, currency="ETH")
         assert results == []
 
@@ -275,17 +333,32 @@ class TestQueryReconciliationEvents:
         t1 = now - timedelta(hours=2)
         t2 = now - timedelta(hours=1)
 
-        await store.write_reconciliation_event(ReconciliationEvent(
-            event_id="rec-1", timestamp=t1, adapter_name="mock",
-            account_id="acc", correlation_id=None, mismatches=(), duration_ms=100,
-        ))
-        await store.write_reconciliation_event(ReconciliationEvent(
-            event_id="rec-2", timestamp=t2, adapter_name="mock",
-            account_id="acc", correlation_id=None, mismatches=(), duration_ms=200,
-        ))
+        await store.write_reconciliation_event(
+            ReconciliationEvent(
+                event_id="rec-1",
+                timestamp=t1,
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id=None,
+                mismatches=(),
+                duration_ms=100,
+            )
+        )
+        await store.write_reconciliation_event(
+            ReconciliationEvent(
+                event_id="rec-2",
+                timestamp=t2,
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id=None,
+                mismatches=(),
+                duration_ms=200,
+            )
+        )
 
         results = await history.query_reconciliation_events(
-            store, start=now - timedelta(minutes=90),
+            store,
+            start=now - timedelta(minutes=90),
         )
         assert len(results) == 1
         assert results[0].event_id == "rec-2"
@@ -300,21 +373,40 @@ class TestQueryHaltEvents:
         t1 = now - timedelta(hours=2)
         t2 = now - timedelta(hours=1)
 
-        await store.write_halt_event(HaltEvent(
-            event_id="h-1", timestamp=t1, adapter_name="mock",
-            account_id="acc", correlation_id=None,
-            action="entered", scope="instrument", instrument=_instrument(),
-            reason="test", detail="", cleared_by=None,
-        ))
-        await store.write_halt_event(HaltEvent(
-            event_id="h-2", timestamp=t2, adapter_name="mock",
-            account_id="acc", correlation_id=None,
-            action="cleared", scope="instrument", instrument=_instrument(),
-            reason="test", detail="", cleared_by="automatic",
-        ))
+        await store.write_halt_event(
+            HaltEvent(
+                event_id="h-1",
+                timestamp=t1,
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id=None,
+                action="entered",
+                scope="instrument",
+                instrument=_instrument(),
+                reason="test",
+                detail="",
+                cleared_by=None,
+            )
+        )
+        await store.write_halt_event(
+            HaltEvent(
+                event_id="h-2",
+                timestamp=t2,
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id=None,
+                action="cleared",
+                scope="instrument",
+                instrument=_instrument(),
+                reason="test",
+                detail="",
+                cleared_by="automatic",
+            )
+        )
 
         results = await history.query_halt_events(
-            store, start=now - timedelta(minutes=90),
+            store,
+            start=now - timedelta(minutes=90),
         )
         assert len(results) == 1
         assert results[0].event_id == "h-2"

@@ -1,6 +1,6 @@
 # unified-trading-execution-bybit
 
-Bybit adapter for [unified-trading-execution](https://github.com/qaisar/unified-trading-execution).  
+Bybit adapter for [unified-trading-execution](https://github.com/qaisar/unified-trading-execution).
 Implements the `Adapter` ABC for Bybit spot and perpetual markets.
 
 ## Status

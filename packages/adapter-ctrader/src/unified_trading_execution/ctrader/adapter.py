@@ -33,7 +33,7 @@ class CTraderAdapter(Adapter):
         access_token: str,
         *,
         testnet: bool = True,
-        event_bus: "EventBus | None" = None,  # noqa: F821
+        event_bus: EventBus | None = None,  # noqa: F821
     ) -> None:
         self._client_id = client_id
         self._client_secret = client_secret
@@ -84,12 +84,14 @@ class CTraderAdapter(Adapter):
     # ---- Capability reporting ----
 
     def supported_order_types(self) -> frozenset[OrderType]:
-        return frozenset({
-            OrderType.MARKET,
-            OrderType.LIMIT,
-            OrderType.STOP,
-            OrderType.STOP_LIMIT,
-        })
+        return frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
+        )
 
     # ---- Rate limits ----
 

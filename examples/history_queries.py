@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import unified_trading_execution as ute
 
@@ -12,7 +12,7 @@ async def main() -> None:
     store: ute.StateStore = ...
 
     # Query all orders from the last 24 hours.
-    yesterday = datetime.now(tz=timezone.utc) - timedelta(days=1)
+    yesterday = datetime.now(tz=UTC) - timedelta(days=1)
     recent_orders = await store.query_orders(start=yesterday)
     for order in recent_orders:
         print(f"{order.client_order_id}: {order.status} {order.filled_quantity}/{order.quantity}")

@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from collections.abc import Callable
+from datetime import UTC, datetime
+from decimal import Decimal
 
 from uuid_extensions import uuid7
-from decimal import Decimal
-from typing import Callable
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.dispatch import (
     dispatch_cancel_order,
     dispatch_modify_order,
@@ -33,21 +33,17 @@ from unified_trading_execution.dispatch import (
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
-    ConnectionStateEvent,
     Event,
     EventBus,
     FillEvent,
     HaltClearedEvent,
     HaltEnteredEvent,
     HaltEvent,
-    OrderCancelledEvent,
-    OrderModifiedEvent,
-    OrderPlacedEvent,
     PositionUpdateEvent,
     ReconciliationCompleteEvent,
     ReconciliationEvent,
 )
-from unified_trading_execution.risk import ReferencePriceFn, RiskConfig
+from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import (
     HaltConfig,
     HaltStateMachine,
@@ -55,14 +51,12 @@ from unified_trading_execution.state import (
     StateStore,
     reconcile,
 )
-from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
     OrderRecord,
     OrderResult,
-    TpSlAttachment,
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
@@ -75,7 +69,7 @@ def _new_id() -> str:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 class Engine:
@@ -176,8 +170,6 @@ class Engine:
         except RuntimeError:
             asyncio.run(self.ashutdown())
         else:
-            import concurrent.futures
-            import threading
             future = asyncio.run_coroutine_threadsafe(self.ashutdown(), loop)
             future.result()
 
@@ -220,7 +212,7 @@ class Engine:
                 rate_limit_budget=self._effective_budget(),
                 order=order,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Section 9.2: query platform before allowing retry
             cid = order.client_order_id or client_order_id
             if cid is not None:
@@ -229,7 +221,8 @@ class Engine:
                     logger.info(
                         "Timeout on place_order for %s — order exists on platform, "
                         "treating as success (status=%s)",
-                        cid, existing.status.value,
+                        cid,
+                        existing.status.value,
                     )
                     self._known_order_ids.add(existing.client_order_id)
                     return existing
@@ -246,6 +239,7 @@ class Engine:
         existing = await self._state_store.get_order(modification.client_order_id)
         if existing is None:
             from unified_trading_execution.errors import OrderNotFoundError
+
             raise OrderNotFoundError(modification.client_order_id)
 
         reference_price = self._resolve_reference_price(existing.instrument)
@@ -313,6 +307,7 @@ class Engine:
         self._check_not_shutdown()
 
         import time
+
         t0 = time.monotonic()
 
         # -- 1. Gather local state --
@@ -352,24 +347,28 @@ class Engine:
         corr_id = _new_id()
         timestamp = _utcnow()
 
-        self._event_bus.publish(ReconciliationCompleteEvent(
-            event_id=_new_id(),
-            timestamp=timestamp,
-            adapter_name=self._adapter.platform_name,
-            account_id=self._adapter.account_id,
-            correlation_id=corr_id,
-            mismatches=result.all_mismatches,
-        ))
+        self._event_bus.publish(
+            ReconciliationCompleteEvent(
+                event_id=_new_id(),
+                timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                mismatches=result.all_mismatches,
+            )
+        )
 
-        await self._state_store.write_reconciliation_event(ReconciliationEvent(
-            event_id=_new_id(),
-            timestamp=timestamp,
-            adapter_name=self._adapter.platform_name,
-            account_id=self._adapter.account_id,
-            correlation_id=corr_id,
-            mismatches=result.all_mismatches,
-            duration_ms=duration_ms,
-        ))
+        await self._state_store.write_reconciliation_event(
+            ReconciliationEvent(
+                event_id=_new_id(),
+                timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                mismatches=result.all_mismatches,
+                duration_ms=duration_ms,
+            )
+        )
 
         # -- 6. Halt management --
         await self._manage_halt_state(result, corr_id, timestamp)
@@ -447,9 +446,7 @@ class Engine:
             try:
                 platform_positions = await self._adapter.fetch_positions()  # type: ignore[attr-defined]
                 if mm.instrument and mm.instrument in platform_positions:
-                    await self._state_store.upsert_position(
-                        platform_positions[mm.instrument]
-                    )
+                    await self._state_store.upsert_position(platform_positions[mm.instrument])
             except Exception:
                 logger.exception("Failed to overwrite position for %s", mm.instrument)
 
@@ -480,7 +477,8 @@ class Engine:
                     (client_order_id,),
                 )
                 logger.info(
-                    "Removed orphan order %s from local mirror", client_order_id,
+                    "Removed orphan order %s from local mirror",
+                    client_order_id,
                 )
             except Exception:
                 logger.exception(
@@ -495,11 +493,10 @@ class Engine:
                 conn = self._state_store.conn  # type: ignore[attr-defined]
                 for cid in platform_fills:
                     await conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ?", (cid,),
+                        "DELETE FROM fills WHERE client_order_id = ?",
+                        (cid,),
                     )
-                all_fills = [
-                    fill for fills in platform_fills.values() for fill in fills
-                ]
+                all_fills = [fill for fills in platform_fills.values() for fill in fills]
                 for fill in all_fills:
                     await self._state_store.upsert_fill(fill)
             except Exception:
@@ -521,29 +518,33 @@ class Engine:
                     reconciliation_is_clean=True,
                 )
                 if cleared:
-                    self._event_bus.publish(HaltClearedEvent(
-                        event_id=_new_id(),
-                        timestamp=timestamp,
-                        adapter_name=self._adapter.platform_name,
-                        account_id=self._adapter.account_id,
-                        correlation_id=corr_id,
-                        scope=entry.scope,  # type: ignore[arg-type]
-                        instrument=entry.instrument,
-                        cleared_by="automatic",
-                    ))
-                    await self._state_store.write_halt_event(HaltEvent(
-                        event_id=_new_id(),
-                        timestamp=timestamp,
-                        adapter_name=self._adapter.platform_name,
-                        account_id=self._adapter.account_id,
-                        correlation_id=corr_id,
-                        action="cleared",
-                        scope=entry.scope,  # type: ignore[arg-type]
-                        instrument=entry.instrument,
-                        reason="reconciliation_clean",
-                        detail="",
-                        cleared_by="automatic",
-                    ))
+                    self._event_bus.publish(
+                        HaltClearedEvent(
+                            event_id=_new_id(),
+                            timestamp=timestamp,
+                            adapter_name=self._adapter.platform_name,
+                            account_id=self._adapter.account_id,
+                            correlation_id=corr_id,
+                            scope=entry.scope,  # type: ignore[arg-type]
+                            instrument=entry.instrument,
+                            cleared_by="automatic",
+                        )
+                    )
+                    await self._state_store.write_halt_event(
+                        HaltEvent(
+                            event_id=_new_id(),
+                            timestamp=timestamp,
+                            adapter_name=self._adapter.platform_name,
+                            account_id=self._adapter.account_id,
+                            correlation_id=corr_id,
+                            action="cleared",
+                            scope=entry.scope,  # type: ignore[arg-type]
+                            instrument=entry.instrument,
+                            reason="reconciliation_clean",
+                            detail="",
+                            cleared_by="automatic",
+                        )
+                    )
             return
 
         if not self._halt_machine.config.auto_halt_enabled:
@@ -558,30 +559,34 @@ class Engine:
                 reason=mismatch.mismatch_type,
                 detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
             ):
-                self._event_bus.publish(HaltEnteredEvent(
-                    event_id=_new_id(),
-                    timestamp=timestamp,
-                    adapter_name=self._adapter.platform_name,
-                    account_id=self._adapter.account_id,
-                    correlation_id=corr_id,
-                    scope=scope,  # type: ignore[arg-type]
-                    instrument=inst,
-                    reason=mismatch.mismatch_type,
-                    detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                ))
-                await self._state_store.write_halt_event(HaltEvent(
-                    event_id=_new_id(),
-                    timestamp=timestamp,
-                    adapter_name=self._adapter.platform_name,
-                    account_id=self._adapter.account_id,
-                    correlation_id=corr_id,
-                    action="entered",
-                    scope=scope,  # type: ignore[arg-type]
-                    instrument=inst,
-                    reason=mismatch.mismatch_type,
-                    detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                    cleared_by=None,
-                ))
+                self._event_bus.publish(
+                    HaltEnteredEvent(
+                        event_id=_new_id(),
+                        timestamp=timestamp,
+                        adapter_name=self._adapter.platform_name,
+                        account_id=self._adapter.account_id,
+                        correlation_id=corr_id,
+                        scope=scope,  # type: ignore[arg-type]
+                        instrument=inst,
+                        reason=mismatch.mismatch_type,
+                        detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
+                    )
+                )
+                await self._state_store.write_halt_event(
+                    HaltEvent(
+                        event_id=_new_id(),
+                        timestamp=timestamp,
+                        adapter_name=self._adapter.platform_name,
+                        account_id=self._adapter.account_id,
+                        correlation_id=corr_id,
+                        action="entered",
+                        scope=scope,  # type: ignore[arg-type]
+                        instrument=inst,
+                        reason=mismatch.mismatch_type,
+                        detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
+                        cleared_by=None,
+                    )
+                )
 
     # ── State mirror access ────────────────────────────────────────
 
@@ -600,7 +605,9 @@ class Engine:
         end: datetime | None = None,
     ) -> list[OrderRecord]:
         return await self._state_store.query_orders(
-            instrument=instrument, start=start, end=end,
+            instrument=instrument,
+            start=start,
+            end=end,
         )
 
     async def get_fill_history(
@@ -610,7 +617,9 @@ class Engine:
         end: datetime | None = None,
     ) -> list[FillRecord]:
         return await self._state_store.query_fills(
-            instrument=instrument, start=start, end=end,
+            instrument=instrument,
+            start=start,
+            end=end,
         )
 
     async def get_position_history(
@@ -620,7 +629,9 @@ class Engine:
         end: datetime | None = None,
     ) -> list[Position]:
         return await self._state_store.query_positions(
-            instrument=instrument, start=start, end=end,
+            instrument=instrument,
+            start=start,
+            end=end,
         )
 
     async def get_balance_history(
@@ -630,7 +641,9 @@ class Engine:
         end: datetime | None = None,
     ) -> list[Balance]:
         return await self._state_store.query_balances(
-            currency=currency, start=start, end=end,
+            currency=currency,
+            start=start,
+            end=end,
         )
 
     async def get_reconciliation_events(
@@ -639,7 +652,8 @@ class Engine:
         end: datetime | None = None,
     ) -> list[ReconciliationEvent]:
         return await self._state_store.query_reconciliation_events(
-            start=start, end=end,
+            start=start,
+            end=end,
         )
 
     async def get_halt_events(
@@ -648,7 +662,8 @@ class Engine:
         end: datetime | None = None,
     ) -> list[HaltEvent]:
         return await self._state_store.query_halt_events(
-            start=start, end=end,
+            start=start,
+            end=end,
         )
 
     # ── Properties ─────────────────────────────────────────────────
@@ -677,8 +692,8 @@ class Engine:
 
     async def _get_or_fetch_spec(self, instrument: Instrument) -> InstrumentSpec:
         if instrument not in self._instrument_specs:
-            self._instrument_specs[instrument] = (
-                await self._adapter.fetch_instrument_spec(instrument)
+            self._instrument_specs[instrument] = await self._adapter.fetch_instrument_spec(
+                instrument
             )
         return self._instrument_specs[instrument]
 
@@ -747,6 +762,4 @@ class Engine:
 
     def _check_not_shutdown(self) -> None:
         if self._shutdown:
-            raise EngineShutdownError(
-                "Engine has been shut down and is permanently unusable."
-            )
+            raise EngineShutdownError("Engine has been shut down and is permanently unusable.")

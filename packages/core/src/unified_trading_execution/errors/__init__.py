@@ -13,6 +13,7 @@ class UteError(Exception):
 
 # ---- Order / dispatch errors ----
 
+
 class InsufficientBalanceError(UteError):
     """Account has insufficient balance to place this order."""
 
@@ -39,11 +40,13 @@ class DuplicateOrderIdError(UteError):
 
 # ---- Connection errors ----
 
+
 class PlatformConnectionError(UteError):
     """Connection to the platform failed or was lost."""
 
 
 # ---- Halt errors (Section 6.4) ----
+
 
 class InstrumentHaltedError(UteError):
     """An instrument is halted — new exposure-increasing orders are blocked."""
@@ -55,11 +58,13 @@ class AccountHaltedError(UteError):
 
 # ---- Engine lifecycle ----
 
+
 class EngineShutdownError(UteError):
     """Called a method on an engine that has been shut down."""
 
 
 # ---- Catch-all ----
+
 
 class PlatformError(UteError):
     """A platform-native error that does not map to a more specific exception.

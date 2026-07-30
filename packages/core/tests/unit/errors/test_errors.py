@@ -5,22 +5,22 @@ from __future__ import annotations
 import pytest
 
 from unified_trading_execution.errors import (
-    UteError,
     AccountHaltedError,
-    PlatformConnectionError,
     DuplicateOrderIdError,
     EngineShutdownError,
     InstrumentHaltedError,
     InsufficientBalanceError,
     InvalidSymbolError,
     OrderNotFoundError,
+    PlatformConnectionError,
     PlatformError,
     RateLimitError,
     UnsupportedOrderTypeError,
+    UteError,
 )
 
-
 # ---- Hierarchy ----
+
 
 def test_all_errors_inherit_from_ute_error():
     assert issubclass(InsufficientBalanceError, UteError)
@@ -42,18 +42,22 @@ def test_ute_error_inherits_from_exception():
 
 # ---- Construction and message ----
 
-@pytest.mark.parametrize("exc_cls", [
-    InsufficientBalanceError,
-    InvalidSymbolError,
-    RateLimitError,
-    OrderNotFoundError,
-    UnsupportedOrderTypeError,
-    DuplicateOrderIdError,
-    PlatformConnectionError,
-    InstrumentHaltedError,
-    AccountHaltedError,
-    EngineShutdownError,
-])
+
+@pytest.mark.parametrize(
+    "exc_cls",
+    [
+        InsufficientBalanceError,
+        InvalidSymbolError,
+        RateLimitError,
+        OrderNotFoundError,
+        UnsupportedOrderTypeError,
+        DuplicateOrderIdError,
+        PlatformConnectionError,
+        InstrumentHaltedError,
+        AccountHaltedError,
+        EngineShutdownError,
+    ],
+)
 def test_error_constructs_with_message(exc_cls):
     e = exc_cls("something went wrong")
     assert str(e) == "something went wrong"
@@ -61,6 +65,7 @@ def test_error_constructs_with_message(exc_cls):
 
 
 # ---- PlatformError — carries raw error ----
+
 
 def test_platform_error_constructs_with_message_only():
     e = PlatformError("generic platform failure")
@@ -76,6 +81,7 @@ def test_platform_error_carries_raw_error():
 
 
 # ---- Catchability ----
+
 
 def test_can_catch_by_ute_error():
     try:
@@ -105,6 +111,7 @@ def test_specific_error_not_caught_by_sibling():
 
 # ---- DuplicateOrderIdError — spec-accurate ----
 
+
 def test_duplicate_order_id_error_message():
     e = DuplicateOrderIdError("client_order_id 'xyz' already exists (FILLED)")
     assert "xyz" in str(e)
@@ -112,6 +119,7 @@ def test_duplicate_order_id_error_message():
 
 
 # ---- InstrumentHaltedError / AccountHaltedError ----
+
 
 def test_instrument_halted_error():
     e = InstrumentHaltedError("BTC/USDT halted: position quantity mismatch")

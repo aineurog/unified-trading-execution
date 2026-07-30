@@ -12,11 +12,11 @@ The Engine calls these functions after preparing the pre-dispatch context
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime, timezone
+from decimal import Decimal
 
 from uuid_extensions import uuid7
-from decimal import Decimal
-from typing import Callable, Awaitable
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.errors import UnsupportedOrderTypeError
@@ -46,7 +46,7 @@ def _new_id() -> str:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 # ── place order ────────────────────────────────────────────────────
@@ -97,6 +97,7 @@ async def dispatch_place_order(
     # -- 3. Halt check (Section 6.4) --------------------------------
     if not halt_machine.can_place_order(order.instrument, order.reduce_only):
         from unified_trading_execution.errors import InstrumentHaltedError
+
         raise InstrumentHaltedError(
             f"Cannot place order for {order.instrument.symbol}: instrument or account is halted"
         )
@@ -140,19 +141,21 @@ async def dispatch_place_order(
     event_bus.publish(event)
 
     # -- 7. Write audit event (after publish — Section 17.12) ------
-    await state_store.write_audit_event(AuditEvent(
-        event_id=_new_id(),
-        timestamp=_utcnow(),
-        adapter_name=adapter.platform_name,
-        account_id=adapter.account_id,
-        correlation_id=correlation_id,
-        event_type="order.placed",
-        payload={
-            "client_order_id": result.client_order_id,
-            "platform_order_id": result.platform_order_id,
-            "status": result.status.value,
-        },
-    ))
+    await state_store.write_audit_event(
+        AuditEvent(
+            event_id=_new_id(),
+            timestamp=_utcnow(),
+            adapter_name=adapter.platform_name,
+            account_id=adapter.account_id,
+            correlation_id=correlation_id,
+            event_type="order.placed",
+            payload={
+                "client_order_id": result.client_order_id,
+                "platform_order_id": result.platform_order_id,
+                "status": result.status.value,
+            },
+        )
+    )
 
     return result
 
@@ -184,6 +187,7 @@ async def dispatch_modify_order(
     existing = await state_store.get_order(modification.client_order_id)
     if existing is None:
         from unified_trading_execution.errors import OrderNotFoundError
+
         raise OrderNotFoundError(modification.client_order_id)
 
     correlation_id = _new_id()
@@ -197,11 +201,17 @@ async def dispatch_modify_order(
         time_in_force=existing.time_in_force,
         client_order_id=existing.client_order_id,
         price=modification.price if modification.price is not None else existing.price,
-        stop_price=modification.stop_price if modification.stop_price is not None else existing.stop_price,
+        stop_price=modification.stop_price
+        if modification.stop_price is not None
+        else existing.stop_price,
         reduce_only=existing.reduce_only,
         client_tag=existing.client_tag,
-        take_profit=modification.take_profit if modification.take_profit is not None else existing.take_profit,
-        stop_loss=modification.stop_loss if modification.stop_loss is not None else existing.stop_loss,
+        take_profit=modification.take_profit
+        if modification.take_profit is not None
+        else existing.take_profit,
+        stop_loss=modification.stop_loss
+        if modification.stop_loss is not None
+        else existing.stop_loss,
     )
 
     # -- 2. Validate order type -------------------------------------
@@ -226,6 +236,7 @@ async def dispatch_modify_order(
     # -- 5. Halt check (modifying to increase exposure is blocked) --
     if not halt_machine.can_place_order(would_be.instrument, would_be.reduce_only):
         from unified_trading_execution.errors import InstrumentHaltedError
+
         raise InstrumentHaltedError(
             f"Cannot modify order for {would_be.instrument.symbol}: instrument or account is halted"
         )
@@ -242,11 +253,17 @@ async def dispatch_modify_order(
         time_in_force=existing.time_in_force,
         client_order_id=existing.client_order_id,
         price=modification.price if modification.price is not None else existing.price,
-        stop_price=modification.stop_price if modification.stop_price is not None else existing.stop_price,
+        stop_price=modification.stop_price
+        if modification.stop_price is not None
+        else existing.stop_price,
         reduce_only=existing.reduce_only,
         client_tag=existing.client_tag,
-        take_profit=modification.take_profit if modification.take_profit is not None else existing.take_profit,
-        stop_loss=modification.stop_loss if modification.stop_loss is not None else existing.stop_loss,
+        take_profit=modification.take_profit
+        if modification.take_profit is not None
+        else existing.take_profit,
+        stop_loss=modification.stop_loss
+        if modification.stop_loss is not None
+        else existing.stop_loss,
         platform_order_id=result.platform_order_id,
         status=result.status,
         filled_quantity=result.filled_quantity,
@@ -270,15 +287,17 @@ async def dispatch_modify_order(
     event_bus.publish(event)
 
     # -- 9. Write audit event ---------------------------------------
-    await state_store.write_audit_event(AuditEvent(
-        event_id=_new_id(),
-        timestamp=_utcnow(),
-        adapter_name=adapter.platform_name,
-        account_id=adapter.account_id,
-        correlation_id=correlation_id,
-        event_type="order.modified",
-        payload={"client_order_id": modification.client_order_id},
-    ))
+    await state_store.write_audit_event(
+        AuditEvent(
+            event_id=_new_id(),
+            timestamp=_utcnow(),
+            adapter_name=adapter.platform_name,
+            account_id=adapter.account_id,
+            correlation_id=correlation_id,
+            event_type="order.modified",
+            payload={"client_order_id": modification.client_order_id},
+        )
+    )
 
     return result
 
@@ -306,6 +325,7 @@ async def dispatch_cancel_order(
     existing = await state_store.get_order(client_order_id)
     if existing is None:
         from unified_trading_execution.errors import OrderNotFoundError
+
         raise OrderNotFoundError(client_order_id)
 
     # -- 1. Delegate to adapter -------------------------------------
@@ -348,14 +368,16 @@ async def dispatch_cancel_order(
     event_bus.publish(event)
 
     # -- 4. Write audit event ---------------------------------------
-    await state_store.write_audit_event(AuditEvent(
-        event_id=_new_id(),
-        timestamp=_utcnow(),
-        adapter_name=adapter.platform_name,
-        account_id=adapter.account_id,
-        correlation_id=correlation_id,
-        event_type="order.cancelled",
-        payload={"client_order_id": client_order_id},
-    ))
+    await state_store.write_audit_event(
+        AuditEvent(
+            event_id=_new_id(),
+            timestamp=_utcnow(),
+            adapter_name=adapter.platform_name,
+            account_id=adapter.account_id,
+            correlation_id=correlation_id,
+            event_type="order.cancelled",
+            payload={"client_order_id": client_order_id},
+        )
+    )
 
     return result

@@ -11,7 +11,7 @@ Configurable per adapter instance:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 from unified_trading_execution.types.enums import HaltClearMode

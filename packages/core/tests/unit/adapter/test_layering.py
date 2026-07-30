@@ -52,9 +52,11 @@ def _extract_imports(filepath: Path) -> set[str]:
                     rel_to = filepath
                     for _ in range(node.level - 1):
                         rel_to = rel_to.parent
-                    pkg = ".".join(
-                        rel_to.resolve().relative_to(CORE_SRC.resolve()).parts
-                    ).removesuffix(".py").removesuffix(".__init__")
+                    pkg = (
+                        ".".join(rel_to.resolve().relative_to(CORE_SRC.resolve()).parts)
+                        .removesuffix(".py")
+                        .removesuffix(".__init__")
+                    )
                     if node.module:
                         imports.add(f"{pkg}.{node.module}")
                     else:
@@ -67,6 +69,7 @@ def _extract_imports(filepath: Path) -> set[str]:
 # ============================================================
 # Contract 1: Core must never import adapter code
 # ============================================================
+
 
 class TestCoreNeverImportsAdapters:
     """Forbidden contract: unified_trading_execution -> adapter packages."""
@@ -107,8 +110,7 @@ class TestCoreNeverImportsAdapters:
 ADAPTER_DIRS: dict[str, Path] = {}
 for adapter_name in ("bybit", "ctrader", "mt5", "ibkr"):
     candidate = (
-        WORKSPACE_ROOT / "packages" / f"adapter-{adapter_name}"
-        / "src" / COREMOD / adapter_name
+        WORKSPACE_ROOT / "packages" / f"adapter-{adapter_name}" / "src" / COREMOD / adapter_name
     )
     if candidate.is_dir():
         ADAPTER_DIRS[adapter_name] = candidate
@@ -132,13 +134,12 @@ class TestAdaptersNeverImportEachOther:
         imports = _adapter_imports(adapter_name)
         others = set(ADAPTER_DIRS.keys()) - {adapter_name}
         violations = {
-            i for i in imports
+            i
+            for i in imports
             for other in others
             if f"{COREMOD}.{other}" in i or i.startswith(f"{other}.")
         }
-        assert violations == set(), (
-            f"{adapter_name} imports other adapters: {violations}"
-        )
+        assert violations == set(), f"{adapter_name} imports other adapters: {violations}"
 
 
 class TestAdaptersOnlyImportCore:
@@ -157,10 +158,8 @@ class TestAdaptersOnlyImportCore:
             if imp == COREMOD:
                 continue  # top-level core import — fine
             # It's a unified_trading_execution.* import
-            submodule = imp[len(COREMOD) + 1:]
+            submodule = imp[len(COREMOD) + 1 :]
             top_level = submodule.split(".")[0]
             if top_level in other_adapters:
                 violations.add(imp)
-        assert violations == set(), (
-            f"{adapter_name} imports forbidden modules: {violations}"
-        )
+        assert violations == set(), f"{adapter_name} imports forbidden modules: {violations}"

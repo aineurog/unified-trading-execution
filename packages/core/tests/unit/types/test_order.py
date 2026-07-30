@@ -5,15 +5,13 @@ Every construction invariant tested for valid and invalid cases.
 
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 
 from unified_trading_execution.types.enums import (
     AssetClass,
-    OptionRight,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -31,20 +29,27 @@ from unified_trading_execution.types.order import (
 
 # ---- Helpers ----
 
-NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 
 
 def make_btc():
     return Instrument(
-        symbol="BTC", quote_currency="USDT", asset_class=AssetClass.SPOT,
-        exchange=None, currency=None, expiry=None, strike=None,
-        option_right=None, multiplier=None,
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency=None,
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
     )
 
 
 # ============================================================
 # TpSlAttachment (Section 17.5)
 # ============================================================
+
 
 class TestTpSlAttachment:
     def test_valid_market_tp(self):
@@ -77,6 +82,7 @@ class TestTpSlAttachment:
 # ============================================================
 # UnifiedOrder (Section 17.5)
 # ============================================================
+
 
 class TestUnifiedOrder:
     def test_market_order_valid(self):
@@ -264,6 +270,7 @@ class TestUnifiedOrder:
 # OrderModification (Section 17.6)
 # ============================================================
 
+
 class TestOrderModification:
     def test_valid_price_mod(self):
         m = OrderModification(client_order_id="abc", price=Decimal("51000"))
@@ -290,6 +297,7 @@ class TestOrderModification:
 # ============================================================
 # OrderResult (Section 17.7)
 # ============================================================
+
 
 class TestOrderResult:
     def test_valid_result(self):
@@ -357,9 +365,13 @@ class TestOrderResult:
 
     def test_is_frozen(self):
         r = OrderResult(
-            client_order_id="abc", platform_order_id="plat-123",
-            status=OrderStatus.OPEN, filled_quantity=Decimal("0"),
-            average_fill_price=None, created_at=NOW, updated_at=NOW,
+            client_order_id="abc",
+            platform_order_id="plat-123",
+            status=OrderStatus.OPEN,
+            filled_quantity=Decimal("0"),
+            average_fill_price=None,
+            created_at=NOW,
+            updated_at=NOW,
         )
         with pytest.raises(Exception):
             r.status = OrderStatus.FILLED  # type: ignore[misc]
@@ -368,6 +380,7 @@ class TestOrderResult:
 # ============================================================
 # OrderRecord (Section 17.8)
 # ============================================================
+
 
 class TestOrderRecord:
     def test_valid_record(self):
@@ -427,6 +440,7 @@ class TestOrderRecord:
 # FillRecord (Section 17.11)
 # ============================================================
 
+
 class TestFillRecord:
     def test_valid_fill(self):
         inst = make_btc()
@@ -463,20 +477,30 @@ class TestFillRecord:
         inst = make_btc()
         with pytest.raises(ValueError, match="fill_quantity must be > 0"):
             FillRecord(
-                client_order_id="abc", platform_fill_id="fill-1",
-                instrument=inst, fill_quantity=Decimal("0"),
-                fill_price=Decimal("50000"), fill_timestamp=NOW,
-                fee_currency=None, fee_amount=None, correlation_id="corr-xyz",
+                client_order_id="abc",
+                platform_fill_id="fill-1",
+                instrument=inst,
+                fill_quantity=Decimal("0"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=NOW,
+                fee_currency=None,
+                fee_amount=None,
+                correlation_id="corr-xyz",
             )
 
     def test_fill_price_must_be_positive(self):
         inst = make_btc()
         with pytest.raises(ValueError, match="fill_price must be > 0"):
             FillRecord(
-                client_order_id="abc", platform_fill_id="fill-1",
-                instrument=inst, fill_quantity=Decimal("0.001"),
-                fill_price=Decimal("0"), fill_timestamp=NOW,
-                fee_currency=None, fee_amount=None, correlation_id="corr-xyz",
+                client_order_id="abc",
+                platform_fill_id="fill-1",
+                instrument=inst,
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("0"),
+                fill_timestamp=NOW,
+                fee_currency=None,
+                fee_amount=None,
+                correlation_id="corr-xyz",
             )
 
     def test_naive_timestamp_rejected(self):
@@ -484,19 +508,29 @@ class TestFillRecord:
         naive = datetime(2026, 7, 28, 12, 0, 0)
         with pytest.raises(ValueError, match="timezone-aware"):
             FillRecord(
-                client_order_id="abc", platform_fill_id="fill-1",
-                instrument=inst, fill_quantity=Decimal("0.001"),
-                fill_price=Decimal("50000"), fill_timestamp=naive,
-                fee_currency=None, fee_amount=None, correlation_id="corr-xyz",
+                client_order_id="abc",
+                platform_fill_id="fill-1",
+                instrument=inst,
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=naive,
+                fee_currency=None,
+                fee_amount=None,
+                correlation_id="corr-xyz",
             )
 
     def test_is_frozen(self):
         inst = make_btc()
         f = FillRecord(
-            client_order_id="abc", platform_fill_id="fill-1",
-            instrument=inst, fill_quantity=Decimal("0.001"),
-            fill_price=Decimal("50000"), fill_timestamp=NOW,
-            fee_currency=None, fee_amount=None, correlation_id="corr-xyz",
+            client_order_id="abc",
+            platform_fill_id="fill-1",
+            instrument=inst,
+            fill_quantity=Decimal("0.001"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW,
+            fee_currency=None,
+            fee_amount=None,
+            correlation_id="corr-xyz",
         )
         with pytest.raises(Exception):
             f.fill_quantity = Decimal("0.002")  # type: ignore[misc]

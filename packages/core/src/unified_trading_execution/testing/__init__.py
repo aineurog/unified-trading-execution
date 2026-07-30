@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import uuid
 from collections import deque
-from datetime import datetime, timezone
+from datetime import UTC, datetime, timezone
 from decimal import Decimal
 
 from unified_trading_execution.adapter import Adapter, RateLimits
@@ -47,7 +47,7 @@ def _new_id() -> str:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 class MockAdapter(Adapter):
@@ -100,9 +100,14 @@ class MockAdapter(Adapter):
         self._fills: list[FillRecord] = []
 
         # Configurable capabilities
-        self._supported_order_types: frozenset[OrderType] = frozenset({
-            OrderType.MARKET, OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT,
-        })
+        self._supported_order_types: frozenset[OrderType] = frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
+        )
         self._rate_limits = RateLimits(
             requests_per_interval=100,
             interval_seconds=60.0,
@@ -156,36 +161,42 @@ class MockAdapter(Adapter):
 
     def inject_fill(self, fill: FillRecord) -> None:
         """Publish a FillEvent to the bus as if received from a websocket stream."""
-        self._event_bus.publish(FillEvent(
-            event_id=_new_id(),
-            timestamp=_utcnow(),
-            adapter_name=self._platform_name,
-            account_id=self._account_id,
-            correlation_id=fill.correlation_id,
-            fill=fill,
-        ))
+        self._event_bus.publish(
+            FillEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=fill.correlation_id,
+                fill=fill,
+            )
+        )
 
     def inject_position_update(self, position: Position) -> None:
         """Publish a PositionUpdateEvent to the bus."""
-        self._event_bus.publish(PositionUpdateEvent(
-            event_id=_new_id(),
-            timestamp=_utcnow(),
-            adapter_name=self._platform_name,
-            account_id=self._account_id,
-            correlation_id=None,
-            position=position,
-        ))
+        self._event_bus.publish(
+            PositionUpdateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=None,
+                position=position,
+            )
+        )
 
     def inject_balance_update(self, balance: Balance) -> None:
         """Publish a BalanceUpdateEvent to the bus."""
-        self._event_bus.publish(BalanceUpdateEvent(
-            event_id=_new_id(),
-            timestamp=_utcnow(),
-            adapter_name=self._platform_name,
-            account_id=self._account_id,
-            correlation_id=None,
-            balance=balance,
-        ))
+        self._event_bus.publish(
+            BalanceUpdateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=None,
+                balance=balance,
+            )
+        )
 
     # -- Instrument specs --
 
@@ -229,27 +240,31 @@ class MockAdapter(Adapter):
         if (err := self._consume_error()) is not None:
             raise err
         self._connected = True
-        self._event_bus.publish(ConnectionStateEvent(
-            event_id=_new_id(),
-            timestamp=_utcnow(),
-            adapter_name=self._platform_name,
-            account_id=self._account_id,
-            correlation_id=None,
-            connected=True,
-        ))
+        self._event_bus.publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=None,
+                connected=True,
+            )
+        )
 
     async def disconnect(self) -> None:
         if (err := self._consume_error()) is not None:
             raise err
         self._connected = False
-        self._event_bus.publish(ConnectionStateEvent(
-            event_id=_new_id(),
-            timestamp=_utcnow(),
-            adapter_name=self._platform_name,
-            account_id=self._account_id,
-            correlation_id=None,
-            connected=False,
-        ))
+        self._event_bus.publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=None,
+                connected=False,
+            )
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -297,15 +312,23 @@ class MockAdapter(Adapter):
             instrument=existing.instrument,
             order_type=existing.order_type,
             side=existing.side,
-            quantity=modification.quantity if modification.quantity is not None else existing.quantity,
+            quantity=modification.quantity
+            if modification.quantity is not None
+            else existing.quantity,
             time_in_force=existing.time_in_force,
             client_order_id=existing.client_order_id,
             price=modification.price if modification.price is not None else existing.price,
-            stop_price=modification.stop_price if modification.stop_price is not None else existing.stop_price,
+            stop_price=modification.stop_price
+            if modification.stop_price is not None
+            else existing.stop_price,
             reduce_only=existing.reduce_only,
             client_tag=existing.client_tag,
-            take_profit=modification.take_profit if modification.take_profit is not None else existing.take_profit,
-            stop_loss=modification.stop_loss if modification.stop_loss is not None else existing.stop_loss,
+            take_profit=modification.take_profit
+            if modification.take_profit is not None
+            else existing.take_profit,
+            stop_loss=modification.stop_loss
+            if modification.stop_loss is not None
+            else existing.stop_loss,
             platform_order_id=existing.platform_order_id,
             status=existing.status,
             filled_quantity=existing.filled_quantity,
@@ -430,7 +453,8 @@ class MockAdapter(Adapter):
         if (err := self._consume_error()) is not None:
             raise err
         return {
-            cid: rec for cid, rec in self._orders.items()
+            cid: rec
+            for cid, rec in self._orders.items()
             if rec.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
         }
 

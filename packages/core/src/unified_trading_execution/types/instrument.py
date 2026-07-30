@@ -92,7 +92,7 @@ def _with_broker_override(instrument: Instrument, override: str) -> Instrument:
         option_right=instrument.option_right,
         multiplier=instrument.multiplier,
     )
-    object.__setattr__(new, '_broker_symbol_override', override)
+    object.__setattr__(new, "_broker_symbol_override", override)
     return new
 
 
