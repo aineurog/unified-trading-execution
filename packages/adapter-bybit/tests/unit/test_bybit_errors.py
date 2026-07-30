@@ -96,9 +96,7 @@ class TestMapBybitRetCode:
             (3400214, PlatformConnectionError),
         ],
     )
-    def test_known_ret_code(
-        self, ret_code: int, expected_type: type
-    ) -> None:
+    def test_known_ret_code(self, ret_code: int, expected_type: type) -> None:
         exc = map_bybit_error(ret_code=ret_code, ret_msg="test message")
         assert isinstance(exc, expected_type)
         assert "test message" in str(exc)
