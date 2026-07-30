@@ -14,14 +14,21 @@ Usage::
 
 from __future__ import annotations
 
+import asyncio
+from decimal import Decimal
+
 from datetime import datetime, timezone
 
+from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
+from unified_trading_execution.bybit.errors import map_bybit_error
+from unified_trading_execution.errors import InvalidSymbolError
+from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.events import EventBus
-from unified_trading_execution.types.enums import OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     OrderModification,
@@ -32,6 +39,8 @@ from unified_trading_execution.types.order import (
 
 _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
+
+
 
 
 def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
@@ -76,6 +85,18 @@ class BybitAdapter(Adapter):
 
     def _update_rate_limits(self, headers: dict[str, str]) -> None:
         self._last_rate_limits = _parse_rate_limits(headers)
+
+    @staticmethod
+    def _instrument_to_category(instrument: Instrument) -> str:
+        if instrument.asset_class == AssetClass.SPOT:
+            return "spot"
+        if instrument.asset_class == AssetClass.FUTURES:
+            if instrument.currency == instrument.quote_currency:
+                return "linear"
+            return "inverse"
+        raise InvalidSymbolError(
+            f"Asset class {instrument.asset_class} is not supported by Bybit",
+        )
 
     # ---- Identification (Section 17.10) ----
 
@@ -147,22 +168,69 @@ class BybitAdapter(Adapter):
     # ---- Instrument metadata ----
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
-        """Fetch trading rules for a single instrument from Bybit.
+        bybit_symbol = to_bybit_symbol(instrument)
+        category = self._instrument_to_category(instrument)
 
-        Raises ``InvalidSymbolError`` if the instrument is not tradable.
-        See Section 17.10, "Instrument metadata."
-        """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Instrument metadata")
+        try:
+            result = await asyncio.to_thread(
+                self._session.get_instruments_info,
+                category=category,
+                symbol=bybit_symbol,
+            )
+            data, _, _ = result  # type: ignore[misc]
+        except FailedRequestError as exc:
+            raise map_bybit_error(
+                http_status=exc.status_code,
+                ret_msg=exc.message,
+            ) from exc
+        except InvalidRequestError as exc:
+            raise map_bybit_error(
+                ret_code=exc.status_code,
+                ret_msg=exc.message,
+            ) from exc
+
+        listings = (data.get("result", {}) or {}).get("list", [])
+        if not listings:
+            raise map_bybit_error(
+                ret_msg=f"No instrument spec found for {bybit_symbol}",
+            )
+
+        entry = listings[0]
+        status = entry.get("status", "")
+        if status != "Trading":
+            raise map_bybit_error(
+                ret_msg=f"Instrument {bybit_symbol} is not tradable (status: {status})",
+            )
+
+        lot_filter = entry.get("lotSizeFilter", {})
+        price_filter = entry.get("priceFilter", {})
+
+        tick_size = Decimal(str(price_filter.get("tickSize", "1")))
+
+        if category == "spot":
+            lot_size = Decimal(str(lot_filter.get("basePrecision", "1")))
+        else:
+            lot_size = Decimal(str(lot_filter.get("qtyStep", "1")))
+
+        return InstrumentSpec(
+            tick_size=tick_size,
+            lot_size=lot_size,
+            min_qty=Decimal(str(lot_filter.get("minOrderQty", "0"))),
+            max_qty=Decimal(str(lot_filter.get("maxOrderQty", "0"))),
+            min_notional=Decimal(str(lot_filter.get("minNotionalValue", "0"))),
+            price_precision=-int(tick_size.as_tuple().exponent),
+            qty_precision=-int(lot_size.as_tuple().exponent),
+        )
 
     # ---- Capability reporting ----
 
     def supported_order_types(self) -> frozenset[OrderType]:
-        """Return the set of order types Bybit supports.
-
-        Must always include at minimum: {MARKET, LIMIT, STOP, STOP_LIMIT}.
-        See Section 17.10, "Capability reporting."
-        """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Capability reporting")
+        return frozenset({
+            OrderType.MARKET,
+            OrderType.LIMIT,
+            OrderType.STOP,
+            OrderType.STOP_LIMIT,
+        })
 
     # ---- Rate limits ----
 
