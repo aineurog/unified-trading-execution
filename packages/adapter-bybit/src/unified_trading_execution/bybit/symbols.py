@@ -40,7 +40,7 @@ def to_bybit_symbol(instrument: Instrument) -> str:
         raise InvalidSymbolError(f"Asset class {instrument.asset_class} is not supported by Bybit")
     if instrument.quote_currency is None:
         raise InvalidSymbolError(
-            f"Instrument {instrument.symbol} has no quote_currency — " f"cannot build Bybit symbol"
+            f"Instrument {instrument.symbol} has no quote_currency — cannot build Bybit symbol"
         )
     return f"{instrument.symbol}{instrument.quote_currency}"
 
