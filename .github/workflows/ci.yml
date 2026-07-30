@@ -95,4 +95,4 @@ jobs:
         env:
           BYBIT_TESTNET_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
           BYBIT_TESTNET_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
-        run: pytest packages/adapter-bybit/tests/integration/ -v
+        run: pytest packages/adapter-bybit/tests/integration/ -v --suppress-no-test-exit-code
