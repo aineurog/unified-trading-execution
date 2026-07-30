@@ -14,16 +14,17 @@ class BybitConfig:
     """Immutable configuration for the BybitAdapter.
 
     Attributes:
-        api_key: Bybit API key (testnet or live).
-        api_secret: Bybit API secret (testnet or live).
-        testnet: If True, connect to testnet; if False, connect to live.
-        account_id: Human-readable account label (defaults to "bybit").
+        api_key: Bybit API key.
+        api_secret: Bybit API secret.
+        testnet: If True, connect to testnet.  If False, connect to mainnet.
+        demo: If True, use the demo subdomain (api-demo / api-demo-testnet).
+        platform_name: Human-readable platform identifier.
+        account_id: Unique account label on this platform.
     """
 
     api_key: str
     api_secret: str
     testnet: bool = True
-
-    # Default values for optional identification fields:
+    demo: bool = False
     platform_name: str = "bybit"
     account_id: str = "bybit-account"

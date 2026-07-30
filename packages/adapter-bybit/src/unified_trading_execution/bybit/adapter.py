@@ -1,9 +1,5 @@
 """BybitAdapter — concrete Adapter ABC implementation for Bybit (Section 17.10).
 
-This is a stub.  Every public method raises ``NotImplementedError`` with
-a docstring pointing to the relevant specification section so the dev
-knows exactly what contract each method must satisfy.
-
 Usage::
 
     from unified_trading_execution.bybit import BybitAdapter, BybitConfig
@@ -18,6 +14,10 @@ Usage::
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from pybit.unified_trading import HTTP
+
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.events import EventBus
@@ -30,12 +30,29 @@ from unified_trading_execution.types.order import (
 )
 
 
+_DEFAULT_REQUESTS_PER_INTERVAL = 120
+_DEFAULT_INTERVAL_SECONDS = 60
+
+
+def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
+    limit = int(headers.get("X-Bapi-Limit", _DEFAULT_REQUESTS_PER_INTERVAL))
+    remaining = int(headers.get("X-Bapi-Remaining", _DEFAULT_REQUESTS_PER_INTERVAL))
+    reset_ts = int(headers.get("X-Bapi-Reset-Timestamp", 0))
+    reset_at = (
+        datetime.fromtimestamp(reset_ts / 1000, tz=timezone.utc)
+        if reset_ts
+        else datetime.now(timezone.utc)
+    )
+    return RateLimits(
+        requests_per_interval=limit,
+        interval_seconds=_DEFAULT_INTERVAL_SECONDS,
+        remaining=remaining,
+        reset_at=reset_at,
+    )
+
+
 class BybitAdapter(Adapter):
     """Concrete Adapter ABC implementation for Bybit.
-
-    All order/connection logic is currently unimplemented — each method
-    raises ``NotImplementedError`` with a pointer to the relevant spec
-    section.  The dev fills in these bodies one by one.
 
     Construction follows the Adapter ABC convention (Section 17.10):
     configuration is supplied as a ``BybitConfig`` dataclass, not loose
@@ -47,8 +64,18 @@ class BybitAdapter(Adapter):
         self._config = config
         self._event_bus = event_bus
         self._connected = False
+        self._last_rate_limits = _parse_rate_limits({})
 
-        # TODO: initialise HTTP session, WebSocket connection handles, etc.
+        self._session = HTTP(
+            testnet=config.testnet,
+            demo=config.demo,
+            api_key=config.api_key,
+            api_secret=config.api_secret,
+            return_response_headers=True,
+        )
+
+    def _update_rate_limits(self, headers: dict[str, str]) -> None:
+        self._last_rate_limits = _parse_rate_limits(headers)
 
     # ---- Identification (Section 17.10) ----
 
@@ -140,10 +167,4 @@ class BybitAdapter(Adapter):
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
-        """Return Bybit's current rate-limit state.
-
-        Queried by the self-throttling validator.  Core may cache this
-        briefly (TTL determined by interval_seconds).
-        See Section 17.10, "Rate limits."
-        """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Rate limits")
+        return self._last_rate_limits
