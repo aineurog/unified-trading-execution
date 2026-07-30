@@ -10,9 +10,8 @@ Verify that the sync facade:
 from __future__ import annotations
 
 import concurrent.futures
-import threading
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -33,8 +32,8 @@ from unified_trading_execution.types.enums import (
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import OrderResult, UnifiedOrder
 
-
 # ── helpers ──────────────────────────────────────────────────────────
+
 
 def _instrument(symbol: str = "BTCUSDT") -> Instrument:
     return Instrument(
@@ -75,7 +74,7 @@ def _order(client_order_id: str) -> UnifiedOrder:
 
 
 def _utcnow() -> datetime:
-    return datetime.now(tz=timezone.utc)
+    return datetime.now(tz=UTC)
 
 
 # ── fixtures ─────────────────────────────────────────────────────────
@@ -87,12 +86,14 @@ def sync_engine():
     event_bus = EventBus()
     adapter = MockAdapter(event_bus=event_bus)
     adapter.add_instrument_spec(_instrument(), _spec())
-    adapter.set_rate_limits(RateLimits(
-        requests_per_interval=1000,
-        interval_seconds=60.0,
-        remaining=1000,
-        reset_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
-    ))
+    adapter.set_rate_limits(
+        RateLimits(
+            requests_per_interval=1000,
+            interval_seconds=60.0,
+            remaining=1000,
+            reset_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+    )
     store = SQLiteStateStore(":memory:")
     eng = SyncEngine(adapter=adapter, state_store=store, event_bus=event_bus)
     eng.connect()
@@ -155,9 +156,7 @@ class TestPersistentEventLoop:
         not prevent process exit."""
         assert sync_engine._loop_thread is not None
         assert sync_engine._loop_thread.is_alive()
-        assert sync_engine._loop_thread.daemon, (
-            "Background loop thread must be a daemon"
-        )
+        assert sync_engine._loop_thread.daemon, "Background loop thread must be a daemon"
 
     def test_loop_thread_name(self, sync_engine):
         """Named thread makes debugging easier."""
@@ -185,9 +184,7 @@ class TestConcurrentSyncCalls:
 
         assert len(results) == n_orders
         client_ids = {r.client_order_id for r in results}
-        assert len(client_ids) == n_orders, (
-            "All orders must have unique client_order_ids"
-        )
+        assert len(client_ids) == n_orders, "All orders must have unique client_order_ids"
         for r in results:
             assert r.status == OrderStatus.OPEN
 
@@ -250,15 +247,12 @@ class TestConcurrentSyncCalls:
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
             futures = [
-                pool.submit(sync_engine.place_order, _order(f"health-{i}"))
-                for i in range(10)
+                pool.submit(sync_engine.place_order, _order(f"health-{i}")) for i in range(10)
             ]
             for f in futures:
                 f.result()  # raise if any failed
 
-        assert not loop_before.is_closed(), (
-            "Background loop must not close under load"
-        )
+        assert not loop_before.is_closed(), "Background loop must not close under load"
 
 
 # ── shutdown behaviour ───────────────────────────────────────────────

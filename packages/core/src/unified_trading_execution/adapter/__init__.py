@@ -157,33 +157,25 @@ class Adapter(ABC):
         Optional: raises NotImplementedError by default. Adapters that
         implement this method enable full reconciliation.
         """
-        raise NotImplementedError(
-            f"{self.platform_name} does not support bulk position fetch"
-        )
+        raise NotImplementedError(f"{self.platform_name} does not support bulk position fetch")
 
     async def fetch_balances(self) -> dict[str, Balance]:
         """Fetch all account balances from the platform, keyed by currency.
 
         Optional: raises NotImplementedError by default.
         """
-        raise NotImplementedError(
-            f"{self.platform_name} does not support bulk balance fetch"
-        )
+        raise NotImplementedError(f"{self.platform_name} does not support bulk balance fetch")
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch all open orders from the platform, keyed by client_order_id.
 
         Optional: raises NotImplementedError by default.
         """
-        raise NotImplementedError(
-            f"{self.platform_name} does not support bulk order fetch"
-        )
+        raise NotImplementedError(f"{self.platform_name} does not support bulk order fetch")
 
     async def fetch_fills(self) -> dict[str, list[FillRecord]]:
         """Fetch recent fills from the platform, keyed by client_order_id.
 
         Optional: raises NotImplementedError by default.
         """
-        raise NotImplementedError(
-            f"{self.platform_name} does not support bulk fill fetch"
-        )
+        raise NotImplementedError(f"{self.platform_name} does not support bulk fill fetch")

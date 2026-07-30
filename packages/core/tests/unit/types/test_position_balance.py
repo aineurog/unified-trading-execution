@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -11,20 +11,27 @@ from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.position import Balance, Position
 
-NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 
 
 def make_btc():
     return Instrument(
-        symbol="BTC", quote_currency="USDT", asset_class=AssetClass.SPOT,
-        exchange=None, currency=None, expiry=None, strike=None,
-        option_right=None, multiplier=None,
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency=None,
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
     )
 
 
 # ============================================================
 # Position
 # ============================================================
+
 
 class TestPosition:
     def test_long_position(self):
@@ -69,6 +76,7 @@ class TestPosition:
 # ============================================================
 # Balance
 # ============================================================
+
 
 class TestBalance:
     def test_valid_balance(self):

@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
 import pytest_asyncio
 
+from unified_trading_execution.events import AuditEvent
+from unified_trading_execution.state.halt import HaltConfig, HaltStateMachine
+from unified_trading_execution.state.reconciliation import reconcile
+from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import (
     AssetClass,
     HaltClearMode,
-    OptionRight,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -20,19 +23,21 @@ from unified_trading_execution.types.enums import (
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
 from unified_trading_execution.types.position import Balance, Position
-from unified_trading_execution.events import AuditEvent
-from unified_trading_execution.state.store import SQLiteStateStore
-from unified_trading_execution.state.reconciliation import reconcile
-from unified_trading_execution.state.halt import HaltConfig, HaltStateMachine
 
-NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
 
 
 def make_inst(symbol="BTC"):
     return Instrument(
-        symbol=symbol, quote_currency="USDT", asset_class=AssetClass.SPOT,
-        exchange=None, currency=None, expiry=None, strike=None,
-        option_right=None, multiplier=None,
+        symbol=symbol,
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency=None,
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
     )
 
 
@@ -97,6 +102,7 @@ def make_fill(client_order_id="abc", qty="0.001", price="50000"):
 # Fixtures
 # ============================================================
 
+
 @pytest_asyncio.fixture
 async def store():
     s = SQLiteStateStore(":memory:")
@@ -108,6 +114,7 @@ async def store():
 # ============================================================
 # SQLiteStateStore — lifecycle
 # ============================================================
+
 
 class TestSQLiteStoreLifecycle:
     @pytest.mark.asyncio
@@ -132,6 +139,7 @@ class TestSQLiteStoreLifecycle:
 # ============================================================
 # SQLiteStateStore — positions
 # ============================================================
+
 
 class TestSQLiteStorePositions:
     @pytest.mark.asyncio
@@ -169,7 +177,7 @@ class TestSQLiteStorePositions:
         await store.upsert_position(make_position(qty="0.5"))
         history = await store.query_positions(
             instrument=make_inst(),
-            start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            start=datetime(2025, 1, 1, tzinfo=UTC),
         )
         assert len(history) == 1
 
@@ -177,6 +185,7 @@ class TestSQLiteStorePositions:
 # ============================================================
 # SQLiteStateStore — balances
 # ============================================================
+
 
 class TestSQLiteStoreBalances:
     @pytest.mark.asyncio
@@ -212,6 +221,7 @@ class TestSQLiteStoreBalances:
 # SQLiteStateStore — orders
 # ============================================================
 
+
 class TestSQLiteStoreOrders:
     @pytest.mark.asyncio
     async def test_upsert_and_get_order(self, store):
@@ -244,7 +254,7 @@ class TestSQLiteStoreOrders:
     async def test_query_orders_filtered_by_time(self, store):
         await store.upsert_order(make_order("abc"))
         results = await store.query_orders(
-            start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            start=datetime(2025, 1, 1, tzinfo=UTC),
         )
         assert len(results) == 1
 
@@ -252,6 +262,7 @@ class TestSQLiteStoreOrders:
 # ============================================================
 # SQLiteStateStore — fills
 # ============================================================
+
 
 class TestSQLiteStoreFills:
     @pytest.mark.asyncio
@@ -273,7 +284,7 @@ class TestSQLiteStoreFills:
     async def test_query_fills_filtered_by_time(self, store):
         await store.upsert_fill(make_fill("abc"))
         results = await store.query_fills(
-            start=datetime(2025, 1, 1, tzinfo=timezone.utc),
+            start=datetime(2025, 1, 1, tzinfo=UTC),
         )
         assert len(results) == 1
 
@@ -289,18 +300,21 @@ class TestSQLiteStoreFills:
 # SQLiteStateStore — audit events
 # ============================================================
 
+
 class TestSQLiteStoreAudit:
     @pytest.mark.asyncio
     async def test_write_audit_event(self, store):
-        await store.write_audit_event(AuditEvent(
-            event_id="evt-1",
-            timestamp=NOW,
-            adapter_name="bybit",
-            account_id="acct-1",
-            correlation_id="corr-1",
-            event_type="order.placed",
-            payload={"client_order_id": "abc"},
-        ))
+        await store.write_audit_event(
+            AuditEvent(
+                event_id="evt-1",
+                timestamp=NOW,
+                adapter_name="bybit",
+                account_id="acct-1",
+                correlation_id="corr-1",
+                event_type="order.placed",
+                payload={"client_order_id": "abc"},
+            )
+        )
         # Verify it's written by querying the table directly
         cursor = await store.conn.execute("SELECT * FROM audit_events WHERE event_id=?", ("evt-1",))
         row = await cursor.fetchone()
@@ -325,6 +339,7 @@ class TestSQLiteStoreAudit:
     @pytest.mark.asyncio
     async def test_reconciliation_event_roundtrip(self, store):
         from unified_trading_execution.events import ReconciliationEvent, ReconciliationMismatch
+
         m = ReconciliationMismatch(
             mismatch_type="position_quantity",
             instrument=make_inst(),
@@ -332,9 +347,13 @@ class TestSQLiteStoreAudit:
             platform_value="1.0",
         )
         evt = ReconciliationEvent(
-            event_id="rec-1", timestamp=NOW, adapter_name="bybit",
-            account_id="acct-1", correlation_id=None,
-            mismatches=(m,), duration_ms=12.3,
+            event_id="rec-1",
+            timestamp=NOW,
+            adapter_name="bybit",
+            account_id="acct-1",
+            correlation_id=None,
+            mismatches=(m,),
+            duration_ms=12.3,
         )
         await store.write_reconciliation_event(evt)
         results = await store.query_reconciliation_events()
@@ -344,13 +363,19 @@ class TestSQLiteStoreAudit:
     @pytest.mark.asyncio
     async def test_halt_event_roundtrip(self, store):
         from unified_trading_execution.events import HaltEvent
+
         evt = HaltEvent(
-            event_id="halt-1", timestamp=NOW, adapter_name="bybit",
-            account_id="acct-1", correlation_id=None,
-            action="entered", scope="instrument",
+            event_id="halt-1",
+            timestamp=NOW,
+            adapter_name="bybit",
+            account_id="acct-1",
+            correlation_id=None,
+            action="entered",
+            scope="instrument",
             instrument=make_inst(),
             reason="position_quantity_mismatch",
-            detail="qty drift", cleared_by=None,
+            detail="qty drift",
+            cleared_by=None,
         )
         await store.write_halt_event(evt)
         results = await store.query_halt_events()
@@ -361,6 +386,7 @@ class TestSQLiteStoreAudit:
 # ============================================================
 # SQLiteStateStore — WAL and performance
 # ============================================================
+
 
 class TestSQLiteStorePerformance:
     @pytest.mark.asyncio
@@ -392,6 +418,7 @@ class TestSQLiteStorePerformance:
 # Reconciliation — 5 mismatch cases (Section 6.3)
 # ============================================================
 
+
 class TestReconciliation:
     """Each mismatch case from Section 6.3 has its own distinct test."""
 
@@ -400,10 +427,14 @@ class TestReconciliation:
         local = {inst: make_position(qty="0.5")}
         platform = {inst: make_position(qty="1.0")}
         result = reconcile(
-            local_positions=local, platform_positions=platform,
-            local_balances={}, platform_balances={},
-            local_orders={}, platform_orders={},
-            local_fills={}, platform_fills={},
+            local_positions=local,
+            platform_positions=platform,
+            local_balances={},
+            platform_balances={},
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
         )
         assert len(result.position_mismatches) == 1
         assert result.position_mismatches[0].mismatch_type == "position_quantity"
@@ -414,10 +445,14 @@ class TestReconciliation:
         local = {"USDT": make_balance(free="9000")}
         platform = {"USDT": make_balance(free="8000")}
         result = reconcile(
-            local_positions={}, platform_positions={},
-            local_balances=local, platform_balances=platform,
-            local_orders={}, platform_orders={},
-            local_fills={}, platform_fills={},
+            local_positions={},
+            platform_positions={},
+            local_balances=local,
+            platform_balances=platform,
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
         )
         assert len(result.balance_mismatches) == 1
         assert result.balance_mismatches[0].mismatch_type == "balance"
@@ -425,10 +460,14 @@ class TestReconciliation:
     def test_case3_orphan_order_on_platform(self):
         platform_orders = {"abc": make_order("abc")}
         result = reconcile(
-            local_positions={}, platform_positions={},
-            local_balances={}, platform_balances={},
-            local_orders={}, platform_orders=platform_orders,
-            local_fills={}, platform_fills={},
+            local_positions={},
+            platform_positions={},
+            local_balances={},
+            platform_balances={},
+            local_orders={},
+            platform_orders=platform_orders,
+            local_fills={},
+            platform_fills={},
         )
         assert len(result.orphan_orders_on_platform) == 1
         assert result.orphan_orders_on_platform[0].client_order_id == "abc"
@@ -436,10 +475,14 @@ class TestReconciliation:
     def test_case4_orphan_order_in_local(self):
         local_orders = {"abc": make_order("abc")}
         result = reconcile(
-            local_positions={}, platform_positions={},
-            local_balances={}, platform_balances={},
-            local_orders=local_orders, platform_orders={},
-            local_fills={}, platform_fills={},
+            local_positions={},
+            platform_positions={},
+            local_balances={},
+            platform_balances={},
+            local_orders=local_orders,
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
         )
         assert len(result.orphan_orders_in_local) == 1
         assert result.orphan_orders_in_local[0] == "abc"
@@ -448,10 +491,14 @@ class TestReconciliation:
         local_fills = {"abc": [make_fill("abc", qty="0.001")]}
         platform_fills = {"abc": [make_fill("abc", qty="0.002")]}
         result = reconcile(
-            local_positions={}, platform_positions={},
-            local_balances={}, platform_balances={},
-            local_orders={}, platform_orders={},
-            local_fills=local_fills, platform_fills=platform_fills,
+            local_positions={},
+            platform_positions={},
+            local_balances={},
+            platform_balances={},
+            local_orders={},
+            platform_orders={},
+            local_fills=local_fills,
+            platform_fills=platform_fills,
         )
         assert len(result.partial_fill_discrepancies) == 1
         assert result.partial_fill_discrepancies[0].mismatch_type == "partial_fill"
@@ -463,10 +510,14 @@ class TestReconciliation:
         orders = {"abc": make_order()}
         fills = {"abc": [make_fill("abc")]}
         result = reconcile(
-            local_positions=pos, platform_positions=pos,
-            local_balances=bal, platform_balances=bal,
-            local_orders=orders, platform_orders=orders,
-            local_fills=fills, platform_fills=fills,
+            local_positions=pos,
+            platform_positions=pos,
+            local_balances=bal,
+            platform_balances=bal,
+            local_orders=orders,
+            platform_orders=orders,
+            local_fills=fills,
+            platform_fills=fills,
         )
         assert result.is_clean
         assert len(result.all_mismatches) == 0
@@ -492,6 +543,7 @@ class TestReconciliation:
 # ============================================================
 # Halt state machine — configurability (Section 6.4)
 # ============================================================
+
 
 class TestHaltStateMachine:
     """Every configurability combination from Section 6.4 is tested."""
@@ -560,8 +612,9 @@ class TestHaltStateMachine:
         cleared = hsm.try_clear_halt("instrument", inst, reconciliation_is_clean=True)
         assert cleared is False
         # Explicit manual clear works
-        cleared = hsm.try_clear_halt("instrument", inst,
-                                     reconciliation_is_clean=True, manual_clear=True)
+        cleared = hsm.try_clear_halt(
+            "instrument", inst, reconciliation_is_clean=True, manual_clear=True
+        )
         assert cleared is True
 
     def test_manual_clear_without_manual_flag_fails(self):
@@ -601,8 +654,7 @@ class TestHaltStateMachine:
 
     def test_clear_non_halted_instrument(self):
         hsm = HaltStateMachine()
-        cleared = hsm.try_clear_halt("instrument", make_inst(),
-                                     reconciliation_is_clean=True)
+        cleared = hsm.try_clear_halt("instrument", make_inst(), reconciliation_is_clean=True)
         assert cleared is False
 
     def test_clear_non_halted_account(self):
@@ -621,8 +673,7 @@ class TestHaltStateMachine:
     def test_account_halt_cannot_be_cleared_by_instrument_clear(self):
         hsm = HaltStateMachine()
         hsm.enter_halt("account", None, "balance_mismatch", "USDT")
-        cleared = hsm.try_clear_halt("instrument", make_inst(),
-                                     reconciliation_is_clean=True)
+        cleared = hsm.try_clear_halt("instrument", make_inst(), reconciliation_is_clean=True)
         assert cleared is False
         assert hsm.is_account_halted()
 
@@ -641,4 +692,3 @@ class TestHaltStateMachine:
         halts = hsm.active_halts()
         assert len(halts) == 1
         assert halts[0].scope == "account"
-

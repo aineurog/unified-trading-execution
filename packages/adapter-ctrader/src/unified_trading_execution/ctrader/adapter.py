@@ -10,6 +10,7 @@ This module contains no business logic, no retry policy, no risk decisions.
 from __future__ import annotations
 
 from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.events import EventBus
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import OrderModification, OrderResult, UnifiedOrder
@@ -33,7 +34,7 @@ class CTraderAdapter(Adapter):
         access_token: str,
         *,
         testnet: bool = True,
-        event_bus: "EventBus | None" = None,  # noqa: F821
+        event_bus: EventBus | None = None,
     ) -> None:
         self._client_id = client_id
         self._client_secret = client_secret
@@ -84,12 +85,14 @@ class CTraderAdapter(Adapter):
     # ---- Capability reporting ----
 
     def supported_order_types(self) -> frozenset[OrderType]:
-        return frozenset({
-            OrderType.MARKET,
-            OrderType.LIMIT,
-            OrderType.STOP,
-            OrderType.STOP_LIMIT,
-        })
+        return frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
+        )
 
     # ---- Rate limits ----
 

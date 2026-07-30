@@ -24,13 +24,10 @@ from unified_trading_execution.events import EventBus
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
-    FillRecord,
     OrderModification,
-    OrderRecord,
     OrderResult,
     UnifiedOrder,
 )
-from unified_trading_execution.types.position import Balance, Position
 
 
 class BybitAdapter(Adapter):
@@ -71,9 +68,7 @@ class BybitAdapter(Adapter):
         Must publish ``ConnectionStateEvent(connected=True)`` on success.
         See Section 17.10, "Connection lifecycle."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Connection lifecycle"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Connection lifecycle")
 
     async def disconnect(self) -> None:
         """Close all connections gracefully.
@@ -81,9 +76,7 @@ class BybitAdapter(Adapter):
         Must publish ``ConnectionStateEvent(connected=False)`` on disconnect.
         See Section 17.10, "Connection lifecycle."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Connection lifecycle"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Connection lifecycle")
 
     @property
     def is_connected(self) -> bool:
@@ -100,9 +93,7 @@ class BybitAdapter(Adapter):
         ``UnsupportedOrderTypeError`` — never approximate.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Order operations"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
         """Translate and submit an order modification to Bybit.
@@ -110,9 +101,7 @@ class BybitAdapter(Adapter):
         Core runs risk checks against the resulting order before calling.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Order operations"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel an existing order by client_order_id.
@@ -120,17 +109,13 @@ class BybitAdapter(Adapter):
         Raises ``OrderNotFoundError`` if Bybit does not know the order.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Order operations"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by client_order_id. Returns None if not found.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Order operations"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
 
     # ---- Instrument metadata ----
 
@@ -140,9 +125,7 @@ class BybitAdapter(Adapter):
         Raises ``InvalidSymbolError`` if the instrument is not tradable.
         See Section 17.10, "Instrument metadata."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Instrument metadata"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Instrument metadata")
 
     # ---- Capability reporting ----
 
@@ -152,9 +135,7 @@ class BybitAdapter(Adapter):
         Must always include at minimum: {MARKET, LIMIT, STOP, STOP_LIMIT}.
         See Section 17.10, "Capability reporting."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Capability reporting"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Capability reporting")
 
     # ---- Rate limits ----
 
@@ -165,6 +146,4 @@ class BybitAdapter(Adapter):
         briefly (TTL determined by interval_seconds).
         See Section 17.10, "Rate limits."
         """
-        raise NotImplementedError(
-            "TODO: implement — see Section 17.10, Rate limits"
-        )
+        raise NotImplementedError("TODO: implement — see Section 17.10, Rate limits")

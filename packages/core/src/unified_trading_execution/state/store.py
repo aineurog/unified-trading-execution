@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,7 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 # ============================================================
 # Instrument serialisation helpers
 # ============================================================
+
 
 def _serialise_instrument(i: Instrument) -> dict[str, Any]:
     return {
@@ -74,6 +75,7 @@ def _serialise_decimal_list(items: list[Decimal]) -> str:
 # StateStore ABC
 # ============================================================
 
+
 class StateStore(ABC):
     """Pluggable storage backend for the state mirror and audit trail."""
 
@@ -89,6 +91,7 @@ class StateStore(ABC):
         """Batched insert — default implementation calls upsert_fill in a loop."""
         for fill in fills:
             await self.upsert_fill(fill)
+
     @abstractmethod
     async def write_audit_event(self, event: AuditEvent) -> None: ...
     @abstractmethod
@@ -104,34 +107,65 @@ class StateStore(ABC):
     async def get_order(self, client_order_id: str) -> OrderRecord | None: ...
 
     @abstractmethod
-    async def query_orders(self, *, instrument: Instrument | None = None,
-                           start: datetime | None = None, end: datetime | None = None,
-                           limit: int = 1000) -> list[OrderRecord]: ...
+    async def query_orders(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[OrderRecord]: ...
     @abstractmethod
-    async def query_fills(self, *, instrument: Instrument | None = None,
-                          start: datetime | None = None, end: datetime | None = None,
-                          limit: int = 1000) -> list[FillRecord]: ...
+    async def query_fills(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[FillRecord]: ...
     @abstractmethod
-    async def query_positions(self, *, instrument: Instrument | None = None,
-                              start: datetime | None = None, end: datetime | None = None,
-                              limit: int = 1000) -> list[Position]: ...
+    async def query_positions(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[Position]: ...
     @abstractmethod
-    async def query_balances(self, *, currency: str | None = None,
-                             start: datetime | None = None, end: datetime | None = None,
-                             limit: int = 1000) -> list[Balance]: ...
+    async def query_balances(
+        self,
+        *,
+        currency: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[Balance]: ...
     @abstractmethod
-    async def query_reconciliation_events(self, *, start: datetime | None = None,
-                                          end: datetime | None = None,
-                                          limit: int = 1000) -> list[ReconciliationEvent]: ...
+    async def query_reconciliation_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[ReconciliationEvent]: ...
     @abstractmethod
-    async def query_halt_events(self, *, start: datetime | None = None,
-                                end: datetime | None = None,
-                                limit: int = 1000) -> list[HaltEvent]: ...
+    async def query_halt_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[HaltEvent]: ...
 
     @abstractmethod
     async def initialize(self) -> None: ...
     @abstractmethod
     async def close(self) -> None: ...
+
+    @property
+    @abstractmethod
+    def conn(self) -> Any:
+        """Escape hatch: the raw DB connection for ad-hoc queries.
+
+        Used sparingly by engine-level reconciliation logic (e.g., DELETE
+        of orphan orders). Backends that don't expose a connection object
+        raise NotImplementedError.
+        """
+        ...
 
     async def flush(self) -> None:
         """Ensure all pending writes are durable before teardown.
@@ -150,6 +184,7 @@ class StateStore(ABC):
 # ============================================================
 # SQLiteStateStore
 # ============================================================
+
 
 class SQLiteStateStore(StateStore):
     """Default v1 StateStore backed by SQLite via aiosqlite.
@@ -192,9 +227,12 @@ class SQLiteStateStore(StateStore):
             await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     async def _run_migrations(self) -> None:
-        await self.conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
+        await self.conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
         cursor = await self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
         row = await cursor.fetchone()
+        assert row is not None, "SELECT with aggregation returned no row"
         current = row[0]
 
         sql_files = sorted(
@@ -207,7 +245,7 @@ class SQLiteStateStore(StateStore):
             sql_path = MIGRATIONS_DIR / fname
             sql = sql_path.read_text()
             await self.conn.executescript(sql)
-            now = datetime.now(tz=timezone.utc).isoformat()
+            now = datetime.now(tz=UTC).isoformat()
             await self.conn.execute(
                 "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
                 (version, now),
@@ -227,10 +265,21 @@ class SQLiteStateStore(StateStore):
                     expiry, strike, option_right, multiplier, broker_symbol_override,
                     quantity, average_entry_price, updated_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (i["symbol"], i["quote_currency"], i["asset_class"], i["exchange"],
-                 i["currency"], i["expiry"], i["strike"], i["option_right"],
-                 i["multiplier"], i["broker_symbol_override"],
-                 str(position.quantity), str(position.average_entry_price), now),
+                (
+                    i["symbol"],
+                    i["quote_currency"],
+                    i["asset_class"],
+                    i["exchange"],
+                    i["currency"],
+                    i["expiry"],
+                    i["strike"],
+                    i["option_right"],
+                    i["multiplier"],
+                    i["broker_symbol_override"],
+                    str(position.quantity),
+                    str(position.average_entry_price),
+                    now,
+                ),
             )
             await self.conn.execute(
                 """INSERT INTO position_history
@@ -238,10 +287,21 @@ class SQLiteStateStore(StateStore):
                     expiry, strike, option_right, multiplier, broker_symbol_override,
                     quantity, average_entry_price, recorded_at)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (i["symbol"], i["quote_currency"], i["asset_class"], i["exchange"],
-                 i["currency"], i["expiry"], i["strike"], i["option_right"],
-                 i["multiplier"], i["broker_symbol_override"],
-                 str(position.quantity), str(position.average_entry_price), now),
+                (
+                    i["symbol"],
+                    i["quote_currency"],
+                    i["asset_class"],
+                    i["exchange"],
+                    i["currency"],
+                    i["expiry"],
+                    i["strike"],
+                    i["option_right"],
+                    i["multiplier"],
+                    i["broker_symbol_override"],
+                    str(position.quantity),
+                    str(position.average_entry_price),
+                    now,
+                ),
             )
         except BaseException:
             await self.conn.rollback()
@@ -280,20 +340,42 @@ class SQLiteStateStore(StateStore):
                 platform_order_id, status, filled_quantity, average_fill_price,
                 correlation_id, created_at, updated_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (order.client_order_id, i["symbol"], i["quote_currency"], i["asset_class"],
-             i["exchange"], i["currency"], i["expiry"], i["strike"], i["option_right"],
-             i["multiplier"], i["broker_symbol_override"],
-             order.order_type.value, order.side.value, str(order.quantity),
-             order.time_in_force.value, str(order.price) if order.price else None,
-             str(order.stop_price) if order.stop_price else None,
-             1 if order.reduce_only else 0, order.client_tag,
-             str(order.take_profit.trigger_price) if order.take_profit else None,
-             str(order.take_profit.limit_price) if order.take_profit and order.take_profit.limit_price else None,
-             str(order.stop_loss.trigger_price) if order.stop_loss else None,
-             str(order.stop_loss.limit_price) if order.stop_loss and order.stop_loss.limit_price else None,
-             order.platform_order_id, order.status.value, str(order.filled_quantity),
-             str(order.average_fill_price) if order.average_fill_price else None,
-             order.correlation_id, order.created_at.isoformat(), order.updated_at.isoformat()),
+            (
+                order.client_order_id,
+                i["symbol"],
+                i["quote_currency"],
+                i["asset_class"],
+                i["exchange"],
+                i["currency"],
+                i["expiry"],
+                i["strike"],
+                i["option_right"],
+                i["multiplier"],
+                i["broker_symbol_override"],
+                order.order_type.value,
+                order.side.value,
+                str(order.quantity),
+                order.time_in_force.value,
+                str(order.price) if order.price else None,
+                str(order.stop_price) if order.stop_price else None,
+                1 if order.reduce_only else 0,
+                order.client_tag,
+                str(order.take_profit.trigger_price) if order.take_profit else None,
+                str(order.take_profit.limit_price)
+                if order.take_profit and order.take_profit.limit_price
+                else None,
+                str(order.stop_loss.trigger_price) if order.stop_loss else None,
+                str(order.stop_loss.limit_price)
+                if order.stop_loss and order.stop_loss.limit_price
+                else None,
+                order.platform_order_id,
+                order.status.value,
+                str(order.filled_quantity),
+                str(order.average_fill_price) if order.average_fill_price else None,
+                order.correlation_id,
+                order.created_at.isoformat(),
+                order.updated_at.isoformat(),
+            ),
         )
 
     async def upsert_fill(self, fill: FillRecord) -> None:
@@ -305,14 +387,26 @@ class SQLiteStateStore(StateStore):
                 broker_symbol_override, fill_quantity, fill_price, fill_timestamp,
                 fee_currency, fee_amount, correlation_id)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fill.client_order_id, fill.platform_fill_id,
-             i["symbol"], i["quote_currency"], i["asset_class"],
-             i["exchange"], i["currency"], i["expiry"], i["strike"], i["option_right"],
-             i["multiplier"], i["broker_symbol_override"],
-             str(fill.fill_quantity), str(fill.fill_price),
-             fill.fill_timestamp.isoformat(),
-             fill.fee_currency, str(fill.fee_amount) if fill.fee_amount else None,
-             fill.correlation_id),
+            (
+                fill.client_order_id,
+                fill.platform_fill_id,
+                i["symbol"],
+                i["quote_currency"],
+                i["asset_class"],
+                i["exchange"],
+                i["currency"],
+                i["expiry"],
+                i["strike"],
+                i["option_right"],
+                i["multiplier"],
+                i["broker_symbol_override"],
+                str(fill.fill_quantity),
+                str(fill.fill_price),
+                fill.fill_timestamp.isoformat(),
+                fill.fee_currency,
+                str(fill.fee_amount) if fill.fee_amount else None,
+                fill.correlation_id,
+            ),
         )
 
     async def upsert_fills_batch(self, fills: list[FillRecord]) -> None:
@@ -333,33 +427,60 @@ class SQLiteStateStore(StateStore):
         """Append a single audit event. Rejects event_id collisions."""
         await self.conn.execute(
             "INSERT INTO audit_events (event_id, timestamp, adapter_name, account_id, correlation_id, event_type, payload_json) VALUES (?,?,?,?,?,?,?)",
-            (event.event_id, event.timestamp.isoformat(), event.adapter_name,
-             event.account_id, event.correlation_id, event.event_type,
-             json.dumps(event.payload)),
+            (
+                event.event_id,
+                event.timestamp.isoformat(),
+                event.adapter_name,
+                event.account_id,
+                event.correlation_id,
+                event.event_type,
+                json.dumps(event.payload),
+            ),
         )
 
     async def write_reconciliation_event(self, event: ReconciliationEvent) -> None:
-        mismatches_json = json.dumps([
-            {"mismatch_type": m.mismatch_type,
-             "instrument": _serialise_instrument(m.instrument) if m.instrument else None,
-             "local_value": m.local_value, "platform_value": m.platform_value}
-            for m in event.mismatches
-        ])
+        mismatches_json = json.dumps(
+            [
+                {
+                    "mismatch_type": m.mismatch_type,
+                    "instrument": _serialise_instrument(m.instrument) if m.instrument else None,
+                    "local_value": m.local_value,
+                    "platform_value": m.platform_value,
+                }
+                for m in event.mismatches
+            ]
+        )
         await self.conn.execute(
             "INSERT INTO reconciliation_events (event_id, timestamp, adapter_name, account_id, correlation_id, mismatches_json, duration_ms) VALUES (?,?,?,?,?,?,?)",
-            (event.event_id, event.timestamp.isoformat(), event.adapter_name,
-             event.account_id, event.correlation_id, mismatches_json, event.duration_ms),
+            (
+                event.event_id,
+                event.timestamp.isoformat(),
+                event.adapter_name,
+                event.account_id,
+                event.correlation_id,
+                mismatches_json,
+                event.duration_ms,
+            ),
         )
 
     async def write_halt_event(self, event: HaltEvent) -> None:
         inst = event.instrument
         await self.conn.execute(
             "INSERT INTO halt_events (event_id, timestamp, adapter_name, account_id, correlation_id, action, scope, symbol, asset_class, reason, detail, cleared_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (event.event_id, event.timestamp.isoformat(), event.adapter_name,
-             event.account_id, event.correlation_id, event.action, event.scope,
-             inst.symbol if inst else None,
-             inst.asset_class.value if inst else None,
-             event.reason, event.detail, event.cleared_by),
+            (
+                event.event_id,
+                event.timestamp.isoformat(),
+                event.adapter_name,
+                event.account_id,
+                event.correlation_id,
+                event.action,
+                event.scope,
+                inst.symbol if inst else None,
+                inst.asset_class.value if inst else None,
+                event.reason,
+                event.detail,
+                event.cleared_by,
+            ),
         )
 
     # ---- Single-record reads ----
@@ -408,9 +529,14 @@ class SQLiteStateStore(StateStore):
 
     # ---- Filtered queries ----
 
-    async def query_orders(self, *, instrument: Instrument | None = None,
-                           start: datetime | None = None, end: datetime | None = None,
-                           limit: int = 1000) -> list[OrderRecord]:
+    async def query_orders(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[OrderRecord]:
         query = "SELECT * FROM orders WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
@@ -427,9 +553,14 @@ class SQLiteStateStore(StateStore):
         cursor = await self.conn.execute(query, params)
         return [self._row_to_order_record(r) for r in await cursor.fetchall()]
 
-    async def query_fills(self, *, instrument: Instrument | None = None,
-                          start: datetime | None = None, end: datetime | None = None,
-                          limit: int = 1000) -> list[FillRecord]:
+    async def query_fills(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[FillRecord]:
         query = "SELECT * FROM fills WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
@@ -446,9 +577,14 @@ class SQLiteStateStore(StateStore):
         cursor = await self.conn.execute(query, params)
         return [self._row_to_fill_record(r) for r in await cursor.fetchall()]
 
-    async def query_positions(self, *, instrument: Instrument | None = None,
-                              start: datetime | None = None, end: datetime | None = None,
-                              limit: int = 1000) -> list[Position]:
+    async def query_positions(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[Position]:
         query = "SELECT * FROM position_history WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
@@ -466,17 +602,24 @@ class SQLiteStateStore(StateStore):
         results: list[Position] = []
         for row in await cursor.fetchall():
             inst = _deserialise_instrument(dict(row))
-            results.append(Position(
-                instrument=inst,
-                quantity=Decimal(row["quantity"]),
-                average_entry_price=Decimal(row["average_entry_price"]),
-                updated_at=datetime.fromisoformat(row["recorded_at"]),
-            ))
+            results.append(
+                Position(
+                    instrument=inst,
+                    quantity=Decimal(row["quantity"]),
+                    average_entry_price=Decimal(row["average_entry_price"]),
+                    updated_at=datetime.fromisoformat(row["recorded_at"]),
+                )
+            )
         return results
 
-    async def query_balances(self, *, currency: str | None = None,
-                             start: datetime | None = None, end: datetime | None = None,
-                             limit: int = 1000) -> list[Balance]:
+    async def query_balances(
+        self,
+        *,
+        currency: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[Balance]:
         query = "SELECT * FROM balance_history WHERE 1=1"
         params: list[Any] = []
         if currency is not None:
@@ -502,9 +645,9 @@ class SQLiteStateStore(StateStore):
             for row in await cursor.fetchall()
         ]
 
-    async def query_reconciliation_events(self, *, start: datetime | None = None,
-                                          end: datetime | None = None,
-                                          limit: int = 1000) -> list[ReconciliationEvent]:
+    async def query_reconciliation_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[ReconciliationEvent]:
         query = "SELECT * FROM reconciliation_events WHERE 1=1"
         params: list[Any] = []
         if start is not None:
@@ -522,26 +665,30 @@ class SQLiteStateStore(StateStore):
             mismatches = tuple(
                 ReconciliationMismatch(
                     mismatch_type=m["mismatch_type"],
-                    instrument=_deserialise_instrument(m["instrument"]) if m["instrument"] else None,
+                    instrument=_deserialise_instrument(m["instrument"])
+                    if m["instrument"]
+                    else None,
                     local_value=m["local_value"],
                     platform_value=m["platform_value"],
                 )
                 for m in mm_data
             )
-            results.append(ReconciliationEvent(
-                event_id=row["event_id"],
-                timestamp=datetime.fromisoformat(row["timestamp"]),
-                adapter_name=row["adapter_name"],
-                account_id=row["account_id"],
-                correlation_id=row["correlation_id"],
-                mismatches=mismatches,
-                duration_ms=row["duration_ms"],
-            ))
+            results.append(
+                ReconciliationEvent(
+                    event_id=row["event_id"],
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    adapter_name=row["adapter_name"],
+                    account_id=row["account_id"],
+                    correlation_id=row["correlation_id"],
+                    mismatches=mismatches,
+                    duration_ms=row["duration_ms"],
+                )
+            )
         return results
 
-    async def query_halt_events(self, *, start: datetime | None = None,
-                                end: datetime | None = None,
-                                limit: int = 1000) -> list[HaltEvent]:
+    async def query_halt_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[HaltEvent]:
         query = "SELECT * FROM halt_events WHERE 1=1"
         params: list[Any] = []
         if start is not None:
@@ -558,24 +705,31 @@ class SQLiteStateStore(StateStore):
             inst = None
             if row["symbol"] is not None and row["asset_class"] is not None:
                 inst = Instrument(
-                    symbol=row["symbol"], quote_currency=None,
+                    symbol=row["symbol"],
+                    quote_currency=None,
                     asset_class=AssetClass(row["asset_class"]),
-                    exchange=None, currency=None, expiry=None,
-                    strike=None, option_right=None, multiplier=None,
+                    exchange=None,
+                    currency=None,
+                    expiry=None,
+                    strike=None,
+                    option_right=None,
+                    multiplier=None,
                 )
-            results.append(HaltEvent(
-                event_id=row["event_id"],
-                timestamp=datetime.fromisoformat(row["timestamp"]),
-                adapter_name=row["adapter_name"],
-                account_id=row["account_id"],
-                correlation_id=row["correlation_id"],
-                action=row["action"],
-                scope=row["scope"],
-                instrument=inst,
-                reason=row["reason"],
-                detail=row["detail"],
-                cleared_by=row["cleared_by"],
-            ))
+            results.append(
+                HaltEvent(
+                    event_id=row["event_id"],
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    adapter_name=row["adapter_name"],
+                    account_id=row["account_id"],
+                    correlation_id=row["correlation_id"],
+                    action=row["action"],
+                    scope=row["scope"],
+                    instrument=inst,
+                    reason=row["reason"],
+                    detail=row["detail"],
+                    cleared_by=row["cleared_by"],
+                )
+            )
         return results
 
     # ---- Row deserialisation ----
@@ -610,7 +764,9 @@ class SQLiteStateStore(StateStore):
             platform_order_id=row["platform_order_id"],
             status=OrderStatus(row["status"]),
             filled_quantity=Decimal(row["filled_quantity"]),
-            average_fill_price=Decimal(row["average_fill_price"]) if row["average_fill_price"] else None,
+            average_fill_price=Decimal(row["average_fill_price"])
+            if row["average_fill_price"]
+            else None,
             correlation_id=row["correlation_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),

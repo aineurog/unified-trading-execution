@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from dataclasses import fields
-from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -30,7 +29,6 @@ from unified_trading_execution.risk import (
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import TpSlAttachment, UnifiedOrder
-
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -110,20 +108,26 @@ class TestValidateOrderSize:
     def test_raises_below_min_qty(self):
         with pytest.raises(InvalidSymbolError, match="below minimum"):
             validate_order_size(
-                _order(quantity=Decimal("0.0001")), _spec(), RiskConfig(),
+                _order(quantity=Decimal("0.0001")),
+                _spec(),
+                RiskConfig(),
             )
 
     def test_raises_above_max_qty(self):
         with pytest.raises(InvalidSymbolError, match="exceeds platform maximum"):
             validate_order_size(
-                _order(quantity=Decimal("101")), _spec(), RiskConfig(),
+                _order(quantity=Decimal("101")),
+                _spec(),
+                RiskConfig(),
             )
 
     def test_raises_on_qty_precision_violation(self):
         # 0.0015 is above min_qty (0.001) but 0.0015 % 0.001 = 0.0005 ≠ 0
         with pytest.raises(InvalidSymbolError, match="violates qty_precision"):
             validate_order_size(
-                _order(quantity=Decimal("0.0015")), _spec(), RiskConfig(),
+                _order(quantity=Decimal("0.0015")),
+                _spec(),
+                RiskConfig(),
             )
 
     def test_passes_when_qty_precision_exact(self):
@@ -156,21 +160,27 @@ class TestValidateOrderSize:
         )
         with pytest.raises(InvalidSymbolError, match="exceeds configured max"):
             validate_order_size(
-                _order(quantity=Decimal("1"), price=Decimal("50000")), _spec(), cfg,
+                _order(quantity=Decimal("1"), price=Decimal("50000")),
+                _spec(),
+                cfg,
             )
 
     def test_raises_when_notional_exceeds_global_cap(self):
         cfg = RiskConfig(max_order_notional=Decimal("10000"))
         with pytest.raises(InvalidSymbolError, match="exceeds global max"):
             validate_order_size(
-                _order(quantity=Decimal("1"), price=Decimal("50000")), _spec(), cfg,
+                _order(quantity=Decimal("1"), price=Decimal("50000")),
+                _spec(),
+                cfg,
             )
 
     def test_raises_when_notional_below_min_notional(self):
         spec = _spec(min_notional=Decimal("100"))
         with pytest.raises(InvalidSymbolError, match="below minimum"):
             validate_order_size(
-                _order(quantity=Decimal("0.001"), price=Decimal("50000")), spec, RiskConfig(),
+                _order(quantity=Decimal("0.001"), price=Decimal("50000")),
+                spec,
+                RiskConfig(),
             )
 
     def test_notional_checks_skipped_when_no_price(self):
@@ -185,7 +195,6 @@ class TestValidateOrderSize:
 
 
 # ── validator 3 — price sanity ──────────────────────────────────────
-
 
 
 class TestValidatePriceSanity:
@@ -411,98 +420,120 @@ class TestRunRiskChecksOrdering:
     def test_validator_1_fails_before_validator_2(self):
         """Symbol validity (v1) fails. Quantity (v2) would also fail if it ran."""
         with pytest.raises(InvalidSymbolError, match="not tradable"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                instrument_spec=None,
-                order=_order(quantity=Decimal("0.0001")),  # would fail v2
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    instrument_spec=None,
+                    order=_order(quantity=Decimal("0.0001")),  # would fail v2
+                )
+            )
 
     def test_validator_1_fails_before_validator_3(self):
         """Symbol validity fails before price sanity could reject the order."""
         with pytest.raises(InvalidSymbolError, match="not tradable"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                instrument_spec=None,
-                order=_order(price=Decimal("999999")),  # would fail v3
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    instrument_spec=None,
+                    order=_order(price=Decimal("999999")),  # would fail v3
+                )
+            )
 
     def test_validator_1_fails_before_validator_4(self):
         """Symbol validity fails before duplicate check could fire."""
         with pytest.raises(InvalidSymbolError, match="not tradable"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                instrument_spec=None,
-                known_order_ids=frozenset({"test-order-001"}),  # would fail v4
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    instrument_spec=None,
+                    known_order_ids=frozenset({"test-order-001"}),  # would fail v4
+                )
+            )
 
     def test_validator_1_fails_before_validator_5(self):
         """Symbol validity fails before rate-limit check could fire."""
         with pytest.raises(InvalidSymbolError, match="not tradable"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                instrument_spec=None,
-                remaining_budget=0,  # would fail v5
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    instrument_spec=None,
+                    remaining_budget=0,  # would fail v5
+                )
+            )
 
     # -- validator 2 fails first ---
 
     def test_validator_2_fails_before_validator_3(self):
         """Size check (v2) fails before price sanity (v3) could run."""
         with pytest.raises(InvalidSymbolError, match="below minimum"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                order=_order(
-                    quantity=Decimal("0.0001"),
-                    price=Decimal("999999"),  # would fail v3
-                ),
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    order=_order(
+                        quantity=Decimal("0.0001"),
+                        price=Decimal("999999"),  # would fail v3
+                    ),
+                )
+            )
 
     def test_validator_2_fails_before_validator_4(self):
         """Size check fails before duplicate check could fire."""
         with pytest.raises(InvalidSymbolError, match="below minimum"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                order=_order(quantity=Decimal("0.0001")),
-                known_order_ids=frozenset({"test-order-001"}),
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    order=_order(quantity=Decimal("0.0001")),
+                    known_order_ids=frozenset({"test-order-001"}),
+                )
+            )
 
     def test_validator_2_fails_before_validator_5(self):
         """Size check fails before rate-limit check could fire."""
         with pytest.raises(InvalidSymbolError, match="below minimum"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                order=_order(quantity=Decimal("0.0001")),
-                remaining_budget=0,
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    order=_order(quantity=Decimal("0.0001")),
+                    remaining_budget=0,
+                )
+            )
 
     # -- validator 3 fails first ---
 
     def test_validator_3_fails_before_validator_4(self):
         """Price sanity (v3) fails before duplicate check (v4) could run."""
         with pytest.raises(InvalidSymbolError, match="deviates"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                order=_order(price=Decimal("999999")),
-                known_order_ids=frozenset({"test-order-001"}),  # would fail v4
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    order=_order(price=Decimal("999999")),
+                    known_order_ids=frozenset({"test-order-001"}),  # would fail v4
+                )
+            )
 
     def test_validator_3_fails_before_validator_5(self):
         """Price sanity fails before rate-limit check could fire."""
         with pytest.raises(InvalidSymbolError, match="deviates"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                order=_order(price=Decimal("999999")),
-                remaining_budget=0,  # would fail v5
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    order=_order(price=Decimal("999999")),
+                    remaining_budget=0,  # would fail v5
+                )
+            )
 
     # -- validator 4 fails first ---
 
     def test_validator_4_fails_before_validator_5(self):
         """Duplicate check (v4) fails before rate-limit (v5) could run."""
         with pytest.raises(DuplicateOrderIdError, match="already in use"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                known_order_ids=frozenset({"test-order-001"}),
-                remaining_budget=0,  # would fail v5
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    known_order_ids=frozenset({"test-order-001"}),
+                    remaining_budget=0,  # would fail v5
+                )
+            )
 
     # -- validator 5 fails (last one) ---
 
     def test_validator_5_fails_when_everything_else_passes(self):
         with pytest.raises(RateLimitError, match="budget exhausted"):
-            run_risk_checks(**self._chain_args(  # type: ignore[arg-type]
-                remaining_budget=0,
-            ))
+            run_risk_checks(
+                **self._chain_args(  # type: ignore[arg-type]
+                    remaining_budget=0,
+                )
+            )
 
     # -- parametrized: exact order via first-failing-validator proof ---
 
@@ -543,7 +574,11 @@ class TestRunRiskChecksOrdering:
         ids=lambda v: v if isinstance(v, str) else "",
     )
     def test_chain_fails_at_correct_validator(
-        self, scenario_desc, overrides, expected_error, expected_match,
+        self,
+        scenario_desc,
+        overrides,
+        expected_error,
+        expected_match,
     ):
         """Each scenario only fails at the stated validator — proving order."""
         args = self._chain_args(**overrides)
@@ -704,10 +739,7 @@ class TestRiskConfig:
 
     def test_no_validator_disable_toggle_exists(self):
         """RiskConfig must expose no boolean flags to disable individual validators."""
-        boolean_fields = [
-            f for f in fields(RiskConfig)
-            if f.type is bool
-        ]
+        boolean_fields = [f for f in fields(RiskConfig) if f.type is bool]
         assert boolean_fields == [], (
             f"RiskConfig has boolean fields that could act as disable toggles: {boolean_fields}"
         )

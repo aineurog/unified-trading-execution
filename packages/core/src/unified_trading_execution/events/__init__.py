@@ -13,9 +13,10 @@ synchronous callback contract).
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Callable, Literal
+from typing import Literal, TypeAlias
 
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
@@ -72,7 +73,7 @@ class OrderCancelledEvent(Event):
 
 @dataclass(frozen=True, slots=True)
 class ReconciliationCompleteEvent(Event):
-    mismatches: tuple["ReconciliationMismatch", ...]  # empty tuple = clean
+    mismatches: tuple[ReconciliationMismatch, ...]  # empty tuple = clean
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,8 +94,11 @@ class HaltClearedEvent(Event):
 @dataclass(frozen=True, slots=True)
 class ReconciliationMismatch:
     mismatch_type: Literal[
-        "position_quantity", "balance", "orphan_on_platform",
-        "orphan_in_local", "partial_fill",
+        "position_quantity",
+        "balance",
+        "orphan_on_platform",
+        "orphan_in_local",
+        "partial_fill",
     ]
     instrument: Instrument | None
     local_value: str  # JSON-serialized
@@ -153,10 +157,10 @@ class AuditEvent:
     account_id: str
     correlation_id: str
     event_type: str  # "order.placed" | "order.modified" | "order.cancelled"
-    payload: dict  # structured metadata, e.g. {"client_order_id": "..."}
+    payload: dict[str, object]  # structured metadata, e.g. {"client_order_id": "..."}
 
 
-Subscriber = Callable[[Event], None]
+Subscriber: TypeAlias = Callable[..., None]
 
 
 class EventBus:
@@ -195,6 +199,7 @@ class EventBus:
                         callback(event)
                     except Exception:
                         import logging
+
                         logger = logging.getLogger(__name__)
                         logger.exception(
                             "Subscriber %s raised for event %s",

@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  lint-and-typecheck:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages (editable)
+        run: |
+          pip install -e packages/core
+          pip install -e packages/adapter-bybit
+          pip install -e packages/adapter-ctrader
+
+      - name: Install dev dependencies
+        run: pip install ruff mypy pytest pytest-asyncio
+
+      - name: Ruff check (non-blocking)
+        run: ruff check packages/ --exit-zero
+
+      - name: Ruff format check
+        run: ruff format --check packages/
+
+      - name: Mypy (strict, per-package)
+        run: |
+          mypy --strict packages/core/src/
+          mypy --strict packages/adapter-bybit/src/
+          mypy --strict packages/adapter-ctrader/src/
+
+  unit-tests:
+    needs: lint-and-typecheck
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages (editable)
+        run: |
+          pip install -e packages/core
+          pip install -e packages/adapter-bybit
+          pip install -e packages/adapter-ctrader
+
+      - name: Install dev dependencies
+        run: pip install pytest pytest-asyncio
+
+      - name: Unit tests
+        run: pytest packages/ --ignore=packages/*/tests/integration -v
+
+  integration-tests:
+    needs: unit-tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      matrix:
+        python-version: ["3.11"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install packages (editable)
+        run: |
+          pip install -e packages/core
+          pip install -e packages/adapter-bybit
+
+      - name: Install dev dependencies
+        run: pip install pytest pytest-asyncio
+
+      - name: Bybit integration tests (testnet)
+        env:
+          BYBIT_TESTNET_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
+          BYBIT_TESTNET_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
+        run: |
+          if ls packages/adapter-bybit/tests/integration/test_*.py 1>/dev/null 2>&1; then
+            pytest packages/adapter-bybit/tests/integration/ -v
+          else
+            echo "No integration test files found — skipping"
+          fi

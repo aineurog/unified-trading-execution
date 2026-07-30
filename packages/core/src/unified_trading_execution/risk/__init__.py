@@ -12,9 +12,10 @@ None of them performs I/O.
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Callable, Protocol
+from typing import Protocol
 
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
@@ -113,8 +114,7 @@ def validate_order_size(
 
     if qty < spec.min_qty:
         raise InvalidSymbolError(
-            f"Order quantity {qty} is below minimum {spec.min_qty} "
-            f"for {order.instrument.symbol}"
+            f"Order quantity {qty} is below minimum {spec.min_qty} for {order.instrument.symbol}"
         )
     if qty > spec.max_qty:
         raise InvalidSymbolError(
@@ -123,7 +123,7 @@ def validate_order_size(
         )
 
     # Precision check
-    qty_tick = Decimal("1") / (10 ** spec.qty_precision)
+    qty_tick = Decimal("1") / (10**spec.qty_precision)
     if qty % qty_tick != 0:
         raise InvalidSymbolError(
             f"Order quantity {qty} violates qty_precision={spec.qty_precision} "
@@ -140,9 +140,7 @@ def validate_order_size(
 
     # Global user cap
     if qty > config.max_order_size:
-        raise InvalidSymbolError(
-            f"Order quantity {qty} exceeds global max {config.max_order_size}"
-        )
+        raise InvalidSymbolError(f"Order quantity {qty} exceeds global max {config.max_order_size}")
 
     # Notional check (if order has a price)
     if order.price is not None:
@@ -216,29 +214,45 @@ def validate_price_sanity(
 
     if order.stop_price is not None:
         _check_price_deviation(
-            "Stop price", order.stop_price, reference_price, max_pct, order.instrument,
+            "Stop price",
+            order.stop_price,
+            reference_price,
+            max_pct,
+            order.instrument,
         )
 
     if order.take_profit is not None:
         _check_price_deviation(
-            "TP trigger", order.take_profit.trigger_price, reference_price,
-            max_pct, order.instrument,
+            "TP trigger",
+            order.take_profit.trigger_price,
+            reference_price,
+            max_pct,
+            order.instrument,
         )
         if order.take_profit.limit_price is not None:
             _check_price_deviation(
-                "TP limit", order.take_profit.limit_price, reference_price,
-                max_pct, order.instrument,
+                "TP limit",
+                order.take_profit.limit_price,
+                reference_price,
+                max_pct,
+                order.instrument,
             )
 
     if order.stop_loss is not None:
         _check_price_deviation(
-            "SL trigger", order.stop_loss.trigger_price, reference_price,
-            max_pct, order.instrument,
+            "SL trigger",
+            order.stop_loss.trigger_price,
+            reference_price,
+            max_pct,
+            order.instrument,
         )
         if order.stop_loss.limit_price is not None:
             _check_price_deviation(
-                "SL limit", order.stop_loss.limit_price, reference_price,
-                max_pct, order.instrument,
+                "SL limit",
+                order.stop_loss.limit_price,
+                reference_price,
+                max_pct,
+                order.instrument,
             )
 
 
@@ -257,9 +271,7 @@ def validate_no_duplicate(
     (Section 9.2), not by blind resubmission through this validator.
     """
     if client_order_id in known_order_ids:
-        raise DuplicateOrderIdError(
-            f"client_order_id '{client_order_id}' is already in use"
-        )
+        raise DuplicateOrderIdError(f"client_order_id '{client_order_id}' is already in use")
 
 
 # ============================================================

@@ -76,7 +76,13 @@ class OrderModification:
     stop_loss: TpSlAttachment | None = None
 
     def __post_init__(self) -> None:
-        if self.price is None and self.stop_price is None and self.quantity is None and self.take_profit is None and self.stop_loss is None:
+        if (
+            self.price is None
+            and self.stop_price is None
+            and self.quantity is None
+            and self.take_profit is None
+            and self.stop_loss is None
+        ):
             raise ValueError("OrderModification must set at least one field to modify")
 
 

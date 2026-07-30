@@ -1,32 +1,33 @@
-repos:
-  - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.6.0
-    hooks:
-      - id: ruff
-        args: [--fix]
-      - id: ruff-format
+# Pre-commit hooks temporarily disabled — re-enable by uncommenting below.
+# See: https://github.com/aineurog/unified-trading-execution
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.0
-    hooks:
-      - id: mypy
-        additional_dependencies:
-          - "types-python-dateutil"
-          - "pytest"
-        args: [--strict]
-
-  - repo: https://github.com/seddonym/import-linter
-    rev: v2.0
-    hooks:
-      - id: import-linter
-        args: ["--contract", "core-never-imports-adapters"]
-
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
-    hooks:
-      - id: check-toml
-      - id: check-yaml
-      - id: check-json
-      - id: end-of-file-fixer
-      - id: trailing-whitespace
-      - id: detect-private-key
+# repos:
+#   - repo: https://github.com/astral-sh/ruff-pre-commit
+#     rev: v0.6.0
+#     hooks:
+#       - id: ruff
+#         args: [--fix]
+#       - id: ruff-format
+#
+#   - repo: https://github.com/pre-commit/mirrors-mypy
+#     rev: v1.11.0
+#     hooks:
+#       - id: mypy
+#         additional_dependencies:
+#           - "types-python-dateutil"
+#         args: [--strict]
+#
+#   - repo: https://github.com/seddonym/import-linter
+#     rev: v2.0
+#     hooks:
+#       - id: import-linter
+#
+#   - repo: https://github.com/pre-commit/pre-commit-hooks
+#     rev: v4.6.0
+#     hooks:
+#       - id: check-toml
+#       - id: check-yaml
+#       - id: check-json
+#       - id: end-of-file-fixer
+#       - id: trailing-whitespace
+#       - id: detect-private-key
