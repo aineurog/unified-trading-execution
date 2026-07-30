@@ -114,8 +114,7 @@ def validate_order_size(
 
     if qty < spec.min_qty:
         raise InvalidSymbolError(
-            f"Order quantity {qty} is below minimum {spec.min_qty} "
-            f"for {order.instrument.symbol}"
+            f"Order quantity {qty} is below minimum {spec.min_qty} for {order.instrument.symbol}"
         )
     if qty > spec.max_qty:
         raise InvalidSymbolError(

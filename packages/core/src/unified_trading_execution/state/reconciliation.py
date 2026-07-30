@@ -109,17 +109,17 @@ def reconcile(
     balance_mismatches: list[ReconciliationMismatch] = []
     all_currencies = set(local_balances.keys()) | set(platform_balances.keys())
     for cur in all_currencies:
-        local = local_balances.get(cur)
-        platform = platform_balances.get(cur)
-        if local is None or platform is None:
+        local_bal = local_balances.get(cur)
+        platform_bal = platform_balances.get(cur)
+        if local_bal is None or platform_bal is None:
             continue
-        if local.free != platform.free or local.total != platform.total:
+        if local_bal.free != platform_bal.free or local_bal.total != platform_bal.total:
             balance_mismatches.append(
                 ReconciliationMismatch(
                     mismatch_type="balance",
                     instrument=None,
-                    local_value=f"free={local.free}, total={local.total}",
-                    platform_value=f"free={platform.free}, total={platform.total}",
+                    local_value=f"free={local_bal.free}, total={local_bal.total}",
+                    platform_value=f"free={platform_bal.free}, total={platform_bal.total}",
                 )
             )
 

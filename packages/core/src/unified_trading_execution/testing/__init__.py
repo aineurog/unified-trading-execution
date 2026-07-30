@@ -89,7 +89,7 @@ class MockAdapter(Adapter):
         self._place_order_queue: deque[OrderResult | BaseException] = deque()
         self._modify_order_queue: deque[OrderResult | BaseException] = deque()
         self._cancel_order_queue: deque[OrderResult | BaseException] = deque()
-        self._get_order_queue: deque[OrderResult | None | BaseException] = deque()
+        self._get_order_queue: deque[OrderResult | BaseException | None] = deque()
 
         # Seeded instrument specs: Instrument -> InstrumentSpec
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
@@ -153,7 +153,7 @@ class MockAdapter(Adapter):
         """Queue a response for the next ``cancel_order()`` call."""
         self._cancel_order_queue.append(result)
 
-    def queue_get_order_response(self, result: OrderResult | None | BaseException) -> None:
+    def queue_get_order_response(self, result: OrderResult | BaseException | None) -> None:
         """Queue a response for the next ``get_order_by_client_id()`` call."""
         self._get_order_queue.append(result)
 
