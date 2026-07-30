@@ -54,3 +54,6 @@ coverage.xml
 
 *.claude
 *.commandcode
+
+# Private project docs (not shared)
+project-docs/

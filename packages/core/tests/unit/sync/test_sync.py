@@ -147,9 +147,9 @@ class TestPersistentEventLoop:
         loop3 = sync_engine._loop
 
         assert loop1 is not None
-        assert (
-            loop1 is loop2 is loop3
-        ), "Background event loop must be reused across calls, not recreated"
+        assert loop1 is loop2 is loop3, (
+            "Background event loop must be reused across calls, not recreated"
+        )
 
     def test_loop_thread_is_daemon(self, sync_engine):
         """The background loop thread must be a daemon thread so it does
@@ -358,9 +358,9 @@ class TestNoAsyncioRunPerCall:
 
         for i in range(50):
             sync_engine.get_order("nonexistent")  # returns None, no error
-            assert (
-                sync_engine._loop is loop_initial
-            ), f"Loop changed on iteration {i} — asyncio.run() suspected"
+            assert sync_engine._loop is loop_initial, (
+                f"Loop changed on iteration {i} — asyncio.run() suspected"
+            )
 
     def test_loop_thread_never_replaced(self, sync_engine):
         """The background thread must persist across calls."""
@@ -368,6 +368,6 @@ class TestNoAsyncioRunPerCall:
 
         for _ in range(30):
             sync_engine.place_order(_order(f"thread-test-{_}"))
-            assert (
-                sync_engine._loop_thread is thread_initial
-            ), "Background thread replaced — loop recreation suspected"
+            assert sync_engine._loop_thread is thread_initial, (
+                "Background thread replaced — loop recreation suspected"
+            )

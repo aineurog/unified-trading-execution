@@ -740,9 +740,9 @@ class TestRiskConfig:
     def test_no_validator_disable_toggle_exists(self):
         """RiskConfig must expose no boolean flags to disable individual validators."""
         boolean_fields = [f for f in fields(RiskConfig) if f.type is bool]
-        assert (
-            boolean_fields == []
-        ), f"RiskConfig has boolean fields that could act as disable toggles: {boolean_fields}"
+        assert boolean_fields == [], (
+            f"RiskConfig has boolean fields that could act as disable toggles: {boolean_fields}"
+        )
 
     def test_config_has_only_the_six_documented_fields(self):
         field_names = {f.name for f in fields(RiskConfig)}

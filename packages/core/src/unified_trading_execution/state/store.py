@@ -156,6 +156,17 @@ class StateStore(ABC):
     @abstractmethod
     async def close(self) -> None: ...
 
+    @property
+    @abstractmethod
+    def conn(self) -> Any:
+        """Escape hatch: the raw DB connection for ad-hoc queries.
+
+        Used sparingly by engine-level reconciliation logic (e.g., DELETE
+        of orphan orders). Backends that don't expose a connection object
+        raise NotImplementedError.
+        """
+        ...
+
     async def flush(self) -> None:
         """Ensure all pending writes are durable before teardown.
 
@@ -221,6 +232,7 @@ class SQLiteStateStore(StateStore):
         )
         cursor = await self.conn.execute("SELECT COALESCE(MAX(version), 0) FROM schema_version")
         row = await cursor.fetchone()
+        assert row is not None, "SELECT with aggregation returned no row"
         current = row[0]
 
         sql_files = sorted(

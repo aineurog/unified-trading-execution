@@ -98,9 +98,9 @@ class TestAdapterABCSurface:
         """Exactly 12 abstract members — nothing added, nothing missing."""
         # Filter out dunder and non-public inherited abstract methods
         ours = {n for n in abstract_methods if not n.startswith("_")}
-        assert (
-            ours == self.EXPECTED_ABSTRACT_MEMBERS
-        ), f"Unexpected abstract members: {ours ^ self.EXPECTED_ABSTRACT_MEMBERS}"
+        assert ours == self.EXPECTED_ABSTRACT_MEMBERS, (
+            f"Unexpected abstract members: {ours ^ self.EXPECTED_ABSTRACT_MEMBERS}"
+        )
 
 
 class TestSupportedOrderTypesMinimum:

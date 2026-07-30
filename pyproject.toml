@@ -11,6 +11,9 @@ authors = [
 [tool.uv.workspace]
 members = ["packages/*"]
 
+[tool.uv.sources]
+unified-trading-execution = { workspace = true }
+
 [tool.uv]
 dev-dependencies = [
     "pytest>=8.0",
@@ -55,6 +58,7 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 module = [
     "unified_trading_execution.bybit.*",
     "unified_trading_execution.ctrader.*",
+    "uuid_extensions",
 ]
 ignore_missing_imports = true
 

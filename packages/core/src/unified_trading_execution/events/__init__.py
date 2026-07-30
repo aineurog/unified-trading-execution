@@ -16,7 +16,7 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Literal
+from typing import Literal, TypeAlias
 
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
@@ -157,10 +157,10 @@ class AuditEvent:
     account_id: str
     correlation_id: str
     event_type: str  # "order.placed" | "order.modified" | "order.cancelled"
-    payload: dict  # structured metadata, e.g. {"client_order_id": "..."}
+    payload: dict[str, object]  # structured metadata, e.g. {"client_order_id": "..."}
 
 
-Subscriber = Callable[[Event], None]
+Subscriber: TypeAlias = Callable[..., None]
 
 
 class EventBus:

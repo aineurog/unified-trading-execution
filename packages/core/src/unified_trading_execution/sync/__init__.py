@@ -15,9 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from datetime import datetime
 from decimal import Decimal
+from typing import Any, TypeVar
 
 from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.engine import Engine
@@ -36,6 +37,8 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+_T = TypeVar("_T")
 
 
 class SyncEngine:
@@ -93,7 +96,7 @@ class SyncEngine:
             self._loop_thread.start()
         return self._loop
 
-    def _run(self, coro):
+    def _run(self, coro: Coroutine[Any, Any, _T]) -> _T:
         """Submit a coroutine to the persistent loop and block until done."""
         self._check_not_shutdown()
         loop = self._ensure_loop()
