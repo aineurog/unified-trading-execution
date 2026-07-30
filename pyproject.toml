@@ -55,6 +55,7 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 module = [
     "unified_trading_execution.bybit.*",
     "unified_trading_execution.ctrader.*",
+    "uuid_extensions",
 ]
 ignore_missing_imports = true
 

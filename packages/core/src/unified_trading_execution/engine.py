@@ -21,6 +21,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Literal
 
 from uuid_extensions import uuid7
 
@@ -33,7 +34,6 @@ from unified_trading_execution.dispatch import (
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
-    Event,
     EventBus,
     FillEvent,
     HaltClearedEvent,
@@ -395,7 +395,7 @@ class Engine:
 
     async def _fetch_platform_positions(self) -> dict[Instrument, Position]:
         try:
-            return await self._adapter.fetch_positions()  # type: ignore[attr-defined]
+            return await self._adapter.fetch_positions()
         except NotImplementedError:
             return {}
         except Exception:
@@ -404,7 +404,7 @@ class Engine:
 
     async def _fetch_platform_balances(self) -> dict[str, Balance]:
         try:
-            return await self._adapter.fetch_balances()  # type: ignore[attr-defined]
+            return await self._adapter.fetch_balances()
         except NotImplementedError:
             return {}
         except Exception:
@@ -413,7 +413,7 @@ class Engine:
 
     async def _fetch_platform_orders(self) -> dict[str, OrderRecord]:
         try:
-            return await self._adapter.fetch_open_orders()  # type: ignore[attr-defined]
+            return await self._adapter.fetch_open_orders()
         except NotImplementedError:
             return {}
         except Exception:
@@ -422,7 +422,7 @@ class Engine:
 
     async def _fetch_platform_fills(self) -> dict[str, list[FillRecord]]:
         try:
-            return await self._adapter.fetch_fills()  # type: ignore[attr-defined]
+            return await self._adapter.fetch_fills()
         except NotImplementedError:
             return {}
         except Exception:
@@ -444,7 +444,7 @@ class Engine:
         for mm in result.position_mismatches:
             # Re-fetch platform position and overwrite local
             try:
-                platform_positions = await self._adapter.fetch_positions()  # type: ignore[attr-defined]
+                platform_positions = await self._adapter.fetch_positions()
                 if mm.instrument and mm.instrument in platform_positions:
                     await self._state_store.upsert_position(platform_positions[mm.instrument])
             except Exception:
@@ -453,7 +453,7 @@ class Engine:
         # Balance mismatches: platform is authoritative
         for mm in result.balance_mismatches:
             try:
-                platform_balances = await self._adapter.fetch_balances()  # type: ignore[attr-defined]
+                platform_balances = await self._adapter.fetch_balances()
                 for bal in platform_balances.values():
                     await self._state_store.upsert_balance(bal)
             except Exception:
@@ -471,7 +471,7 @@ class Engine:
         # cleaned up. The order record in audit_events remains immutable.
         for client_order_id in result.orphan_orders_in_local:
             try:
-                conn = self._state_store.conn  # type: ignore[attr-defined]
+                conn = self._state_store.conn
                 await conn.execute(
                     "DELETE FROM orders WHERE client_order_id = ?",
                     (client_order_id,),
@@ -489,8 +489,8 @@ class Engine:
         # Partial fill discrepancies: overwrite local fills with platform
         if result.partial_fill_discrepancies:
             try:
-                platform_fills = await self._adapter.fetch_fills()  # type: ignore[attr-defined]
-                conn = self._state_store.conn  # type: ignore[attr-defined]
+                platform_fills = await self._adapter.fetch_fills()
+                conn = self._state_store.conn
                 for cid in platform_fills:
                     await conn.execute(
                         "DELETE FROM fills WHERE client_order_id = ?",
@@ -513,7 +513,7 @@ class Engine:
             # Clear all active halts — iterate over them directly
             for entry in self._halt_machine.active_halts():
                 cleared = self._halt_machine.try_clear_halt(
-                    entry.scope,  # type: ignore[arg-type]
+                    entry.scope,
                     instrument=entry.instrument,
                     reconciliation_is_clean=True,
                 )
@@ -525,7 +525,7 @@ class Engine:
                             adapter_name=self._adapter.platform_name,
                             account_id=self._adapter.account_id,
                             correlation_id=corr_id,
-                            scope=entry.scope,  # type: ignore[arg-type]
+                            scope=entry.scope,
                             instrument=entry.instrument,
                             cleared_by="automatic",
                         )
@@ -538,7 +538,7 @@ class Engine:
                             account_id=self._adapter.account_id,
                             correlation_id=corr_id,
                             action="cleared",
-                            scope=entry.scope,  # type: ignore[arg-type]
+                            scope=entry.scope,
                             instrument=entry.instrument,
                             reason="reconciliation_clean",
                             detail="",
@@ -551,10 +551,10 @@ class Engine:
             return
 
         for mismatch in result.all_mismatches:
-            scope = "instrument" if mismatch.instrument else "account"
+            scope: Literal["instrument", "account"] = "instrument" if mismatch.instrument else "account"
             inst = mismatch.instrument
             if self._halt_machine.enter_halt(
-                scope=scope,  # type: ignore[arg-type]
+                scope=scope,
                 instrument=inst,
                 reason=mismatch.mismatch_type,
                 detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
@@ -566,7 +566,7 @@ class Engine:
                         adapter_name=self._adapter.platform_name,
                         account_id=self._adapter.account_id,
                         correlation_id=corr_id,
-                        scope=scope,  # type: ignore[arg-type]
+                        scope=scope,
                         instrument=inst,
                         reason=mismatch.mismatch_type,
                         detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
@@ -580,7 +580,7 @@ class Engine:
                         account_id=self._adapter.account_id,
                         correlation_id=corr_id,
                         action="entered",
-                        scope=scope,  # type: ignore[arg-type]
+                        scope=scope,
                         instrument=inst,
                         reason=mismatch.mismatch_type,
                         detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
@@ -731,30 +731,30 @@ class Engine:
 
     # ── Internal: EventBus subscribers (state mirror) ──────────────
 
-    def _on_fill(self, event: Event) -> None:
-        asyncio.ensure_future(self._persist_fill(event))  # type: ignore[arg-type]
+    def _on_fill(self, event: FillEvent) -> None:
+        asyncio.ensure_future(self._persist_fill(event))
 
-    def _on_position_update(self, event: Event) -> None:
-        asyncio.ensure_future(self._persist_position(event))  # type: ignore[arg-type]
+    def _on_position_update(self, event: PositionUpdateEvent) -> None:
+        asyncio.ensure_future(self._persist_position(event))
 
-    def _on_balance_update(self, event: Event) -> None:
-        asyncio.ensure_future(self._persist_balance(event))  # type: ignore[arg-type]
+    def _on_balance_update(self, event: BalanceUpdateEvent) -> None:
+        asyncio.ensure_future(self._persist_balance(event))
 
-    async def _persist_fill(self, event: Event) -> None:
+    async def _persist_fill(self, event: FillEvent) -> None:
         try:
-            await self._state_store.upsert_fill(event.fill)  # type: ignore[attr-defined]
+            await self._state_store.upsert_fill(event.fill)
         except Exception:
             logger.exception("Failed to persist fill %s", event.event_id)
 
-    async def _persist_position(self, event: Event) -> None:
+    async def _persist_position(self, event: PositionUpdateEvent) -> None:
         try:
-            await self._state_store.upsert_position(event.position)  # type: ignore[attr-defined]
+            await self._state_store.upsert_position(event.position)
         except Exception:
             logger.exception("Failed to persist position %s", event.event_id)
 
-    async def _persist_balance(self, event: Event) -> None:
+    async def _persist_balance(self, event: BalanceUpdateEvent) -> None:
         try:
-            await self._state_store.upsert_balance(event.balance)  # type: ignore[attr-defined]
+            await self._state_store.upsert_balance(event.balance)
         except Exception:
             logger.exception("Failed to persist balance %s", event.event_id)
 
