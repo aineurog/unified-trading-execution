@@ -190,7 +190,7 @@ class BybitAdapter(Adapter):
                 category=category,
                 symbol=bybit_symbol,
             )
-            data, _, _ = result  # type: ignore[misc]
+            data, _, _ = result
         except FailedRequestError as exc:
             raise map_bybit_error(
                 http_status=exc.status_code,
@@ -238,12 +238,14 @@ class BybitAdapter(Adapter):
     # ---- Capability reporting ----
 
     def supported_order_types(self) -> frozenset[OrderType]:
-        return frozenset({
-            OrderType.MARKET,
-            OrderType.LIMIT,
-            OrderType.STOP,
-            OrderType.STOP_LIMIT,
-        })
+        return frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
+        )
 
     # ---- Rate limits ----
 

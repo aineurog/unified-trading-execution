@@ -1,4 +1,5 @@
 """Unit tests for BybitAdapter.fetch_instrument_spec and supported_order_types."""
+
 from __future__ import annotations
 
 from decimal import Decimal
@@ -105,7 +106,9 @@ _INVERSE_RESPONSE = {
 
 class TestFetchInstrumentSpec:
     async def test_spot_instrument(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.return_value = (
             _SPOT_RESPONSE,
@@ -136,7 +139,9 @@ class TestFetchInstrumentSpec:
         assert spec.qty_precision == 6
 
     async def test_linear_perpetual(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.return_value = (
             _LINEAR_RESPONSE,
@@ -164,7 +169,9 @@ class TestFetchInstrumentSpec:
         assert spec.qty_precision == 3
 
     async def test_inverse_perpetual(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.return_value = (
             _INVERSE_RESPONSE,
@@ -195,7 +202,9 @@ class TestFetchInstrumentSpec:
         assert spec.qty_precision == 0
 
     async def test_unsupported_asset_class(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         instrument = Instrument(
             symbol="AAPL",
@@ -215,7 +224,9 @@ class TestFetchInstrumentSpec:
         mock_pybit_http.get_instruments_info.assert_not_called()
 
     async def test_invalid_symbol_from_bybit(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.side_effect = InvalidRequestError(
             request="GET /v5/market/instruments-info",
@@ -241,7 +252,9 @@ class TestFetchInstrumentSpec:
             await adapter.fetch_instrument_spec(instrument)
 
     async def test_http_error(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.side_effect = FailedRequestError(
             request="GET /v5/market/instruments-info",
@@ -269,7 +282,9 @@ class TestFetchInstrumentSpec:
             await adapter.fetch_instrument_spec(instrument)
 
     async def test_empty_list_response(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         mock_pybit_http.get_instruments_info.return_value = (
             {"retCode": 0, "result": {"list": []}},
@@ -293,7 +308,9 @@ class TestFetchInstrumentSpec:
             await adapter.fetch_instrument_spec(instrument)
 
     async def test_not_trading_status(
-        self, adapter, mock_pybit_http: MagicMock,
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
     ) -> None:
         response = {
             "retCode": 0,
