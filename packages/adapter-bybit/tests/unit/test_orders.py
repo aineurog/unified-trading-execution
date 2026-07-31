@@ -721,13 +721,13 @@ class TestPlaceOrder:
         }
         mock_pybit_http.place_order.return_value = (
             {"retCode": 0, "result": {"orderId": "o1", "orderLinkId": "c1"}},
-            headers,
             {},
+            headers,
         )
         mock_pybit_http.get_open_orders.return_value = (
             {"retCode": 0, "result": {"list": [_order_entry()], "category": "spot"}},
-            headers,
             {},
+            headers,
         )
 
         order = _order(_spot_instrument(), order_type=OrderType.MARKET)
@@ -865,10 +865,10 @@ class TestCancelOrder:
         ) -> tuple[dict[str, Any], None, dict[str, Any]]:
             category = kwargs["category"]
             if category == "spot":
-                return ({"retCode": 0, "result": {"list": [], "category": "spot"}}, None, {})
+                return ({"retCode": 0, "result": {"list": [], "category": "spot"}}, {}, {})
             return (
                 {"retCode": 0, "result": {"list": [_order_entry()], "category": category}},
-                None,
+                {},
                 {},
             )
 
@@ -933,7 +933,7 @@ class TestGetOrderByClientId:
                 return ({"retCode": 0, "result": {"list": [], "category": category}}, None, {})
             return (
                 {"retCode": 0, "result": {"list": [_order_entry()], "category": category}},
-                None,
+                {},
                 {},
             )
 

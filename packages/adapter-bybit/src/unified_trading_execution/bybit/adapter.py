@@ -179,6 +179,7 @@ class BybitAdapter(Adapter):
             await asyncio.to_thread(self._ws.disconnect)
             self._ws = None
         self._connected = False
+        self._order_refs.clear()
         self._publish_connection_state(False)
 
     @property
@@ -293,9 +294,9 @@ class BybitAdapter(Adapter):
             raise map_bybit_error(http_status=exc.status_code, ret_msg=exc.message) from exc
         except InvalidRequestError as exc:
             raise map_bybit_error(ret_code=exc.status_code, ret_msg=exc.message) from exc
-        data, headers, _ = result
-        self._update_rate_limits(headers or {})
-        return data, headers
+        data, _, response_headers = result
+        self._update_rate_limits(response_headers or {})
+        return data, response_headers
 
     async def _query_order_entry(
         self,
@@ -379,23 +380,11 @@ class BybitAdapter(Adapter):
         bybit_symbol = to_bybit_symbol(instrument)
         category = self._instrument_to_category(instrument)
 
-        try:
-            result = await asyncio.to_thread(
-                self._session.get_instruments_info,
-                category=category,
-                symbol=bybit_symbol,
-            )
-            data, _, _ = result
-        except FailedRequestError as exc:
-            raise map_bybit_error(
-                http_status=exc.status_code,
-                ret_msg=exc.message,
-            ) from exc
-        except InvalidRequestError as exc:
-            raise map_bybit_error(
-                ret_code=exc.status_code,
-                ret_msg=exc.message,
-            ) from exc
+        data, _ = await self._run_request(
+            self._session.get_instruments_info,
+            category=category,
+            symbol=bybit_symbol,
+        )
 
         listings = (data.get("result", {}) or {}).get("list", [])
         if not listings:
