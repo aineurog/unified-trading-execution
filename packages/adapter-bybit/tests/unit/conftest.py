@@ -29,6 +29,20 @@ def mock_pybit_http():
         yield mock_session
 
 
+@pytest.fixture(autouse=True)
+def mock_bybit_websocket():
+    """Mock BybitWebSocket so connect/disconnect never open a real socket.
+
+    The mock reports ``is_connected() == True`` by default; tests that
+    simulate drops/reconnects override the return value directly.
+    """
+    with patch("unified_trading_execution.bybit.adapter.BybitWebSocket") as mock_cls:
+        mock_ws = MagicMock()
+        mock_ws.is_connected.return_value = True
+        mock_cls.return_value = mock_ws
+        yield mock_ws
+
+
 @pytest.fixture
 def event_bus() -> EventBus:
     """A fresh EventBus for each test — no cross-test subscriber leakage."""

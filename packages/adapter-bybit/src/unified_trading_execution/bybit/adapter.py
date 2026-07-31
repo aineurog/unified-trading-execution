@@ -15,19 +15,20 @@ Usage::
 from __future__ import annotations
 
 import asyncio
-from decimal import Decimal
-
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
+from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.errors import map_bybit_error
-from unified_trading_execution.errors import InvalidSymbolError
 from unified_trading_execution.bybit.symbols import to_bybit_symbol
-from unified_trading_execution.events import EventBus
+from unified_trading_execution.bybit.websocket import BybitWebSocket
+from unified_trading_execution.errors import InvalidSymbolError
+from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -36,9 +37,17 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 
-
 _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
+_CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
+
+
+def _new_id() -> str:
+    return str(uuid7())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
@@ -86,6 +95,8 @@ class BybitAdapter(Adapter):
         self._config = config
         self._event_bus = event_bus
         self._connected = False
+        self._ws: BybitWebSocket | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
         self._last_rate_limits = _parse_rate_limits({})
 
         self._session = HTTP(
@@ -129,7 +140,18 @@ class BybitAdapter(Adapter):
         Must publish ``ConnectionStateEvent(connected=True)`` on success.
         See Section 17.10, "Connection lifecycle."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Connection lifecycle")
+        if self._connected:
+            return
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
+        ws = BybitWebSocket(self._config)
+        await asyncio.to_thread(ws.connect)
+        self._ws = ws
+        self._connected = True
+        self._publish_connection_state(True)
+        self._monitor_task = asyncio.create_task(self._monitor_connection())
 
     async def disconnect(self) -> None:
         """Close all connections gracefully.
@@ -137,12 +159,43 @@ class BybitAdapter(Adapter):
         Must publish ``ConnectionStateEvent(connected=False)`` on disconnect.
         See Section 17.10, "Connection lifecycle."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Connection lifecycle")
+        if self._ws is None and not self._connected:
+            return
+        if self._monitor_task is not None:
+            self._monitor_task.cancel()
+            await asyncio.gather(self._monitor_task, return_exceptions=True)
+            self._monitor_task = None
+        if self._ws is not None:
+            await asyncio.to_thread(self._ws.disconnect)
+            self._ws = None
+        self._connected = False
+        self._publish_connection_state(False)
 
     @property
     def is_connected(self) -> bool:
         """Return True if connections are currently established."""
         return self._connected
+
+    def _publish_connection_state(self, connected: bool) -> None:
+        self._event_bus.publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                connected=connected,
+            )
+        )
+
+    async def _monitor_connection(self) -> None:
+        """Detect platform-initiated drops/reconnects and publish state changes."""
+        while True:
+            await asyncio.sleep(_CONNECTION_MONITOR_INTERVAL_SECONDS)
+            connected = self._ws is not None and self._ws.is_connected()
+            if connected != self._connected:
+                self._connected = connected
+                self._publish_connection_state(connected)
 
     # ---- Order operations ----
 
