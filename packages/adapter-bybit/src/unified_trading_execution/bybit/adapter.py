@@ -15,8 +15,10 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import Any
 
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
@@ -25,9 +27,15 @@ from uuid_extensions import uuid7
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.errors import map_bybit_error
+from unified_trading_execution.bybit.orders import (
+    build_amend_payload,
+    build_cancel_payload,
+    build_place_order_payload,
+    parse_order_result,
+)
 from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.bybit.websocket import BybitWebSocket
-from unified_trading_execution.errors import InvalidSymbolError
+from unified_trading_execution.errors import InvalidSymbolError, OrderNotFoundError
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
@@ -40,6 +48,7 @@ from unified_trading_execution.types.order import (
 _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
 _CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
+_ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 
 
 def _new_id() -> str:
@@ -98,6 +107,7 @@ class BybitAdapter(Adapter):
         self._ws: BybitWebSocket | None = None
         self._monitor_task: asyncio.Task[None] | None = None
         self._last_rate_limits = _parse_rate_limits({})
+        self._order_refs: dict[str, tuple[str, str]] = {}
 
         self._session = HTTP(
             testnet=config.testnet,
@@ -203,11 +213,24 @@ class BybitAdapter(Adapter):
         """Translate and submit a fully-validated order to Bybit.
 
         Receives a ``UnifiedOrder`` that has already passed all risk checks.
+        Bybit's place-order ack carries no order state, so the adapter
+        re-queries the order to build an accurate ``OrderResult``.
         If Bybit supports native TP/SL attachment, use it; otherwise raise
         ``UnsupportedOrderTypeError`` — never approximate.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
+        category = self._instrument_to_category(order.instrument)
+        symbol = to_bybit_symbol(order.instrument)
+        client_order_id = order.client_order_id or _new_id()
+        payload = build_place_order_payload(
+            order,
+            category=category,
+            symbol=symbol,
+            client_order_id=client_order_id,
+        )
+        await self._run_request(self._session.place_order, **payload)
+        self._order_refs[client_order_id] = (category, symbol)
+        return await self._require_order_result(client_order_id, "placed on Bybit")
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
         """Translate and submit an order modification to Bybit.
@@ -215,7 +238,14 @@ class BybitAdapter(Adapter):
         Core runs risk checks against the resulting order before calling.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
+        category, symbol = await self._resolve_order_ref(modification.client_order_id)
+        payload = build_amend_payload(
+            modification,
+            category=category,
+            symbol=symbol,
+        )
+        await self._run_request(self._session.amend_order, **payload)
+        return await self._require_order_result(modification.client_order_id, "amended on Bybit")
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel an existing order by client_order_id.
@@ -223,13 +253,125 @@ class BybitAdapter(Adapter):
         Raises ``OrderNotFoundError`` if Bybit does not know the order.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
+        category, symbol = await self._resolve_order_ref(client_order_id)
+        payload = build_cancel_payload(
+            client_order_id,
+            category=category,
+            symbol=symbol,
+        )
+        await self._run_request(self._session.cancel_order, **payload)
+        return await self._require_order_result(client_order_id, "cancelled on Bybit")
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by client_order_id. Returns None if not found.
         See Section 17.10, "Order operations."
         """
-        raise NotImplementedError("TODO: implement — see Section 17.10, Order operations")
+        found = await self._find_order(client_order_id)
+        if found is None:
+            return None
+        category, symbol, entry = found
+        self._order_refs[client_order_id] = (category, symbol)
+        return parse_order_result(entry, client_order_id)
+
+    async def _require_order_result(self, client_order_id: str, context: str) -> OrderResult:
+        result = await self.get_order_by_client_id(client_order_id)
+        if result is None:
+            raise OrderNotFoundError(
+                f"Order {client_order_id} was {context} but could not be re-queried"
+            )
+        return result
+
+    async def _run_request(
+        self,
+        method: Callable[..., Any],
+        **kwargs: Any,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
+        """Invoke a pybit HTTP method, translating native errors and rate limits."""
+        try:
+            result = await asyncio.to_thread(method, **kwargs)
+        except FailedRequestError as exc:
+            raise map_bybit_error(http_status=exc.status_code, ret_msg=exc.message) from exc
+        except InvalidRequestError as exc:
+            raise map_bybit_error(ret_code=exc.status_code, ret_msg=exc.message) from exc
+        data, headers, _ = result
+        self._update_rate_limits(headers or {})
+        return data, headers
+
+    async def _query_order_entry(
+        self,
+        client_order_id: str,
+        category: str,
+        *,
+        symbol: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return the raw Bybit order object for a client order id, or None.
+
+        Queries open/closed orders (realtime) first, then falls back to the
+        two-year order history so closed orders survive server restarts.
+        """
+        query: dict[str, Any] = {"category": category, "orderLinkId": client_order_id}
+        if symbol is not None:
+            query["symbol"] = symbol
+
+        data = await self._query_realtime(client_order_id, query)
+        if data is None:
+            data = await self._query_history(client_order_id, query)
+        return data
+
+    async def _query_realtime(
+        self,
+        client_order_id: str,
+        query: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            data, _ = await self._run_request(self._session.get_open_orders, **query)
+        except OrderNotFoundError:
+            return None
+        return self._find_entry_in(data, client_order_id)
+
+    async def _query_history(
+        self,
+        client_order_id: str,
+        query: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        try:
+            data, _ = await self._run_request(self._session.get_order_history, **query)
+        except OrderNotFoundError:
+            return None
+        return self._find_entry_in(data, client_order_id)
+
+    @staticmethod
+    def _find_entry_in(data: dict[str, Any], client_order_id: str) -> dict[str, Any] | None:
+        entries: list[dict[str, Any]] = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if entry.get("orderLinkId") == client_order_id:
+                return entry
+        return None
+
+    async def _find_order(
+        self,
+        client_order_id: str,
+    ) -> tuple[str, str, dict[str, Any]] | None:
+        """Locate an order's (category, symbol, entry) via the ref cache or a scan."""
+        ref = self._order_refs.get(client_order_id)
+        if ref is not None:
+            entry = await self._query_order_entry(client_order_id, ref[0], symbol=ref[1])
+            if entry is not None:
+                return ref[0], ref[1], entry
+            return None
+        for category in _ORDER_CATEGORIES:
+            entry = await self._query_order_entry(client_order_id, category)
+            if entry is not None:
+                return category, entry["symbol"], entry
+        return None
+
+    async def _resolve_order_ref(self, client_order_id: str) -> tuple[str, str]:
+        found = await self._find_order(client_order_id)
+        if found is None:
+            raise OrderNotFoundError(f"Order {client_order_id} not found on Bybit")
+        category, symbol, _ = found
+        self._order_refs[client_order_id] = (category, symbol)
+        return category, symbol
 
     # ---- Instrument metadata ----
 
