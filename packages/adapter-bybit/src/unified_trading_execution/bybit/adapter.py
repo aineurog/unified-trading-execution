@@ -407,8 +407,17 @@ class BybitAdapter(Adapter):
                     self._open_order_ids.add(platform_id)
 
     def _on_execution_message(self, message: dict[str, Any]) -> None:
-        """Translate ``execution`` (fill) stream updates into ``FillEvent``."""
+        """Translate ``execution`` stream updates into ``FillEvent``.
+
+        Only ``Trade`` executions are emitted — the WebSocket ``execution``
+        stream reports real trades but can also carry Funding/AdlTrade/BustTrade
+        events for non-trade balance changes.  Filtering here matches
+        ``fetch_fills`` so the REST snapshot and the live mirror stay strictly
+        comparable.
+        """
         for entry in message.get("data") or []:
+            if entry.get("execType") != "Trade":
+                continue
             try:
                 instrument = self._resolve_instrument(
                     entry.get("symbol") or "", entry.get("category") or ""

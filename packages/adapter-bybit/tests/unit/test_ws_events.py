@@ -271,6 +271,7 @@ class TestStreamEmission:
                         "category": "linear",
                         "execId": "exec-1",
                         "orderLinkId": "client-1",
+                        "execType": "Trade",
                         "execQty": "0.5",
                         "execPrice": "95900.1",
                         "execTime": "1706270400353",
@@ -281,6 +282,39 @@ class TestStreamEmission:
         assert len(captured) == 1
         assert captured[0].correlation_id == "client-1"
         assert captured[0].fill.instrument == _BTCUSDT
+
+    def test_execution_filters_non_trade(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "funding-1",
+                        "execType": "Funding",
+                        "execQty": "0",
+                        "execPrice": "0.0001",
+                        "execTime": "1706270400353",
+                    },
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "client-1",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    },
+                ]
+            }
+        )
+        assert len(captured) == 1
 
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
@@ -393,7 +427,7 @@ class TestStreamEmission:
         adapter._instruments = {}
         captured: list[Event] = []
         event_bus.subscribe(Event, captured.append)
-        adapter._on_execution_message({"data": [{"symbol": "UNKNOWN", "category": "linear"}]})
+        adapter._on_execution_message({"data": [{"symbol": "UNKNOWN", "category": "linear", "execType": "Trade"}]})
         assert captured == []
 
     def test_missing_loop_raises(self, adapter: BybitAdapter) -> None:
@@ -407,6 +441,7 @@ class TestStreamEmission:
                             "symbol": "BTCUSDT",
                             "category": "linear",
                             "execId": "exec-1",
+                            "execType": "Trade",
                             "execQty": "0.5",
                             "execPrice": "95900.1",
                             "execTime": "1706270400353",
