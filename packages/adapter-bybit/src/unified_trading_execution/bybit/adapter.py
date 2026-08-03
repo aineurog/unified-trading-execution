@@ -18,7 +18,7 @@ import asyncio
 import logging
 import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
@@ -60,10 +60,13 @@ from unified_trading_execution.events import (
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
+    FillRecord,
     OrderModification,
+    OrderRecord,
     OrderResult,
     UnifiedOrder,
 )
+from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +74,10 @@ _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
 _CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
 _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
+# The wallet is a Bybit unified-account concept; v1 targets that single
+# account type.  If real multi-account-type support is ever needed this is
+# promoted to BybitConfig — mirroring the hardcoded-categories pattern above.
+_ACCOUNT_TYPE = "UNIFIED"
 _MAX_TRACKED_FINAL_ORDER_IDS = 10_000
 
 
@@ -695,3 +702,158 @@ class BybitAdapter(Adapter):
 
     async def get_rate_limits(self) -> RateLimits:
         return self._last_rate_limits
+
+    # ---- Reconciliation data (Section 6.1, Section 6.3) ----
+
+    async def _paged_results(
+        self,
+        method: Callable[..., Any],
+        category: str,
+        **extra: Any,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield every entry of a cursor-paginated ``list`` endpoint.
+
+        Iterates the Bybit ``nextPageCursor`` loop so pagination never leaks
+        into the fetch methods below.  Termination is guaranteed: the cursor
+        only continues from a response, and an absent/empty cursor ends the
+        loop (no unbounded growth).
+
+        ``extra`` kwargs (e.g. ``settleCoin``) are forwarded on every page
+        request so callers can scope queries without duplicating the loop.
+        """
+        cursor: str | None = None
+        while True:
+            kwargs: dict[str, Any] = {"category": category, **extra}
+            if cursor:
+                kwargs["cursor"] = cursor
+            data, _ = await self._run_request(method, **kwargs)
+            result = data.get("result") or {}
+            for entry in result.get("list") or []:
+                yield entry
+            cursor = result.get("nextPageCursor") or None
+            if not cursor:
+                break
+
+    async def fetch_positions(self) -> dict[Instrument, Position]:
+        """Fetch all Bybit positions across every applicable category, keyed by Instrument.
+
+        Returns rows for both open and flat (size-0) positions — the same
+        ``Position`` shape the WebSocket position stream emits — so the REST
+        snapshot and the live mirror stay strictly comparable.  An entry that
+        cannot be translated (unknown/de-listed symbol) is skipped with a
+        logged error rather than aborting the whole snapshot, consistent with
+        the WebSocket handlers.
+
+        Category coverage:
+        - ``linear``: queried twice — once scoped to ``settleCoin=USDT``
+          (USDT-margined perps, e.g. BTCUSDT) and once to ``settleCoin=USDC``
+          (USDC-margined perps, e.g. BTCPERP).  Both are required: the V5
+          ``/position/list`` endpoint requires either ``symbol`` or
+          ``settleCoin`` when ``category=linear``, and omitting ``settleCoin``
+          returns an error or empty result.
+        - ``inverse``: queried without ``settleCoin`` — the endpoint accepts
+          ``category=inverse`` alone and returns all inverse positions.
+        - ``spot``: excluded — spot holdings have no position concept on Bybit
+          (no entry price, no liquidation price, no PnL tracking).  Spot
+          balances are reconciled via ``fetch_balances`` instead.
+        """
+        result: dict[Instrument, Position] = {}
+
+        # linear — must be split by settleCoin to cover both USDT and USDC perps.
+        for settle_coin in ("USDT", "USDC"):
+            async for entry in self._paged_results(
+                self._session.get_positions, "linear", settleCoin=settle_coin
+            ):
+                try:
+                    instrument = self._resolve_instrument(entry.get("symbol") or "", "linear")
+                    position = translate_position(entry, instrument=instrument)
+                except Exception:
+                    logger.exception("Skipping malformed Bybit linear position entry: %s", entry)
+                    continue
+                result[position.instrument] = position
+
+        # inverse — category alone is sufficient; no settleCoin required.
+        async for entry in self._paged_results(self._session.get_positions, "inverse"):
+            try:
+                instrument = self._resolve_instrument(entry.get("symbol") or "", "inverse")
+                position = translate_position(entry, instrument=instrument)
+            except Exception:
+                logger.exception("Skipping malformed Bybit inverse position entry: %s", entry)
+                continue
+            result[position.instrument] = position
+
+        return result
+
+    async def fetch_balances(self) -> dict[str, Balance]:
+        """Fetch the account's per-coin balance, keyed by currency.
+
+        Reuses ``translate_wallet_member`` so the REST snapshot and the
+        WebSocket wallet stream produce identical ``Balance`` records.  The
+        account does not support cursor pagination and returns a single
+        per-coin member at ``result.list[0]``.
+        """
+        data, _ = await self._run_request(
+            self._session.get_wallet_balance,
+            accountType=_ACCOUNT_TYPE,
+        )
+        members = (data.get("result") or {}).get("list") or []
+        if not members:
+            return {}
+        result: dict[str, Balance] = {}
+        for balance in translate_wallet_member(members[0], timestamp=_utcnow()):
+            result[balance.currency] = balance
+        return result
+
+    async def fetch_open_orders(self) -> dict[str, OrderRecord]:
+        """Fetch every open order, keyed by client order id.
+
+        Engine-placed orders always carry ``orderLinkId`` and key normally;
+        an orphan order placed outside the engine may lack it, in which case
+        the platform order id is used as a stable non-colliding key so it can
+        still be reconciled (auto-imported) by core.  An entry with neither id
+        is skipped with a log — never silently collapsed onto an empty key.
+        """
+        result: dict[str, OrderRecord] = {}
+        for category in _ORDER_CATEGORIES:
+            async for entry in self._paged_results(self._session.get_open_orders, category):
+                try:
+                    instrument = self._resolve_instrument(entry.get("symbol") or "", category)
+                    order = translate_order_entry(entry, instrument=instrument)
+                except Exception:
+                    logger.exception("Skipping malformed Bybit order entry: %s", entry)
+                    continue
+                key = order.client_order_id or order.platform_order_id
+                if not key:
+                    logger.error("Bybit open order entry has no order id: %s", entry)
+                    continue
+                result[key] = order
+        return result
+
+    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+        """Fetch recent fills, grouped by client order id.
+
+        Only ``Trade`` executions are returned — the WebSocket ``execution``
+        stream reports real trades and excludes funding/adl/bust events, so
+        filtering here keeps REST and WS views identical.  Executions without
+        an ``orderLinkId`` cannot be attributed in core and are skipped with
+        a log.
+        """
+        result: dict[str, list[FillRecord]] = {}
+        for category in _ORDER_CATEGORIES:
+            async for entry in self._paged_results(self._session.get_executions, category):
+                if entry.get("execType") != "Trade":
+                    continue
+                client_order_id = entry.get("orderLinkId") or ""
+                if not client_order_id:
+                    logger.error("Skipping Bybit execution without orderLinkId: %s", entry)
+                    continue
+                try:
+                    instrument = self._resolve_instrument(entry.get("symbol") or "", category)
+                    fill = translate_fill(
+                        entry, instrument=instrument, client_order_id=client_order_id
+                    )
+                except Exception:
+                    logger.exception("Skipping malformed Bybit execution entry: %s", entry)
+                    continue
+                result.setdefault(client_order_id, []).append(fill)
+        return result
