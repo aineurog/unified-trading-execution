@@ -15,6 +15,9 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import logging
+import threading
+from collections import OrderedDict
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,10 +36,27 @@ from unified_trading_execution.bybit.orders import (
     build_place_order_payload,
     parse_order_result,
 )
-from unified_trading_execution.bybit.symbols import to_bybit_symbol
+from unified_trading_execution.bybit.streams import (
+    is_final_order_status,
+    is_terminal_order_status,
+    translate_fill,
+    translate_order_entry,
+    translate_position,
+    translate_wallet_member,
+)
+from unified_trading_execution.bybit.symbols import from_bybit_symbol, to_bybit_symbol
 from unified_trading_execution.bybit.websocket import BybitWebSocket
-from unified_trading_execution.errors import InvalidSymbolError, OrderNotFoundError
-from unified_trading_execution.events import ConnectionStateEvent, EventBus
+from unified_trading_execution.errors import InvalidSymbolError, OrderNotFoundError, PlatformError
+from unified_trading_execution.events import (
+    BalanceUpdateEvent,
+    ConnectionStateEvent,
+    Event,
+    EventBus,
+    FillEvent,
+    OrderCancelledEvent,
+    OrderPlacedEvent,
+    PositionUpdateEvent,
+)
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -45,10 +65,13 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 
+logger = logging.getLogger(__name__)
+
 _DEFAULT_REQUESTS_PER_INTERVAL = 120
 _DEFAULT_INTERVAL_SECONDS = 60
 _CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
 _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
+_MAX_TRACKED_FINAL_ORDER_IDS = 10_000
 
 
 def _new_id() -> str:
@@ -57,6 +80,13 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _parse_stream_ms(raw: object) -> datetime:
+    """Parse a Bybit stream millisecond timestamp into a tz-aware datetime."""
+    ms = int(str(raw))
+    seconds, millis = divmod(ms, 1000)
+    return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
 def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
@@ -108,6 +138,13 @@ class BybitAdapter(Adapter):
         self._monitor_task: asyncio.Task[None] | None = None
         self._last_rate_limits = _parse_rate_limits({})
         self._order_refs: dict[str, tuple[str, str]] = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._instruments: dict[tuple[str, str], Instrument] = {}
+        self._open_order_ids: set[str] = set()
+        self._final_order_ids: OrderedDict[str, None] = OrderedDict()
+        # Protects _open_order_ids and _final_order_ids which are read/written
+        # from both the event-loop thread and pybit's background WS thread.
+        self._order_ids_lock = threading.Lock()
 
         self._session = HTTP(
             testnet=config.testnet,
@@ -156,9 +193,17 @@ class BybitAdapter(Adapter):
             self._monitor_task.cancel()
             await asyncio.gather(self._monitor_task, return_exceptions=True)
             self._monitor_task = None
+
+        self._loop = asyncio.get_running_loop()
+        await self._refresh_instrument_registry()
+
         ws = BybitWebSocket(self._config)
         await asyncio.to_thread(ws.connect)
         self._ws = ws
+        await asyncio.to_thread(ws.subscribe_order, self._on_order_message)
+        await asyncio.to_thread(ws.subscribe_execution, self._on_execution_message)
+        await asyncio.to_thread(ws.subscribe_position, self._on_position_message)
+        await asyncio.to_thread(ws.subscribe_wallet, self._on_wallet_message)
         self._connected = True
         self._publish_connection_state(True)
         self._monitor_task = asyncio.create_task(self._monitor_connection())
@@ -207,6 +252,221 @@ class BybitAdapter(Adapter):
             if connected != self._connected:
                 self._connected = connected
                 self._publish_connection_state(connected)
+
+    # ---- WebSocket event streams (Section 6.1, Section 17.12) ----
+
+    async def _refresh_instrument_registry(self) -> None:
+        """Populate the ``(category, symbol) -> Instrument`` reverse registry.
+
+        Seeded from the platform's instrument list on connect so inbound
+        stream messages carrying only a symbol string can be resolved back to
+        a canonical ``Instrument`` (Section 6.4).  The registry lives for the
+        lifetime of the adapter instance.
+
+        Paginates through all pages using ``nextPageCursor`` so the registry
+        is complete — a missing instrument would cause stream messages to be
+        silently dropped.
+        """
+        for category in _ORDER_CATEGORIES:
+            cursor: str | None = None
+            while True:
+                kwargs: dict[str, Any] = {"category": category}
+                if cursor:
+                    kwargs["cursor"] = cursor
+                data, _ = await self._run_request(
+                    self._session.get_instruments_info,
+                    **kwargs,
+                )
+                result = data.get("result") or {}
+                listings = result.get("list") or []
+                for listing in listings:
+                    symbol = listing.get("symbol")
+                    base = listing.get("baseCoin")
+                    quote = listing.get("quoteCoin")
+                    if not symbol or not base or not quote:
+                        continue
+                    try:
+                        instrument = from_bybit_symbol(symbol, base, quote, category)
+                    except InvalidSymbolError:
+                        continue
+                    self._instruments[(category, symbol)] = instrument
+                cursor = result.get("nextPageCursor") or None
+                if not cursor:
+                    break
+
+    def _resolve_instrument(self, symbol: str, category: str) -> Instrument:
+        """Look up the canonical ``Instrument`` for a stream ``(category, symbol)``.
+
+        Raises ``PlatformError`` when the symbol is unknown — an unrecognised
+        instrument must never be silently mapped (fail loud, not silent).
+        """
+        instrument = self._instruments.get((category, symbol))
+        if instrument is None:
+            raise PlatformError(f"Unknown Bybit instrument {category}:{symbol} in stream update")
+        return instrument
+
+    def _publish_from_ws(self, event: Event) -> None:
+        """Publish an event from pybit's WS thread by scheduling it on the loop."""
+        loop = self._loop
+        if loop is None:
+            raise PlatformError("Bybit adapter is not connected to an event loop")
+        loop.call_soon_threadsafe(self._event_bus.publish, event)
+
+    def _move_to_final(self, platform_id: str) -> None:
+        """Retire an order id from the live set into the bounded LRU.
+
+        Removes the id from ``_open_order_ids`` and records it in
+        ``_final_order_ids`` (bounded) so duplicate terminal echoes are
+        suppressed without unbounded memory growth.
+
+        Must be called with ``_order_ids_lock`` held.
+        """
+        self._open_order_ids.discard(platform_id)
+        self._final_order_ids[platform_id] = None
+        self._final_order_ids.move_to_end(platform_id)
+        while len(self._final_order_ids) > _MAX_TRACKED_FINAL_ORDER_IDS:
+            self._final_order_ids.popitem(last=False)
+
+    def _on_order_message(self, message: dict[str, Any]) -> None:
+        """Translate ``order`` stream entries into reconcile-safe order events.
+
+        Emits ``OrderPlacedEvent`` for a newly-seen order and
+        ``OrderCancelledEvent`` for a previously-seen order that reaches a
+        terminal cancelled state.  ``OrderModifiedEvent`` is deliberately not
+        emitted — the stream carries no ``previous`` state, so core's mirror
+        diffs updates instead (Section 6.1).
+
+        Seen-order bookkeeping is bounded: ``_open_order_ids`` holds only live
+        (non-final) orders and is pruned as they finalise, while
+        ``_final_order_ids`` is a bounded LRU purely to suppress duplicate
+        terminal echoes (Bybit can repeat a ``Filled`` and redeliver terminal
+        states) so an echo is never misclassified as a brand-new placement.
+        """
+        for entry in message.get("data") or []:
+            try:
+                instrument = self._resolve_instrument(
+                    entry.get("symbol") or "", entry.get("category") or ""
+                )
+                order = translate_order_entry(entry, instrument=instrument)
+            except Exception:
+                logger.exception("Skipping malformed Bybit order stream entry: %s", entry)
+                continue
+
+            platform_id = order.platform_order_id or ""
+            if not platform_id:
+                logger.error("Bybit order stream entry has no orderId: %s", entry)
+                continue
+
+            with self._order_ids_lock:
+                if platform_id in self._final_order_ids:
+                    # Duplicate echo of an already-final order — ignore.
+                    continue
+
+                if platform_id in self._open_order_ids:
+                    # Previously-seen live order.  Emit a cancel only when it now
+                    # reaches a terminal cancelled state; a fill is final without
+                    # being a cancellation, so it emits no event of its own.
+                    if is_terminal_order_status(order.status):
+                        self._move_to_final(platform_id)
+                        self._publish_from_ws(
+                            OrderCancelledEvent(
+                                event_id=_new_id(),
+                                timestamp=_utcnow(),
+                                adapter_name=self.platform_name,
+                                account_id=self.account_id,
+                                correlation_id=order.client_order_id or None,
+                                client_order_id=order.client_order_id,
+                                instrument=instrument,
+                            )
+                        )
+                    elif is_final_order_status(order.status):
+                        self._move_to_final(platform_id)
+                    continue
+
+                # Brand-new order — first sighting.
+                self._publish_from_ws(
+                    OrderPlacedEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=order.client_order_id or None,
+                        order=order,
+                    )
+                )
+                if is_final_order_status(order.status):
+                    self._move_to_final(platform_id)
+                else:
+                    self._open_order_ids.add(platform_id)
+
+    def _on_execution_message(self, message: dict[str, Any]) -> None:
+        """Translate ``execution`` (fill) stream updates into ``FillEvent``."""
+        for entry in message.get("data") or []:
+            try:
+                instrument = self._resolve_instrument(
+                    entry.get("symbol") or "", entry.get("category") or ""
+                )
+                client_order_id = entry.get("orderLinkId") or ""
+                fill = translate_fill(entry, instrument=instrument, client_order_id=client_order_id)
+            except Exception:
+                logger.exception("Skipping malformed Bybit execution stream entry: %s", entry)
+                continue
+            self._publish_from_ws(
+                FillEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=client_order_id or None,
+                    fill=fill,
+                )
+            )
+
+    def _on_position_message(self, message: dict[str, Any]) -> None:
+        """Translate ``position`` stream updates into ``PositionUpdateEvent``."""
+        for entry in message.get("data") or []:
+            try:
+                instrument = self._resolve_instrument(
+                    entry.get("symbol") or "", entry.get("category") or ""
+                )
+                position = translate_position(entry, instrument=instrument)
+            except Exception:
+                logger.exception("Skipping malformed Bybit position stream entry: %s", entry)
+                continue
+            self._publish_from_ws(
+                PositionUpdateEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    position=position,
+                )
+            )
+
+    def _on_wallet_message(self, message: dict[str, Any]) -> None:
+        """Translate ``wallet`` stream updates into one ``BalanceUpdateEvent`` per coin."""
+        try:
+            timestamp = _utcnow()
+            creation_time = message.get("creationTime")
+            if creation_time:
+                timestamp = _parse_stream_ms(creation_time)
+            members = message.get("data") or []
+        except Exception:
+            logger.exception("Skipping malformed Bybit wallet stream message: %s", message)
+            return
+        for member in members:
+            for balance in translate_wallet_member(member, timestamp=timestamp):
+                self._publish_from_ws(
+                    BalanceUpdateEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        balance=balance,
+                    )
+                )
 
     # ---- Order operations ----
 

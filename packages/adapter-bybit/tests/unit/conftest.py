@@ -25,6 +25,11 @@ def mock_pybit_http():
     """
     with patch("unified_trading_execution.bybit.adapter.HTTP") as mock_cls:
         mock_session = MagicMock()
+        mock_session.get_instruments_info.return_value = (
+            {"result": {"list": []}},
+            None,
+            {},
+        )
         mock_cls.return_value = mock_session
         yield mock_session
 
