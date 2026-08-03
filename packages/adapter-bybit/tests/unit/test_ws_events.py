@@ -156,6 +156,55 @@ class TestStreamsTranslation:
         assert balances[1].free == Decimal("100")
         assert balances[1].used == Decimal("0")
 
+    def test_translate_wallet_clamps_negative_free(self) -> None:
+        member = {
+            "accountType": "UNIFIED",
+            "coin": [
+                {
+                    "coin": "USDT",
+                    "walletBalance": "1.0",
+                    "totalPositionIM": "50",
+                },
+            ],
+        }
+        balances = streams.translate_wallet_member(member, timestamp=_TS)
+        assert len(balances) == 1
+        assert balances[0].free == Decimal("0")
+        assert balances[0].used == Decimal("50")
+        assert balances[0].total == Decimal("50")
+        assert balances[0].free + balances[0].used == balances[0].total
+
+    def test_translate_fill_zero_fee_is_preserved(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-1",
+                "orderLinkId": "client-1",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+                "execFee": "0",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="client-1",
+        )
+        assert fill.fee_amount == Decimal("0")
+
+    def test_translate_fill_missing_fee_is_none(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-1",
+                "orderLinkId": "client-1",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="client-1",
+        )
+        assert fill.fee_amount is None
+
     def test_translate_order_limit(self) -> None:
         order = streams.translate_order_entry(_base_order_entry(), instrument=_BTCUSDT)
         assert order.order_type == OrderType.LIMIT

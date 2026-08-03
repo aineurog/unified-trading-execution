@@ -95,6 +95,13 @@ def _parse_ms(raw: object, field: str) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
+def _parse_fee(raw: object) -> Decimal | None:
+    """Parse the ``execFee`` field — zero fee is distinct from missing data."""
+    if raw is None or raw == "":
+        return None
+    return Decimal(str(raw))
+
+
 def translate_fill(
     entry: dict[str, Any], *, instrument: Instrument, client_order_id: str
 ) -> FillRecord:
@@ -119,7 +126,7 @@ def translate_fill(
         fill_price=_decimal(entry.get("execPrice"), "execPrice"),
         fill_timestamp=_parse_ms(entry.get("execTime"), "execTime"),
         fee_currency=_optional_string(entry, "feeCurrency"),
-        fee_amount=_optional_decimal(entry.get("execFee")),
+        fee_amount=_parse_fee(entry.get("execFee")),
         correlation_id=client_order_id,
     )
 
@@ -171,12 +178,16 @@ def translate_wallet_member(member: dict[str, Any], *, timestamp: datetime) -> t
             if value is not None:
                 used += value
 
+        free = total - used
+        if free < 0:
+            free = Decimal("0")
+
         result.append(
             Balance(
                 currency=str(currency),
-                free=total - used,
+                free=free,
                 used=used,
-                total=total,
+                total=free + used,
                 updated_at=timestamp,
             )
         )
