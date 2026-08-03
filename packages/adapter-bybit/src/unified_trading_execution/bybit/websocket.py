@@ -1,13 +1,18 @@
 """Bybit WebSocket connection wrapper.
 
 pybit's ``WebSocket`` is a threaded websocket-client wrapper that blocks
-during construction while it connects and reconnects automatically.  This
-module wraps it behind a small, testable surface and translates
-pybit/websocket-client failures into the unified exception hierarchy before
-they cross the adapter boundary (Section 17.10).
+during construction while it connects and reconnects automatically, and
+invokes stream callbacks on a background daemon thread.  This module wraps
+it behind a small, testable surface, translates pybit/websocket-client
+failures into the unified exception hierarchy before they cross the adapter
+boundary (Section 17.10), and exposes a private-topic subscription API
+(``order`` / ``execution`` / ``position`` / ``wallet``).
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
+from typing import Any
 
 import websocket
 from pybit.exceptions import InvalidChannelTypeError, UnauthorizedExceptionError
@@ -23,6 +28,9 @@ class BybitWebSocket:
     The underlying client connects in its constructor and runs in a daemon
     thread.  Call :meth:`connect` from a worker thread (e.g. via
     ``asyncio.to_thread``) because it blocks until the socket is connected.
+    Stream callbacks are invoked by pybit on its background thread — the
+    adapter is responsible for marshalling any resulting work back onto the
+    event loop.
     """
 
     def __init__(self, config: BybitConfig) -> None:
@@ -82,3 +90,41 @@ class BybitWebSocket:
             return bool(self._ws.is_connected())
         except Exception:
             return False
+
+    def subscribe_order(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Subscribe to the private ``order`` stream.
+
+        Args:
+            callback: Receives each complete message ``{"topic": ..., "data": [...]}``
+                on pybit's background thread.  Conditional on an open connection.
+        """
+        self._require_connected().order_stream(callback)
+
+    def subscribe_execution(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Subscribe to the private ``execution`` (fills) stream.
+
+        Args:
+            callback: Receives each complete message on pybit's background thread.
+        """
+        self._require_connected().execution_stream(callback)
+
+    def subscribe_position(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Subscribe to the private ``position`` stream.
+
+        Args:
+            callback: Receives each complete message on pybit's background thread.
+        """
+        self._require_connected().position_stream(callback)
+
+    def subscribe_wallet(self, callback: Callable[[dict[str, Any]], None]) -> None:
+        """Subscribe to the private ``wallet`` stream.
+
+        Args:
+            callback: Receives each complete message on pybit's background thread.
+        """
+        self._require_connected().wallet_stream(callback)
+
+    def _require_connected(self) -> WebSocket:
+        if self._ws is None:
+            raise PlatformConnectionError("Bybit WebSocket is not connected")
+        return self._ws
