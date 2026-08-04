@@ -43,7 +43,7 @@ class Instrument:
         return self._broker_symbol_override
 
     def __post_init__(self) -> None:
-        if not self.symbol or not self.symbol.isupper():
+        if not self.symbol or self.symbol != self.symbol.upper():
             raise ValueError(f"symbol must be non-empty and uppercase, got {self.symbol!r}")
 
         # expiry is required for OPTION only — FUTURES with expiry=None is a perpetual.
