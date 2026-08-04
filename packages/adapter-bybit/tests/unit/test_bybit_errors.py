@@ -144,7 +144,9 @@ class TestMapBybitRetCode:
         assert isinstance(exc, PlatformError)
 
     def test_110094_order_value_is_not_balance_error(self) -> None:
-        exc = map_bybit_error(ret_code=110094, ret_msg="Order does not meet minimum order value 5 usd")
+        exc = map_bybit_error(
+            ret_code=110094, ret_msg="Order does not meet minimum order value 5 usd"
+        )
         assert isinstance(exc, PlatformError)
         assert not isinstance(exc, InsufficientBalanceError)
         assert exc.platform_error == {"ret_code": 110094}
