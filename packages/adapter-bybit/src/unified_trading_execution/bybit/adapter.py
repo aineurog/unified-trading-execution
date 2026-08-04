@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime
@@ -57,7 +58,7 @@ from unified_trading_execution.events import (
     OrderPlacedEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.types.enums import AssetClass, OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -147,6 +148,12 @@ class BybitAdapter(Adapter):
         self._order_refs: dict[str, tuple[str, str]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         self._instruments: dict[tuple[str, str], Instrument] = {}
+        # Cache of fetched InstrumentSpecs, keyed by the canonical Instrument.
+        # Each value carries the time.monotonic() wall-clock at fetch so the
+        # optional TTL (config.instrument_spec_cache_ttl) can expire it.  Lives
+        # for the adapter instance lifetime (Section 17.3).
+        self._instrument_specs: dict[Instrument, tuple[InstrumentSpec, float]] = {}
+        self._instrument_spec_cache_ttl: float | None = config.instrument_spec_cache_ttl
         self._open_order_ids: set[str] = set()
         self._final_order_ids: OrderedDict[str, None] = OrderedDict()
         # Protects _open_order_ids and _final_order_ids which are read/written
@@ -252,12 +259,24 @@ class BybitAdapter(Adapter):
         )
 
     async def _monitor_connection(self) -> None:
-        """Detect platform-initiated drops/reconnects and publish state changes."""
+        """Detect platform-initiated drops/reconnects and publish state changes.
+
+        On a reconnect (False -> True) the instrument registry is re-refreshed
+        so cached ``InstrumentSpec`` entries invalidated by a mid-session
+        platform change (status leaving ``Trading``) are dropped, forcing a
+        re-fetch on the next access (Section 17.3).
+        """
         while True:
             await asyncio.sleep(_CONNECTION_MONITOR_INTERVAL_SECONDS)
             connected = self._ws is not None and self._ws.is_connected()
             if connected != self._connected:
+                was_connected = self._connected
                 self._connected = connected
+                if connected and not was_connected:
+                    try:
+                        await self._refresh_instrument_registry()
+                    except Exception:
+                        logger.exception("Bybit instrument registry refresh after reconnect failed")
                 self._publish_connection_state(connected)
 
     # ---- WebSocket event streams (Section 6.1, Section 17.12) ----
@@ -273,6 +292,12 @@ class BybitAdapter(Adapter):
         Paginates through all pages using ``nextPageCursor`` so the registry
         is complete — a missing instrument would cause stream messages to be
         silently dropped.
+
+        Also refreshes cached ``InstrumentSpec`` entries: a refreshed listing
+        whose ``status`` has left ``Trading`` (halted/delisted) invalidates the
+        cached spec so the next ``fetch_instrument_spec`` re-fetches.  This is
+        the reconnect-time invalidation trigger (Section 17.3): cached specs on
+        initial connect are empty, so the check is a no-op then.
         """
         for category in _ORDER_CATEGORIES:
             cursor: str | None = None
@@ -297,6 +322,8 @@ class BybitAdapter(Adapter):
                     except InvalidSymbolError:
                         continue
                     self._instruments[(category, symbol)] = instrument
+                    if listing.get("status") != "Trading":
+                        self._invalidate_instrument_spec(instrument)
                 cursor = result.get("nextPageCursor") or None
                 if not cursor:
                     break
@@ -358,6 +385,14 @@ class BybitAdapter(Adapter):
             except Exception:
                 logger.exception("Skipping malformed Bybit order stream entry: %s", entry)
                 continue
+
+            # A rejected order is a symptom that the platform's rules for this
+            # instrument differ from the cached spec (Section 17.3) — e.g. a
+            # changed tick/lot size or a halted contract.  Invalidating is
+            # idempotent, so an instrument whose spec was never cached is a
+            # no-op; the next fetch_instrument_spec re-queries fresh rules.
+            if order.status == OrderStatus.REJECTED:
+                self._invalidate_spec_from_ws(instrument)
 
             platform_id = order.platform_order_id or ""
             if not platform_id:
@@ -652,7 +687,43 @@ class BybitAdapter(Adapter):
 
     # ---- Instrument metadata ----
 
+    def _invalidate_instrument_spec(self, instrument: Instrument) -> None:
+        """Drop a cached ``InstrumentSpec`` so the next access re-fetches.
+
+        Idempotent: ``dict.pop`` never raises for a missing key, so unknown
+        instruments simply leave the cache untouched (no thrash for
+        genuinely-misspelled symbols).  Event-loop thread only.
+        """
+        self._instrument_specs.pop(instrument, None)
+
+    def _invalidate_spec_from_ws(self, instrument: Instrument) -> None:
+        """Schedule spec invalidation from pybit's WS thread onto the loop.
+
+        Mirrors ``_publish_from_ws``: pybit invokes stream callbacks on its
+        background thread, and ``_instrument_specs`` is only ever mutated on
+        the event loop.
+        """
+        loop = self._loop
+        if loop is None:
+            raise PlatformError("Bybit adapter is not connected to an event loop")
+        loop.call_soon_threadsafe(self._invalidate_instrument_spec, instrument)
+
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
+        """Fetch (or return a cached) ``InstrumentSpec`` for ``instrument``.
+
+        Cached per Section 17.3: each entry re-fetches after an expiry set by
+        ``instrument_spec_cache_ttl`` (defaults to one day) or on adapter-internal
+        invalidation.  ``None`` caches indefinitely.  Invalidation is internally
+        visible only — core never sees the cache, only the ``InstrumentSpec`` value.
+        """
+        cached = self._instrument_specs.get(instrument)
+        if cached is not None:
+            spec, fetched_at = cached
+            ttl = self._instrument_spec_cache_ttl
+            if ttl is None or time.monotonic() - fetched_at < ttl:
+                return spec
+            self._instrument_specs.pop(instrument, None)
+
         bybit_symbol = to_bybit_symbol(instrument)
         category = self._instrument_to_category(instrument)
 
@@ -685,7 +756,7 @@ class BybitAdapter(Adapter):
         else:
             lot_size = Decimal(str(lot_filter.get("qtyStep", "1")))
 
-        return InstrumentSpec(
+        spec = InstrumentSpec(
             tick_size=tick_size,
             lot_size=lot_size,
             min_qty=Decimal(str(lot_filter.get("minOrderQty", "0"))),
@@ -694,6 +765,8 @@ class BybitAdapter(Adapter):
             price_precision=-int(tick_size.as_tuple().exponent),
             qty_precision=-int(lot_size.as_tuple().exponent),
         )
+        self._instrument_specs[instrument] = (spec, time.monotonic())
+        return spec
 
     # ---- Capability reporting ----
 

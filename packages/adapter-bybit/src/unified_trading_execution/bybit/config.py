@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS: float = 86400.0
+
 
 @dataclass(frozen=True, slots=True)
 class BybitConfig:
@@ -20,6 +22,10 @@ class BybitConfig:
         demo: If True, use the demo subdomain (api-demo / api-demo-testnet).
         platform_name: Human-readable platform identifier.
         account_id: Unique account label on this platform.
+        instrument_spec_cache_ttl: Seconds a cached ``InstrumentSpec`` is trusted
+            before being re-fetched.  Defaults to one day
+            (``DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS``); ``None`` caches
+            indefinitely, relying on invalidation only (Section 17.3).
     """
 
     api_key: str
@@ -28,3 +34,10 @@ class BybitConfig:
     demo: bool = False
     platform_name: str = "bybit"
     account_id: str = "bybit-account"
+    instrument_spec_cache_ttl: float | None = DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS
+
+    def __post_init__(self) -> None:
+        """Validate configuration invariants at construction."""
+        ttl = self.instrument_spec_cache_ttl
+        if ttl is not None and ttl <= 0:
+            raise ValueError(f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}")
