@@ -143,6 +143,22 @@ class TestMapBybitRetCode:
         exc = map_bybit_error(ret_code=170141, ret_msg="Duplicate clientOrderId")
         assert isinstance(exc, PlatformError)
 
+    def test_110094_order_value_is_not_balance_error(self) -> None:
+        exc = map_bybit_error(ret_code=110094, ret_msg="Order does not meet minimum order value 5 usd")
+        assert isinstance(exc, PlatformError)
+        assert not isinstance(exc, InsufficientBalanceError)
+        assert exc.platform_error == {"ret_code": 110094}
+
+    def test_110101_collateral_is_not_balance_error(self) -> None:
+        exc = map_bybit_error(ret_code=110101, ret_msg="Settlement asset not enabled as collateral")
+        assert isinstance(exc, PlatformError)
+        assert not isinstance(exc, InsufficientBalanceError)
+
+    def test_170140_spot_min_amt_is_not_balance_error(self) -> None:
+        exc = map_bybit_error(ret_code=170140, ret_msg="Order value exceeded lower limit")
+        assert isinstance(exc, PlatformError)
+        assert not isinstance(exc, InsufficientBalanceError)
+
 
 class TestMapBybitEdgeCases:
     def test_no_args_maps_to_platform_error(self) -> None:

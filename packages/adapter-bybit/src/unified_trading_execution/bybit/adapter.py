@@ -47,7 +47,12 @@ from unified_trading_execution.bybit.streams import (
 )
 from unified_trading_execution.bybit.symbols import from_bybit_symbol, to_bybit_symbol
 from unified_trading_execution.bybit.websocket import BybitWebSocket
-from unified_trading_execution.errors import InvalidSymbolError, OrderNotFoundError, PlatformError
+from unified_trading_execution.errors import (
+    InvalidSymbolError,
+    OrderNotFoundError,
+    PlatformError,
+    UteError,
+)
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
     ConnectionStateEvent,
@@ -540,7 +545,17 @@ class BybitAdapter(Adapter):
             symbol=symbol,
             client_order_id=client_order_id,
         )
-        await self._run_request(self._session.place_order, **payload)
+        try:
+            await self._run_request(self._session.place_order, **payload)
+        except UteError:
+            # A platform rejection is a symptom that the cached rules for this
+            # instrument may differ from reality (Section 17.3) — e.g. a changed
+            # tick/lot size or min-notional.  Invalidate so the next
+            # fetch_instrument_spec re-queries fresh rules, then re-raise the
+            # mapped error to the caller (invalidation is a side-effect, never
+            # a swallow).
+            self._invalidate_instrument_spec(order.instrument)
+            raise
         self._order_refs[client_order_id] = (category, symbol)
         return await self._require_order_result(client_order_id, "placed on Bybit")
 
@@ -556,7 +571,13 @@ class BybitAdapter(Adapter):
             category=category,
             symbol=symbol,
         )
-        await self._run_request(self._session.amend_order, **payload)
+        try:
+            await self._run_request(self._session.amend_order, **payload)
+        except UteError:
+            instrument = self._instruments.get((category, symbol))
+            if instrument is not None:
+                self._invalidate_instrument_spec(instrument)
+            raise
         return await self._require_order_result(modification.client_order_id, "amended on Bybit")
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
@@ -756,12 +777,35 @@ class BybitAdapter(Adapter):
         else:
             lot_size = Decimal(str(lot_filter.get("qtyStep", "1")))
 
+        # Spot uses ``minOrderAmt`` (minimum quote-currency order value, e.g. $5
+        # for BTCUSDT spot) — there is no ``minNotionalValue`` field on spot.
+        # Linear and inverse both carry ``minNotionalValue``.
+        if category == "spot":
+            min_notional_raw = lot_filter.get("minOrderAmt", "0")
+        else:
+            min_notional_raw = lot_filter.get("minNotionalValue", "0")
+
+        raw_min_qty = Decimal(str(lot_filter.get("minOrderQty", "0")))
+
+        # Inverse perpetuals/futures: each contract = $1 USD (Bybit design
+        # constant — all 25 inverse symbols share quote=USD, qtyStep=1,
+        # contract_size=$1).  ``minNotionalValue`` is expressed in USD, so it
+        # equals the minimum contract count directly.  We raise ``min_qty`` to
+        # ``minNotionalValue`` so callers never need to reason about the implicit
+        # $1/contract conversion — ``min_qty`` already encodes the floor.
+        min_qty: Decimal
+        if category == "inverse":
+            min_notional_dec = Decimal(str(min_notional_raw))
+            min_qty = max(raw_min_qty, min_notional_dec)
+        else:
+            min_qty = raw_min_qty
+
         spec = InstrumentSpec(
             tick_size=tick_size,
             lot_size=lot_size,
-            min_qty=Decimal(str(lot_filter.get("minOrderQty", "0"))),
+            min_qty=min_qty,
             max_qty=Decimal(str(lot_filter.get("maxOrderQty", "0"))),
-            min_notional=Decimal(str(lot_filter.get("minNotionalValue", "0"))),
+            min_notional=Decimal(str(min_notional_raw)),
             price_precision=-int(tick_size.as_tuple().exponent),
             qty_precision=-int(lot_size.as_tuple().exponent),
         )
@@ -894,21 +938,42 @@ class BybitAdapter(Adapter):
         the platform order id is used as a stable non-colliding key so it can
         still be reconciled (auto-imported) by core.  An entry with neither id
         is skipped with a log — never silently collapsed onto an empty key.
+
+        Category coverage:
+        - ``spot`` and ``inverse``: queried with category alone — both endpoints
+          accept no additional scoping parameter.
+        - ``linear``: queried twice (``settleCoin=USDT`` then ``settleCoin=USDC``)
+          because Bybit's ``get_open_orders`` requires either ``symbol`` or
+          ``settleCoin`` for ``category=linear`` and omitting both returns an
+          API error (ErrCode 10001).
         """
         result: dict[str, OrderRecord] = {}
-        for category in _ORDER_CATEGORIES:
+
+        def _collect(entry: dict[str, Any], category: str) -> None:
+            try:
+                instrument = self._resolve_instrument(entry.get("symbol") or "", category)
+                order = translate_order_entry(entry, instrument=instrument)
+            except Exception:
+                logger.exception("Skipping malformed Bybit order entry: %s", entry)
+                return
+            key = order.client_order_id or order.platform_order_id
+            if not key:
+                logger.error("Bybit open order entry has no order id: %s", entry)
+                return
+            result[key] = order
+
+        # spot and inverse — category alone is accepted.
+        for category in ("spot", "inverse"):
             async for entry in self._paged_results(self._session.get_open_orders, category):
-                try:
-                    instrument = self._resolve_instrument(entry.get("symbol") or "", category)
-                    order = translate_order_entry(entry, instrument=instrument)
-                except Exception:
-                    logger.exception("Skipping malformed Bybit order entry: %s", entry)
-                    continue
-                key = order.client_order_id or order.platform_order_id
-                if not key:
-                    logger.error("Bybit open order entry has no order id: %s", entry)
-                    continue
-                result[key] = order
+                _collect(entry, category)
+
+        # linear — must be split by settleCoin (USDT and USDC perps).
+        for settle_coin in ("USDT", "USDC"):
+            async for entry in self._paged_results(
+                self._session.get_open_orders, "linear", settleCoin=settle_coin
+            ):
+                _collect(entry, "linear")
+
         return result
 
     async def fetch_fills(self) -> dict[str, list[FillRecord]]:

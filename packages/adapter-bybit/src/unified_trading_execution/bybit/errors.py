@@ -46,6 +46,13 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     30256: InsufficientBalanceError,  # "Margin limit exceeded (Spot)"
     170033: InsufficientBalanceError,  # "margin Insufficient account balance"
     170131: InsufficientBalanceError,  # "Balance insufficient"
+    # NOTE: 110094 ("Order does not meet minimum order value N usd"), 110101
+    # ("Settlement asset not enabled as collateral") and 170140 ("Order value
+    # exceeded lower limit") are deliberately NOT mapped here — they are
+    # order-value / account-configuration rejections, not balance errors, and
+    # core has no dedicated type for them yet.  They fall through to
+    # PlatformError, which preserves the native ret_code for an errors.py
+    # follow-up.
     # ---- Order not found ----
     110001: OrderNotFoundError,  # "Order does not exist"
     170143: OrderNotFoundError,  # "Cannot be found on order book"
