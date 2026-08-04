@@ -455,7 +455,7 @@ class TestInstrumentSpecCache:
             await adapter.fetch_instrument_spec(_spot_instrument())
 
             clock.return_value = 100.0 + 10.0
-            # Not yet expired: at exactly ttl seconds elapsed we stay cached.
+            # Exactly at TTL: < ttl is False, so the entry is expired and refetched.
             spec = await adapter.fetch_instrument_spec(_spot_instrument())
             assert spec is not None
 
