@@ -262,8 +262,11 @@ def is_final_order_status(status: OrderStatus) -> bool:
 def _translate_tp_sl(trigger_raw: object, limit_raw: object) -> TpSlAttachment | None:
     if trigger_raw in _EMPTY:
         return None
+    trigger = _decimal(trigger_raw, "takeProfit/stopLoss")
+    if trigger == 0:
+        return None
     limit = _optional_decimal(limit_raw)
     return TpSlAttachment(
-        trigger_price=_decimal(trigger_raw, "takeProfit/stopLoss"),
+        trigger_price=trigger,
         limit_price=limit,
     )

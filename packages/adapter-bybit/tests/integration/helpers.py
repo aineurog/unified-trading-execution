@@ -82,7 +82,9 @@ def build_unified_order(
     )
 
 
-def valid_qty_from_spec(spec: InstrumentSpec, reference: Decimal = Decimal("1")) -> Decimal:
+def valid_qty_from_spec(
+    spec: InstrumentSpec, reference: Decimal | None = None
+) -> Decimal:
     """A spec-compliant quantity: >= min_qty, satisfies min_notional, aligned to lot_size.
 
     ``reference`` is the current mid price and is used to enforce the minimum
@@ -90,6 +92,10 @@ def valid_qty_from_spec(spec: InstrumentSpec, reference: Decimal = Decimal("1"))
     (minimum quote-currency order value); for derivatives it is
     ``minNotionalValue``.  Both are stored in ``InstrumentSpec.min_notional``
     after the adapter parses the correct field per category.
+
+    When ``reference`` is ``None``, the notional-based bump is skipped and the
+    returned quantity is simply ``min_qty`` aligned to the lot boundary — safe
+    for orders that will rest below market and never fill.
     """
     lot = spec.lot_size if spec.lot_size > 0 else Decimal("1")
     min_qty = spec.min_qty if spec.min_qty > 0 else lot
@@ -98,10 +104,10 @@ def valid_qty_from_spec(spec: InstrumentSpec, reference: Decimal = Decimal("1"))
     qty = align_up_to_lot(min_qty, lot)
 
     # If min_notional is set, bump qty until qty * reference >= min_notional.
-    # Use a safety factor of 1.1 to stay comfortably above the threshold and
-    # absorb mid-price drift between spec fetch and order placement.
-    if spec.min_notional > 0 and reference > 0:
-        required_qty = (spec.min_notional * Decimal("1.1")) / reference
+    # Use a safety factor of 5x to absorb mid-price drift and tick-alignment
+    # rounding that can bring the effective notional back under the threshold.
+    if reference is not None and spec.min_notional > 0 and reference > 0:
+        required_qty = (spec.min_notional * Decimal("5.0")) / reference
         if required_qty > qty:
             qty = align_up_to_lot(required_qty, lot)
 

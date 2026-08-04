@@ -16,19 +16,26 @@ from unified_trading_execution.events import (
     BalanceUpdateEvent,
     EventBus,
     FillEvent,
+    OrderCancelledEvent,
     OrderPlacedEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType
 from unified_trading_execution.types.instrument import Instrument
 
-from .conftest import EventCollector, LoopProbe, cleanup_open_orders
-from .helpers import build_unified_order, random_client_id, valid_qty_from_spec
+from .conftest import EventCollector, LoopProbe, _reference_price, cleanup_open_orders
+from .helpers import (
+    build_unified_order,
+    random_client_id,
+    valid_price_from_spec,
+    valid_qty_from_spec,
+)
 
 
 async def _market_qty(adapter: BybitAdapter, instrument: Instrument) -> Decimal:
     spec = await adapter.fetch_instrument_spec(instrument)
-    qty = valid_qty_from_spec(spec)
+    price = await _reference_price(adapter, instrument)
+    qty = valid_qty_from_spec(spec, price)
     return qty if qty > 0 else Decimal("0.001")
 
 
@@ -224,16 +231,16 @@ async def test_subscriber_exception_is_isolated(
 
 async def test_order_stream_dedup_terminal_echo(
     connected_adapter: BybitAdapter,
-    linear_instrument: Instrument,
+    traded_instrument: Instrument,
     reference_price: Decimal,
     collect_events: EventCollector,
 ) -> None:
     """A terminal echo for an already-final order emits no second OrderPlacedEvent."""
-    spec = await connected_adapter.fetch_instrument_spec(linear_instrument)
-    qty = valid_qty_from_spec(spec) or Decimal("0.001")
-    price = reference_price
+    spec = await connected_adapter.fetch_instrument_spec(traded_instrument)
+    qty = valid_qty_from_spec(spec, reference_price) or Decimal("0.001")
+    price = valid_price_from_spec(spec, reference_price)
     order = build_unified_order(
-        linear_instrument,
+        traded_instrument,
         OrderType.LIMIT,
         OrderSide.BUY,
         qty,
@@ -247,10 +254,14 @@ async def test_order_stream_dedup_terminal_echo(
         order_id = placed[0].order.platform_order_id
         assert order_id is not None
 
+        # Cancel and wait for the WS cancellation event — once it fires,
+        # the order is in _final_order_ids and echoes are suppressed.
         await connected_adapter.cancel_order(order.client_order_id)
-        # After finalising, repeated terminal echoes are suppressed.  Allow
-        # time for the exchange to resend; we must not see a NEW OrderPlacedEvent
-        # for the same platform id.
+        await collect_events.wait_for(OrderCancelledEvent)
+
+        # Drain the collector, then wait for any echo.  After cancellation,
+        # no new OrderPlacedEvent with the same platform id may appear.
+        collect_events.drain()
         await asyncio.sleep(2.0)
         placed_after = [
             event
