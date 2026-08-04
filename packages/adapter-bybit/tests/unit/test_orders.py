@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
@@ -32,7 +33,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
     TimeInForce,
 )
-from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     OrderModification,
     TpSlAttachment,
@@ -660,6 +661,71 @@ class TestPlaceOrder:
         with pytest.raises(InsufficientBalanceError):
             await adapter.place_order(order)
 
+    async def test_place_rejection_invalidates_cached_spec(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """A REST rejection must drop the cached spec (Side effect, never swallow)."""
+        instrument = _spot_instrument()
+        adapter._instrument_specs[instrument] = (
+            InstrumentSpec(
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("10"),
+                min_notional=Decimal("5"),
+                price_precision=3,
+                qty_precision=3,
+            ),
+            time.monotonic(),
+        )
+        mock_pybit_http.place_order.side_effect = InvalidRequestError(
+            request="POST /v5/order/create",
+            message="Invalid quantity",
+            status_code=10002,
+            time="12:00:00",
+            resp_headers=None,
+        )
+
+        order = _order(instrument, order_type=OrderType.LIMIT, price=Decimal("100"))
+        with pytest.raises(PlatformError):
+            await adapter.place_order(order)
+        assert instrument not in adapter._instrument_specs
+
+    async def test_place_success_keeps_cached_spec(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """A successful placement must NOT invalidate a cached spec."""
+        instrument = _spot_instrument()
+        spec = InstrumentSpec(
+            tick_size=Decimal("0.1"),
+            lot_size=Decimal("0.001"),
+            min_qty=Decimal("0.001"),
+            max_qty=Decimal("10"),
+            min_notional=Decimal("5"),
+            price_precision=3,
+            qty_precision=3,
+        )
+        adapter._instrument_specs[instrument] = (spec, time.monotonic())
+        mock_pybit_http.place_order.return_value = (
+            {"retCode": 0, "result": {"orderId": "o1", "orderLinkId": "c1"}},
+            None,
+            {},
+        )
+        mock_pybit_http.get_open_orders.return_value = (
+            {"retCode": 0, "result": {"list": [_order_entry()], "category": "spot"}},
+            None,
+            {},
+        )
+
+        order = _order(instrument, order_type=OrderType.MARKET)
+        await adapter.place_order(order)
+        cached = adapter._instrument_specs.get(instrument)
+        assert cached is not None and cached[0] is spec
+
     async def test_translates_rate_limit(
         self,
         adapter: BybitAdapter,
@@ -792,6 +858,45 @@ class TestModifyOrder:
         with pytest.raises(OrderNotFoundError):
             await adapter.modify_order(modification)
         mock_pybit_http.amend_order.assert_not_called()
+
+    async def test_modify_rejection_invalidates_cached_spec(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """A REST rejection on amend must invalidate the resolved instrument's spec."""
+        instrument = _futures_instrument()
+        adapter._instruments[("linear", "BTCUSDT")] = instrument
+        adapter._order_refs["c1"] = ("linear", "BTCUSDT")
+        adapter._instrument_specs[instrument] = (
+            InstrumentSpec(
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("10"),
+                min_notional=Decimal("5"),
+                price_precision=3,
+                qty_precision=3,
+            ),
+            time.monotonic(),
+        )
+        mock_pybit_http.amend_order.side_effect = InvalidRequestError(
+            request="POST /v5/order/amend",
+            message="Invalid price",
+            status_code=10005,
+            time="12:00:00",
+            resp_headers=None,
+        )
+        mock_pybit_http.get_open_orders.return_value = (
+            {"retCode": 0, "result": {"list": [_order_entry()], "category": "linear"}},
+            None,
+            {},
+        )
+
+        modification = OrderModification(client_order_id="c1", price=Decimal("101"))
+        with pytest.raises(PlatformError):
+            await adapter.modify_order(modification)
+        assert instrument not in adapter._instrument_specs
 
 
 class TestCancelOrder:
