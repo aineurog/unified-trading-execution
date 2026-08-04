@@ -118,7 +118,9 @@ async def test_order_roundtrip(
             return
 
         if order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
-            new_price = price * Decimal("0.99")
+            new_price = await _spec_valid_price(
+                connected_adapter, traded_instrument, price * Decimal("0.99")
+            )
             modification = OrderModification(
                 client_order_id=order.client_order_id,
                 price=new_price,
@@ -322,7 +324,8 @@ async def test_tp_sl_attachment_round_trip_limit(
         result = await connected_adapter.place_order(order)
         await _assert_complete_result(result)
     finally:
-        await connected_adapter.cancel_order(order.client_order_id)
+        with contextlib.suppress(Exception):
+            await connected_adapter.cancel_order(order.client_order_id)
         await cleanup_open_orders(connected_adapter)
 
 
