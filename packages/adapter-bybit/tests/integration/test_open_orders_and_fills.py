@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from unified_trading_execution.bybit import BybitAdapter
-from unified_trading_execution.types.enums import OrderSide, OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType
 from unified_trading_execution.types.instrument import Instrument
 
 from .conftest import cleanup_open_orders
@@ -43,14 +45,23 @@ async def test_fetch_open_orders_roundtrip(
     traded_instrument: Instrument,
     reference_price: Decimal,
 ) -> None:
+    # Spot orders need free USDT; skip when account has none available.
+    if traded_instrument.asset_class == AssetClass.SPOT:
+        balances = await connected_adapter.fetch_balances()
+        usdt = balances.get("USDT")
+        if usdt and usdt.free == 0:
+            pytest.skip("No free USDT for spot order — testnet balance depleted")
+
     qty, price = await _limit_qty_price(connected_adapter, traded_instrument, reference_price)
+    spec = await connected_adapter.fetch_instrument_spec(traded_instrument)
+    limit_price = valid_price_from_spec(spec, reference_price * Decimal("0.9"))
     order = build_unified_order(
         traded_instrument,
         OrderType.LIMIT,
         OrderSide.BUY,
         qty,
         client_order_id=random_client_id("open-rt"),
-        price=price * Decimal("0.9"),  # below market -> rests
+        price=limit_price,  # below market, tick-aligned -> rests
     )
     try:
         await connected_adapter.place_order(order)

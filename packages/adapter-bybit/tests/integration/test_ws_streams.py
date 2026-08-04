@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 from decimal import Decimal
 
+import pytest
+
 from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
@@ -119,6 +121,12 @@ async def test_spot_fill_produces_fill_event_no_position(
     spot_instrument: Instrument,
     collect_events: EventCollector,
 ) -> None:
+    # Market spot orders need free USDT; skip when account has none available.
+    balances = await connected_adapter.fetch_balances()
+    usdt = balances.get("USDT")
+    if usdt and usdt.free == 0:
+        pytest.skip("No free USDT for spot order — testnet balance depleted")
+
     qty = await _market_qty(connected_adapter, spot_instrument)
     order = build_unified_order(
         spot_instrument,
