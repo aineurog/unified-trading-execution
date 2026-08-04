@@ -82,7 +82,7 @@ def build_unified_order(
     )
 
 
-def valid_qty_from_spec(spec: InstrumentSpec, reference: Decimal) -> Decimal:
+def valid_qty_from_spec(spec: InstrumentSpec, reference: Decimal = Decimal("1")) -> Decimal:
     """A spec-compliant quantity: >= min_qty, satisfies min_notional, aligned to lot_size.
 
     ``reference`` is the current mid price and is used to enforce the minimum

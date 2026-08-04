@@ -34,9 +34,7 @@ async def _live_listing(
     return cast(dict[str, Any], listings[0])
 
 
-def _assert_spec_matches_live(
-    spec: InstrumentSpec, listing: dict[str, Any], category: str
-) -> None:
+def _assert_spec_matches_live(spec: InstrumentSpec, listing: dict[str, Any], category: str) -> None:
     """Assert the unified spec is consistent with the platform filters."""
     lot_filter = listing.get("lotSizeFilter") or {}
     price_filter = listing.get("priceFilter") or {}

@@ -33,7 +33,7 @@ _SPOT_RESPONSE = {
                     "quotePrecision": "0.01",
                     "minOrderQty": "0.0001",
                     "maxOrderQty": "956.96588822",
-                    "minNotionalValue": "5",
+                    "minOrderAmt": "5",
                 },
                 "priceFilter": {
                     "tickSize": "0.1",
@@ -195,7 +195,7 @@ class TestFetchInstrumentSpec:
 
         assert spec.tick_size == Decimal("0.5")
         assert spec.lot_size == Decimal("1")
-        assert spec.min_qty == Decimal("1")
+        assert spec.min_qty == Decimal("10")
         assert spec.max_qty == Decimal("1000000")
         assert spec.min_notional == Decimal("10")
         assert spec.price_precision == 1

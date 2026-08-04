@@ -29,7 +29,7 @@ _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 _PREFERRED_SYMBOLS: dict[str, tuple[str, ...]] = {
     "spot": ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT"),
     "linear": ("BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT"),
-    "inverse": ("ETHUSD","BTCUSD", "XRPUSD", "EOSUSD", "LTCUSD"),
+    "inverse": ("ETHUSD", "BTCUSD", "XRPUSD", "EOSUSD", "LTCUSD"),
 }
 
 
