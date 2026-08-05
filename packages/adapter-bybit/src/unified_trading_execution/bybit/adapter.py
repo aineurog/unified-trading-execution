@@ -30,7 +30,13 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.errors import map_bybit_error
+from unified_trading_execution.bybit.errors import LeverageExceedsMaxError, map_bybit_error
+from unified_trading_execution.bybit.events import (
+    LeverageAppliedEvent,
+    LeverageApplyFailedEvent,
+    MarginModeChangedEvent,
+)
+from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
@@ -63,6 +69,7 @@ from unified_trading_execution.events import (
     OrderPlacedEvent,
     PositionUpdateEvent,
 )
+from unified_trading_execution.state.store import StateStore
 from unified_trading_execution.types.enums import AssetClass, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -143,9 +150,21 @@ class BybitAdapter(Adapter):
     translated events from its internal WebSocket handlers.
     """
 
-    def __init__(self, config: BybitConfig, *, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        config: BybitConfig,
+        *,
+        event_bus: EventBus,
+        state_store: StateStore | None = None,
+    ) -> None:
         self._config = config
         self._event_bus = event_bus
+        # Optional handle to the shared StateStore, used only for the
+        # adapter-owned ``adapter_config`` keyspace (leverage/margin-mode
+        # intent, Section 2).  The Adapter ABC deliberately keeps the
+        # state *mirror* out of the adapter; this is the one documented
+        # exception, scoped to the adapter's own config table.
+        self._state_store = state_store
         self._connected = False
         self._ws: BybitWebSocket | None = None
         self._monitor_task: asyncio.Task[None] | None = None
@@ -188,6 +207,190 @@ class BybitAdapter(Adapter):
             f"Asset class {instrument.asset_class} is not supported by Bybit",
         )
 
+    # ---- Leverage and margin mode (Section 4, Phase 3) ----
+
+    @staticmethod
+    def _leverage_key(instrument: Instrument) -> str:
+        """adapter_config key for stored leverage intent — ``leverage.{symbol}``."""
+        return f"leverage.{to_bybit_symbol(instrument)}"
+
+    @staticmethod
+    def _margin_mode_key(instrument: Instrument) -> str:
+        """adapter_config key for stored margin mode intent — ``margin_mode.{symbol}``."""
+        return f"margin_mode.{to_bybit_symbol(instrument)}"
+
+    async def _require_store(self) -> StateStore:
+        """Return the state store or raise if leverage persistence is unavailable.
+
+        Leverage intent persistence needs the shared StateStore, which is an
+        optional constructor argument (the Adapter ABC keeps the state mirror
+        out of the adapter).  A missing store is a hard error here — silently
+        skipping persistence would silently defeat user intent.
+        """
+        if self._state_store is None:
+            raise PlatformError(
+                "BybitAdapter was constructed without a state_store — "
+                "leverage/margin-mode persistence is unavailable"
+            )
+        return self._state_store
+
+    async def _validate_leverage(self, instrument: Instrument, leverage: int) -> None:
+        """Reject leverage requests that the platform cannot honour.
+
+        Per Section 8, validation is eager at the ``set_leverage`` call, not
+        lazy on platform rejection: a spot instrument is invalid, and a value
+        above ``max_leverage`` raises ``LeverageExceedsMaxError`` with the
+        platform's cap in the message.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise InvalidSymbolError(
+                f"Spot instrument {to_bybit_symbol(instrument)} has no leverage"
+            )
+        spec = await self.fetch_instrument_spec(instrument)
+        if spec.max_leverage is not None and leverage > int(spec.max_leverage):
+            raise LeverageExceedsMaxError(
+                f"Leverage {leverage} exceeds max {spec.max_leverage} "
+                f"for {to_bybit_symbol(instrument)}"
+            )
+
+    async def _block_on_open_position(self, instrument: Instrument) -> None:
+        """Raise if the instrument has an open position and the guard is enabled.
+
+        Section 5.6 — ``block_on_open_position`` defaults to True.  Changing
+        leverage with an open position recalculates margin immediately and can
+        cause liquidation, so the safe default is to refuse.
+        """
+        if not self._config.leverage.block_on_open_position:
+            return
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if Decimal(str(entry.get("size") or "0")) != 0:
+                raise PlatformError(
+                    f"Cannot change leverage with open position for {to_bybit_symbol(instrument)}"
+                )
+
+    async def set_leverage(self, instrument: Instrument, leverage: int) -> None:
+        """Set leverage for *instrument* on the platform and persist the intent.
+
+        In one-way mode (default), ``buyLeverage`` and ``sellLeverage`` are
+        both set to ``leverage``.  Asymmetric leverage is not supported in v1.
+
+        Raises:
+            InvalidSymbolError: instrument not supported / not derivatives.
+            LeverageExceedsMaxError: leverage exceeds the platform max.
+            PlatformError: platform rejected the request, or an open position
+                blocked the change while ``block_on_open_position`` is enabled.
+        """
+        await self._validate_leverage(instrument, leverage)
+        await self._block_on_open_position(instrument)
+
+        category = self._instrument_to_category(instrument)
+        symbol = to_bybit_symbol(instrument)
+        await self._run_request(
+            self._session.set_leverage,
+            category=category,
+            symbol=symbol,
+            buyLeverage=str(leverage),
+            sellLeverage=str(leverage),
+        )
+        store = await self._require_store()
+        await store.set_adapter_config(self._leverage_key(instrument), str(leverage))
+
+    async def get_leverage(self, instrument: Instrument) -> int | None:
+        """Query current leverage from the platform for *instrument*.
+
+        Returns the leverage value (buy = sell in one-way mode), or None if the
+        instrument has no leverage setting (spot, delisted, etc.).
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        if not entries:
+            return None
+        raw = entries[0].get("leverage")
+        if raw is None:
+            return None
+        return int(str(raw))
+
+    async def remove_leverage(self, instrument: Instrument) -> None:
+        """Remove stored leverage intent for *instrument*.
+
+        Does NOT change leverage on the platform — only drops the stored intent
+        so the engine stops managing it.  ``margin_mode.{symbol}`` is left
+        untouched; margin mode is independently managed (Section 5.7).
+        """
+        store = await self._require_store()
+        await store.delete_adapter_config(self._leverage_key(instrument))
+
+    async def set_margin_mode(
+        self,
+        instrument: Instrument,
+        mode: MarginMode,
+        *,
+        leverage: int,
+    ) -> None:
+        """Set the margin mode for *instrument* on the platform and persist.
+
+        Bybit's ``switch_margin_mode`` requires ``buyLeverage`` and
+        ``sellLeverage`` in the same call (equal in one-way mode); ``leverage``
+        supplies both values.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise InvalidSymbolError(
+                f"Spot instrument {to_bybit_symbol(instrument)} has no margin mode"
+            )
+        symbol = to_bybit_symbol(instrument)
+        await self._run_request(
+            self._session.switch_margin_mode,
+            category=category,
+            symbol=symbol,
+            tradeMode=1 if mode is MarginMode.ISOLATED else 0,
+            buyLeverage=str(leverage),
+            sellLeverage=str(leverage),
+        )
+        store = await self._require_store()
+        await store.set_adapter_config(self._margin_mode_key(instrument), mode.value)
+        await store.set_adapter_config(self._leverage_key(instrument), str(leverage))
+
+    async def get_margin_mode(self, instrument: Instrument) -> MarginMode | None:
+        """Query the current margin mode from the platform for *instrument*.
+
+        Returns None if the instrument has no margin mode (spot, etc.).
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        if not entries:
+            return None
+        trade_mode = entries[0].get("tradeMode")
+        if trade_mode == "0":
+            return MarginMode.CROSS
+        if trade_mode == "1":
+            return MarginMode.ISOLATED
+        return None
+
     # ---- Identification (Section 17.10) ----
 
     @property
@@ -226,6 +429,97 @@ class BybitAdapter(Adapter):
         self._connected = True
         self._publish_connection_state(True)
         self._monitor_task = asyncio.create_task(self._monitor_connection())
+        await self._reapply_stored_intent()
+
+    async def _reapply_stored_intent(self) -> None:
+        """Reapply stored leverage / margin-mode intent to the platform (Section 5.1).
+
+        Runs after a successful connect.  For each instrument with stored intent:
+
+        - if margin mode is stored, ``switch_margin_mode`` is called with the
+          stored margin mode and the stored leverage value — a single call that
+          sets both.
+        - if only leverage is stored, ``set_leverage`` restores it.
+        - a platform rejection emits ``LeverageApplyFailedEvent`` and never
+          crashes the connection (Section 5.8); successful applies emit
+          ``LeverageAppliedEvent`` (and ``MarginModeChangedEvent`` when a margin
+          mode was applied).
+
+        Instruments with no stored intent are not touched — their platform
+        leverage/margin mode is whatever it is.
+        """
+        if not self._config.leverage.auto_apply_on_connect:
+            return
+        if self._state_store is None:
+            return
+
+        leverage_rows = await self._state_store.list_adapter_config("leverage.")
+        margin_rows = await self._state_store.list_adapter_config("margin_mode.")
+        if not leverage_rows and not margin_rows:
+            return
+
+        instruments = {to_bybit_symbol(i): i for i in self._instruments.values()}
+
+        for full_key, value in leverage_rows.items():
+            symbol = full_key.removeprefix("leverage.")
+            instrument = instruments.get(symbol)
+            if instrument is None:
+                # Not listed / delisted — skip.  The stored intent is left in
+                # place so the symbol is re-managed if it is re-listed
+                # (Section 9.1); there is no Instrument to emit an event with.
+                logger.warning(
+                    "Skipping stored leverage reapply for unknown/delisted symbol %s",
+                    symbol,
+                )
+                continue
+            leverage = int(value)
+            margin_value = margin_rows.get(f"margin_mode.{symbol}")
+            try:
+                if margin_value is not None:
+                    previous = await self.get_margin_mode(instrument)
+                    await self.set_margin_mode(
+                        instrument,
+                        MarginMode(margin_value),
+                        leverage=leverage,
+                    )
+                    self._event_bus.publish(
+                        MarginModeChangedEvent(
+                            event_id=_new_id(),
+                            timestamp=_utcnow(),
+                            adapter_name=self.platform_name,
+                            account_id=self.account_id,
+                            correlation_id=None,
+                            instrument=instrument,
+                            previous=previous,
+                            current=MarginMode(margin_value),
+                        )
+                    )
+                else:
+                    await self.set_leverage(instrument, leverage)
+                self._event_bus.publish(
+                    LeverageAppliedEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        instrument=instrument,
+                        leverage=leverage,
+                    )
+                )
+            except Exception as exc:
+                self._event_bus.publish(
+                    LeverageApplyFailedEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        instrument=instrument,
+                        leverage=leverage,
+                        reason=str(exc),
+                    )
+                )
 
     async def disconnect(self) -> None:
         """Close all connections gracefully.

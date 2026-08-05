@@ -18,6 +18,15 @@ from unified_trading_execution.errors import (
     UteError,
 )
 
+
+class LeverageDriftError(UteError):
+    """Platform leverage differs from stored intent — order rejected."""
+
+
+class LeverageExceedsMaxError(UteError):
+    """Requested leverage exceeds the platform's maximum for this instrument."""
+
+
 _RET_CODE_MAP: dict[int, type[UteError]] = {
     # ---- Rate limiting ----
     10006: RateLimitError,  # "Too many visits. Exceeded the API Rate Limit"
