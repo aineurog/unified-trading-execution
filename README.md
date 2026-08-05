@@ -33,6 +33,7 @@ import asyncio
 import unified_trading_execution as ute
 from unified_trading_execution.bybit import BybitAdapter
 
+
 async def main():
     # State store is backed by SQLite by default
     engine = ute.Engine(
@@ -42,7 +43,9 @@ async def main():
     await engine.connect()
 
     btc = ute.Instrument(
-        symbol="BTC", quote_currency="USDT", asset_class=ute.AssetClass.SPOT,
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=ute.AssetClass.SPOT,
     )
     await engine.fetch_instrument_spec(btc)
 
@@ -58,6 +61,7 @@ async def main():
     print(f"Order {result.client_order_id}: {result.status}")
 
     await engine.ashutdown()
+
 
 asyncio.run(main())
 ```
@@ -75,7 +79,9 @@ engine = ute.SyncEngine(
 engine.connect()
 
 btc = ute.Instrument(
-    symbol="BTC", quote_currency="USDT", asset_class=ute.AssetClass.SPOT,
+    symbol="BTC",
+    quote_currency="USDT",
+    asset_class=ute.AssetClass.SPOT,
 )
 engine.fetch_instrument_spec(btc)
 

@@ -239,9 +239,10 @@ class TestFetchOpenOrders:
         _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
         entry = _open_order()
         mock_pybit_http.get_open_orders.side_effect = [
-            _EMPTY,
-            ({"result": {"list": [entry], "nextPageCursor": ""}}, None, {}),
-            _EMPTY,
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            ({"result": {"list": [entry], "nextPageCursor": ""}}, None, {}),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
         ]
 
         result = await adapter.fetch_open_orders()
@@ -258,9 +259,10 @@ class TestFetchOpenOrders:
         _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
         entry = _open_order(orderLinkId="", orderId="order-7")
         mock_pybit_http.get_open_orders.side_effect = [
-            _EMPTY,
-            ({"result": {"list": [entry], "nextPageCursor": ""}}, None, {}),
-            _EMPTY,
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            ({"result": {"list": [entry], "nextPageCursor": ""}}, None, {}),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
         ]
 
         result = await adapter.fetch_open_orders()

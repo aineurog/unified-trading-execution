@@ -52,7 +52,7 @@ async def test_fetch_open_orders_roundtrip(
         if usdt and usdt.free == 0:
             pytest.skip("No free USDT for spot order — testnet balance depleted")
 
-    qty, price = await _limit_qty_price(connected_adapter, traded_instrument, reference_price)
+    qty, _price = await _limit_qty_price(connected_adapter, traded_instrument, reference_price)
     spec = await connected_adapter.fetch_instrument_spec(traded_instrument)
     limit_price = valid_price_from_spec(spec, reference_price * Decimal("0.9"))
     order = build_unified_order(

@@ -4,7 +4,6 @@ from datetime import UTC, datetime
 
 import pytest
 
-from unified_trading_execution.adapter import RateLimits
 from unified_trading_execution.bybit.adapter import _parse_rate_limits, _safe_header_int
 
 
