@@ -107,3 +107,4 @@ class InstrumentSpec:
     min_notional: Decimal
     price_precision: int
     qty_precision: int
+    max_leverage: Decimal | None = None  # None for spot / platforms without leverage

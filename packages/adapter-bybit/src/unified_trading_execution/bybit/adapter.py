@@ -772,6 +772,12 @@ class BybitAdapter(Adapter):
 
         tick_size = Decimal(str(price_filter.get("tickSize", "1")))
 
+        # Only derivatives carry ``leverageFilter``; spot has none, so
+        # ``max_leverage`` stays None there.
+        leverage_filter = entry.get("leverageFilter") or {}
+        max_leverage_raw = leverage_filter.get("maxLeverage")
+        max_leverage = Decimal(str(max_leverage_raw)) if max_leverage_raw else None
+
         if category == "spot":
             lot_size = Decimal(str(lot_filter.get("basePrecision", "1")))
         else:
@@ -808,6 +814,7 @@ class BybitAdapter(Adapter):
             min_notional=Decimal(str(min_notional_raw)),
             price_precision=-int(tick_size.as_tuple().exponent),
             qty_precision=-int(lot_size.as_tuple().exponent),
+            max_leverage=max_leverage,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec

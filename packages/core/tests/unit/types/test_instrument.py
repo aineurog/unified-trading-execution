@@ -356,6 +356,7 @@ def test_instrument_spec_valid():
     )
     assert spec.tick_size == Decimal("0.01")
     assert spec.price_precision == 2
+    assert spec.max_leverage is None
 
 
 def test_instrument_spec_is_frozen():
