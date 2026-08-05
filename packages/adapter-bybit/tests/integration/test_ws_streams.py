@@ -27,6 +27,7 @@ from unified_trading_execution.types.instrument import Instrument
 
 from .conftest import EventCollector, LoopProbe, _reference_price, cleanup_open_orders
 from .helpers import (
+    align_to_tick,
     build_unified_order,
     random_client_id,
     valid_price_from_spec,
@@ -253,7 +254,7 @@ async def test_order_stream_dedup_terminal_echo(
         OrderSide.BUY,
         qty,
         client_order_id=random_client_id("ws-dedup"),
-        price=price * Decimal("0.9"),
+        price=align_to_tick(price * Decimal("0.9"), spec.tick_size),
     )
     try:
         await connected_adapter.place_order(order)
