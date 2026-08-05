@@ -194,7 +194,7 @@ async def test_instant_open_and_close(
         positions = await connected_adapter.fetch_positions()
         pos = positions.get(traded_instrument)
         if pos is not None:
-            assert isinstance(pos.quantity, Decimal), f"position quantity must be Decimal"
+            assert isinstance(pos.quantity, Decimal), "position quantity must be Decimal"
             assert pos.quantity >= 0, (
                 f"sell must not leave a short position on {traded_instrument.symbol}, "
                 f"got {pos.quantity}"

@@ -287,7 +287,7 @@ def collect_events(event_bus: EventBus) -> EventCollector:
 
 
 @pytest.fixture
-async def responsive_loop_probe() -> AsyncIterator["LoopProbe"]:
+async def responsive_loop_probe() -> AsyncIterator[LoopProbe]:
     """Prove the event loop stays responsive while WS messages stream in.
 
     Yields an asyncio task that bumps a counter every 20ms; the test asserts
