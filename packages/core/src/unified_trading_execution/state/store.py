@@ -152,6 +152,15 @@ class StateStore(ABC):
     ) -> list[HaltEvent]: ...
 
     @abstractmethod
+    async def get_adapter_config(self, key: str) -> str | None: ...
+    @abstractmethod
+    async def set_adapter_config(self, key: str, value: str) -> None: ...
+    @abstractmethod
+    async def delete_adapter_config(self, key: str) -> None: ...
+    @abstractmethod
+    async def list_adapter_config(self, prefix: str) -> dict[str, str]: ...
+
+    @abstractmethod
     async def initialize(self) -> None: ...
     @abstractmethod
     async def close(self) -> None: ...
@@ -526,6 +535,36 @@ class SQLiteStateStore(StateStore):
         if row is None:
             return None
         return self._row_to_order_record(row)
+
+    # ---- Adapter config (key/value, Section 2.1) ----
+
+    async def get_adapter_config(self, key: str) -> str | None:
+        cursor = await self.conn.execute(
+            "SELECT value FROM adapter_config WHERE key=?",
+            (key,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        return str(row[0])
+
+    async def set_adapter_config(self, key: str, value: str) -> None:
+        now = datetime.now(tz=UTC).isoformat()
+        await self.conn.execute(
+            "INSERT OR REPLACE INTO adapter_config (key, value, updated_at) VALUES (?, ?, ?)",
+            (key, value, now),
+        )
+
+    async def delete_adapter_config(self, key: str) -> None:
+        await self.conn.execute("DELETE FROM adapter_config WHERE key=?", (key,))
+
+    async def list_adapter_config(self, prefix: str) -> dict[str, str]:
+        cursor = await self.conn.execute(
+            "SELECT key, value FROM adapter_config WHERE key LIKE ?",
+            (prefix + "%",),
+        )
+        rows = await cursor.fetchall()
+        return {str(row["key"]): str(row["value"]) for row in rows}
 
     # ---- Filtered queries ----
 
