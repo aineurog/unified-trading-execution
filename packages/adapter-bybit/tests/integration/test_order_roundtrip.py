@@ -354,12 +354,8 @@ async def test_tp_sl_attachment_round_trip_limit(
     """Limit TP/SL (tpslMode=Partial) is accepted by testnet derivatives."""
     qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
-    tp_price = await _align_to_tick(
-        connected_adapter, linear_instrument, price * Decimal("1.2")
-    )
-    sl_price = await _align_to_tick(
-        connected_adapter, linear_instrument, price * Decimal("0.8")
-    )
+    tp_price = await _align_to_tick(connected_adapter, linear_instrument, price * Decimal("1.2"))
+    sl_price = await _align_to_tick(connected_adapter, linear_instrument, price * Decimal("0.8"))
     order = build_unified_order(
         linear_instrument,
         OrderType.LIMIT,
