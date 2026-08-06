@@ -141,6 +141,9 @@ def build_place_order_payload(
         "orderLinkId": client_order_id,
     }
 
+    if category == "spot" and order.order_type == OrderType.MARKET:
+        payload["marketUnit"] = "baseCoin"
+
     if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
         payload["price"] = str(order.price)
         payload["timeInForce"] = _TIME_IN_FORCE[order.time_in_force]

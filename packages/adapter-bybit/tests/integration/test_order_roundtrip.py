@@ -46,12 +46,35 @@ def _is_futures(instrument: Instrument) -> bool:
     return instrument.asset_class == AssetClass.FUTURES
 
 
-async def _spec_valid_qty(adapter: BybitAdapter, instrument: Instrument) -> Decimal:
+async def _spec_valid_qty(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    reference: Decimal | None = None,
+) -> Decimal:
     spec = await adapter.fetch_instrument_spec(instrument)
-    qty = valid_qty_from_spec(spec)
+    qty = valid_qty_from_spec(spec, reference)
     if qty > 0:
         return qty
     return Decimal("0.001")
+
+
+async def _align_to_tick(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    value: Decimal,
+) -> Decimal:
+    """Align ``value`` to the nearest tick without flipping its market side.
+
+    Rounding to the nearest tick (rather than always up) keeps a below-market
+    resting price below market and an above-market fill price above market,
+    correcting only the decimal precision Bybit rejects via 170134.
+    """
+    spec = await adapter.fetch_instrument_spec(instrument)
+    if spec.tick_size <= 0:
+        return value
+    steps = (value / spec.tick_size).to_integral_value(rounding="ROUND_HALF_UP")
+    aligned = steps * spec.tick_size
+    return aligned if aligned > 0 else spec.tick_size
 
 
 async def _spec_valid_price(
@@ -85,14 +108,23 @@ async def test_order_roundtrip(
     if order_type in (OrderType.STOP, OrderType.STOP_LIMIT) and not _is_futures(traded_instrument):
         pytest.skip("STOP orders are not supported for spot on Bybit")
 
-    qty = await _spec_valid_qty(connected_adapter, traded_instrument)
+    qty = await _spec_valid_qty(connected_adapter, traded_instrument, reference_price)
     price = await _spec_valid_price(connected_adapter, traded_instrument, reference_price)
 
     kwargs: dict = {"client_order_id": random_client_id("rt")}
-    if order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
+    if order_type is OrderType.LIMIT:
+        # Rest BELOW market so the order stays open (unfilled) long enough for
+        # the query -> modify -> cancel cycle.  Placing at the mid price fills
+        # instantly and any later amend/cancel returns "too late" (110001).
+        kwargs["price"] = await _align_to_tick(
+            connected_adapter, traded_instrument, price * Decimal("0.95")
+        )
+    elif order_type is OrderType.STOP_LIMIT:
         kwargs["price"] = price
     if order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
-        kwargs["stop_price"] = price * Decimal("1.5")
+        kwargs["stop_price"] = await _align_to_tick(
+            connected_adapter, traded_instrument, price * Decimal("1.5")
+        )
 
     order = build_unified_order(
         traded_instrument,
@@ -141,8 +173,9 @@ async def test_order_roundtrip(
 async def test_market_order_roundtrip_fills(
     connected_adapter: BybitAdapter,
     traded_instrument: Instrument,
+    reference_price: Decimal,
 ) -> None:
-    qty = await _spec_valid_qty(connected_adapter, traded_instrument)
+    qty = await _spec_valid_qty(connected_adapter, traded_instrument, reference_price)
     order = build_unified_order(
         traded_instrument,
         OrderType.MARKET,
@@ -161,13 +194,14 @@ async def test_market_order_roundtrip_fills(
 async def test_instant_open_and_close(
     connected_adapter: BybitAdapter,
     traded_instrument: Instrument,
+    reference_price: Decimal,
     collect_events,
 ) -> None:
     """Market buy opens a position, immediate market sell closes it."""
     if not _is_futures(traded_instrument):
         pytest.skip("instant open/close is a derivatives position-cycle test")
 
-    qty = await _spec_valid_qty(connected_adapter, traded_instrument)
+    qty = await _spec_valid_qty(connected_adapter, traded_instrument, reference_price)
     open_order = build_unified_order(
         traded_instrument,
         OrderType.MARKET,
@@ -209,9 +243,13 @@ async def test_limit_instant_fill_and_cancel_remainder(
     reference_price: Decimal,
 ) -> None:
     """A limit above market fills instantly — no residual open order remains."""
-    qty = await _spec_valid_qty(connected_adapter, traded_instrument)
+    qty = await _spec_valid_qty(connected_adapter, traded_instrument, reference_price)
     price = await _spec_valid_price(connected_adapter, traded_instrument, reference_price)
-    fill_price = price * Decimal("1.2")  # above market -> instant fill
+    # A small premium above market (1% > ask spread, far under Bybit's ~+5%
+    # buy-price ceiling) guarantees an instant fill without tripping 170193.
+    fill_price = await _align_to_tick(
+        connected_adapter, traded_instrument, price * Decimal("1.01")
+    )  # above market -> instant fill
 
     order = build_unified_order(
         traded_instrument,
@@ -239,15 +277,18 @@ async def test_finalize_only_when_closed(
     reference_price: Decimal,
 ) -> None:
     """An order stays open (live) until closed; only then does it finalize."""
-    qty = await _spec_valid_qty(connected_adapter, traded_instrument)
+    qty = await _spec_valid_qty(connected_adapter, traded_instrument, reference_price)
     price = await _spec_valid_price(connected_adapter, traded_instrument, reference_price)
+    below = await _align_to_tick(
+        connected_adapter, traded_instrument, price * Decimal("0.9")
+    )  # below market -> rests unfilled
     order = build_unified_order(
         traded_instrument,
         OrderType.LIMIT,
         OrderSide.BUY,
         qty,
         client_order_id=random_client_id("finalize"),
-        price=price * Decimal("0.9"),  # below market -> rests unfilled
+        price=below,
     )
     try:
         result = await connected_adapter.place_order(order)
@@ -276,7 +317,7 @@ async def test_tp_sl_attachment_round_trip_market(
     linear_reference_price: Decimal,
 ) -> None:
     """Market TP/SL (tpslMode=Full) is accepted by testnet derivatives."""
-    qty = await _spec_valid_qty(connected_adapter, linear_instrument)
+    qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
     order = build_unified_order(
         linear_instrument,
@@ -285,14 +326,23 @@ async def test_tp_sl_attachment_round_trip_market(
         qty,
         client_order_id=random_client_id("tpsl-full"),
         price=price,
-        take_profit=TpSlAttachment(trigger_price=price * Decimal("1.2")),
-        stop_loss=TpSlAttachment(trigger_price=price * Decimal("0.8")),
+        take_profit=TpSlAttachment(
+            trigger_price=await _align_to_tick(
+                connected_adapter, linear_instrument, price * Decimal("1.2")
+            )
+        ),
+        stop_loss=TpSlAttachment(
+            trigger_price=await _align_to_tick(
+                connected_adapter, linear_instrument, price * Decimal("0.8")
+            )
+        ),
     )
     try:
         result = await connected_adapter.place_order(order)
         await _assert_complete_result(result)
     finally:
-        await connected_adapter.cancel_order(order.client_order_id)
+        with contextlib.suppress(Exception):
+            await connected_adapter.cancel_order(order.client_order_id)
         await cleanup_open_orders(connected_adapter)
 
 
@@ -302,8 +352,14 @@ async def test_tp_sl_attachment_round_trip_limit(
     linear_reference_price: Decimal,
 ) -> None:
     """Limit TP/SL (tpslMode=Partial) is accepted by testnet derivatives."""
-    qty = await _spec_valid_qty(connected_adapter, linear_instrument)
+    qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
+    tp_price = await _align_to_tick(
+        connected_adapter, linear_instrument, price * Decimal("1.2")
+    )
+    sl_price = await _align_to_tick(
+        connected_adapter, linear_instrument, price * Decimal("0.8")
+    )
     order = build_unified_order(
         linear_instrument,
         OrderType.LIMIT,
@@ -312,12 +368,12 @@ async def test_tp_sl_attachment_round_trip_limit(
         client_order_id=random_client_id("tpsl-partial"),
         price=price,
         take_profit=TpSlAttachment(
-            trigger_price=price * Decimal("1.2"),
-            limit_price=price * Decimal("1.2"),
+            trigger_price=tp_price,
+            limit_price=tp_price,
         ),
         stop_loss=TpSlAttachment(
-            trigger_price=price * Decimal("0.8"),
-            limit_price=price * Decimal("0.8"),
+            trigger_price=sl_price,
+            limit_price=sl_price,
         ),
     )
     try:
@@ -335,30 +391,53 @@ async def test_modify_tp_sl(
     linear_reference_price: Decimal,
 ) -> None:
     """Modify_order updates attached TP/SL trigger prices."""
-    qty = await _spec_valid_qty(connected_adapter, linear_instrument)
+    qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
+    # Rest the entry BELOW market so it stays open (unfilled) and its attached
+    # TP/SL remain amendable.  Placing at the mid/bid price fills instantly on
+    # a tight book, after which amend returns 110001 "too late to replace".
+    entry_price = await _align_to_tick(
+        connected_adapter, linear_instrument, price * Decimal("0.95")
+    )
     order = build_unified_order(
         linear_instrument,
         OrderType.LIMIT,
         OrderSide.BUY,
         qty,
         client_order_id=random_client_id("modify-tpsl"),
-        price=price,
-        take_profit=TpSlAttachment(trigger_price=price * Decimal("1.2")),
-        stop_loss=TpSlAttachment(trigger_price=price * Decimal("0.8")),
+        price=entry_price,
+        take_profit=TpSlAttachment(
+            trigger_price=await _align_to_tick(
+                connected_adapter, linear_instrument, entry_price * Decimal("1.2")
+            )
+        ),
+        stop_loss=TpSlAttachment(
+            trigger_price=await _align_to_tick(
+                connected_adapter, linear_instrument, entry_price * Decimal("0.8")
+            )
+        ),
     )
     try:
         await connected_adapter.place_order(order)
         modification = OrderModification(
             client_order_id=order.client_order_id,
-            take_profit=TpSlAttachment(trigger_price=price * Decimal("1.5")),
-            stop_loss=TpSlAttachment(trigger_price=price * Decimal("0.5")),
+            take_profit=TpSlAttachment(
+                trigger_price=await _align_to_tick(
+                    connected_adapter, linear_instrument, entry_price * Decimal("1.5")
+                )
+            ),
+            stop_loss=TpSlAttachment(
+                trigger_price=await _align_to_tick(
+                    connected_adapter, linear_instrument, entry_price * Decimal("0.5")
+                )
+            ),
         )
         modified = await connected_adapter.modify_order(modification)
         await _assert_complete_result(modified)
         assert modified.client_order_id == order.client_order_id
     finally:
-        await connected_adapter.cancel_order(order.client_order_id)
+        with contextlib.suppress(Exception):
+            await connected_adapter.cancel_order(order.client_order_id)
         await cleanup_open_orders(connected_adapter)
 
 
@@ -368,7 +447,7 @@ async def test_stop_trigger_direction(
     linear_reference_price: Decimal,
 ) -> None:
     """BUY stops carry triggerDirection=1, SELL stops triggerDirection=2."""
-    qty = await _spec_valid_qty(connected_adapter, linear_instrument)
+    qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
 
     buy_stop = build_unified_order(
@@ -395,8 +474,9 @@ async def test_stop_trigger_direction(
                 "untriggered stop must rest OPEN on the platform"
             )
     finally:
-        await connected_adapter.cancel_order(buy_stop.client_order_id)
-        await connected_adapter.cancel_order(sell_stop.client_order_id)
+        with contextlib.suppress(Exception):
+            await connected_adapter.cancel_order(buy_stop.client_order_id)
+            await connected_adapter.cancel_order(sell_stop.client_order_id)
         await cleanup_open_orders(connected_adapter)
 
 
@@ -406,7 +486,7 @@ async def test_stop_order_status_mapping(
     linear_reference_price: Decimal,
 ) -> None:
     """Bybit's Untriggered stop maps to unified OPEN on a live response."""
-    qty = await _spec_valid_qty(connected_adapter, linear_instrument)
+    qty = await _spec_valid_qty(connected_adapter, linear_instrument, linear_reference_price)
     price = await _spec_valid_price(connected_adapter, linear_instrument, linear_reference_price)
     order = build_unified_order(
         linear_instrument,
@@ -425,5 +505,6 @@ async def test_stop_order_status_mapping(
         assert queried is not None
         assert queried.status == OrderStatus.OPEN
     finally:
-        await connected_adapter.cancel_order(order.client_order_id)
+        with contextlib.suppress(Exception):
+            await connected_adapter.cancel_order(order.client_order_id)
         await cleanup_open_orders(connected_adapter)

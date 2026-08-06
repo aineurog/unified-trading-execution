@@ -54,9 +54,24 @@ def _assert_spec_matches_live(spec: InstrumentSpec, listing: dict[str, Any], cat
     )
     assert spec.lot_size == expected_lot, f"lot_size {spec.lot_size} != live {expected_lot}"
     assert spec.tick_size == Decimal(str(price_filter.get("tickSize", "1")))
-    assert spec.min_qty == Decimal(str(lot_filter.get("minOrderQty", "0")))
     assert spec.max_qty == Decimal(str(lot_filter.get("maxOrderQty", "0")))
-    assert spec.min_notional == Decimal(str(lot_filter.get("minNotionalValue", "0")))
+
+    raw_min_qty = Decimal(str(lot_filter.get("minOrderQty", "0")))
+
+    if category == "spot":
+        # Spot has no minNotionalValue; the quote-currency floor is minOrderAmt.
+        expected_min_notional = Decimal(str(lot_filter.get("minOrderAmt", "0")))
+        assert spec.min_qty == raw_min_qty
+    else:
+        expected_min_notional = Decimal(str(lot_filter.get("minNotionalValue", "0")))
+        # Inverse contracts are fixed at $1 each, so min_qty is raised to the
+        # minNotionalValue floor (the adapter's documented design choice).
+        if category == "inverse":
+            assert spec.min_qty == max(raw_min_qty, expected_min_notional)
+        else:
+            assert spec.min_qty == raw_min_qty
+
+    assert spec.min_notional == expected_min_notional
 
 
 async def test_spec_matches_live_instrument(
