@@ -69,6 +69,11 @@ _LINEAR_RESPONSE = {
                     "minPrice": "0.10",
                     "maxPrice": "1999999.80",
                 },
+                "leverageFilter": {
+                    "minLeverage": "1",
+                    "maxLeverage": "100.00",
+                    "leverageStep": "0.01",
+                },
             }
         ],
     },
@@ -97,6 +102,11 @@ _INVERSE_RESPONSE = {
                     "tickSize": "0.5",
                     "minPrice": "0.5",
                     "maxPrice": "999999.5",
+                },
+                "leverageFilter": {
+                    "minLeverage": "1",
+                    "maxLeverage": "125",
+                    "leverageStep": "0.01",
                 },
             }
         ],
@@ -137,6 +147,7 @@ class TestFetchInstrumentSpec:
         assert spec.min_notional == Decimal("5")
         assert spec.price_precision == 1
         assert spec.qty_precision == 6
+        assert spec.max_leverage is None
 
     async def test_linear_perpetual(
         self,
@@ -167,6 +178,7 @@ class TestFetchInstrumentSpec:
         assert spec.lot_size == Decimal("0.001")
         assert spec.price_precision == 2
         assert spec.qty_precision == 3
+        assert spec.max_leverage == Decimal("100.00")
 
     async def test_inverse_perpetual(
         self,
@@ -200,6 +212,7 @@ class TestFetchInstrumentSpec:
         assert spec.min_notional == Decimal("10")
         assert spec.price_precision == 1
         assert spec.qty_precision == 0
+        assert spec.max_leverage == Decimal("125")
 
     async def test_unsupported_asset_class(
         self,

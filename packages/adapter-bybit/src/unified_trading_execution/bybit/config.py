@@ -6,7 +6,9 @@ loose strings — this keeps configuration type-safe and testable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from unified_trading_execution.bybit.margin import LeverageConfig
 
 DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS: float = 86400.0
 
@@ -26,6 +28,7 @@ class BybitConfig:
             before being re-fetched.  Defaults to one day
             (``DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS``); ``None`` caches
             indefinitely, relying on invalidation only (Section 17.3).
+        leverage: Leverage behavior configuration (Section 4.3).
     """
 
     api_key: str
@@ -35,6 +38,7 @@ class BybitConfig:
     platform_name: str = "bybit"
     account_id: str = "bybit-account"
     instrument_spec_cache_ttl: float | None = DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS
+    leverage: LeverageConfig = field(default_factory=LeverageConfig)
 
     def __post_init__(self) -> None:
         """Validate configuration invariants at construction."""

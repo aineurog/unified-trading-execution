@@ -30,6 +30,11 @@ def mock_pybit_http():
             None,
             {},
         )
+        mock_session.get_account_info.return_value = (
+            {"result": {"unifiedMarginStatus": 1}},
+            None,
+            {},
+        )
         mock_cls.return_value = mock_session
         yield mock_session
 

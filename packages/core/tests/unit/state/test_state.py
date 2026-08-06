@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -692,3 +693,86 @@ class TestHaltStateMachine:
         halts = hsm.active_halts()
         assert len(halts) == 1
         assert halts[0].scope == "account"
+
+
+# ============================================================
+# SQLiteStateStore — adapter_config (Section 2.1)
+# ============================================================
+
+
+class TestAdapterConfig:
+    @pytest.mark.asyncio
+    async def test_migration_creates_adapter_config_table(self):
+        """002_adapter_config.sql runs on initialize and creates the table."""
+        s = SQLiteStateStore(":memory:")
+        await s.initialize()
+        try:
+            cursor = await s.conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='adapter_config'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            assert row[0] == "adapter_config"
+        finally:
+            await s.close()
+
+    @pytest.mark.asyncio
+    async def test_set_and_get(self, store):
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+
+    @pytest.mark.asyncio
+    async def test_get_missing_returns_none(self, store):
+        assert await store.get_adapter_config("leverage.NOPE") is None
+
+    @pytest.mark.asyncio
+    async def test_set_overwrites_existing(self, store):
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.BTCUSDT", "50")
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "50"
+
+    @pytest.mark.asyncio
+    async def test_set_updates_updated_at(self, store):
+        async def read_updated_at() -> str:
+            cursor = await store.conn.execute(
+                "SELECT updated_at FROM adapter_config WHERE key=?", ("leverage.BTCUSDT",)
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            return row[0]
+
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        first = datetime.fromisoformat(await read_updated_at())
+        assert first.tzinfo is not None  # stored as timezone-aware ISO-8601 UTC
+        await asyncio.sleep(0.001)
+        await store.set_adapter_config("leverage.BTCUSDT", "20")
+        second = datetime.fromisoformat(await read_updated_at())
+        assert second > first
+
+    @pytest.mark.asyncio
+    async def test_delete_removes_key(self, store):
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.delete_adapter_config("leverage.BTCUSDT")
+        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+
+    @pytest.mark.asyncio
+    async def test_delete_missing_is_noop(self, store):
+        await store.delete_adapter_config("leverage.NOPE")  # should not raise
+
+    @pytest.mark.asyncio
+    async def test_list_by_prefix(self, store):
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.ETHUSDT", "20")
+        await store.set_adapter_config("margin_mode.BTCUSDT", "cross")
+        result = await store.list_adapter_config("leverage.")
+        assert result == {"leverage.BTCUSDT": "10", "leverage.ETHUSDT": "20"}
+
+    @pytest.mark.asyncio
+    async def test_list_when_empty(self, store):
+        assert await store.list_adapter_config("leverage.") == {}
+
+    @pytest.mark.asyncio
+    async def test_list_excludes_non_matching(self, store):
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("margin_mode.BTCUSDT", "cross")
+        assert await store.list_adapter_config("leverage.") == {"leverage.BTCUSDT": "10"}

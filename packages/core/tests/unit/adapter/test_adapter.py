@@ -135,11 +135,9 @@ class TestAdapterZeroImplementation:
             Adapter()  # type: ignore[abstract]
 
     def test_no_concrete_methods(self):
-        """Public methods must be abstract, except the four optional
-        reconciliation methods (fetch_positions, fetch_balances,
-        fetch_open_orders, fetch_fills) which provide NotImplementedError
-        defaults so adapters that don't support reconciliation don't have
-        to implement them.
+        """Public methods must be abstract, except the listed optional
+        methods which provide defaults so adapters that don't need them
+        don't have to implement them.
         """
         from unified_trading_execution.adapter import Adapter
 
@@ -149,6 +147,8 @@ class TestAdapterZeroImplementation:
                 "fetch_balances",
                 "fetch_open_orders",
                 "fetch_fills",
+                "attach_halt_machine",
+                "reconcile_user_intent",
             }
         )
         concrete = []
