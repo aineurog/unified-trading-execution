@@ -24,6 +24,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
+    AuditEvent,
     EventBus,
     OrderCancelledEvent,
     OrderModifiedEvent,
@@ -165,6 +166,22 @@ class TestEngineLifecycle:
         result = await engine.place_order(_order())
         known = engine._known_order_ids
         assert result.client_order_id in known
+
+    async def test_get_audit_events_returns_written_records(self, engine):
+        await engine.state_store.write_audit_event(
+            AuditEvent(
+                event_id="audit-1",
+                timestamp=_utcnow(),
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id="corr-1",
+                event_type="bybit.leverage.applied",
+                payload={"symbol": "BTCUSDT", "leverage": 10},
+            )
+        )
+        results = await engine.get_audit_events()
+        assert len(results) == 1
+        assert results[0].event_type == "bybit.leverage.applied"
 
 
 class TestEngineConstruction:

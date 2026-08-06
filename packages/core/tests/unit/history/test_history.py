@@ -13,7 +13,7 @@ import pytest
 
 # Module under test
 from unified_trading_execution import history
-from unified_trading_execution.events import HaltEvent, ReconciliationEvent
+from unified_trading_execution.events import AuditEvent, HaltEvent, ReconciliationEvent
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import (
     AssetClass,
@@ -410,3 +410,63 @@ class TestQueryHaltEvents:
         )
         assert len(results) == 1
         assert results[0].event_id == "h-2"
+
+
+# ── audit trail filterability ────────────────────────────────────────
+
+
+class TestQueryAuditEvents:
+    async def test_time_range_filter(self, store):
+        now = _utcnow()
+        t1 = now - timedelta(hours=2)
+        t2 = now - timedelta(hours=1)
+
+        await store.write_audit_event(
+            AuditEvent(
+                event_id="a-1",
+                timestamp=t1,
+                adapter_name="mock",
+                account_id="acc",
+                correlation_id="corr-1",
+                event_type="order.placed",
+                payload={"client_order_id": "c1"},
+            )
+        )
+        await store.write_audit_event(
+            AuditEvent(
+                event_id="a-2",
+                timestamp=t2,
+                adapter_name="bybit",
+                account_id="acc",
+                correlation_id="corr-2",
+                event_type="bybit.leverage.applied",
+                payload={"symbol": "BTCUSDT", "leverage": 10},
+            )
+        )
+
+        results = await history.query_audit_events(
+            store,
+            start=now - timedelta(minutes=90),
+        )
+        assert len(results) == 1
+        assert results[0].event_id == "a-2"
+        assert results[0].event_type == "bybit.leverage.applied"
+        assert results[0].payload["symbol"] == "BTCUSDT"
+
+    async def test_payload_roundtrip(self, store):
+        await store.write_audit_event(
+            AuditEvent(
+                event_id="a-3",
+                timestamp=_utcnow(),
+                adapter_name="bybit",
+                account_id="acc",
+                correlation_id="",
+                event_type="bybit.leverage.drift",
+                payload={"symbol": "BTCUSDT", "stored_leverage": 10, "platform_leverage": 50},
+            )
+        )
+
+        results = await history.query_audit_events(store)
+        assert len(results) == 1
+        assert results[0].payload["stored_leverage"] == 10
+        assert results[0].payload["platform_leverage"] == 50

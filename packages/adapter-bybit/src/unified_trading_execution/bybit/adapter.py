@@ -65,6 +65,7 @@ from unified_trading_execution.errors import (
     UteError,
 )
 from unified_trading_execution.events import (
+    AuditEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
@@ -427,29 +428,28 @@ class BybitAdapter(Adapter):
         *,
         context: str,
     ) -> None:
-        """Execute the configured ``on_drift`` behavior for a leverage mismatch.
-        """
+        """Execute the configured ``on_drift`` behavior for a leverage mismatch."""
         on_drift = self._config.leverage.on_drift
 
         if on_drift == "reapply":
             await self.set_leverage(instrument, stored)
             action: Literal["reapplied", "notified", "halted"] = "reapplied"
-            self._emit_drift_event(instrument, stored, platform, action)
+            await self._emit_drift_event(instrument, stored, platform, action)
             return
 
         if on_drift == "notify":
-            self._emit_drift_event(instrument, stored, platform, "notified")
+            await self._emit_drift_event(instrument, stored, platform, "notified")
             return
 
         # on_drift == "halt"
-        self._emit_drift_event(instrument, stored, platform, "halted")
+        await self._emit_drift_event(instrument, stored, platform, "halted")
         await self._enter_instrument_halt(
             instrument,
             reason="leverage_drift",
             detail=f"{context}: stored={stored} platform={platform}",
         )
 
-    def _emit_drift_event(
+    async def _emit_drift_event(
         self,
         instrument: Instrument,
         stored: int,
@@ -468,6 +468,15 @@ class BybitAdapter(Adapter):
                 platform_leverage=platform,
                 action_taken=action,
             )
+        )
+        await self._write_leverage_audit(
+            event_type="bybit.leverage.drift",
+            instrument=instrument,
+            payload={
+                "stored_leverage": stored,
+                "platform_leverage": platform,
+                "action_taken": action,
+            },
         )
 
     async def _enter_instrument_halt(
@@ -547,6 +556,39 @@ class BybitAdapter(Adapter):
             )
         except Exception:
             logger.exception("Failed to write halt audit for %s", instrument)
+
+    async def _write_leverage_audit(
+        self,
+        *,
+        event_type: str,
+        instrument: Instrument,
+        payload: dict[str, object],
+    ) -> None:
+        """Append a leverage/margin-mode ``AuditEvent`` to the state store.
+
+        Adapter-owned events never pass through core's dispatch pipeline, so —
+        following Section 6.1 — the adapter writes the audit record itself in
+        the same coroutine as the bus publish, so no emit is ever missing from
+        the trail.  A failure to write is logged, not raised: it must not
+        corrupt an in-flight on_drift action or crash a connect/reconcile pass.
+        """
+        store = self._state_store
+        if store is None:
+            return
+        try:
+            await store.write_audit_event(
+                AuditEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id="",
+                    event_type=event_type,
+                    payload={"symbol": to_bybit_symbol(instrument), **payload},
+                )
+            )
+        except Exception:
+            logger.exception("Failed to write %s audit for %s", event_type, instrument)
 
     async def _strict_check_leverage(self, instrument: Instrument) -> None:
         """Pre-order leverage verification (Phase 5, §5.2).
@@ -716,6 +758,16 @@ class BybitAdapter(Adapter):
                     current=stored,
                 )
             )
+            await self._write_leverage_audit(
+                event_type="bybit.margin_mode.changed",
+                instrument=instrument,
+                payload={
+                    "previous": previous.value if previous else None,
+                    "current": stored.value,
+                    "leverage": leverage,
+                    "context": "reconciliation",
+                },
+            )
             return
 
         if on_drift == "notify":
@@ -836,6 +888,16 @@ class BybitAdapter(Adapter):
                             current=MarginMode(margin_value),
                         )
                     )
+                    await self._write_leverage_audit(
+                        event_type="bybit.margin_mode.changed",
+                        instrument=instrument,
+                        payload={
+                            "previous": previous.value if previous else None,
+                            "current": MarginMode(margin_value).value,
+                            "leverage": leverage,
+                            "context": "connect_reapply",
+                        },
+                    )
                 else:
                     await self.set_leverage(instrument, leverage)
                 self._event_bus.publish(
@@ -849,6 +911,11 @@ class BybitAdapter(Adapter):
                         leverage=leverage,
                     )
                 )
+                await self._write_leverage_audit(
+                    event_type="bybit.leverage.applied",
+                    instrument=instrument,
+                    payload={"leverage": leverage},
+                )
             except Exception as exc:
                 self._event_bus.publish(
                     LeverageApplyFailedEvent(
@@ -861,6 +928,11 @@ class BybitAdapter(Adapter):
                         leverage=leverage,
                         reason=str(exc),
                     )
+                )
+                await self._write_leverage_audit(
+                    event_type="bybit.leverage.apply_failed",
+                    instrument=instrument,
+                    payload={"leverage": leverage, "reason": str(exc)},
                 )
 
     async def disconnect(self) -> None:

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from unified_trading_execution.events import HaltEvent, ReconciliationEvent
+from unified_trading_execution.events import AuditEvent, HaltEvent, ReconciliationEvent
 from unified_trading_execution.state.store import StateStore
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
@@ -119,7 +119,23 @@ async def query_halt_events(
     )
 
 
+async def query_audit_events(
+    store: StateStore,
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    limit: int = 1000,
+) -> list[AuditEvent]:
+    """Return generic audit-trail records within the given time range."""
+    return await store.query_audit_events(
+        start=start,
+        end=end,
+        limit=limit,
+    )
+
+
 __all__ = [
+    "query_audit_events",
     "query_balance_history",
     "query_fill_history",
     "query_halt_events",

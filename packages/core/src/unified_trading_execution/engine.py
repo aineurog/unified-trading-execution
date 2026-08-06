@@ -33,6 +33,7 @@ from unified_trading_execution.dispatch import (
 )
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import (
+    AuditEvent,
     BalanceUpdateEvent,
     EventBus,
     FillEvent,
@@ -670,6 +671,16 @@ class Engine:
         end: datetime | None = None,
     ) -> list[HaltEvent]:
         return await self._state_store.query_halt_events(
+            start=start,
+            end=end,
+        )
+
+    async def get_audit_events(
+        self,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[AuditEvent]:
+        return await self._state_store.query_audit_events(
             start=start,
             end=end,
         )

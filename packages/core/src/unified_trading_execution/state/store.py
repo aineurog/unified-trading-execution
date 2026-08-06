@@ -152,6 +152,11 @@ class StateStore(ABC):
     ) -> list[HaltEvent]: ...
 
     @abstractmethod
+    async def query_audit_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[AuditEvent]: ...
+
+    @abstractmethod
     async def get_adapter_config(self, key: str) -> str | None: ...
     @abstractmethod
     async def set_adapter_config(self, key: str, value: str) -> None: ...
@@ -767,6 +772,40 @@ class SQLiteStateStore(StateStore):
                     reason=row["reason"],
                     detail=row["detail"],
                     cleared_by=row["cleared_by"],
+                )
+            )
+        return results
+
+    async def query_audit_events(
+        self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
+    ) -> list[AuditEvent]:
+        """Return filtered audit-trail records, newest first.
+
+        Filters are conjunctive — all supplied criteria must match. When no
+        filters are given, returns the most recent audit events up to *limit*.
+        """
+        query = "SELECT * FROM audit_events WHERE 1=1"
+        params: list[Any] = []
+        if start is not None:
+            query += " AND timestamp >= ?"
+            params.append(start.isoformat())
+        if end is not None:
+            query += " AND timestamp <= ?"
+            params.append(end.isoformat())
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        cursor = await self.conn.execute(query, params)
+        results: list[AuditEvent] = []
+        for row in await cursor.fetchall():
+            results.append(
+                AuditEvent(
+                    event_id=row["event_id"],
+                    timestamp=datetime.fromisoformat(row["timestamp"]),
+                    adapter_name=row["adapter_name"],
+                    account_id=row["account_id"],
+                    correlation_id=row["correlation_id"],
+                    event_type=row["event_type"],
+                    payload=json.loads(row["payload_json"]),
                 )
             )
         return results
