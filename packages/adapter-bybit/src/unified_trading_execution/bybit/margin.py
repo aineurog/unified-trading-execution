@@ -14,7 +14,7 @@ from typing import Literal
 
 
 class MarginMode(StrEnum):
-    """Bybit margin mode per symbol (Section 3.1)."""
+    """Bybit margin mode"""
 
     CROSS = "cross"
     ISOLATED = "isolated"

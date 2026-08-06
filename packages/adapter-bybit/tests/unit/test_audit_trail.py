@@ -183,8 +183,15 @@ class TestReapplyAuditTrail:
             seed_margin="isolated",
         )
         try:
+            mock_pybit_http.get_account_info.return_value = (
+                {"result": {"marginMode": "REGULAR_MARGIN"}},
+                None,
+                {},
+            )
+            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
             mock_pybit_http.get_positions.return_value = _flat_position()
-            mock_pybit_http.switch_margin_mode.return_value = _ok()
+            mock_pybit_http.set_margin_mode.return_value = _ok()
+            mock_pybit_http.set_leverage.return_value = _ok()
 
             await adapter.connect()
 
@@ -286,12 +293,17 @@ class TestDriftAuditTrail:
             seed_margin="isolated",
         )
         try:
-            mock_pybit_http.get_positions.side_effect = [
-                _position(leverage="10", trade_mode="0"),  # get_leverage (reconcile)
-                _position(leverage="10", trade_mode="0"),  # get_margin_mode (reconcile)
-            ]
-            mock_pybit_http.get_instruments_info.return_value = _spec_response()
-            mock_pybit_http.switch_margin_mode.return_value = _ok()
+            # Platform leverage matches stored intent; account-wide marginMode
+            # is CROSS while stored intent is ISOLATED → drift, reapply.
+            mock_pybit_http.get_positions.return_value = _position(leverage="10")
+            mock_pybit_http.get_account_info.return_value = (
+                {"result": {"marginMode": "REGULAR_MARGIN"}},
+                None,
+                {},
+            )
+            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
+            mock_pybit_http.set_margin_mode.return_value = _ok()
+            mock_pybit_http.set_leverage.return_value = _ok()
 
             await adapter.reconcile_user_intent()
 

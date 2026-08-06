@@ -27,6 +27,14 @@ class LeverageExceedsMaxError(UteError):
     """Requested leverage exceeds the platform's maximum for this instrument."""
 
 
+class LeverageNotModifiedError(PlatformError):
+    """Leverage is already at the requested value — an idempotent no-op (110043)."""
+
+
+class MarginModeNotModifiedError(PlatformError):
+    """Margin mode is already at the requested value — an idempotent no-op (110026)."""
+
+
 _RET_CODE_MAP: dict[int, type[UteError]] = {
     # ---- Rate limiting ----
     10006: RateLimitError,  # "Too many visits. Exceeded the API Rate Limit"
@@ -55,13 +63,9 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     30256: InsufficientBalanceError,  # "Margin limit exceeded (Spot)"
     170033: InsufficientBalanceError,  # "margin Insufficient account balance"
     170131: InsufficientBalanceError,  # "Balance insufficient"
-    # NOTE: 110094 ("Order does not meet minimum order value N usd"), 110101
-    # ("Settlement asset not enabled as collateral") and 170140 ("Order value
-    # exceeded lower limit") are deliberately NOT mapped here — they are
-    # order-value / account-configuration rejections, not balance errors, and
-    # core has no dedicated type for them yet.  They fall through to
-    # PlatformError, which preserves the native ret_code for an errors.py
-    # follow-up.
+    # ---- Leverage / margin mode already active (idempotent no-op) ----
+    110043: LeverageNotModifiedError,  # "leverage not modified"
+    110026: MarginModeNotModifiedError,  # "Cross/isolated margin mode has not been modified"
     # ---- Order not found ----
     110001: OrderNotFoundError,  # "Order does not exist"
     170143: OrderNotFoundError,  # "Cannot be found on order book"

@@ -33,6 +33,8 @@ from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.errors import (
     LeverageDriftError,
     LeverageExceedsMaxError,
+    LeverageNotModifiedError,
+    MarginModeNotModifiedError,
     map_bybit_error,
 )
 from unified_trading_execution.bybit.events import (
@@ -265,12 +267,18 @@ class BybitAdapter(Adapter):
                 f"for {to_bybit_symbol(instrument)}"
             )
 
-    async def _block_on_open_position(self, instrument: Instrument) -> None:
+    async def _block_on_open_position(
+        self,
+        instrument: Instrument,
+        *,
+        action: str = "change leverage",
+    ) -> None:
         """Raise if the instrument has an open position and the guard is enabled.
 
         Section 5.6 — ``block_on_open_position`` defaults to True.  Changing
-        leverage with an open position recalculates margin immediately and can
-        cause liquidation, so the safe default is to refuse.
+        leverage or margin mode with an open position recalculates margin
+        immediately and can cause liquidation, so the safe default is to
+        refuse.  ``action`` names the operation in the raised error.
         """
         if not self._config.leverage.block_on_open_position:
             return
@@ -286,7 +294,7 @@ class BybitAdapter(Adapter):
         for entry in entries:
             if Decimal(str(entry.get("size") or "0")) != 0:
                 raise PlatformError(
-                    f"Cannot change leverage with open position for {to_bybit_symbol(instrument)}"
+                    f"Cannot {action} with open position for {to_bybit_symbol(instrument)}"
                 )
 
     async def set_leverage(self, instrument: Instrument, leverage: int) -> None:
@@ -306,13 +314,20 @@ class BybitAdapter(Adapter):
 
         category = self._instrument_to_category(instrument)
         symbol = to_bybit_symbol(instrument)
-        await self._run_request(
-            self._session.set_leverage,
-            category=category,
-            symbol=symbol,
-            buyLeverage=str(leverage),
-            sellLeverage=str(leverage),
-        )
+        try:
+            await self._run_request(
+                self._session.set_leverage,
+                category=category,
+                symbol=symbol,
+                buyLeverage=str(leverage),
+                sellLeverage=str(leverage),
+            )
+        except LeverageNotModifiedError:
+            logger.info(
+                "Leverage already %s for %s — treating as applied",
+                leverage,
+                symbol,
+            )
         store = await self._require_store()
         await store.set_adapter_config(self._leverage_key(instrument), str(leverage))
 
@@ -348,6 +363,16 @@ class BybitAdapter(Adapter):
         store = await self._require_store()
         await store.delete_adapter_config(self._leverage_key(instrument))
 
+    async def remove_margin_mode(self, instrument: Instrument) -> None:
+        """Remove stored margin-mode intent for *instrument*.
+
+        Does NOT change margin mode on the platform — only drops the stored
+        intent so the engine stops managing it.  ``leverage.{symbol}`` is left
+        untouched; leverage is independently managed.
+        """
+        store = await self._require_store()
+        await store.delete_adapter_config(self._margin_mode_key(instrument))
+
     async def set_margin_mode(
         self,
         instrument: Instrument,
@@ -355,11 +380,19 @@ class BybitAdapter(Adapter):
         *,
         leverage: int,
     ) -> None:
-        """Set the margin mode for *instrument* on the platform and persist.
+        """Set the margin mode on the platform and persist.
 
-        Bybit's ``switch_margin_mode`` requires ``buyLeverage`` and
-        ``sellLeverage`` in the same call (equal in one-way mode); ``leverage``
-        supplies both values.
+        Bybit only supports the Unified Trading Account (UTA) where margin mode is **account
+        wide**: ``POST /v5/account/set-margin-mode`` takes ``ISOLATED_MARGIN``
+        or ``REGULAR_MARGIN`` (Bybit's name for cross) and no symbol or
+        leverage.  Leverage is per symbol, so it is applied separately via
+        :meth:`set_leverage`.
+
+        The call is atomic on local failures: leverage is validated and the
+        open-position guard runs *before* the account-wide switch, so a
+        rejected request never leaves the platform half-switched with stale
+        stored intent
+
         """
         category = self._instrument_to_category(instrument)
         if category == "spot":
@@ -367,39 +400,47 @@ class BybitAdapter(Adapter):
                 f"Spot instrument {to_bybit_symbol(instrument)} has no margin mode"
             )
         symbol = to_bybit_symbol(instrument)
-        await self._run_request(
-            self._session.switch_margin_mode,
-            category=category,
-            symbol=symbol,
-            tradeMode=1 if mode is MarginMode.ISOLATED else 0,
-            buyLeverage=str(leverage),
-            sellLeverage=str(leverage),
+        await self._validate_leverage(instrument, leverage)
+        await self._block_on_open_position(
+            instrument,
+            action="switch margin mode",
         )
+        target = "ISOLATED_MARGIN" if mode is MarginMode.ISOLATED else "REGULAR_MARGIN"
+        try:
+            await self._run_request(
+                self._session.set_margin_mode,
+                setMarginMode=target,
+            )
+        except MarginModeNotModifiedError:
+            logger.info(
+                "Margin mode already %s for %s — treating as applied",
+                target,
+                symbol,
+            )
+        await self.set_leverage(instrument, leverage)
         store = await self._require_store()
         await store.set_adapter_config(self._margin_mode_key(instrument), mode.value)
         await store.set_adapter_config(self._leverage_key(instrument), str(leverage))
 
     async def get_margin_mode(self, instrument: Instrument) -> MarginMode | None:
-        """Query the current margin mode from the platform for *instrument*.
+        """Query the current margin mode from the platform.
 
         Returns None if the instrument has no margin mode (spot, etc.).
+
+        UTA holds margin mode **account wide**, so this reads
+        ``marginMode`` from ``GET /v5/account/info`` (``REGULAR_MARGIN`` →
+        cross, ``ISOLATED_MARGIN`` → isolated).  ``PORTFOLIO_MARGIN`` is not
+        mapped to a ``MarginMode`` and yields None.
         """
         category = self._instrument_to_category(instrument)
         if category == "spot":
             return None
-        data, _ = await self._run_request(
-            self._session.get_positions,
-            category=category,
-            symbol=to_bybit_symbol(instrument),
-        )
-        entries = (data.get("result") or {}).get("list") or []
-        if not entries:
-            return None
-        trade_mode = entries[0].get("tradeMode")
-        if trade_mode == "0":
-            return MarginMode.CROSS
-        if trade_mode == "1":
+        data, _ = await self._run_request(self._session.get_account_info)
+        margin_mode = (data.get("result") or {}).get("marginMode")
+        if margin_mode == "ISOLATED_MARGIN":
             return MarginMode.ISOLATED
+        if margin_mode == "REGULAR_MARGIN":
+            return MarginMode.CROSS
         return None
 
     # ---- Adapter-owned user intent (Phase 5, Phase 6) ----
@@ -566,8 +607,8 @@ class BybitAdapter(Adapter):
     ) -> None:
         """Append a leverage/margin-mode ``AuditEvent`` to the state store.
 
-        Adapter-owned events never pass through core's dispatch pipeline, so —
-        following Section 6.1 — the adapter writes the audit record itself in
+        Adapter-owned events never pass through core's dispatch pipeline,
+        the adapter writes the audit record itself in
         the same coroutine as the bus publish, so no emit is ever missing from
         the trail.  A failure to write is logged, not raised: it must not
         corrupt an in-flight on_drift action or crash a connect/reconcile pass.
@@ -743,7 +784,11 @@ class BybitAdapter(Adapter):
         on_drift = self._config.leverage.on_drift
 
         if on_drift == "reapply":
-            leverage = await self._stored_leverage(instrument) or 1
+            leverage = await self._stored_leverage(instrument)
+            if leverage is None:
+                # No stored leverage (e.g. after remove_leverage): preserve the
+                # platform's current leverage rather than forcing 1x.
+                leverage = await self.get_leverage(instrument) or 1
             previous = platform
             await self.set_margin_mode(instrument, stored, leverage=leverage)
             self._event_bus.publish(
@@ -826,7 +871,7 @@ class BybitAdapter(Adapter):
         await self._reapply_stored_intent()
 
     async def _reapply_stored_intent(self) -> None:
-        """Reapply stored leverage / margin-mode intent to the platform (Section 5.1).
+        """Reapply stored leverage / margin-mode intent to the platform.
 
         Runs after a successful connect.  For each instrument with stored intent:
 
@@ -835,7 +880,7 @@ class BybitAdapter(Adapter):
           sets both.
         - if only leverage is stored, ``set_leverage`` restores it.
         - a platform rejection emits ``LeverageApplyFailedEvent`` and never
-          crashes the connection (Section 5.8); successful applies emit
+          crashes the connection; successful applies emit
           ``LeverageAppliedEvent`` (and ``MarginModeChangedEvent`` when a margin
           mode was applied).
 
@@ -1441,7 +1486,7 @@ class BybitAdapter(Adapter):
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         """Fetch (or return a cached) ``InstrumentSpec`` for ``instrument``.
 
-        Cached per Section 17.3: each entry re-fetches after an expiry set by
+        Each entry re-fetches after an expiry set by
         ``instrument_spec_cache_ttl`` (defaults to one day) or on adapter-internal
         invalidation.  ``None`` caches indefinitely.  Invalidation is internally
         visible only — core never sees the cache, only the ``InstrumentSpec`` value.

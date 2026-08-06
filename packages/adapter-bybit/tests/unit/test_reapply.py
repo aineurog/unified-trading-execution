@@ -7,6 +7,7 @@ events.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -127,7 +128,7 @@ class _Collector:
 async def reapply_adapter(
     bybit_config: BybitConfig,
     event_bus: EventBus,
-) -> tuple[BybitAdapter, SQLiteStateStore, _Collector]:
+) -> AsyncIterator[tuple[BybitAdapter, SQLiteStateStore, _Collector]]:
     """Connected adapter + store + event collector for one reapply scenario.
 
     The store is pre-initialized; the test seeds intent keys before connecting.
@@ -184,14 +185,16 @@ class TestReapplyStoredIntent:
         await store.set_adapter_config("leverage.BTCUSDT", "20")
         await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
         mock_pybit_http.get_positions.return_value = _flat_position()
-        mock_pybit_http.switch_margin_mode.return_value = _ok()
+        mock_pybit_http.set_margin_mode.return_value = _ok()
+        mock_pybit_http.set_leverage.return_value = _ok()
+        mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
 
         await adapter.connect()
 
-        mock_pybit_http.switch_margin_mode.assert_called_once_with(
+        mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="ISOLATED_MARGIN")
+        mock_pybit_http.set_leverage.assert_called_once_with(
             category="linear",
             symbol="BTCUSDT",
-            tradeMode=1,
             buyLeverage="20",
             sellLeverage="20",
         )

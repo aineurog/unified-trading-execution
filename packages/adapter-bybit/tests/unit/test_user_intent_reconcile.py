@@ -7,7 +7,7 @@ margin-mode intent, queries the platform, and applies the configured
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 from unittest.mock import MagicMock
 
 from unified_trading_execution.bybit import BybitAdapter
@@ -118,7 +118,7 @@ class _Collector:
 
 async def _make_adapter(
     *,
-    on_drift: str = "reapply",
+    on_drift: Literal["reapply", "notify", "halt"] = "reapply",
     auto_halt_enabled: bool = True,
     seed_leverage: str | None = None,
     seed_margin: str | None = None,
@@ -249,15 +249,20 @@ class TestReconcileMarginModeDrift:
     ) -> None:
         adapter, store, _, _ = await _make_adapter(seed_leverage="20", seed_margin="isolated")
         try:
-            mock_pybit_http.get_positions.return_value = _position(leverage="20", trade_mode="0")
-            mock_pybit_http.switch_margin_mode.return_value = _ok()
+            # Platform reports CROSS (account-wide marginMode) while the stored
+            # intent is ISOLATED → reapply should set the account to isolated.
+            mock_pybit_http.get_account_info.return_value = (
+                {"result": {"marginMode": "REGULAR_MARGIN"}},
+                None,
+                {},
+            )
+            mock_pybit_http.get_positions.return_value = _position(leverage="20")
+            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
+            mock_pybit_http.set_margin_mode.return_value = _ok()
+            mock_pybit_http.set_leverage.return_value = _ok()
             await adapter.reconcile_user_intent()
-            mock_pybit_http.switch_margin_mode.assert_called_once_with(
-                category="linear",
-                symbol="BTCUSDT",
-                tradeMode=1,
-                buyLeverage="20",
-                sellLeverage="20",
+            mock_pybit_http.set_margin_mode.assert_called_once_with(
+                setMarginMode="ISOLATED_MARGIN",
             )
         finally:
             await store.close()

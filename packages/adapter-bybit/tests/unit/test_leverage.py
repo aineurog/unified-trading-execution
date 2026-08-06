@@ -8,11 +8,12 @@ in-memory SQLiteStateStore.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
-from pybit.exceptions import FailedRequestError, InvalidRequestError
+from pybit.exceptions import InvalidRequestError
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
@@ -100,7 +101,7 @@ async def store_adapter(
     bybit_config: BybitConfig,
     event_bus: EventBus,
     mock_pybit_http: MagicMock,
-) -> tuple[BybitAdapter, SQLiteStateStore]:
+) -> AsyncIterator[tuple[BybitAdapter, SQLiteStateStore]]:
     """A BybitAdapter wired to a real in-memory state store (and mocked HTTP).
 
     The ``mock_pybit_http`` autouse fixture keeps pybit HTTP mocked; this
@@ -231,6 +232,28 @@ class TestSetLeverage:
 
         assert await store.get_adapter_config("leverage.BTCUSDT") is None
 
+    async def test_set_leverage_already_active_is_noop(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """Bybit rejects set-leverage to the current value (110043) — treat as success."""
+        adapter, store = store_adapter
+        mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
+        mock_pybit_http.get_positions.return_value = _position_response(size="0")
+        mock_pybit_http.set_leverage.side_effect = InvalidRequestError(
+            request="POST /v5/position/set-leverage",
+            message="leverage not modified",
+            status_code=110043,
+            time="12:00:00",
+            resp_headers=None,
+        )
+
+        await adapter.set_leverage(_linear_instrument(), 10)
+
+        mock_pybit_http.set_leverage.assert_called_once()
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+
 
 class TestGetLeverage:
     async def test_get_leverage_returns_value(
@@ -283,21 +306,53 @@ class TestRemoveLeverage:
         mock_pybit_http.set_leverage.assert_not_called()
 
 
+class TestRemoveMarginMode:
+    async def test_remove_margin_mode_drops_intent_only(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        adapter, store = store_adapter
+        await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
+        await store.set_adapter_config("leverage.BTCUSDT", "10")
+
+        await adapter.remove_margin_mode(_linear_instrument())
+
+        assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
+        # Leverage intent is independently managed and left untouched.
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        mock_pybit_http.set_margin_mode.assert_not_called()
+        mock_pybit_http.set_leverage.assert_not_called()
+
+
 class TestSetMarginMode:
+    """Set margin mode on a UTA (unified) account.
+
+    Margin mode is account-wide: ``set-margin-mode`` takes ``setMarginMode``
+    (no symbol or leverage); leverage is applied separately via ``set_leverage``.
+    """
+
+    def _leverage_spec(self, mock_pybit_http: MagicMock) -> None:
+        mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
+        mock_pybit_http.get_positions.return_value = _position_response(size="0")
+        mock_pybit_http.set_leverage.return_value = _ok()
+
     async def test_set_margin_mode_cross_to_isolated(
         self,
         store_adapter: tuple[BybitAdapter, SQLiteStateStore],
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store = store_adapter
-        mock_pybit_http.switch_margin_mode.return_value = _ok()
+        self._leverage_spec(mock_pybit_http)
+        mock_pybit_http.set_margin_mode.return_value = _ok()
 
         await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
 
-        mock_pybit_http.switch_margin_mode.assert_called_once_with(
+        mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="ISOLATED_MARGIN")
+        mock_pybit_http.switch_margin_mode.assert_not_called()
+        mock_pybit_http.set_leverage.assert_called_once_with(
             category="linear",
             symbol="BTCUSDT",
-            tradeMode=1,
             buyLeverage="10",
             sellLeverage="10",
         )
@@ -310,18 +365,20 @@ class TestSetMarginMode:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store = store_adapter
-        mock_pybit_http.switch_margin_mode.return_value = _ok()
+        self._leverage_spec(mock_pybit_http)
+        mock_pybit_http.set_margin_mode.return_value = _ok()
 
         await adapter.set_margin_mode(_linear_instrument(), MarginMode.CROSS, leverage=5)
 
-        mock_pybit_http.switch_margin_mode.assert_called_once_with(
+        mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="REGULAR_MARGIN")
+        mock_pybit_http.set_leverage.assert_called_once_with(
             category="linear",
             symbol="BTCUSDT",
-            tradeMode=0,
             buyLeverage="5",
             sellLeverage="5",
         )
         assert await store.get_adapter_config("margin_mode.BTCUSDT") == "cross"
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "5"
 
     async def test_set_margin_mode_spot_raises(
         self,
@@ -333,7 +390,8 @@ class TestSetMarginMode:
         with pytest.raises(InvalidSymbolError):
             await adapter.set_margin_mode(_spot_instrument(), MarginMode.CROSS, leverage=10)
 
-        mock_pybit_http.switch_margin_mode.assert_not_called()
+        mock_pybit_http.set_margin_mode.assert_not_called()
+        mock_pybit_http.set_leverage.assert_not_called()
 
     async def test_set_margin_mode_platform_rejection_propagates(
         self,
@@ -341,8 +399,8 @@ class TestSetMarginMode:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store = store_adapter
-        mock_pybit_http.switch_margin_mode.side_effect = FailedRequestError(
-            request="POST /v5/position/switch-isolated",
+        mock_pybit_http.set_margin_mode.side_effect = InvalidRequestError(
+            request="POST /v5/account/set-margin-mode",
             message="Bad request",
             status_code=400,
             time="12:00:00",
@@ -352,19 +410,117 @@ class TestSetMarginMode:
         with pytest.raises(PlatformError):
             await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
 
+        mock_pybit_http.set_leverage.assert_not_called()
         assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
+
+    async def test_set_margin_mode_uta_already_active_is_noop(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        adapter, store = store_adapter
+        self._leverage_spec(mock_pybit_http)
+        mock_pybit_http.set_margin_mode.side_effect = InvalidRequestError(
+            request="POST /v5/account/set-margin-mode",
+            message="Cross/isolated margin mode has not been modified",
+            status_code=110026,
+            time="12:00:00",
+            resp_headers=None,
+        )
+
+        await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
+
+        assert await store.get_adapter_config("margin_mode.BTCUSDT") == "isolated"
+        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+
+    async def test_set_margin_mode_blocked_by_open_position(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """Open-position guard runs before the account switch — atomic no-op."""
+        adapter, store = store_adapter
+        mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
+        mock_pybit_http.get_positions.return_value = _position_response(size="0.5")
+        mock_pybit_http.set_margin_mode.return_value = _ok()
+
+        with pytest.raises(PlatformError):
+            await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
+
+        # Nothing reached the platform and nothing was persisted.
+        mock_pybit_http.set_margin_mode.assert_not_called()
+        mock_pybit_http.set_leverage.assert_not_called()
+        assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+
+    async def test_set_margin_mode_open_position_guard_disabled(
+        self,
+        bybit_config: BybitConfig,
+        event_bus: EventBus,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
+        mock_pybit_http.get_positions.return_value = _position_response(size="0.5")
+        mock_pybit_http.set_margin_mode.return_value = _ok()
+        mock_pybit_http.set_leverage.return_value = _ok()
+        store = SQLiteStateStore(":memory:")
+        await store.initialize()
+        try:
+            config = BybitConfig(
+                api_key=bybit_config.api_key,
+                api_secret=bybit_config.api_secret,
+                testnet=bybit_config.testnet,
+                leverage=LeverageConfig(block_on_open_position=False),
+            )
+            adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
+
+            await adapter.set_margin_mode(
+                _linear_instrument(), MarginMode.ISOLATED, leverage=10
+            )
+        finally:
+            await store.close()
+
+        mock_pybit_http.set_margin_mode.assert_called_once()
+        mock_pybit_http.set_leverage.assert_called_once()
+
+    async def test_set_margin_mode_rejects_invalid_leverage_atomically(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """Leverage cap is validated before the switch — nothing changes if invalid."""
+        adapter, store = store_adapter
+        mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
+
+        with pytest.raises(LeverageExceedsMaxError):
+            await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=101)
+
+        mock_pybit_http.set_margin_mode.assert_not_called()
+        mock_pybit_http.set_leverage.assert_not_called()
+        assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.BTCUSDT") is None
 
 
 class TestGetMarginMode:
+    """Get margin mode on a UTA account — reads account-wide ``marginMode``."""
+
+    def _mock_with_mode(self, mock_pybit_http: MagicMock, mode: str) -> None:
+        mock_pybit_http.get_account_info.return_value = (
+            {"result": {"marginMode": mode}},
+            None,
+            {},
+        )
+
     async def test_get_margin_mode_cross(
         self,
         store_adapter: tuple[BybitAdapter, SQLiteStateStore],
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, _ = store_adapter
-        mock_pybit_http.get_positions.return_value = _position_response(trade_mode="0")
+        self._mock_with_mode(mock_pybit_http, "REGULAR_MARGIN")
 
         assert await adapter.get_margin_mode(_linear_instrument()) is MarginMode.CROSS
+        mock_pybit_http.get_positions.assert_not_called()
 
     async def test_get_margin_mode_isolated(
         self,
@@ -372,20 +528,26 @@ class TestGetMarginMode:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, _ = store_adapter
-        mock_pybit_http.get_positions.return_value = _position_response(trade_mode="1")
+        self._mock_with_mode(mock_pybit_http, "ISOLATED_MARGIN")
 
         assert await adapter.get_margin_mode(_linear_instrument()) is MarginMode.ISOLATED
 
-    async def test_get_margin_mode_no_position_returns_none(
+    async def test_get_margin_mode_portfolio_returns_none(
         self,
         store_adapter: tuple[BybitAdapter, SQLiteStateStore],
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, _ = store_adapter
-        mock_pybit_http.get_positions.return_value = (
-            {"retCode": 0, "retMsg": "OK", "result": {"list": []}},
-            None,
-            {},
-        )
+        self._mock_with_mode(mock_pybit_http, "PORTFOLIO_MARGIN")
+
+        assert await adapter.get_margin_mode(_linear_instrument()) is None
+
+    async def test_get_margin_mode_unknown_returns_none(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        adapter, _ = store_adapter
+        self._mock_with_mode(mock_pybit_http, "")
 
         assert await adapter.get_margin_mode(_linear_instrument()) is None
