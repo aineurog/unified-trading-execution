@@ -731,4 +731,3 @@ class TestAuditTrail:
                     await adapter2.disconnect()
             with contextlib.suppress(Exception):
                 await adapter.disconnect()
-

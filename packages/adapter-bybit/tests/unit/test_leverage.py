@@ -474,9 +474,7 @@ class TestSetMarginMode:
             )
             adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
 
-            await adapter.set_margin_mode(
-                _linear_instrument(), MarginMode.ISOLATED, leverage=10
-            )
+            await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
         finally:
             await store.close()
 
