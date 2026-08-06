@@ -478,11 +478,7 @@ class Engine:
         # cleaned up. The order record in audit_events remains immutable.
         for client_order_id in result.orphan_orders_in_local:
             try:
-                conn = self._state_store.conn
-                await conn.execute(
-                    "DELETE FROM orders WHERE client_order_id = ?",
-                    (client_order_id,),
-                )
+                await self._state_store.delete_orders_by_client_ids([client_order_id])
                 logger.info(
                     "Removed orphan order %s from local mirror",
                     client_order_id,
@@ -497,12 +493,7 @@ class Engine:
         if result.partial_fill_discrepancies:
             try:
                 platform_fills = await self._adapter.fetch_fills()
-                conn = self._state_store.conn
-                for cid in platform_fills:
-                    await conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ?",
-                        (cid,),
-                    )
+                await self._state_store.delete_fills_by_client_ids(list(platform_fills))
                 all_fills = [fill for fills in platform_fills.values() for fill in fills]
                 for fill in all_fills:
                     await self._state_store.upsert_fill(fill)
