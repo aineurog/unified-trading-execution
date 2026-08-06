@@ -111,6 +111,7 @@ class Engine:
         self._risk_config = risk_config or RiskConfig()
         self._halt_machine = HaltStateMachine(halt_config)
         self._shutdown = False
+        self._adapter.attach_halt_machine(self._halt_machine)
 
         # Mutable cached state
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
@@ -372,6 +373,11 @@ class Engine:
 
         # -- 6. Halt management --
         await self._manage_halt_state(result, corr_id, timestamp)
+
+        # -- 7. Adapter-owned user intent reconciliation --
+        # Adapters that manage adapter-owned intent (e.g. Bybit leverage /
+        # margin mode) detect and correct drift here.
+        await self._adapter.reconcile_user_intent()
 
         return result
 

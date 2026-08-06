@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 
+from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -179,3 +180,24 @@ class Adapter(ABC):
         Optional: raises NotImplementedError by default.
         """
         raise NotImplementedError(f"{self.platform_name} does not support bulk fill fetch")
+
+    # ---- Adapter-owned user intent (optional) ------------------------
+
+    def attach_halt_machine(self, halt_machine: HaltStateMachine | None) -> None:
+        """Optional: let core share its halt state machine with the adapter.
+
+        Adapters that enforce adapter-owned user intent (e.g. Bybit leverage
+        drift) override this to store the reference so they can enter
+        instrument-scoped halts directly. Default no-op.
+        """
+        return None
+
+    async def reconcile_user_intent(self) -> None:
+        """Optional: reconcile adapter-owned user intent with the platform.
+
+        Adapters that manage user intent (e.g. Bybit leverage / margin mode,
+        Section 5.3) override this. Core calls it during a reconciliation pass
+        so adapter-owned drift is corrected (reapplied / notified / halted)
+        without core knowing adapter-specific types. Default no-op.
+        """
+        return None

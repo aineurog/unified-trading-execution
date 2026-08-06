@@ -22,7 +22,7 @@ from collections import OrderedDict
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, Literal
 
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
@@ -30,10 +30,15 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.errors import LeverageExceedsMaxError, map_bybit_error
+from unified_trading_execution.bybit.errors import (
+    LeverageDriftError,
+    LeverageExceedsMaxError,
+    map_bybit_error,
+)
 from unified_trading_execution.bybit.events import (
     LeverageAppliedEvent,
     LeverageApplyFailedEvent,
+    LeverageDriftEvent,
     MarginModeChangedEvent,
 )
 from unified_trading_execution.bybit.margin import MarginMode
@@ -65,10 +70,14 @@ from unified_trading_execution.events import (
     Event,
     EventBus,
     FillEvent,
+    HaltClearedEvent,
+    HaltEnteredEvent,
+    HaltEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
     PositionUpdateEvent,
 )
+from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
 from unified_trading_execution.types.enums import AssetClass, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
@@ -165,6 +174,7 @@ class BybitAdapter(Adapter):
         # state *mirror* out of the adapter; this is the one documented
         # exception, scoped to the adapter's own config table.
         self._state_store = state_store
+        self._halt_machine: HaltStateMachine | None = None
         self._connected = False
         self._ws: BybitWebSocket | None = None
         self._monitor_task: asyncio.Task[None] | None = None
@@ -390,6 +400,338 @@ class BybitAdapter(Adapter):
         if trade_mode == "1":
             return MarginMode.ISOLATED
         return None
+
+    # ---- Adapter-owned user intent (Phase 5, Phase 6) ----
+
+    def attach_halt_machine(self, halt_machine: HaltStateMachine | None) -> None:
+        """Store core's shared halt state machine so drift can enter halts."""
+        self._halt_machine = halt_machine
+
+    async def _stored_leverage(self, instrument: Instrument) -> int | None:
+        """Read the stored leverage intent for *instrument*, or None."""
+        if self._state_store is None:
+            return None
+        raw = await self._state_store.get_adapter_config(self._leverage_key(instrument))
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
+    async def _handle_leverage_drift(
+        self,
+        instrument: Instrument,
+        stored: int,
+        platform: int,
+        *,
+        context: str,
+    ) -> None:
+        """Execute the configured ``on_drift`` behavior for a leverage mismatch.
+        """
+        on_drift = self._config.leverage.on_drift
+
+        if on_drift == "reapply":
+            await self.set_leverage(instrument, stored)
+            action: Literal["reapplied", "notified", "halted"] = "reapplied"
+            self._emit_drift_event(instrument, stored, platform, action)
+            return
+
+        if on_drift == "notify":
+            self._emit_drift_event(instrument, stored, platform, "notified")
+            return
+
+        # on_drift == "halt"
+        self._emit_drift_event(instrument, stored, platform, "halted")
+        await self._enter_instrument_halt(
+            instrument,
+            reason="leverage_drift",
+            detail=f"{context}: stored={stored} platform={platform}",
+        )
+
+    def _emit_drift_event(
+        self,
+        instrument: Instrument,
+        stored: int,
+        platform: int,
+        action: Literal["reapplied", "notified", "halted"],
+    ) -> None:
+        self._event_bus.publish(
+            LeverageDriftEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                instrument=instrument,
+                stored_leverage=stored,
+                platform_leverage=platform,
+                action_taken=action,
+            )
+        )
+
+    async def _enter_instrument_halt(
+        self,
+        instrument: Instrument,
+        *,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Enter an instrument-scoped halt and persist its audit record.
+
+        A missing halt machine (adapter constructed standalone, or core not
+        sharing one) degrades to logging — drift is still reported via
+        ``LeverageDriftEvent`` so users are not silently left in the dark.
+        """
+        halt_machine = self._halt_machine
+        if halt_machine is None:
+            logger.warning(
+                "Cannot enter %s halt for %s — no halt machine attached",
+                reason,
+                to_bybit_symbol(instrument),
+            )
+            return
+        if not halt_machine.enter_halt(
+            scope="instrument",
+            instrument=instrument,
+            reason=reason,
+            detail=detail,
+        ):
+            return
+        self._event_bus.publish(
+            HaltEnteredEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                scope="instrument",
+                instrument=instrument,
+                reason=reason,
+                detail=detail,
+            )
+        )
+        await self._write_halt_audit(
+            action="entered",
+            instrument=instrument,
+            reason=reason,
+            detail=detail,
+        )
+
+    async def _write_halt_audit(
+        self,
+        *,
+        action: Literal["entered", "cleared"],
+        instrument: Instrument,
+        reason: str,
+        detail: str,
+    ) -> None:
+        store = self._state_store
+        if store is None:
+            return
+        try:
+            await store.write_halt_event(
+                HaltEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    action=action,
+                    scope="instrument",
+                    instrument=instrument,
+                    reason=reason,
+                    detail=detail,
+                    cleared_by="automatic" if action == "cleared" else None,
+                )
+            )
+        except Exception:
+            logger.exception("Failed to write halt audit for %s", instrument)
+
+    async def _strict_check_leverage(self, instrument: Instrument) -> None:
+        """Pre-order leverage verification (Phase 5, §5.2).
+
+        Runs when ``strict_check`` is enabled, before every order dispatch:
+        if a stored leverage intent exists and the platform leverage differs,
+        the configured ``on_drift`` behavior is executed — reapply restores the
+        stored value and the order proceeds; notify/halt raise
+        ``LeverageDriftError`` to reject the order.
+        """
+        if not self._config.leverage.strict_check:
+            return
+        stored = await self._stored_leverage(instrument)
+        if stored is None:
+            return
+        platform = await self.get_leverage(instrument)
+        if platform is None or platform == stored:
+            return
+        await self._handle_leverage_drift(
+            instrument,
+            stored,
+            platform,
+            context="pre-order strict check",
+        )
+        if self._config.leverage.on_drift != "reapply":
+            raise LeverageDriftError(
+                f"Platform leverage {platform} differs from stored intent {stored} "
+                f"for {to_bybit_symbol(instrument)}"
+            )
+
+    async def reconcile_user_intent(self) -> None:
+        """Reconcile stored leverage/margin-mode intent against the platform (§5.3).
+
+        Called by core during ``engine.reconcile()``.  For each instrument with
+        a stored intent, the platform's current value is queried and compared;
+        a mismatch executes the configured ``on_drift`` behavior exactly as the
+        strict check does, minus the per-order rejection (reconcile does not
+        raise — it re-applies, notifies, or halts).  When the platform has
+        recovered to the stored intent, any residual drift halt is cleared.
+        """
+        if self._state_store is None:
+            return
+        leverage_rows = await self._state_store.list_adapter_config("leverage.")
+        margin_rows = await self._state_store.list_adapter_config("margin_mode.")
+        if not leverage_rows and not margin_rows:
+            return
+        instruments = {to_bybit_symbol(i): i for i in self._instruments.values()}
+
+        for full_key, value in leverage_rows.items():
+            symbol = full_key.removeprefix("leverage.")
+            instrument = instruments.get(symbol)
+            if instrument is None:
+                continue
+            try:
+                stored = int(value)
+            except ValueError:
+                continue
+            platform = await self.get_leverage(instrument)
+            if platform is None:
+                continue
+            if platform == stored:
+                await self._try_clear_recovered_halt(instrument)
+                continue
+            try:
+                await self._handle_leverage_drift(
+                    instrument,
+                    stored,
+                    platform,
+                    context="reconciliation",
+                )
+            except Exception:
+                logger.exception(
+                    "Leverage drift handling failed for %s during reconcile",
+                    symbol,
+                )
+
+        for full_key, value in margin_rows.items():
+            symbol = full_key.removeprefix("margin_mode.")
+            instrument = instruments.get(symbol)
+            if instrument is None:
+                continue
+            try:
+                stored_mode = MarginMode(value)
+            except ValueError:
+                continue
+            platform_mode = await self.get_margin_mode(instrument)
+            if platform_mode is None:
+                continue
+            if platform_mode is stored_mode:
+                await self._try_clear_recovered_halt(instrument)
+                continue
+            try:
+                await self._handle_margin_mode_drift(
+                    instrument,
+                    stored_mode,
+                    platform_mode,
+                )
+            except Exception:
+                logger.exception(
+                    "Margin-mode drift handling failed for %s during reconcile",
+                    symbol,
+                )
+
+    async def _try_clear_recovered_halt(self, instrument: Instrument) -> None:
+        """Clear an instrument halt once the platform matches stored intent.
+
+        §5.3 — a drift halt blocks new orders until cleared; when a later
+        reconcile pass finds the platform back in line with stored intent the
+        halt is cleared automatically and a ``HaltClearedEvent`` published.
+        """
+        halt_machine = self._halt_machine
+        if halt_machine is None:
+            return
+        if not halt_machine.try_clear_halt(
+            "instrument",
+            instrument=instrument,
+            reconciliation_is_clean=True,
+        ):
+            return
+        self._event_bus.publish(
+            HaltClearedEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                scope="instrument",
+                instrument=instrument,
+                cleared_by="automatic",
+            )
+        )
+        await self._write_halt_audit(
+            action="cleared",
+            instrument=instrument,
+            reason="leverage_drift_recovered",
+            detail="Platform leverage matches stored intent",
+        )
+
+    async def _handle_margin_mode_drift(
+        self,
+        instrument: Instrument,
+        stored: MarginMode,
+        platform: MarginMode,
+    ) -> None:
+        """Execute the configured ``on_drift`` behavior for a margin-mode mismatch.
+
+        Mirror of ``_handle_leverage_drift`` for margin mode: reapply restores
+        the stored mode (with the stored leverage value), notify only reports,
+        halt enters an instrument-scoped halt.  A recovered margin mode is
+        handled by ``reconcile_user_intent`` via ``_try_clear_recovered_halt``.
+        """
+        on_drift = self._config.leverage.on_drift
+
+        if on_drift == "reapply":
+            leverage = await self._stored_leverage(instrument) or 1
+            previous = platform
+            await self.set_margin_mode(instrument, stored, leverage=leverage)
+            self._event_bus.publish(
+                MarginModeChangedEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    instrument=instrument,
+                    previous=previous,
+                    current=stored,
+                )
+            )
+            return
+
+        if on_drift == "notify":
+            logger.warning(
+                "Margin mode drift for %s: stored=%s platform=%s",
+                to_bybit_symbol(instrument),
+                stored.value,
+                platform.value,
+            )
+            return
+
+        await self._enter_instrument_halt(
+            instrument,
+            reason="margin_mode_drift",
+            detail=f"stored={stored.value} platform={platform.value}",
+        )
 
     # ---- Identification (Section 17.10) ----
 
@@ -830,6 +1172,7 @@ class BybitAdapter(Adapter):
         ``UnsupportedOrderTypeError`` — never approximate.
         See Section 17.10, "Order operations."
         """
+        await self._strict_check_leverage(order.instrument)
         category = self._instrument_to_category(order.instrument)
         symbol = to_bybit_symbol(order.instrument)
         client_order_id = order.client_order_id or _new_id()
