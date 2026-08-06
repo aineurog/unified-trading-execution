@@ -132,6 +132,21 @@ def align_down_to_tick(value: Decimal, tick_size: Decimal) -> Decimal:
     return steps * tick_size
 
 
+def align_to_tick(value: Decimal, tick_size: Decimal) -> Decimal:
+    """Round ``value`` to the nearest multiple of ``tick_size``.
+
+    Nearest (rather than a fixed up/down direction) preserves which side of the
+    market a derived price sits on — a below-market resting price stays below,
+    an above-market fill price stays above — while fixing the decimal precision
+    Bybit rejects via 170134.
+    """
+    if tick_size <= 0:
+        return value
+    steps = (value / tick_size).to_integral_value(rounding="ROUND_HALF_UP")
+    aligned = steps * tick_size
+    return aligned if aligned > 0 else tick_size
+
+
 def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:
     """Round ``value`` up to the nearest multiple of ``lot_size``."""
     if lot_size <= 0:

@@ -199,8 +199,28 @@ class TestBuildPlaceOrderPayload:
             client_order_id="c1",
         )
         assert payload["orderType"] == "Market"
+        assert payload["marketUnit"] == "baseCoin"
         assert "price" not in payload
         assert "timeInForce" not in payload
+
+    def test_market_unit_base_coin_only_for_spot_market(self) -> None:
+        futures = _order(_futures_instrument(), order_type=OrderType.MARKET)
+        futures_payload = build_place_order_payload(
+            futures,
+            category="linear",
+            symbol="BTCUSDT",
+            client_order_id="c1",
+        )
+        assert "marketUnit" not in futures_payload
+
+        spot_limit = _order(_spot_instrument(), order_type=OrderType.LIMIT, price=Decimal("100"))
+        spot_limit_payload = build_place_order_payload(
+            spot_limit,
+            category="spot",
+            symbol="BTCUSDT",
+            client_order_id="c1",
+        )
+        assert "marketUnit" not in spot_limit_payload
 
     def test_stop_buy_sets_trigger_and_direction_rise(self) -> None:
         order = _order(
