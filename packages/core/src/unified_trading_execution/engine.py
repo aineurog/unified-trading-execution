@@ -113,6 +113,7 @@ class Engine:
         self._halt_machine = HaltStateMachine(halt_config)
         self._shutdown = False
         self._adapter.attach_halt_machine(self._halt_machine)
+        self._adapter.attach_event_bus(self._event_bus)
 
         # Mutable cached state
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}

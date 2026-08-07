@@ -148,6 +148,7 @@ class TestAdapterZeroImplementation:
                 "fetch_open_orders",
                 "fetch_fills",
                 "attach_halt_machine",
+                "attach_event_bus",
                 "reconcile_user_intent",
             }
         )

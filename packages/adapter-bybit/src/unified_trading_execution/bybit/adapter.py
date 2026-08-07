@@ -166,7 +166,7 @@ class BybitAdapter(Adapter):
         self,
         config: BybitConfig,
         *,
-        event_bus: EventBus,
+        event_bus: EventBus | None = None,
         state_store: StateStore | None = None,
     ) -> None:
         self._config = config
@@ -449,6 +449,18 @@ class BybitAdapter(Adapter):
         """Store core's shared halt state machine so drift can enter halts."""
         self._halt_machine = halt_machine
 
+    def attach_event_bus(self, event_bus: EventBus) -> None:
+        """Store the engine's shared event bus so WS handlers can publish."""
+        self._event_bus = event_bus
+
+    def _publish(self, event: Event) -> None:
+        """Publish onto the engine's bus, requiring it was wired first."""
+        if self._event_bus is None:
+            raise RuntimeError(
+                "event_bus not wired — construct via Engine or call attach_event_bus() first"
+            )
+        self._event_bus.publish(event)
+
     async def _stored_leverage(self, instrument: Instrument) -> int | None:
         """Read the stored leverage intent for *instrument*, or None."""
         if self._state_store is None:
@@ -497,7 +509,7 @@ class BybitAdapter(Adapter):
         platform: int,
         action: Literal["reapplied", "notified", "halted"],
     ) -> None:
-        self._event_bus.publish(
+        self._publish(
             LeverageDriftEvent(
                 event_id=_new_id(),
                 timestamp=_utcnow(),
@@ -548,7 +560,7 @@ class BybitAdapter(Adapter):
             detail=detail,
         ):
             return
-        self._event_bus.publish(
+        self._publish(
             HaltEnteredEvent(
                 event_id=_new_id(),
                 timestamp=_utcnow(),
@@ -749,7 +761,7 @@ class BybitAdapter(Adapter):
             reconciliation_is_clean=True,
         ):
             return
-        self._event_bus.publish(
+        self._publish(
             HaltClearedEvent(
                 event_id=_new_id(),
                 timestamp=_utcnow(),
@@ -791,7 +803,7 @@ class BybitAdapter(Adapter):
                 leverage = await self.get_leverage(instrument) or 1
             previous = platform
             await self.set_margin_mode(instrument, stored, leverage=leverage)
-            self._event_bus.publish(
+            self._publish(
                 MarginModeChangedEvent(
                     event_id=_new_id(),
                     timestamp=_utcnow(),
@@ -921,7 +933,7 @@ class BybitAdapter(Adapter):
                         MarginMode(margin_value),
                         leverage=leverage,
                     )
-                    self._event_bus.publish(
+                    self._publish(
                         MarginModeChangedEvent(
                             event_id=_new_id(),
                             timestamp=_utcnow(),
@@ -945,7 +957,7 @@ class BybitAdapter(Adapter):
                     )
                 else:
                     await self.set_leverage(instrument, leverage)
-                self._event_bus.publish(
+                self._publish(
                     LeverageAppliedEvent(
                         event_id=_new_id(),
                         timestamp=_utcnow(),
@@ -962,7 +974,7 @@ class BybitAdapter(Adapter):
                     payload={"leverage": leverage},
                 )
             except Exception as exc:
-                self._event_bus.publish(
+                self._publish(
                     LeverageApplyFailedEvent(
                         event_id=_new_id(),
                         timestamp=_utcnow(),
@@ -1005,7 +1017,7 @@ class BybitAdapter(Adapter):
         return self._connected
 
     def _publish_connection_state(self, connected: bool) -> None:
-        self._event_bus.publish(
+        self._publish(
             ConnectionStateEvent(
                 event_id=_new_id(),
                 timestamp=_utcnow(),
@@ -1102,7 +1114,7 @@ class BybitAdapter(Adapter):
         loop = self._loop
         if loop is None:
             raise PlatformError("Bybit adapter is not connected to an event loop")
-        loop.call_soon_threadsafe(self._event_bus.publish, event)
+        loop.call_soon_threadsafe(self._publish, event)
 
     def _move_to_final(self, platform_id: str) -> None:
         """Retire an order id from the live set into the bounded LRU.
