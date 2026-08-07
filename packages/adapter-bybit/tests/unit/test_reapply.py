@@ -157,7 +157,8 @@ class TestReapplyStoredIntent:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_leverage.return_value = _ok()
@@ -172,7 +173,8 @@ class TestReapplyStoredIntent:
         )
         applied = collector.of_type(LeverageAppliedEvent)
         assert len(applied) == 1
-        assert applied[0].leverage == 10
+        assert applied[0].buy_leverage == 10
+        assert applied[0].sell_leverage == 10
         assert collector.of_type(LeverageApplyFailedEvent) == []
         await adapter.disconnect()
 
@@ -182,7 +184,8 @@ class TestReapplyStoredIntent:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "20")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "20")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "20")
         await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_margin_mode.return_value = _ok()
@@ -211,7 +214,8 @@ class TestReapplyStoredIntent:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_leverage.side_effect = FailedRequestError(
@@ -228,7 +232,8 @@ class TestReapplyStoredIntent:
         assert adapter.is_connected is True
         failed = collector.of_type(LeverageApplyFailedEvent)
         assert len(failed) == 1
-        assert failed[0].leverage == 10
+        assert failed[0].buy_leverage == 10
+        assert failed[0].sell_leverage == 10
         assert "Invalid leverage" in failed[0].reason
         assert collector.of_type(LeverageAppliedEvent) == []
         await adapter.disconnect()
@@ -240,7 +245,8 @@ class TestReapplyStoredIntent:
     ) -> None:
         adapter, store, collector = reapply_adapter
         # Stored intent for a symbol not in the registry (delisted / never listed).
-        await store.set_adapter_config("leverage.NOPEUSDT", "10")
+        await store.set_adapter_config("leverage.buy:NOPEUSDT", "10")
+        await store.set_adapter_config("leverage.sell:NOPEUSDT", "10")
 
         await adapter.connect()
 
@@ -258,7 +264,8 @@ class TestReapplyStoredIntent:
     ) -> None:
         store = SQLiteStateStore(":memory:")
         await store.initialize()
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         try:
             config = BybitConfig(
                 api_key=bybit_config.api_key,

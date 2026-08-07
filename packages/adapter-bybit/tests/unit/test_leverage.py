@@ -17,7 +17,10 @@ from pybit.exceptions import InvalidRequestError
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.errors import LeverageExceedsMaxError
+from unified_trading_execution.bybit.errors import (
+    AsymmetricLeverageError,
+    LeverageExceedsMaxError,
+)
 from unified_trading_execution.bybit.margin import LeverageConfig, MarginMode
 from unified_trading_execution.errors import InvalidSymbolError, PlatformError
 from unified_trading_execution.events import EventBus
@@ -132,7 +135,7 @@ class TestSetLeverage:
         mock_pybit_http.get_positions.return_value = _position_response(size="0")
         mock_pybit_http.set_leverage.return_value = _ok()
 
-        await adapter.set_leverage(_linear_instrument(), 10)
+        await adapter.set_leverage(_linear_instrument(), buy_leverage=10)
 
         # One-way mode: buyLeverage == sellLeverage == 10.
         mock_pybit_http.set_leverage.assert_called_once_with(
@@ -141,7 +144,27 @@ class TestSetLeverage:
             buyLeverage="10",
             sellLeverage="10",
         )
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.sell:BTCUSDT") == "10"
+
+    async def test_set_leverage_asymmetric_raises(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """buy != sell requires hedge mode, unsupported in v1 — reject upfront."""
+        adapter, store = store_adapter
+
+        with pytest.raises(AsymmetricLeverageError):
+            await adapter.set_leverage(
+                _linear_instrument(),
+                buy_leverage=10,
+                sell_leverage=20,
+            )
+
+        mock_pybit_http.set_leverage.assert_not_called()
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.sell:BTCUSDT") is None
 
     async def test_set_leverage_spot_raises(
         self,
@@ -151,10 +174,10 @@ class TestSetLeverage:
         adapter, store = store_adapter
 
         with pytest.raises(InvalidSymbolError):
-            await adapter.set_leverage(_spot_instrument(), 10)
+            await adapter.set_leverage(_spot_instrument(), buy_leverage=10)
 
         mock_pybit_http.set_leverage.assert_not_called()
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
     async def test_set_leverage_exceeds_max_raises(
         self,
@@ -165,10 +188,10 @@ class TestSetLeverage:
         mock_pybit_http.get_instruments_info.return_value = _spec_response("100")
 
         with pytest.raises(LeverageExceedsMaxError):
-            await adapter.set_leverage(_linear_instrument(), 101)
+            await adapter.set_leverage(_linear_instrument(), buy_leverage=101)
 
         mock_pybit_http.set_leverage.assert_not_called()
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
     async def test_set_leverage_blocked_by_open_position(
         self,
@@ -180,10 +203,10 @@ class TestSetLeverage:
         mock_pybit_http.get_positions.return_value = _position_response(size="0.5")
 
         with pytest.raises(PlatformError):
-            await adapter.set_leverage(_linear_instrument(), 10)
+            await adapter.set_leverage(_linear_instrument(), buy_leverage=10)
 
         mock_pybit_http.set_leverage.assert_not_called()
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
     async def test_set_leverage_open_position_guard_disabled(
         self,
@@ -205,7 +228,7 @@ class TestSetLeverage:
             )
             adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
 
-            await adapter.set_leverage(_linear_instrument(), 10)
+            await adapter.set_leverage(_linear_instrument(), buy_leverage=10)
         finally:
             await store.close()
 
@@ -228,9 +251,9 @@ class TestSetLeverage:
         )
 
         with pytest.raises(PlatformError):
-            await adapter.set_leverage(_linear_instrument(), 10)
+            await adapter.set_leverage(_linear_instrument(), buy_leverage=10)
 
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
     async def test_set_leverage_already_active_is_noop(
         self,
@@ -249,10 +272,10 @@ class TestSetLeverage:
             resp_headers=None,
         )
 
-        await adapter.set_leverage(_linear_instrument(), 10)
+        await adapter.set_leverage(_linear_instrument(), buy_leverage=10)
 
         mock_pybit_http.set_leverage.assert_called_once()
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "10"
 
 
 class TestGetLeverage:
@@ -264,7 +287,7 @@ class TestGetLeverage:
         adapter, _ = store_adapter
         mock_pybit_http.get_positions.return_value = _position_response(leverage="20")
 
-        assert await adapter.get_leverage(_linear_instrument()) == 20
+        assert await adapter.get_leverage(_linear_instrument()) == (20, 20)
 
     async def test_get_leverage_spot_returns_none(
         self,
@@ -298,11 +321,11 @@ class TestRemoveLeverage:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store = store_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
 
         await adapter.remove_leverage(_linear_instrument())
 
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
         mock_pybit_http.set_leverage.assert_not_called()
 
 
@@ -314,13 +337,13 @@ class TestRemoveMarginMode:
     ) -> None:
         adapter, store = store_adapter
         await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
 
         await adapter.remove_margin_mode(_linear_instrument())
 
         assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
         # Leverage intent is independently managed and left untouched.
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "10"
         mock_pybit_http.set_margin_mode.assert_not_called()
         mock_pybit_http.set_leverage.assert_not_called()
 
@@ -357,7 +380,7 @@ class TestSetMarginMode:
             sellLeverage="10",
         )
         assert await store.get_adapter_config("margin_mode.BTCUSDT") == "isolated"
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "10"
 
     async def test_set_margin_mode_isolated_to_cross(
         self,
@@ -378,7 +401,7 @@ class TestSetMarginMode:
             sellLeverage="5",
         )
         assert await store.get_adapter_config("margin_mode.BTCUSDT") == "cross"
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "5"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "5"
 
     async def test_set_margin_mode_spot_raises(
         self,
@@ -431,7 +454,7 @@ class TestSetMarginMode:
         await adapter.set_margin_mode(_linear_instrument(), MarginMode.ISOLATED, leverage=10)
 
         assert await store.get_adapter_config("margin_mode.BTCUSDT") == "isolated"
-        assert await store.get_adapter_config("leverage.BTCUSDT") == "10"
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") == "10"
 
     async def test_set_margin_mode_blocked_by_open_position(
         self,
@@ -451,7 +474,7 @@ class TestSetMarginMode:
         mock_pybit_http.set_margin_mode.assert_not_called()
         mock_pybit_http.set_leverage.assert_not_called()
         assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
     async def test_set_margin_mode_open_position_guard_disabled(
         self,
@@ -496,7 +519,7 @@ class TestSetMarginMode:
         mock_pybit_http.set_margin_mode.assert_not_called()
         mock_pybit_http.set_leverage.assert_not_called()
         assert await store.get_adapter_config("margin_mode.BTCUSDT") is None
-        assert await store.get_adapter_config("leverage.BTCUSDT") is None
+        assert await store.get_adapter_config("leverage.buy:BTCUSDT") is None
 
 
 class TestGetMarginMode:

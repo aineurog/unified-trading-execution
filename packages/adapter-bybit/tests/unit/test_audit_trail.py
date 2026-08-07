@@ -137,7 +137,8 @@ async def _make_adapter(
     adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
     if seed_leverage is not None:
-        await store.set_adapter_config("leverage.BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     if seed_margin is not None:
         await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
     return adapter, store
@@ -166,7 +167,8 @@ class TestReapplyAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.applied"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["leverage"] == 10
+            assert matches[0].payload["buy_leverage"] == 10
+            assert matches[0].payload["sell_leverage"] == 10
             assert matches[0].adapter_name == "bybit"
         finally:
             await adapter.disconnect()
@@ -228,7 +230,8 @@ class TestReapplyAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.apply_failed"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["leverage"] == 10
+            assert matches[0].payload["buy_leverage"] == 10
+            assert matches[0].payload["sell_leverage"] == 10
             reason = matches[0].payload["reason"]
             assert isinstance(reason, str)
             assert "Invalid leverage" in reason
@@ -253,8 +256,10 @@ class TestDriftAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.drift"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["stored_leverage"] == 10
-            assert matches[0].payload["platform_leverage"] == 50
+            assert matches[0].payload["stored_buy"] == 10
+            assert matches[0].payload["stored_sell"] == 10
+            assert matches[0].payload["platform_buy"] == 50
+            assert matches[0].payload["platform_sell"] == 50
             assert matches[0].payload["action_taken"] == "notified"
         finally:
             await store.close()

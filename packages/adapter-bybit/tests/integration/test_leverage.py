@@ -63,8 +63,8 @@ async def _set_and_verify(
     instrument: Instrument,
     leverage: int,
 ) -> None:
-    await adapter.set_leverage(instrument, leverage)
-    assert await adapter.get_leverage(instrument) == leverage
+    await adapter.set_leverage(instrument, buy_leverage=leverage)
+    assert await adapter.get_leverage(instrument) == (leverage, leverage)
 
 
 async def _categorise(adapter: BybitAdapter, instrument: Instrument) -> str:
@@ -156,7 +156,7 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
 
     async def test_set_get_leverage_inverse(
         self,
@@ -172,7 +172,7 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(traded_instrument, original)
+                    await adapter.set_leverage(traded_instrument, buy_leverage=original[0])
 
     async def test_set_leverage_spot_raises(
         self,
@@ -180,7 +180,7 @@ class TestSetGetLeverage:
         spot_instrument: Instrument,
     ) -> None:
         with pytest.raises(InvalidSymbolError):
-            await store_connected_adapter.set_leverage(spot_instrument, 10)
+            await store_connected_adapter.set_leverage(spot_instrument, buy_leverage=10)
 
     async def test_set_leverage_exceeds_max(
         self,
@@ -191,7 +191,7 @@ class TestSetGetLeverage:
         spec = await adapter.fetch_instrument_spec(linear_instrument)
         assert spec.max_leverage is not None
         with pytest.raises(LeverageExceedsMaxError):
-            await adapter.set_leverage(linear_instrument, int(spec.max_leverage) + 1)
+            await adapter.set_leverage(linear_instrument, buy_leverage=int(spec.max_leverage) + 1)
 
     async def test_leverage_symmetric(
         self,
@@ -215,7 +215,7 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
 
 
 class TestMarginMode:
@@ -263,7 +263,7 @@ class TestReapplyOnConnect:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 15)
+            await adapter.set_leverage(linear_instrument, buy_leverage=15)
             await adapter.disconnect()
             adapter2 = BybitAdapter(
                 bybit_config,
@@ -271,12 +271,12 @@ class TestReapplyOnConnect:
                 state_store=store,
             )
             await adapter2.connect()
-            assert await adapter2.get_leverage(linear_instrument) == 15
+            assert await adapter2.get_leverage(linear_instrument) == (15, 15)
             await adapter2.disconnect()
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
                     await adapter.disconnect()
 
     async def test_leverage_apply_failed_on_delisted(
@@ -316,7 +316,7 @@ class TestStrictCheck:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             qty = await _spec_valid_qty(adapter, linear_instrument)
@@ -334,7 +334,7 @@ class TestStrictCheck:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_strict_check_off_skips_verification(
@@ -362,7 +362,7 @@ class TestStrictCheck:
         original = await adapter.get_leverage(linear_instrument)
         order = None
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             spec = await adapter.fetch_instrument_spec(linear_instrument)
@@ -386,7 +386,7 @@ class TestStrictCheck:
                     await adapter.cancel_order(order.client_order_id)
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
 
@@ -411,17 +411,17 @@ class TestReconcileIntent:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
-            assert await adapter.get_leverage(linear_instrument) == 50
+            assert await adapter.get_leverage(linear_instrument) == (50, 50)
 
             await adapter.reconcile_user_intent()
 
-            assert await adapter.get_leverage(linear_instrument) == 10
+            assert await adapter.get_leverage(linear_instrument) == (10, 10)
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_leverage_drift_halt_mode(
@@ -444,7 +444,7 @@ class TestReconcileIntent:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
@@ -462,7 +462,7 @@ class TestReconcileIntent:
                 )
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_leverage_drift_notify_mode(
@@ -483,16 +483,16 @@ class TestReconcileIntent:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
 
-            assert await adapter.get_leverage(linear_instrument) == 50
+            assert await adapter.get_leverage(linear_instrument) == (50, 50)
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_recovery_clears_drift_halt(
@@ -515,7 +515,7 @@ class TestReconcileIntent:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
@@ -527,7 +527,7 @@ class TestReconcileIntent:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
 
@@ -568,13 +568,13 @@ class TestReconcileMarginMode:
         finally:
             if original_leverage is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage)
+                    await _set_leverage_direct(adapter, linear_instrument, original_leverage[0])
             if original_mode is not None:
                 with contextlib.suppress(Exception):
                     await adapter.set_margin_mode(
                         linear_instrument,
                         original_mode,
-                        leverage=original_leverage or 10,
+                        leverage=original_leverage[0] if original_leverage else 10,
                     )
             await adapter.disconnect()
 
@@ -604,23 +604,23 @@ class TestReconcileMarginMode:
             await _set_margin_mode_direct(adapter, "REGULAR_MARGIN")
             await _set_leverage_direct(adapter, linear_instrument, 25)
             assert await adapter.get_margin_mode(linear_instrument) is MarginMode.CROSS
-            assert await adapter.get_leverage(linear_instrument) == 25
+            assert await adapter.get_leverage(linear_instrument) == (25, 25)
 
             await adapter.reconcile_user_intent()
 
             # Margin reverted to isolated without forcing leverage back to 1x.
             assert await adapter.get_margin_mode(linear_instrument) is MarginMode.ISOLATED
-            assert await adapter.get_leverage(linear_instrument) == 25
+            assert await adapter.get_leverage(linear_instrument) == (25, 25)
         finally:
             if original_leverage is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage)
+                    await _set_leverage_direct(adapter, linear_instrument, original_leverage[0])
             if original_mode is not None:
                 with contextlib.suppress(Exception):
                     await adapter.set_margin_mode(
                         linear_instrument,
                         original_mode,
-                        leverage=original_leverage or 10,
+                        leverage=original_leverage[0] if original_leverage else 10,
                     )
             await adapter.disconnect()
 
@@ -646,13 +646,13 @@ class TestAuditTrail:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await adapter.disconnect()
 
             # Reconnect: stored intent reapplied → LeverageAppliedEvent + audit.
             adapter2 = BybitAdapter(config, event_bus=EventBus(), state_store=store)
             await adapter2.connect()
-            assert await adapter2.get_leverage(linear_instrument) == 10
+            assert await adapter2.get_leverage(linear_instrument) == (10, 10)
 
             applied = [
                 e
@@ -661,12 +661,13 @@ class TestAuditTrail:
             ]
             assert len(applied) == 1
             assert applied[0].payload["symbol"] == to_bybit_symbol(linear_instrument)
-            assert applied[0].payload["leverage"] == 10
+            assert applied[0].payload["buy_leverage"] == 10
+            assert applied[0].payload["sell_leverage"] == 10
 
             # Drift out-of-band, reconcile → LeverageDriftEvent + audit.
             await _set_leverage_direct(adapter2, linear_instrument, 50)
             await adapter2.reconcile_user_intent()
-            assert await adapter2.get_leverage(linear_instrument) == 10
+            assert await adapter2.get_leverage(linear_instrument) == (10, 10)
 
             drift = [
                 e
@@ -675,13 +676,15 @@ class TestAuditTrail:
             ]
             assert len(drift) == 1
             assert drift[0].payload["symbol"] == to_bybit_symbol(linear_instrument)
-            assert drift[0].payload["stored_leverage"] == 10
-            assert drift[0].payload["platform_leverage"] == 50
+            assert drift[0].payload["stored_buy"] == 10
+            assert drift[0].payload["platform_buy"] == 50
+            assert drift[0].payload["stored_sell"] == 10
+            assert drift[0].payload["platform_sell"] == 50
             assert drift[0].payload["action_taken"] == "reapplied"
         finally:
             with contextlib.suppress(Exception):
                 if original is not None:
-                    await _set_leverage_direct(adapter2, linear_instrument, original)
+                    await _set_leverage_direct(adapter2, linear_instrument, original[0])
             with contextlib.suppress(Exception):
                 await adapter.disconnect()
             with contextlib.suppress(Exception):

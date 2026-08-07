@@ -147,7 +147,8 @@ async def _new_adapter(
     adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
     if seed_leverage is not None:
-        await store.set_adapter_config("leverage.BTCUSDT", str(seed_leverage))
+        await store.set_adapter_config("leverage.buy:BTCUSDT", str(seed_leverage))
+        await store.set_adapter_config("leverage.sell:BTCUSDT", str(seed_leverage))
     return adapter, store, event_bus
 
 
@@ -158,7 +159,8 @@ class TestStrictCheckDriftAction:
     ) -> None:
         adapter, store, _ = await _new_adapter(strict_check=True, seed_leverage=None)
         try:
-            await store.delete_adapter_config("leverage.BTCUSDT")
+            await store.delete_adapter_config("leverage.buy:BTCUSDT")
+            await store.delete_adapter_config("leverage.sell:BTCUSDT")
             mock_pybit_http.get_positions.return_value = _position("50")
             await adapter._strict_check_leverage(_futures_instrument())
             mock_pybit_http.get_positions.assert_not_called()
@@ -211,8 +213,10 @@ class TestStrictCheckDriftAction:
             mock_pybit_http.set_leverage.assert_not_called()
             assert len(drift_events) == 1
             assert drift_events[0].action_taken == "notified"
-            assert drift_events[0].stored_leverage == 10
-            assert drift_events[0].platform_leverage == 50
+            assert drift_events[0].stored_buy == 10
+            assert drift_events[0].stored_sell == 10
+            assert drift_events[0].platform_buy == 50
+            assert drift_events[0].platform_sell == 50
         finally:
             await store.close()
 
@@ -248,7 +252,8 @@ class TestPlaceOrderStrictCheck:
             )
             adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
             adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
-            await store.set_adapter_config("leverage.BTCUSDT", "10")
+            await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+            await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
             with pytest.raises(LeverageDriftError):
                 await adapter.place_order(_make_order())
             mock_pybit_http.place_order.assert_not_called()

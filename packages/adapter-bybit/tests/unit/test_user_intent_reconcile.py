@@ -137,7 +137,8 @@ async def _make_adapter(
     halt_machine = HaltStateMachine(HaltConfig(auto_halt_enabled=auto_halt_enabled))
     adapter.attach_halt_machine(halt_machine)
     if seed_leverage is not None:
-        await store.set_adapter_config("leverage.BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     if seed_margin is not None:
         await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
     return adapter, store, halt_machine, _Collector(bus)
@@ -175,8 +176,10 @@ class TestReconcileLeverageDrift:
             drift = collector.of_type(LeverageDriftEvent)
             assert len(drift) == 1
             assert drift[0].action_taken == "reapplied"
-            assert drift[0].stored_leverage == 10
-            assert drift[0].platform_leverage == 50
+            assert drift[0].stored_buy == 10
+            assert drift[0].stored_sell == 10
+            assert drift[0].platform_buy == 50
+            assert drift[0].platform_sell == 50
         finally:
             await store.close()
 
