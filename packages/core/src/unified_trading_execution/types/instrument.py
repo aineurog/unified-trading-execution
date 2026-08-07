@@ -24,14 +24,14 @@ class Instrument:
     """
 
     symbol: str
-    quote_currency: str | None
     asset_class: AssetClass
-    exchange: str | None
-    currency: str | None
-    expiry: date | None
-    strike: Decimal | None
-    option_right: OptionRight | None
-    multiplier: int | None
+    quote_currency: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    expiry: date | None = None
+    strike: Decimal | None = None
+    option_right: OptionRight | None = None
+    multiplier: int | None = None
     _broker_symbol_override: str | None = field(default=None, init=False, repr=False)
 
     @property
