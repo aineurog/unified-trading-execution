@@ -120,7 +120,6 @@ async def _make_adapter(
     on_drift: Literal["reapply", "notify", "halt"] = "reapply",
     auto_halt_enabled: bool = True,
     seed_leverage: str | None = None,
-    seed_margin: str | None = None,
 ) -> tuple[BybitAdapter, SQLiteStateStore, HaltStateMachine, _Collector]:
     store = SQLiteStateStore(":memory:")
     await store.initialize()
@@ -141,8 +140,6 @@ async def _make_adapter(
     if seed_leverage is not None:
         await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
         await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
-    if seed_margin is not None:
-        await store.set_adapter_config("margin_mode", seed_margin)
     return adapter, store, halt_machine, _Collector(bus)
 
 
@@ -243,32 +240,6 @@ class TestReconcileLeverageDrift:
             cleared = collector.of_type(HaltClearedEvent)
             assert len(cleared) == 1
             assert cleared[0].scope == "instrument"
-        finally:
-            await store.close()
-
-
-class TestReconcileMarginModeDrift:
-    async def test_margin_mode_drift_reapplies(
-        self,
-        mock_pybit_http: MagicMock,
-    ) -> None:
-        adapter, store, _, _ = await _make_adapter(seed_leverage="20", seed_margin="isolated")
-        try:
-            # Platform reports CROSS (account-wide marginMode) while the stored
-            # intent is ISOLATED → reapply should set the account to isolated.
-            mock_pybit_http.get_account_info.return_value = (
-                {"result": {"marginMode": "REGULAR_MARGIN"}},
-                None,
-                {},
-            )
-            mock_pybit_http.get_positions.return_value = _position(leverage="20")
-            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
-            mock_pybit_http.set_margin_mode.return_value = _ok()
-            mock_pybit_http.set_leverage.return_value = _ok()
-            await adapter.reconcile_user_intent()
-            mock_pybit_http.set_margin_mode.assert_called_once_with(
-                setMarginMode="ISOLATED_MARGIN",
-            )
         finally:
             await store.close()
 

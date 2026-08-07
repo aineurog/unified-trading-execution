@@ -279,14 +279,6 @@ class BybitAdapter(Adapter):
         """adapter_config key for one per-instrument leverage behavior knob."""
         return f"leverage.policy.{knob}:{to_bybit_symbol(instrument)}"
 
-    @staticmethod
-    def _margin_mode_key() -> str:
-        """adapter_config key for stored margin mode intent.
-
-        Margin mode is account-wide on Bybit UTA — a single key, no symbol.
-        """
-        return "margin_mode"
-
     async def _require_store(self) -> StateStore:
         """Return the state store or raise if leverage persistence is unavailable.
 
@@ -503,22 +495,13 @@ class BybitAdapter(Adapter):
         await store.delete_adapter_config(self._leverage_buy_key(instrument))
         await store.delete_adapter_config(self._leverage_sell_key(instrument))
 
-    async def remove_margin_mode(self) -> None:
-        """Remove stored margin-mode intent for the account.
-
-        Does NOT change margin mode on the platform — only drops the stored
-        intent so the engine stops managing it.  Per-symbol leverage intent
-        is left untouched; leverage is independently managed (Section 5.7).
-        """
-        store = await self._require_store()
-        await store.delete_adapter_config(self._margin_mode_key())
-
     async def set_margin_mode(self, mode: MarginMode) -> None:
-        """Set the account-wide margin mode on the platform and persist intent.
+        """Set the account-wide margin mode on the platform.
 
-        Bybit UTA margin mode is account-wide — ``POST /v5/account/set-margin-mode``
-        takes only ``setMarginMode``, no symbol or leverage parameter.  Leverage
-        is set independently per symbol via :meth:`set_leverage`.
+        Margin mode is now a static ``BybitConfig`` value applied on connect —
+        this is a low-level platform call used by :meth:`connect` to enforce
+        the configured mode.  It is intentionally not a persisted per-symbol
+        intent.
 
         Raises:
             PlatformError: platform rejected the switch.
@@ -531,8 +514,6 @@ class BybitAdapter(Adapter):
             )
         except MarginModeNotModifiedError:
             logger.info("Margin mode already %s — treating as applied", target)
-        store = await self._require_store()
-        await store.set_adapter_config(self._margin_mode_key(), mode.value)
 
     async def get_margin_mode(self) -> MarginMode | None:
         """Query the current account-wide margin mode from the platform.
@@ -841,7 +822,7 @@ class BybitAdapter(Adapter):
             )
 
     async def reconcile_user_intent(self) -> None:
-        """Reconcile stored leverage/margin-mode intent against the platform (§5.3).
+        """Reconcile stored leverage intent against the platform (§5.3).
 
         Called by core during ``engine.reconcile()``.  For each instrument with
         a stored intent, the platform's current value is queried and compared;
@@ -849,12 +830,14 @@ class BybitAdapter(Adapter):
         strict check does, minus the per-order rejection (reconcile does not
         raise — it re-applies, notifies, or halts).  When the platform has
         recovered to the stored intent, any residual drift halt is cleared.
+
+        Margin mode is not reconciled — it is a static ``BybitConfig`` value
+        applied on connect, not per-symbol persisted intent.
         """
         if self._state_store is None:
             return
         leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
-        stored_margin_mode = await self._state_store.get_adapter_config(self._margin_mode_key())
-        if not leverage_rows and stored_margin_mode is None:
+        if not leverage_rows:
             return
         instruments = {to_bybit_symbol(i): i for i in self._instruments.values()}
 
@@ -885,25 +868,6 @@ class BybitAdapter(Adapter):
                     "Leverage drift handling failed for %s during reconcile",
                     symbol,
                 )
-
-        # Margin mode is account-wide — single key, no per-symbol loop.
-        stored_mode_value = stored_margin_mode
-        if stored_mode_value is not None:
-            try:
-                stored_mode = MarginMode(stored_mode_value)
-            except ValueError:
-                logger.warning(
-                    "Stored margin mode value %r is unrecognised — skipping",
-                    stored_mode_value,
-                )
-                stored_mode = None
-            if stored_mode is not None:
-                platform_mode = await self.get_margin_mode()
-                if platform_mode is not None and platform_mode is not stored_mode:
-                    try:
-                        await self._handle_margin_mode_drift(stored_mode, platform_mode)
-                    except Exception:
-                        logger.exception("Margin-mode drift handling failed during reconcile")
 
     async def _try_clear_recovered_halt(self, instrument: Instrument) -> None:
         """Clear an instrument halt once the platform matches stored intent.
@@ -938,64 +902,6 @@ class BybitAdapter(Adapter):
             instrument=instrument,
             reason="leverage_drift_recovered",
             detail="Platform leverage matches stored intent",
-        )
-
-    async def _handle_margin_mode_drift(
-        self,
-        stored: MarginMode,
-        platform: MarginMode,
-    ) -> None:
-        """Execute the configured ``on_drift`` behavior for an account-level margin-mode mismatch.
-
-        Margin mode is account-wide — no instrument parameter.  Reapply
-        restores the stored mode, notify only reports, halt is not applicable
-        at the account margin-mode level (no per-instrument halt for this).
-        Margin drift always uses the default ``on_drift`` behavior since there is
-        no per-symbol policy for an account-wide setting.
-        """
-        on_drift = DEFAULT_ON_DRIFT
-
-        if on_drift == "reapply":
-            previous = platform
-            await self.set_margin_mode(stored)
-            self._publish(
-                MarginModeChangedEvent(
-                    event_id=_new_id(),
-                    timestamp=_utcnow(),
-                    adapter_name=self.platform_name,
-                    account_id=self.account_id,
-                    correlation_id=None,
-                    previous=previous,
-                    current=stored,
-                )
-            )
-            await self._write_leverage_audit(
-                event_type="bybit.margin_mode.changed",
-                instrument=None,
-                payload={
-                    "previous": previous.value if previous else None,
-                    "current": stored.value,
-                    "context": "reconciliation",
-                },
-            )
-            return
-
-        if on_drift == "notify":
-            logger.warning(
-                "Margin mode drift: stored=%s platform=%s",
-                stored.value,
-                platform.value,
-            )
-            return
-
-        # on_drift == "halt": margin mode is account-wide, no instrument to halt.
-        # Log clearly and notify — halting a specific instrument for an account-wide
-        # setting would be misleading.
-        logger.error(
-            "Margin mode drift (stored=%s platform=%s) — on_drift=halt is not applicable "
-            "for account-wide margin mode; treating as notify.",
-            stored.value,
-            platform.value,
         )
 
     # ---- Identification (Section 17.10) ----
@@ -1036,69 +942,76 @@ class BybitAdapter(Adapter):
         self._connected = True
         self._publish_connection_state(True)
         self._monitor_task = asyncio.create_task(self._monitor_connection())
+        await self._apply_configured_margin_mode()
         await self._reapply_stored_intent()
 
+    async def _apply_configured_margin_mode(self) -> None:
+        """Apply the ``BybitConfig`` margin mode to the platform at connect.
+
+        Margin mode is a static configuration value, not runtime intent.  When
+        the platform already matches the configured mode, this is a no-op.
+        Failures are logged but never crash the connection — margin mode does
+        not gate order dispatch.
+        """
+        mode = self._config.margin_mode
+        if isinstance(mode, str):
+            mode = MarginMode(mode)
+        try:
+            previous = await self.get_margin_mode()
+            await self.set_margin_mode(mode)
+        except Exception:
+            logger.exception(
+                "Failed to apply configured margin mode %s on connect",
+                mode.value,
+            )
+            return
+        if previous is mode:
+            return
+        self._publish(
+            MarginModeChangedEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                previous=previous,
+                current=mode,
+            )
+        )
+        await self._write_leverage_audit(
+            event_type="bybit.margin_mode.changed",
+            instrument=None,
+            payload={
+                "previous": previous.value if previous else None,
+                "current": mode.value,
+                "context": "connect",
+            },
+        )
+
     async def _reapply_stored_intent(self) -> None:
-        """Reapply stored leverage / margin-mode intent to the platform.
+        """Reapply stored leverage intent to the platform.
 
-        Runs after a successful connect.  For each instrument with stored intent:
+        Runs after a successful connect.  For each instrument with stored
+        leverage intent:
 
-        - if margin mode is stored, ``switch_margin_mode`` is called with the
-          stored margin mode and the stored leverage value — a single call that
-          sets both.
-        - if only leverage is stored, ``set_leverage`` restores it.
+        - ``set_leverage`` restores the stored value.
         - a platform rejection emits ``LeverageApplyFailedEvent`` and never
           crashes the connection; successful applies emit
-          ``LeverageAppliedEvent`` (and ``MarginModeChangedEvent`` when a margin
-          mode was applied).
+          ``LeverageAppliedEvent``.
+
+        Margin mode is not persisted intent — it is a static ``BybitConfig``
+        value applied separately at connect.
 
         Instruments with no stored intent are not touched — their platform
-        leverage/margin mode is whatever it is.  For each symbol with stored
-        intent, its per-symbol ``auto_apply_on_connect`` policy decides whether
-        it is re-applied (default on; unconfigured symbols were never re-applied
+        leverage is whatever it is.  For each symbol with stored intent, its
+        per-symbol ``auto_apply_on_connect`` policy decides whether it is
+        re-applied (default on; unconfigured symbols were never re-applied
         because they have no stored intent to restore).
         """
         if self._state_store is None:
             return
 
         leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
-        margin_mode_value = await self._state_store.get_adapter_config(self._margin_mode_key())
-        if not leverage_rows and margin_mode_value is None:
-            return
-
-        # ---- Account-wide margin mode (applied once, before per-symbol leverage) ----
-        if margin_mode_value is not None:
-            try:
-                mode = MarginMode(margin_mode_value)
-                previous = await self.get_margin_mode()
-                await self.set_margin_mode(mode)
-                self._publish(
-                    MarginModeChangedEvent(
-                        event_id=_new_id(),
-                        timestamp=_utcnow(),
-                        adapter_name=self.platform_name,
-                        account_id=self.account_id,
-                        correlation_id=None,
-                        previous=previous,
-                        current=mode,
-                    )
-                )
-                await self._write_leverage_audit(
-                    event_type="bybit.margin_mode.changed",
-                    instrument=None,
-                    payload={
-                        "previous": previous.value if previous else None,
-                        "current": mode.value,
-                        "context": "connect_reapply",
-                    },
-                )
-            except Exception as exc:
-                logger.exception(
-                    "Failed to reapply stored margin mode %r on connect: %s",
-                    margin_mode_value,
-                    exc,
-                )
-
         if not leverage_rows:
             return
 

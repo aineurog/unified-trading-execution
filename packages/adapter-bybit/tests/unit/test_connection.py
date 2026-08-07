@@ -91,6 +91,9 @@ class TestConnect:
         await _wait_until(lambda: len(events) >= 2)
         assert events[-1].connected is False
 
+        # Restore a healthy WS before reconnecting so the replacement monitor
+        # created during connect() does not instantly observe a drop.
+        mock_bybit_websocket.is_connected.return_value = True
         await adapter.connect()
         assert adapter.is_connected is True
         assert len(events) == 3

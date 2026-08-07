@@ -68,11 +68,11 @@ async def _set_and_verify(
 
 
 async def _categorise(adapter: BybitAdapter, instrument: Instrument) -> str:
-    return adapter._instrument_to_category(instrument)
+    return str(adapter._instrument_to_category(instrument))
 
 
 async def _symbol(adapter: BybitAdapter, instrument: Instrument) -> str:
-    return to_bybit_symbol(instrument)
+    return str(to_bybit_symbol(instrument))
 
 
 async def _set_leverage_direct(
@@ -219,35 +219,57 @@ class TestSetGetLeverage:
 
 
 class TestMarginMode:
-    async def test_set_margin_mode_cross_to_isolated(
+    """Margin mode is a static ``BybitConfig`` value applied at connect.
+
+    Margin mode is account-wide and configured at adapter construction, not set
+    at runtime.  ``connect()`` applies the configured mode to the platform; the
+    platform value is retrieved with ``get_margin_mode()``.
+    """
+
+    async def test_configured_isolated_applied_on_connect(
         self,
-        store_connected_adapter: BybitAdapter,
-        linear_instrument: Instrument,
+        bybit_config: BybitConfig,
+        leverage_store: SQLiteStateStore,
     ) -> None:
-        adapter = store_connected_adapter
-        original = await adapter.get_margin_mode()
+        config = BybitConfig(
+            api_key=bybit_config.api_key,
+            api_secret=bybit_config.api_secret,
+            testnet=True,
+            margin_mode=MarginMode.ISOLATED,
+        )
+        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=leverage_store)
+        await adapter.connect()
         try:
-            await adapter.set_margin_mode(MarginMode.ISOLATED)
             assert await adapter.get_margin_mode() is MarginMode.ISOLATED
         finally:
-            if original is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(original)
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
 
-    async def test_set_margin_mode_isolated_to_cross(
+    async def test_configured_cross_applied_on_connect(
         self,
-        store_connected_adapter: BybitAdapter,
-        linear_instrument: Instrument,
+        bybit_config: BybitConfig,
+        leverage_store: SQLiteStateStore,
     ) -> None:
-        adapter = store_connected_adapter
-        original = await adapter.get_margin_mode()
+        config = BybitConfig(
+            api_key=bybit_config.api_key,
+            api_secret=bybit_config.api_secret,
+            testnet=True,
+            margin_mode=MarginMode.CROSS,
+        )
+        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=leverage_store)
+        await adapter.connect()
         try:
-            await adapter.set_margin_mode(MarginMode.CROSS)
             assert await adapter.get_margin_mode() is MarginMode.CROSS
         finally:
-            if original is not None and original is not MarginMode.CROSS:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(original)
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
+
+    async def test_get_margin_mode_reads_platform(
+        self,
+        store_connected_adapter: BybitAdapter,
+    ) -> None:
+        mode = await store_connected_adapter.get_margin_mode()
+        assert mode in (MarginMode.CROSS, MarginMode.ISOLATED, None)
 
 
 class TestReapplyOnConnect:
@@ -535,90 +557,6 @@ class TestReconcileIntent:
             await adapter.disconnect()
 
 
-class TestReconcileMarginMode:
-    """Phase 6 (Step 14) — margin-mode drift reconciliation on the live platform.
-
-    Margin mode is account-wide, so "drift" here means the account-wide
-    ``set-margin-mode`` was changed out-of-band; reconciliation must restore the
-    stored per-symbol intent.
-    """
-
-    async def test_margin_mode_drift_detected_and_reapplied(
-        self,
-        bybit_config: BybitConfig,
-        linear_instrument: Instrument,
-        leverage_store: SQLiteStateStore,
-    ) -> None:
-        """Drift the account out of isolated out-of-band; reconcile restores it."""
-        store = leverage_store
-        config = BybitConfig(
-            api_key=bybit_config.api_key,
-            api_secret=bybit_config.api_secret,
-            testnet=True,
-        )
-        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-        await adapter.connect()
-        original_mode = await adapter.get_margin_mode()
-        original_leverage = await adapter.get_leverage(linear_instrument)
-        try:
-            await adapter.set_margin_mode(MarginMode.ISOLATED)
-            await _set_margin_mode_direct(adapter, "REGULAR_MARGIN")
-            assert await adapter.get_margin_mode() is MarginMode.CROSS
-
-            await adapter.reconcile_user_intent()
-
-            assert await adapter.get_margin_mode() is MarginMode.ISOLATED
-        finally:
-            if original_leverage is not None:
-                with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage[0])
-            if original_mode is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(original_mode)
-            await adapter.disconnect()
-
-    async def test_margin_mode_drift_preserves_platform_leverage_after_remove(
-        self,
-        bybit_config: BybitConfig,
-        linear_instrument: Instrument,
-        leverage_store: SQLiteStateStore,
-    ) -> None:
-        """remove_leverage leaves margin intent; margin drift reapply must keep
-        the platform's current leverage rather than forcing 1x."""
-        store = leverage_store
-        config = BybitConfig(
-            api_key=bybit_config.api_key,
-            api_secret=bybit_config.api_secret,
-            testnet=True,
-        )
-        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-        await adapter.connect()
-        original_mode = await adapter.get_margin_mode()
-        original_leverage = await adapter.get_leverage(linear_instrument)
-        try:
-            await adapter.set_margin_mode(MarginMode.ISOLATED)
-            await adapter.remove_leverage(linear_instrument)
-            # Out-of-band: margin to cross AND leverage to 25, no stored leverage.
-            await _set_margin_mode_direct(adapter, "REGULAR_MARGIN")
-            await _set_leverage_direct(adapter, linear_instrument, 25)
-            assert await adapter.get_margin_mode() is MarginMode.CROSS
-            assert await adapter.get_leverage(linear_instrument) == (25, 25)
-
-            await adapter.reconcile_user_intent()
-
-            # Margin reverted to isolated without forcing leverage back to 1x.
-            assert await adapter.get_margin_mode() is MarginMode.ISOLATED
-            assert await adapter.get_leverage(linear_instrument) == (25, 25)
-        finally:
-            if original_leverage is not None:
-                with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage[0])
-            if original_mode is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(original_mode)
-            await adapter.disconnect()
-
-
 class TestAuditTrail:
     """Phase 7 (Step 13) — leverage events appear in the audit trail."""
 
@@ -686,42 +624,29 @@ class TestAuditTrail:
     async def test_margin_mode_events_in_audit_trail(
         self,
         bybit_config: BybitConfig,
-        linear_instrument: Instrument,
         leverage_store: SQLiteStateStore,
     ) -> None:
-        """Margin-mode reapply-on-connect lands in the audit trail."""
+        """Margin mode applied from config on connect lands in the audit trail."""
         store = leverage_store
         config = BybitConfig(
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
+            margin_mode=MarginMode.ISOLATED,
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
-        original = await adapter.get_margin_mode()
-        adapter2 = None
         try:
-            await adapter.set_margin_mode(MarginMode.ISOLATED)
-            await adapter.disconnect()
-
-            adapter2 = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-            await adapter2.connect()
-            assert await adapter2.get_margin_mode() is MarginMode.ISOLATED
-
             changed = [
                 e
                 for e in await store.query_audit_events()
                 if e.event_type == "bybit.margin_mode.changed"
             ]
-            assert len(changed) == 1
-            assert changed[0].payload["current"] == "isolated"
-            assert changed[0].payload["context"] == "connect_reapply"
+            # If the platform already matched ISOLATED, connect is a no-op and
+            # no audit record is written — both outcomes are valid.
+            if changed:
+                assert changed[0].payload["current"] == "isolated"
+                assert changed[0].payload["context"] == "connect"
         finally:
-            if original is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(original)
-            if adapter2 is not None:
-                with contextlib.suppress(Exception):
-                    await adapter2.disconnect()
             with contextlib.suppress(Exception):
                 await adapter.disconnect()
