@@ -106,6 +106,22 @@ _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 _ACCOUNT_TYPE = "UNIFIED"
 _MAX_TRACKED_FINAL_ORDER_IDS = 10_000
 _LEVERAGE_KIND_PREFIX = "leverage."
+# Per-instrument leverage behavior knobs, stored flat (one key per knob under
+# ``leverage.policy.{knob}:{symbol}``) so strict checks / reconciliation /
+# reapply can read just the knob they need without any serialization.
+_POLICY_KNOB_ON_DRIFT = "on_drift"
+_POLICY_KNOB_STRICT_CHECK = "strict_check"
+_POLICY_KNOB_BLOCK_ON_OPEN = "block_on_open"
+_POLICY_KNOB_AUTO_APPLY = "auto_apply"
+# Defaults for leverage behavior.  They live here (and in set_leverage's
+# signature) rather than in BybitConfig because they are per-instrument: the
+# values chosen at set_leverage time are persisted per symbol and only fall
+# back to these module defaults for symbols that were never configured.
+DEFAULT_LEVERAGE = 1
+DEFAULT_ON_DRIFT: Literal["reapply", "notify", "halt"] = "reapply"
+DEFAULT_STRICT_CHECK = True
+DEFAULT_BLOCK_ON_OPEN_POSITION = True
+DEFAULT_AUTO_APPLY_ON_CONNECT = True
 
 
 def _new_id() -> str:
@@ -259,6 +275,11 @@ class BybitAdapter(Adapter):
         return f"leverage.sell:{to_bybit_symbol(instrument)}"
 
     @staticmethod
+    def _leverage_policy_key(instrument: Instrument, knob: str) -> str:
+        """adapter_config key for one per-instrument leverage behavior knob."""
+        return f"leverage.policy.{knob}:{to_bybit_symbol(instrument)}"
+
+    @staticmethod
     def _margin_mode_key() -> str:
         """adapter_config key for stored margin mode intent.
 
@@ -309,12 +330,15 @@ class BybitAdapter(Adapter):
     ) -> None:
         """Raise if the instrument has an open position and the guard is enabled.
 
-        Section 5.6 — ``block_on_open_position`` defaults to True.  Changing
-        leverage or margin mode with an open position recalculates margin
-        immediately and can cause liquidation, so the safe default is to
-        refuse.  ``action`` names the operation in the raised error.
+        The guard reads the instrument's per-symbol ``block_on_open`` knob (set
+        at ``set_leverage`` time); unconfigured instruments use the default.  An
+        open position blocks leverage changes because they recalculate margin
+        immediately and can cause liquidation.  ``action`` names the operation
+        in the raised error.
         """
-        if not self._config.leverage.block_on_open_position:
+        raw = await self._policy_knob(instrument, _POLICY_KNOB_BLOCK_ON_OPEN)
+        enabled = DEFAULT_BLOCK_ON_OPEN_POSITION if raw is None else raw == "1"
+        if not enabled:
             return
         category = self._instrument_to_category(instrument)
         if category == "spot":
@@ -335,8 +359,12 @@ class BybitAdapter(Adapter):
         self,
         instrument: Instrument,
         *,
-        buy_leverage: int,
+        buy_leverage: int = DEFAULT_LEVERAGE,
         sell_leverage: int | None = None,
+        on_drift: Literal["reapply", "notify", "halt"] = DEFAULT_ON_DRIFT,
+        strict_check: bool = DEFAULT_STRICT_CHECK,
+        block_on_open_position: bool = DEFAULT_BLOCK_ON_OPEN_POSITION,
+        auto_apply_on_connect: bool = DEFAULT_AUTO_APPLY_ON_CONNECT,
     ) -> None:
         """Set leverage for *instrument* on the platform and persist the intent.
 
@@ -347,6 +375,14 @@ class BybitAdapter(Adapter):
         ``buyLeverage == sellLeverage``, so any buy != sell request is rejected
         upfront with ``AsymmetricLeverageError``.  ``sell_leverage`` defaults
         to ``buy_leverage``.
+
+        The behavioral knobs (``on_drift``, ``strict_check``,
+        ``block_on_open_position``, ``auto_apply_on_connect``) default inside
+        this method and are persisted per instrument as flat
+        ``leverage.policy.{knob}:{symbol}`` rows so later strict checks /
+        reconciliation resolve each symbol's behavior from its own stored rows.
+        Symbols never configured fall back to these defaults, with a leverage
+        value of ``DEFAULT_LEVERAGE`` (1).
 
         Raises:
             InvalidSymbolError: instrument not supported / not derivatives.
@@ -366,7 +402,40 @@ class BybitAdapter(Adapter):
             )
         await self._validate_leverage(instrument, buy_leverage)
         await self._block_on_open_position(instrument)
+        await self._apply_leverage_values(instrument, buy_leverage, sell_leverage)
 
+        store = await self._require_store()
+        await store.set_adapter_config(self._leverage_buy_key(instrument), str(buy_leverage))
+        await store.set_adapter_config(self._leverage_sell_key(instrument), str(sell_leverage))
+        await store.set_adapter_config(
+            self._leverage_policy_key(instrument, _POLICY_KNOB_ON_DRIFT),
+            on_drift,
+        )
+        await store.set_adapter_config(
+            self._leverage_policy_key(instrument, _POLICY_KNOB_STRICT_CHECK),
+            "1" if strict_check else "0",
+        )
+        await store.set_adapter_config(
+            self._leverage_policy_key(instrument, _POLICY_KNOB_BLOCK_ON_OPEN),
+            "1" if block_on_open_position else "0",
+        )
+        await store.set_adapter_config(
+            self._leverage_policy_key(instrument, _POLICY_KNOB_AUTO_APPLY),
+            "1" if auto_apply_on_connect else "0",
+        )
+
+    async def _apply_leverage_values(
+        self,
+        instrument: Instrument,
+        buy_leverage: int,
+        sell_leverage: int,
+    ) -> None:
+        """Apply leverage values on the platform without touching stored policy.
+
+        Used by ``set_leverage`` and by drift-reapply; does not persist any
+        policy knob, so reapply cannot clobber the stored behavior.
+        """
+        symbol = to_bybit_symbol(instrument)
         category = self._instrument_to_category(instrument)
         try:
             await self._run_request(
@@ -382,9 +451,6 @@ class BybitAdapter(Adapter):
                 buy_leverage,
                 symbol,
             )
-        store = await self._require_store()
-        await store.set_adapter_config(self._leverage_buy_key(instrument), str(buy_leverage))
-        await store.set_adapter_config(self._leverage_sell_key(instrument), str(sell_leverage))
 
     async def get_leverage(self, instrument: Instrument) -> tuple[int, int] | None:
         """Query current leverage from the platform for *instrument*.
@@ -501,6 +567,32 @@ class BybitAdapter(Adapter):
             )
         self._event_bus.publish(event)
 
+    async def _policy_knob(self, instrument: Instrument, knob: str) -> str | None:
+        """Read one persisted behavior knob for *instrument* (None if unset).
+
+        Unconfigured symbols return None so callers fall back to the module
+        default for that knob.
+        """
+        if self._state_store is None:
+            return None
+        try:
+            return await self._state_store.get_adapter_config(
+                self._leverage_policy_key(instrument, knob)
+            )
+        except Exception:
+            logger.exception("Failed to read leverage policy for %s", instrument)
+            return None
+
+    async def _intent_leverage(self, instrument: Instrument) -> tuple[int, int]:
+        """Return the effective per-side leverage intent for *instrument*.
+
+        Uses the stored value if present, otherwise the default (1x).
+        """
+        stored = await self._stored_leverage(instrument)
+        if stored is not None:
+            return stored
+        return (DEFAULT_LEVERAGE, DEFAULT_LEVERAGE)
+
     async def _stored_leverage(self, instrument: Instrument) -> tuple[int, int] | None:
         """Read the stored leverage intent for *instrument* as ``(buy, sell)``.
 
@@ -540,14 +632,11 @@ class BybitAdapter(Adapter):
         context: str,
     ) -> None:
         """Execute the configured ``on_drift`` behavior for a leverage mismatch."""
-        on_drift = self._config.leverage.on_drift
+        raw = await self._policy_knob(instrument, _POLICY_KNOB_ON_DRIFT)
+        on_drift = raw if raw is not None else DEFAULT_ON_DRIFT
 
         if on_drift == "reapply":
-            await self.set_leverage(
-                instrument,
-                buy_leverage=stored[0],
-                sell_leverage=stored[1],
-            )
+            await self._apply_leverage_values(instrument, stored[0], stored[1])
             action: Literal["reapplied", "notified", "halted"] = "reapplied"
             await self._emit_drift_event(instrument, stored, platform, action)
             return
@@ -720,29 +809,34 @@ class BybitAdapter(Adapter):
     async def _strict_check_leverage(self, instrument: Instrument) -> None:
         """Pre-order leverage verification (Phase 5, §5.2).
 
-        Runs when ``strict_check`` is enabled, before every order dispatch:
-        if a stored leverage intent exists and the platform leverage differs,
-        the configured ``on_drift`` behavior is executed — reapply restores the
-        stored value and the order proceeds; notify/halt raise
-        ``LeverageDriftError`` to reject the order.
+        Runs before every order dispatch.  The per-symbol policy decides whether
+        the check runs at all (persisted via ``set_leverage``; unconfigured
+        symbols use the default, which enables it).  The effective intent is the
+        stored value, or the default (1x) for symbols never configured.  If the
+        platform leverage differs, the per-symbol ``on_drift`` behavior is
+        executed — reapply restores the intent and the order proceeds;
+        notify/halt raise ``LeverageDriftError`` to reject the order.
         """
-        if not self._config.leverage.strict_check:
+        strict_raw = await self._policy_knob(instrument, _POLICY_KNOB_STRICT_CHECK)
+        if strict_raw is not None and strict_raw == "0":
             return
-        stored = await self._stored_leverage(instrument)
-        if stored is None:
+        if strict_raw is None and not DEFAULT_STRICT_CHECK:
             return
+        intent = await self._intent_leverage(instrument)
         platform = await self.get_leverage(instrument)
-        if platform is None or platform == stored:
+        if platform is None or platform == intent:
             return
         await self._handle_leverage_drift(
             instrument,
-            stored,
+            intent,
             platform,
             context="pre-order strict check",
         )
-        if self._config.leverage.on_drift != "reapply":
+        on_drift_raw = await self._policy_knob(instrument, _POLICY_KNOB_ON_DRIFT)
+        on_drift = on_drift_raw if on_drift_raw is not None else DEFAULT_ON_DRIFT
+        if on_drift != "reapply":
             raise LeverageDriftError(
-                f"Platform leverage {platform} differs from stored intent {stored} "
+                f"Platform leverage {platform} differs from intent {intent} "
                 f"for {to_bybit_symbol(instrument)}"
             )
 
@@ -798,7 +892,10 @@ class BybitAdapter(Adapter):
             try:
                 stored_mode = MarginMode(stored_mode_value)
             except ValueError:
-                logger.warning("Stored margin mode value %r is unrecognised — skipping", stored_mode_value)
+                logger.warning(
+                    "Stored margin mode value %r is unrecognised — skipping",
+                    stored_mode_value,
+                )
                 stored_mode = None
             if stored_mode is not None:
                 platform_mode = await self.get_margin_mode()
@@ -853,8 +950,10 @@ class BybitAdapter(Adapter):
         Margin mode is account-wide — no instrument parameter.  Reapply
         restores the stored mode, notify only reports, halt is not applicable
         at the account margin-mode level (no per-instrument halt for this).
+        Margin drift always uses the default ``on_drift`` behavior since there is
+        no per-symbol policy for an account-wide setting.
         """
-        on_drift = self._config.leverage.on_drift
+        on_drift = DEFAULT_ON_DRIFT
 
         if on_drift == "reapply":
             previous = platform
@@ -954,10 +1053,11 @@ class BybitAdapter(Adapter):
           mode was applied).
 
         Instruments with no stored intent are not touched — their platform
-        leverage/margin mode is whatever it is.
+        leverage/margin mode is whatever it is.  For each symbol with stored
+        intent, its per-symbol ``auto_apply_on_connect`` policy decides whether
+        it is re-applied (default on; unconfigured symbols were never re-applied
+        because they have no stored intent to restore).
         """
-        if not self._config.leverage.auto_apply_on_connect:
-            return
         if self._state_store is None:
             return
 
@@ -1019,6 +1119,13 @@ class BybitAdapter(Adapter):
                     "Skipping stored leverage reapply for unknown/delisted symbol %s",
                     symbol,
                 )
+                continue
+            auto_apply_raw = await self._policy_knob(instrument, _POLICY_KNOB_AUTO_APPLY)
+            if auto_apply_raw is None:
+                auto_apply = DEFAULT_AUTO_APPLY_ON_CONNECT
+            else:
+                auto_apply = auto_apply_raw == "1"
+            if not auto_apply:
                 continue
             try:
                 await self.set_leverage(

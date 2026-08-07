@@ -21,7 +21,7 @@ from unified_trading_execution.bybit.events import (
     LeverageApplyFailedEvent,
     MarginModeChangedEvent,
 )
-from unified_trading_execution.bybit.margin import LeverageConfig, MarginMode
+from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass
@@ -141,7 +141,6 @@ async def reapply_adapter(
         api_key=bybit_config.api_key,
         api_secret=bybit_config.api_secret,
         testnet=bybit_config.testnet,
-        leverage=LeverageConfig(),
     )
     adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
@@ -186,7 +185,7 @@ class TestReapplyStoredIntent:
         adapter, store, collector = reapply_adapter
         await store.set_adapter_config("leverage.buy:BTCUSDT", "20")
         await store.set_adapter_config("leverage.sell:BTCUSDT", "20")
-        await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
+        await store.set_adapter_config("margin_mode", "isolated")
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_margin_mode.return_value = _ok()
         mock_pybit_http.set_leverage.return_value = _ok()
@@ -267,11 +266,16 @@ class TestReapplyStoredIntent:
         await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
         await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         try:
+            # auto_apply_on_connect is a per-symbol policy knob persisted at
+            # set_leverage time; disable it here by seeding the policy row.
+            await store.set_adapter_config(
+                "leverage.policy.auto_apply:BTCUSDT",
+                "0",
+            )
             config = BybitConfig(
                 api_key=bybit_config.api_key,
                 api_secret=bybit_config.api_secret,
                 testnet=bybit_config.testnet,
-                leverage=LeverageConfig(auto_apply_on_connect=False),
             )
             adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
             adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}

@@ -15,7 +15,6 @@ from pybit.exceptions import FailedRequestError
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.margin import LeverageConfig
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass
@@ -132,15 +131,18 @@ async def _make_adapter(
         api_key=bybit_config.api_key,
         api_secret=bybit_config.api_secret,
         testnet=bybit_config.testnet,
-        leverage=LeverageConfig(on_drift=on_drift),
     )
     adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
+    await store.set_adapter_config(
+        "leverage.policy.on_drift:BTCUSDT",
+        on_drift,
+    )
     if seed_leverage is not None:
         await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
         await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     if seed_margin is not None:
-        await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
+        await store.set_adapter_config("margin_mode", seed_margin)
     return adapter, store
 
 
@@ -200,9 +202,8 @@ class TestReapplyAuditTrail:
             events = await store.query_audit_events()
             matches = [e for e in events if e.event_type == "bybit.margin_mode.changed"]
             assert len(matches) == 1
-            assert matches[0].payload["symbol"] == "BTCUSDT"
             assert matches[0].payload["current"] == "isolated"
-            assert matches[0].payload["leverage"] == 20
+            assert matches[0].payload["context"] == "connect_reapply"
         finally:
             await adapter.disconnect()
             await store.close()

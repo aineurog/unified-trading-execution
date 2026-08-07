@@ -18,7 +18,6 @@ from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.errors import LeverageDriftError
 from unified_trading_execution.bybit.events import LeverageDriftEvent
-from unified_trading_execution.bybit.margin import LeverageConfig
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
@@ -141,11 +140,18 @@ async def _new_adapter(
         api_key="test-api-key",
         api_secret="test-api-secret",
         testnet=True,
-        leverage=LeverageConfig(strict_check=strict_check, on_drift=on_drift),
     )
     event_bus = EventBus()
     adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
+    await store.set_adapter_config(
+        "leverage.policy.strict_check:BTCUSDT",
+        "1" if strict_check else "0",
+    )
+    await store.set_adapter_config(
+        "leverage.policy.on_drift:BTCUSDT",
+        on_drift,
+    )
     if seed_leverage is not None:
         await store.set_adapter_config("leverage.buy:BTCUSDT", str(seed_leverage))
         await store.set_adapter_config("leverage.sell:BTCUSDT", str(seed_leverage))
@@ -153,17 +159,15 @@ async def _new_adapter(
 
 
 class TestStrictCheckDriftAction:
-    async def test_skipped_when_no_stored_intent(
+    async def test_skipped_when_platform_matches_default_intent(
         self,
         mock_pybit_http: MagicMock,
     ) -> None:
+        """No stored intent falls back to the default 1x; matching the platform is a no-op."""
         adapter, store, _ = await _new_adapter(strict_check=True, seed_leverage=None)
         try:
-            await store.delete_adapter_config("leverage.buy:BTCUSDT")
-            await store.delete_adapter_config("leverage.sell:BTCUSDT")
-            mock_pybit_http.get_positions.return_value = _position("50")
+            mock_pybit_http.get_positions.return_value = _position("1")
             await adapter._strict_check_leverage(_futures_instrument())
-            mock_pybit_http.get_positions.assert_not_called()
             mock_pybit_http.set_leverage.assert_not_called()
         finally:
             await store.close()
@@ -248,10 +252,11 @@ class TestPlaceOrderStrictCheck:
                 testnet=True,
                 api_key="k",
                 api_secret="s",
-                leverage=LeverageConfig(strict_check=True, on_drift="notify"),
             )
             adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
             adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
+            await store.set_adapter_config("leverage.policy.strict_check:BTCUSDT", "1")
+            await store.set_adapter_config("leverage.policy.on_drift:BTCUSDT", "notify")
             await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
             await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
             with pytest.raises(LeverageDriftError):

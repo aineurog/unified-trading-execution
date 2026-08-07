@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.events import LeverageDriftEvent
-from unified_trading_execution.bybit.margin import LeverageConfig
 from unified_trading_execution.events import EventBus, HaltClearedEvent, HaltEnteredEvent
 from unified_trading_execution.state.halt import HaltConfig, HaltStateMachine
 from unified_trading_execution.state.store import SQLiteStateStore
@@ -130,17 +129,20 @@ async def _make_adapter(
         testnet=True,
         api_key="k",
         api_secret="s",
-        leverage=LeverageConfig(on_drift=on_drift),
     )
     adapter = BybitAdapter(config, event_bus=bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
     halt_machine = HaltStateMachine(HaltConfig(auto_halt_enabled=auto_halt_enabled))
     adapter.attach_halt_machine(halt_machine)
+    await store.set_adapter_config(
+        "leverage.policy.on_drift:BTCUSDT",
+        on_drift,
+    )
     if seed_leverage is not None:
         await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
         await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     if seed_margin is not None:
-        await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
+        await store.set_adapter_config("margin_mode", seed_margin)
     return adapter, store, halt_machine, _Collector(bus)
 
 
