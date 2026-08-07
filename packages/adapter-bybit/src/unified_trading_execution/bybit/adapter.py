@@ -540,6 +540,10 @@ class BybitAdapter(Adapter):
         """Store the engine's shared event bus so WS handlers can publish."""
         self._event_bus = event_bus
 
+    def attach_state_store(self, state_store: StateStore) -> None:
+        """Receive the engine-managed StateStore so the adapter can persist intent."""
+        self._state_store = state_store
+
     def _publish(self, event: Event) -> None:
         """Publish onto the engine's bus, requiring it was wired first."""
         if self._event_bus is None:

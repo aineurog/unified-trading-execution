@@ -14,6 +14,7 @@ from decimal import Decimal
 
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.halt import HaltStateMachine
+from unified_trading_execution.state import StateStore
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -201,6 +202,15 @@ class Adapter(ABC):
         position/balance updates) without ever constructing a bus itself.
         Default no-op — adapters that publish events override this to store
         the reference.
+        """
+        return None
+
+    def attach_state_store(self, state_store: StateStore) -> None:
+        """Optional: provide the shared StateStore to the adapter.
+
+        Adapters that persist adapter-owned intent (leverage/margin-mode)
+        may use this hook to store a reference to the engine-managed StateStore.
+        Default no-op so adapters that do not need the store are unaffected.
         """
         return None
 

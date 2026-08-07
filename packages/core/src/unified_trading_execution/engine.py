@@ -128,6 +128,10 @@ class Engine:
         self._risk_config = risk_config or RiskConfig()
         self._halt_machine = HaltStateMachine(halt_config)
         self._shutdown = False
+        # Give the adapter access to core-managed resources (halt machine,
+        # event bus, and the automatically-created state store) so adapters
+        # that persist intent (leverage/margin-mode) can use the shared store.
+        self._adapter.attach_state_store(self._state_store)
         self._adapter.attach_halt_machine(self._halt_machine)
         self._adapter.attach_event_bus(self._event_bus)
 
