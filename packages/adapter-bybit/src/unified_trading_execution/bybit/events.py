@@ -49,8 +49,10 @@ class LeverageDriftEvent(Event):
 
 @dataclass(frozen=True, slots=True)
 class MarginModeChangedEvent(Event):
-    """Margin mode was changed for an instrument."""
+    """Account-wide margin mode was changed.
 
-    instrument: Instrument
+    Bybit UTA margin mode is account-wide — no instrument field.
+    """
+
     previous: MarginMode | None
     current: MarginMode
