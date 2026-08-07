@@ -34,6 +34,33 @@ from unified_trading_execution.types.position import Balance, Position
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 
+def _slug(component: str) -> str:
+    """Sanitize one filename component to `[a-z0-9_]` (pass through junk).
+
+    Keeps the resolved path filesystem-safe regardless of how a platform /
+    account identifier is spelled.
+    """
+    cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in component).lower()
+    return cleaned.strip("_") or "unknown"
+
+
+def default_state_store_path(platform_name: str, account_id: str) -> str:
+    """Resolve the default ``StateStore`` location per Section 6.2.
+
+    Returns ``./<project>_data/<platform>_<account>.db`` relative to the process
+    working directory, where ``<project>`` is the name of the current working
+    directory itself (predictable and human-inspectable, never hidden or
+    written to a system location).  ``<platform>`` and ``<account>`` are
+    slugified so the resulting filename is always filesystem-safe.
+
+    Example with ``platform_name="bybit"``, ``account_id="acct123"`` and a CWD
+    named ``ute``: ``./ute_data/bybit_acct123.db``.
+    """
+    project = Path.cwd().name
+    filename = f"{_slug(platform_name)}_{_slug(account_id)}.db"
+    return os.path.join(f"./{project}_data", filename)
+
+
 # ============================================================
 # Instrument serialisation helpers
 # ============================================================
@@ -236,6 +263,8 @@ class SQLiteStateStore(StateStore):
     # ---- Lifecycle ----
 
     async def initialize(self) -> None:
+        if self._path != ":memory:":
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self._path, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         await self._run_migrations()

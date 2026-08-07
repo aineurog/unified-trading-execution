@@ -190,6 +190,28 @@ class TestEngineConstruction:
         eng = Engine(adapter=mock_adapter, state_store=store)
         assert eng.event_bus is not None
 
+    def test_auto_creates_state_store_when_none_provided(self, mock_adapter):
+        eng = Engine(adapter=mock_adapter)
+        assert isinstance(eng.state_store, SQLiteStateStore)
+        assert eng.state_store.path != ":memory:"
+
+    def test_default_state_store_path_is_user_visible(self, mock_adapter, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        eng = Engine(adapter=mock_adapter)
+        path = eng.state_store.path
+        assert path.endswith(".db")
+        assert "mock" in path
+        assert "mock_account" in path
+
+    def test_default_state_store_initializes_to_file(self, mock_adapter, monkeypatch, tmp_path):
+        import asyncio
+
+        monkeypatch.chdir(tmp_path)
+        eng = Engine(adapter=mock_adapter)
+        asyncio.run(eng.connect())
+        assert eng.state_store.path != ":memory:"
+        assert (tmp_path / eng.state_store.path[2:]).exists()
+
     def test_accepts_risk_config(self, mock_adapter):
         store = SQLiteStateStore(":memory:")
         cfg = RiskConfig(max_order_size=Decimal("50"))
