@@ -10,11 +10,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.halt import HaltStateMachine
-from unified_trading_execution.state import StateStore
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -25,6 +24,9 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+if TYPE_CHECKING:
+    from unified_trading_execution.state import StateStore
 
 
 @dataclass(frozen=True, slots=True)

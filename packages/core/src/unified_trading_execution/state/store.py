@@ -373,11 +373,23 @@ class SQLiteStateStore(StateStore):
             try:
                 await self.conn.execute(
                     "INSERT OR REPLACE INTO balances (currency, free, used, total, updated_at) VALUES (?,?,?,?,?)",
-                    (balance.currency, str(balance.free), str(balance.used), str(balance.total), now),
+                    (
+                        balance.currency,
+                        str(balance.free),
+                        str(balance.used),
+                        str(balance.total),
+                        now,
+                    ),
                 )
                 await self.conn.execute(
                     "INSERT INTO balance_history (currency, free, used, total, recorded_at) VALUES (?,?,?,?,?)",
-                    (balance.currency, str(balance.free), str(balance.used), str(balance.total), now),
+                    (
+                        balance.currency,
+                        str(balance.free),
+                        str(balance.used),
+                        str(balance.total),
+                        now,
+                    ),
                 )
             except BaseException:
                 await self.conn.rollback()

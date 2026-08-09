@@ -149,6 +149,7 @@ class TestAdapterZeroImplementation:
                 "fetch_fills",
                 "attach_halt_machine",
                 "attach_event_bus",
+                "attach_state_store",
                 "reconcile_user_intent",
             }
         )
