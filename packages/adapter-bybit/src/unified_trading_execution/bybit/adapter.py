@@ -570,9 +570,7 @@ class BybitAdapter(Adapter):
         symbol = to_bybit_symbol(instrument)
         category = self._instrument_to_category(instrument)
         if category == "spot":
-            raise InvalidSymbolError(
-                f"Position mode is not supported for spot symbol {symbol}"
-            )
+            raise InvalidSymbolError(f"Position mode is not supported for spot symbol {symbol}")
         await self._apply_position_mode(instrument, mode)
 
         store = await self._require_store()
@@ -701,9 +699,7 @@ class BybitAdapter(Adapter):
             return None
         if self._state_store is None:
             return 0
-        raw = await self._state_store.get_adapter_config(
-            self._position_mode_key(instrument)
-        )
+        raw = await self._state_store.get_adapter_config(self._position_mode_key(instrument))
         try:
             mode = PositionMode(raw) if raw is not None else PositionMode.ONE_WAY
         except ValueError:
@@ -1173,9 +1169,7 @@ class BybitAdapter(Adapter):
                     )
 
         # ---- Per-symbol position mode drift ----
-        position_mode_rows = await self._state_store.list_adapter_config(
-            _POSITION_MODE_KIND_PREFIX
-        )
+        position_mode_rows = await self._state_store.list_adapter_config(_POSITION_MODE_KIND_PREFIX)
         for full_key, value in position_mode_rows.items():
             symbol = full_key.removeprefix(_POSITION_MODE_KIND_PREFIX)
             if "." in symbol:
@@ -1426,9 +1420,7 @@ class BybitAdapter(Adapter):
                     )
 
         # ---- Per-symbol position mode reapply ----
-        position_mode_rows = await self._state_store.list_adapter_config(
-            _POSITION_MODE_KIND_PREFIX
-        )
+        position_mode_rows = await self._state_store.list_adapter_config(_POSITION_MODE_KIND_PREFIX)
         for full_key, value in position_mode_rows.items():
             symbol = full_key.removeprefix(_POSITION_MODE_KIND_PREFIX)
             if "." in symbol:
@@ -1453,9 +1445,7 @@ class BybitAdapter(Adapter):
                 f"position_mode.policy.{_POLICY_KNOB_AUTO_APPLY}:{symbol}"
             )
             auto_apply = (
-                DEFAULT_AUTO_APPLY_ON_CONNECT
-                if auto_apply_raw is None
-                else auto_apply_raw == "1"
+                DEFAULT_AUTO_APPLY_ON_CONNECT if auto_apply_raw is None else auto_apply_raw == "1"
             )
             if not auto_apply:
                 continue

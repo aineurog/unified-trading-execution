@@ -66,9 +66,7 @@ def _position_response(position_idx: str = "0") -> tuple[dict[str, Any], None, d
         {
             "retCode": 0,
             "retMsg": "OK",
-            "result": {
-                "list": [{"symbol": "BTCUSDT", "size": "0", "positionIdx": position_idx}]
-            },
+            "result": {"list": [{"symbol": "BTCUSDT", "size": "0", "positionIdx": position_idx}]},
         },
         None,
         {},
@@ -183,9 +181,7 @@ class TestSetPositionMode:
         )
 
         assert await store.get_adapter_config("position_mode.policy.on_drift:BTCUSDT") == "halt"
-        assert (
-            await store.get_adapter_config("position_mode.policy.auto_apply:BTCUSDT") == "0"
-        )
+        assert await store.get_adapter_config("position_mode.policy.auto_apply:BTCUSDT") == "0"
 
     async def test_set_spot_raises(
         self,
@@ -384,9 +380,7 @@ async def _make_reconcile_adapter(
 
 class TestReconcilePositionModeDrift:
     async def test_match_is_noop(self, mock_pybit_http: MagicMock) -> None:
-        adapter, store, halt_machine, collector = await _make_reconcile_adapter(
-            seed_mode="hedge"
-        )
+        adapter, store, halt_machine, collector = await _make_reconcile_adapter(seed_mode="hedge")
         try:
             mock_pybit_http.get_positions.return_value = _position_response("1")
             await adapter.reconcile_user_intent()
@@ -493,9 +487,7 @@ class TestReconcilePositionModeDrift:
             await store.close()
 
     async def test_policy_knob_rows_are_skipped(self, mock_pybit_http: MagicMock) -> None:
-        adapter, store, halt_machine, collector = await _make_reconcile_adapter(
-            on_drift="reapply"
-        )
+        adapter, store, halt_machine, collector = await _make_reconcile_adapter(on_drift="reapply")
         try:
             await store.set_adapter_config("position_mode.policy.on_drift:BTCUSDT", "halt")
             await adapter.reconcile_user_intent()

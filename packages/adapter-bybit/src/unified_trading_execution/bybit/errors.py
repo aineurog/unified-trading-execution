@@ -76,16 +76,16 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     30256: InsufficientBalanceError,  # "Margin limit exceeded (Spot)"
     170033: InsufficientBalanceError,  # "margin Insufficient account balance"
     170131: InsufficientBalanceError,  # "Balance insufficient"
-     # ---- Leverage / margin mode already active (idempotent no-op) ----
-     110043: LeverageNotModifiedError,  # "leverage not modified"
-     110026: MarginModeNotModifiedError,  # "Cross/isolated margin mode has not been modified"
-     # ---- Position mode (switch-mode) ----
-     # 110030 "You have existing position, so position mode cannot be switched" and
-     # 110031 "Existing open orders" intentionally stay unmapped — the platform
-     # enforces the no-open-position/no-open-order guard and the generic
-     # PlatformError fallback (with ret_code context) surfaces the reason to the
-     # user, mirroring how leverage's block_on_open_position guard is surfaced.
-     110025: PositionModeNotModifiedError,  # "Position mode not modified"
+    # ---- Leverage / margin mode already active (idempotent no-op) ----
+    110043: LeverageNotModifiedError,  # "leverage not modified"
+    110026: MarginModeNotModifiedError,  # "Cross/isolated margin mode has not been modified"
+    # ---- Position mode (switch-mode) ----
+    # 110030 "You have existing position, so position mode cannot be switched" and
+    # 110031 "Existing open orders" intentionally stay unmapped — the platform
+    # enforces the no-open-position/no-open-order guard and the generic
+    # PlatformError fallback (with ret_code context) surfaces the reason to the
+    # user, mirroring how leverage's block_on_open_position guard is surfaced.
+    110025: PositionModeNotModifiedError,  # "Position mode not modified"
     # ---- Order not found ----
     110001: OrderNotFoundError,  # "Order does not exist"
     170143: OrderNotFoundError,  # "Cannot be found on order book"
