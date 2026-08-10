@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from typing import Union
 
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument
@@ -36,7 +37,7 @@ class UnifiedOrder:
     instrument: Instrument
     order_type: OrderType
     side: OrderSide
-    quantity: Decimal
+    quantity: Union[Decimal, int, float, str]
     time_in_force: TimeInForce
     client_order_id: str | None = None
     price: Decimal | None = None  # LIMIT, STOP_LIMIT
