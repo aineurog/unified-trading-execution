@@ -265,6 +265,61 @@ class TestUnifiedOrder:
         o.client_order_id = "engine-set-id"
         assert o.client_order_id == "engine-set-id"
 
+    def test_coerces_int_quantity(self):
+        o = UnifiedOrder(
+            instrument=make_btc(),
+            order_type=OrderType.MARKET,
+            side=OrderSide.BUY,
+            quantity=1,  # type: ignore[arg-type]
+            time_in_force=TimeInForce.IOC,
+        )
+        assert o.quantity == Decimal("1")
+        assert isinstance(o.quantity, Decimal)
+
+    def test_coerces_float_quantity_sharply(self):
+        o = UnifiedOrder(
+            instrument=make_btc(),
+            order_type=OrderType.MARKET,
+            side=OrderSide.BUY,
+            quantity=0.1,  # type: ignore[arg-type]
+            time_in_force=TimeInForce.IOC,
+        )
+        assert o.quantity == Decimal("0.1")  # not Decimal("0.1000000000000000055511151231")
+
+    def test_coerces_string_quantity(self):
+        o = UnifiedOrder(
+            instrument=make_btc(),
+            order_type=OrderType.MARKET,
+            side=OrderSide.BUY,
+            quantity="2.5",  # type: ignore[arg-type]
+            time_in_force=TimeInForce.IOC,
+        )
+        assert o.quantity == Decimal("2.5")
+        assert isinstance(o.quantity, Decimal)
+
+    def test_coerces_limit_price_and_stop_price(self):
+        o = UnifiedOrder(
+            instrument=make_btc(),
+            order_type=OrderType.STOP_LIMIT,
+            side=OrderSide.SELL,
+            quantity=Decimal("0.001"),
+            price=51000,  # type: ignore[arg-type]
+            stop_price="50500",  # type: ignore[arg-type]
+            time_in_force=TimeInForce.GTC,
+        )
+        assert o.price == Decimal("51000")
+        assert o.stop_price == Decimal("50500")
+
+    def test_coerced_quantity_still_validated(self):
+        with pytest.raises(ValueError):
+            UnifiedOrder(
+                instrument=make_btc(),
+                order_type=OrderType.MARKET,
+                side=OrderSide.BUY,
+                quantity=0,  # type: ignore[arg-type]
+                time_in_force=TimeInForce.IOC,
+            )
+
 
 # ============================================================
 # OrderModification (Section 17.6)

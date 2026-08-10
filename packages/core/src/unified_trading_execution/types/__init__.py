@@ -20,8 +20,11 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+from unified_trading_execution.types.utils import as_decimal
 
 __all__ = [
+    # Helpers
+    "as_decimal",
     # Enums
     "AssetClass",
     "HaltClearMode",

@@ -35,6 +35,7 @@ from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import (
     AuditEvent,
     BalanceUpdateEvent,
+    ConnectionStateEvent,
     EventBus,
     FillEvent,
     HaltClearedEvent,
@@ -141,11 +142,14 @@ class Engine:
         self._rate_limit_budget: int = 0
         self._rate_limit_reset_at: datetime | None = None
         self._rate_limit_refresh_lock = asyncio.Lock()
+        self._last_connected: bool | None = None
+        self._reconcile_task: asyncio.Task[None] | None = None
 
         # Wire up state-mirror subscriptions
         self._event_bus.subscribe(FillEvent, self._on_fill)
         self._event_bus.subscribe(PositionUpdateEvent, self._on_position_update)
         self._event_bus.subscribe(BalanceUpdateEvent, self._on_balance_update)
+        self._event_bus.subscribe(ConnectionStateEvent, self._on_connection_state)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -163,6 +167,33 @@ class Engine:
 
         # Fetch initial rate limits
         await self._refresh_rate_limits()
+
+    def _on_connection_state(self, event: ConnectionStateEvent) -> None:
+        """Trigger an automatic reconcile when the connection re-establishes.
+
+        Section 6.1: reconciliation is triggered immediately after any
+        reconnect, since a dropped connection is the highest-risk window for
+        drift.  This is the core-side half of that contract — adapters only
+        publish ``ConnectionStateEvent``; they never call ``reconcile``.
+
+        The first connect is not treated as a reconnect: ``_last_connected`` is
+        None before the adapter's initial ``connected=True``, and we only react
+        on a False -> True transition we have observed ourselves.
+        """
+        if self._shutdown:
+            return
+        if event.connected and self._last_connected is False:
+            # Already have one reconciliation in flight — don't stack them.
+            if self._reconcile_task is None or self._reconcile_task.done():
+                self._reconcile_task = asyncio.ensure_future(self._reconcile_on_reconnect())
+        self._last_connected = event.connected
+
+    async def _reconcile_on_reconnect(self) -> None:
+        """Best-effort reconcile after a reconnect; never fatal on failure."""
+        try:
+            await self.reconcile()
+        except Exception:
+            logger.exception("Automatic reconciliation after reconnect failed")
 
     async def disconnect(self) -> None:
         """Disconnect the adapter gracefully."""
@@ -183,7 +214,10 @@ class Engine:
             await self._adapter.disconnect()
         except Exception:
             logger.exception("Error during adapter disconnect in shutdown")
-        # Step 3 — close state store
+        # Step 3 — cancel any pending reconnect reconciliation before closing
+        if self._reconcile_task is not None and not self._reconcile_task.done():
+            self._reconcile_task.cancel()
+        # Step 4 — close state store
         await self._state_store.close()
 
     def shutdown(self) -> None:
