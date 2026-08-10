@@ -43,8 +43,18 @@ class Instrument:
         return self._broker_symbol_override
 
     def __post_init__(self) -> None:
-        if not self.symbol or self.symbol != self.symbol.upper():
-            raise ValueError(f"symbol must be non-empty and uppercase, got {self.symbol!r}")
+        # Normalize identifier fields to uppercase. Digits (e.g. symbol "4" in
+        # "4USDT") are unaffected by .upper(), so this is safe for any input.
+        # Only reassign when changed — avoids setattr on the already-uppercase path.
+        if self.symbol != self.symbol.upper():
+            object.__setattr__(self, "symbol", self.symbol.upper())
+        if self.quote_currency is not None and self.quote_currency != self.quote_currency.upper():
+            object.__setattr__(self, "quote_currency", self.quote_currency.upper())
+        if self.currency is not None and self.currency != self.currency.upper():
+            object.__setattr__(self, "currency", self.currency.upper())
+
+        if not self.symbol:
+            raise ValueError(f"symbol must be non-empty, got {self.symbol!r}")
 
         # expiry is required for OPTION only — FUTURES with expiry=None is a perpetual.
         if self.asset_class == AssetClass.OPTION:

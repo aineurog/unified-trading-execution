@@ -161,23 +161,42 @@ def test_with_broker_override_preserves_all_other_fields():
 # ---- Instrument: symbol invariant ----
 
 
-def test_symbol_must_be_non_empty_uppercase():
-    with pytest.raises(ValueError, match="symbol must be non-empty and uppercase"):
-        Instrument(
-            symbol="btc",
-            quote_currency="USDT",
-            asset_class=AssetClass.SPOT,
-            exchange=None,
-            currency=None,
-            expiry=None,
-            strike=None,
-            option_right=None,
-            multiplier=None,
-        )
+def test_lowercase_identifiers_are_normalized_to_uppercase():
+    inst = Instrument(
+        symbol="btc",
+        quote_currency="usdt",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency="bytes",
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
+    )
+    assert inst.symbol == "BTC"
+    assert inst.quote_currency == "USDT"
+    assert inst.currency == "BYTES"
+
+
+def test_numeric_symbol_lowercase_quote_is_normalized():
+    # Symbol "4" has no letters; .upper() leaves it unchanged, quote is uppercased.
+    inst = Instrument(
+        symbol="4",
+        quote_currency="usdt",
+        asset_class=AssetClass.SPOT,
+        exchange=None,
+        currency=None,
+        expiry=None,
+        strike=None,
+        option_right=None,
+        multiplier=None,
+    )
+    assert inst.symbol == "4"
+    assert inst.quote_currency == "USDT"
 
 
 def test_symbol_must_not_be_empty():
-    with pytest.raises(ValueError, match="symbol must be non-empty and uppercase"):
+    with pytest.raises(ValueError, match="symbol must be non-empty"):
         Instrument(
             symbol="",
             quote_currency="USDT",
