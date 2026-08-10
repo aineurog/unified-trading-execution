@@ -17,8 +17,8 @@ import pytest
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
+from unified_trading_execution.bybit.enums import MarginMode
 from unified_trading_execution.bybit.errors import LeverageDriftError, LeverageExceedsMaxError
-from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.errors import InvalidSymbolError
 from unified_trading_execution.events import EventBus

@@ -30,12 +30,14 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.bybit.config import BybitConfig
+from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 from unified_trading_execution.bybit.errors import (
     AsymmetricLeverageError,
     LeverageDriftError,
     LeverageExceedsMaxError,
     LeverageNotModifiedError,
     MarginModeNotModifiedError,
+    PositionModeNotModifiedError,
     map_bybit_error,
 )
 from unified_trading_execution.bybit.events import (
@@ -43,8 +45,10 @@ from unified_trading_execution.bybit.events import (
     LeverageApplyFailedEvent,
     LeverageDriftEvent,
     MarginModeChangedEvent,
+    PositionModeAppliedEvent,
+    PositionModeApplyFailedEvent,
+    PositionModeDriftEvent,
 )
-from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
@@ -83,7 +87,12 @@ from unified_trading_execution.events import (
 )
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
-from unified_trading_execution.types.enums import AssetClass, OrderStatus, OrderType
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -106,6 +115,7 @@ _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 _ACCOUNT_TYPE = "UNIFIED"
 _MAX_TRACKED_FINAL_ORDER_IDS = 10_000
 _LEVERAGE_KIND_PREFIX = "leverage."
+_POSITION_MODE_KIND_PREFIX = "position_mode."
 # Per-instrument leverage behavior knobs, stored flat (one key per knob under
 # ``leverage.policy.{knob}:{symbol}``) so strict checks / reconciliation /
 # reapply can read just the knob they need without any serialization.
@@ -113,6 +123,14 @@ _POLICY_KNOB_ON_DRIFT = "on_drift"
 _POLICY_KNOB_STRICT_CHECK = "strict_check"
 _POLICY_KNOB_BLOCK_ON_OPEN = "block_on_open"
 _POLICY_KNOB_AUTO_APPLY = "auto_apply"
+# Position mode is a single value per symbol (one-way / hedge) — unlike
+# leverage there is no per-side schema, so no grouping helper is needed.
+# ``get_position_mode`` maps ``positionIdx`` directly (0 = one-way, 1/2 =
+# hedge), so no reverse map is needed here.
+_POSITION_MODE_TO_INT: dict[PositionMode, int] = {
+    PositionMode.ONE_WAY: 0,
+    PositionMode.HEDGE: 3,
+}
 # Defaults for leverage behavior.  They live here (and in set_leverage's
 # signature) rather than in BybitConfig because they are per-instrument: the
 # values chosen at set_leverage time are persisted per symbol and only fall
@@ -130,6 +148,22 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _coerce_position_mode(mode: str | PositionMode) -> PositionMode:
+    """Coerce a user-supplied mode to the ``PositionMode`` enum.
+
+    Accepts the enum member directly or the raw string values ``"one_way"`` /
+    ``"hedge"`` so callers need not import the enum.
+    """
+    if isinstance(mode, PositionMode):
+        return mode
+    try:
+        return PositionMode(mode)
+    except ValueError:
+        raise ValueError(
+            f"Invalid position mode {mode!r} — expected 'one_way' or 'hedge'"
+        ) from None
 
 
 def _parse_stream_ms(raw: object) -> datetime:
@@ -278,6 +312,16 @@ class BybitAdapter(Adapter):
     def _leverage_policy_key(instrument: Instrument, knob: str) -> str:
         """adapter_config key for one per-instrument leverage behavior knob."""
         return f"leverage.policy.{knob}:{to_bybit_symbol(instrument)}"
+
+    @staticmethod
+    def _position_mode_key(instrument: Instrument) -> str:
+        """adapter_config key for stored position mode intent."""
+        return f"position_mode.{to_bybit_symbol(instrument)}"
+
+    @staticmethod
+    def _position_mode_policy_key(instrument: Instrument, knob: str) -> str:
+        """adapter_config key for one per-instrument position mode behavior knob."""
+        return f"position_mode.policy.{knob}:{to_bybit_symbol(instrument)}"
 
     async def _require_store(self) -> StateStore:
         """Return the state store or raise if leverage persistence is unavailable.
@@ -495,6 +539,185 @@ class BybitAdapter(Adapter):
         await store.delete_adapter_config(self._leverage_buy_key(instrument))
         await store.delete_adapter_config(self._leverage_sell_key(instrument))
 
+    async def set_position_mode(
+        self,
+        instrument: Instrument,
+        mode: str | PositionMode,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = DEFAULT_ON_DRIFT,
+        auto_apply_on_connect: bool = DEFAULT_AUTO_APPLY_ON_CONNECT,
+    ) -> None:
+        """Set position mode for *instrument* on the platform and persist intent.
+
+        ``mode`` is the ``PositionMode`` enum or the raw strings ``"one_way"``
+        (Bybit mode=0) / ``"hedge"`` (Bybit mode=3) — no enum import needed.
+        The platform enforces that no open position or open order exists
+        before the switch — if that condition is not met, Bybit returns 110030
+        or 110031, translated to ``PlatformError``.
+
+        The behavior knobs (``on_drift``, ``auto_apply_on_connect``) are
+        persisted per instrument as flat ``position_mode.policy.{knob}:{symbol}``
+        rows so later reapply / reconciliation resolve each symbol's behavior
+        from its own stored rows.
+
+        Raises:
+            InvalidSymbolError: instrument is spot or unsupported category.
+            ValueError: ``mode`` is not a valid position mode string.
+            PlatformError: platform rejected the switch (110030: open position,
+                110031: open orders, or other platform error).
+        """
+        mode = _coerce_position_mode(mode)
+        symbol = to_bybit_symbol(instrument)
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise InvalidSymbolError(
+                f"Position mode is not supported for spot symbol {symbol}"
+            )
+        await self._apply_position_mode(instrument, mode)
+
+        store = await self._require_store()
+        await store.set_adapter_config(self._position_mode_key(instrument), mode.value)
+        await store.set_adapter_config(
+            self._position_mode_policy_key(instrument, _POLICY_KNOB_ON_DRIFT),
+            on_drift,
+        )
+        await store.set_adapter_config(
+            self._position_mode_policy_key(instrument, _POLICY_KNOB_AUTO_APPLY),
+            "1" if auto_apply_on_connect else "0",
+        )
+
+    async def _apply_position_mode(
+        self,
+        instrument: Instrument,
+        mode: PositionMode,
+    ) -> None:
+        """Apply position mode on the platform without touching stored intent.
+
+        Used by ``set_position_mode`` and by drift-reapply; does not persist
+        anything, so reapply cannot clobber the stored behavior.  A 110025
+        "not modified" is treated as already-applied and suppressed.
+        """
+        symbol = to_bybit_symbol(instrument)
+        category = self._instrument_to_category(instrument)
+        try:
+            await self._run_request(
+                self._session.switch_position_mode,
+                category=category,
+                symbol=symbol,
+                mode=_POSITION_MODE_TO_INT[mode],
+            )
+        except PositionModeNotModifiedError:
+            logger.info(
+                "Position mode already %s for %s — treating as applied",
+                mode.value,
+                symbol,
+            )
+
+    async def get_position_mode(self, instrument: Instrument) -> PositionMode | None:
+        """Query the current position mode from the platform for *instrument*.
+
+        Reads ``positionIdx`` from ``get_positions`` (0 = one-way, 1 = hedge
+        long, 2 = hedge short).  Returns None if the instrument has no open
+        position (mode unreadable from the platform) or if the instrument is
+        spot.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        if not entries:
+            return None
+        position_idx = int(str(entries[0].get("positionIdx") or "0"))
+        if position_idx == 0:
+            return PositionMode.ONE_WAY
+        if position_idx in (1, 2):
+            return PositionMode.HEDGE
+        return None
+
+    async def remove_position_mode(self, instrument: Instrument) -> None:
+        """Remove stored position mode intent for *instrument*.
+
+        Does NOT change the mode on the platform — only drops the stored
+        intent so the engine stops managing it.  Leverage intent is untouched.
+        """
+        store = await self._require_store()
+        await store.delete_adapter_config(self._position_mode_key(instrument))
+        await store.delete_adapter_config(
+            self._position_mode_policy_key(instrument, _POLICY_KNOB_ON_DRIFT)
+        )
+        await store.delete_adapter_config(
+            self._position_mode_policy_key(instrument, _POLICY_KNOB_AUTO_APPLY)
+        )
+
+    async def set_position_mode_for_coin(
+        self,
+        coin: str,
+        category: str,
+        mode: str | PositionMode,
+    ) -> None:
+        """Batch-switch position mode for all symbols of *coin* with no open positions.
+
+        Passes ``coin`` to ``switch_position_mode`` — Bybit applies the switch
+        to every symbol of the settle coin that has no open positions or
+        orders; newly listed symbols of that coin inherit the mode.
+
+        ``mode`` is the ``PositionMode`` enum or the raw strings ``"one_way"`` /
+        ``"hedge"``.
+
+        This does NOT persist per-symbol intent, so drift detection will not
+        apply to symbols switched this way.  Call ``set_position_mode`` per
+        symbol afterward if you want drift management.
+
+        Raises:
+            ValueError: ``mode`` is not a valid position mode string.
+            PlatformError: if the batch switch is rejected by Bybit.
+        """
+        mode = _coerce_position_mode(mode)
+        await self._run_request(
+            self._session.switch_position_mode,
+            category=category,
+            coin=coin,
+            mode=_POSITION_MODE_TO_INT[mode],
+        )
+
+    async def _resolve_position_idx(self, instrument: Instrument, side: OrderSide) -> int | None:
+        """Resolve the Bybit ``positionIdx`` for an order on *instrument*.
+
+        The stored position-mode intent is the source of truth (Section 6 /
+        PLAN_feat_bybit-position-mode): the mode this adapter put the platform
+        in is the mode orders must address.  Under hedge mode the order's
+        side picks the leg — Buy opens the long side (1), Sell the short (2);
+        under one-way mode every order carries 0.  ``None`` is returned when
+        the instrument is spot (no position mode), so no ``positionIdx`` is
+        attached at all.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+        if self._state_store is None:
+            return 0
+        raw = await self._state_store.get_adapter_config(
+            self._position_mode_key(instrument)
+        )
+        try:
+            mode = PositionMode(raw) if raw is not None else PositionMode.ONE_WAY
+        except ValueError:
+            logger.warning(
+                "Unrecognised stored position mode %r for %s — defaulting to one-way",
+                raw,
+                to_bybit_symbol(instrument),
+            )
+            mode = PositionMode.ONE_WAY
+        if mode is PositionMode.ONE_WAY:
+            return 0
+        # Hedge mode: the leg follows the order side.
+        return 1 if side == OrderSide.BUY else 2
+
     async def set_margin_mode(self, mode: MarginMode) -> None:
         """Set the account-wide margin mode on the platform.
 
@@ -566,6 +789,22 @@ class BybitAdapter(Adapter):
             )
         except Exception:
             logger.exception("Failed to read leverage policy for %s", instrument)
+            return None
+
+    async def _position_mode_policy_knob(self, instrument: Instrument, knob: str) -> str | None:
+        """Read one persisted position-mode behavior knob for *instrument*.
+
+        Unconfigured symbols return None so callers fall back to the module
+        default for that knob.
+        """
+        if self._state_store is None:
+            return None
+        try:
+            return await self._state_store.get_adapter_config(
+                self._position_mode_policy_key(instrument, knob)
+            )
+        except Exception:
+            logger.exception("Failed to read position mode policy for %s", instrument)
             return None
 
     async def _intent_leverage(self, instrument: Instrument) -> tuple[int, int]:
@@ -669,6 +908,65 @@ class BybitAdapter(Adapter):
                 "stored_sell": stored[1],
                 "platform_buy": platform[0],
                 "platform_sell": platform[1],
+                "action_taken": action,
+            },
+        )
+
+    async def _handle_position_mode_drift(
+        self,
+        instrument: Instrument,
+        stored: PositionMode,
+        platform: PositionMode,
+        *,
+        context: str,
+    ) -> None:
+        """Execute the configured ``on_drift`` behavior for a position mode mismatch."""
+        raw = await self._position_mode_policy_knob(instrument, _POLICY_KNOB_ON_DRIFT)
+        on_drift = raw if raw is not None else DEFAULT_ON_DRIFT
+
+        if on_drift == "reapply":
+            await self._apply_position_mode(instrument, stored)
+            await self._emit_position_mode_drift_event(instrument, stored, platform, "reapplied")
+            return
+
+        if on_drift == "notify":
+            await self._emit_position_mode_drift_event(instrument, stored, platform, "notified")
+            return
+
+        # on_drift == "halt"
+        await self._emit_position_mode_drift_event(instrument, stored, platform, "halted")
+        await self._enter_instrument_halt(
+            instrument,
+            reason="position_mode_drift",
+            detail=f"{context}: stored={stored.value} platform={platform.value}",
+        )
+
+    async def _emit_position_mode_drift_event(
+        self,
+        instrument: Instrument,
+        stored: PositionMode,
+        platform: PositionMode,
+        action: Literal["reapplied", "notified", "halted"],
+    ) -> None:
+        self._publish(
+            PositionModeDriftEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                instrument=instrument,
+                stored=stored,
+                platform=platform,
+                action_taken=action,
+            )
+        )
+        await self._write_leverage_audit(
+            event_type="bybit.position_mode.drift",
+            instrument=instrument,
+            payload={
+                "stored": stored.value,
+                "platform": platform.value,
                 "action_taken": action,
             },
         )
@@ -826,7 +1124,7 @@ class BybitAdapter(Adapter):
             )
 
     async def reconcile_user_intent(self) -> None:
-        """Reconcile stored leverage intent against the platform (§5.3).
+        """Reconcile stored leverage / position-mode intent (§5.3).
 
         Called by core during ``engine.reconcile()``.  For each instrument with
         a stored intent, the platform's current value is queried and compared;
@@ -835,41 +1133,76 @@ class BybitAdapter(Adapter):
         raise — it re-applies, notifies, or halts).  When the platform has
         recovered to the stored intent, any residual drift halt is cleared.
 
-        Margin mode is not reconciled — it is a static ``BybitConfig`` value
-        applied on connect, not per-symbol persisted intent.
+        Position mode is only reconcilable while the symbol has an open
+        position (``positionIdx`` is unreadable otherwise); symbols without
+        one are skipped.  Margin mode is not reconciled — it is a static
+        ``BybitConfig`` value applied on connect, not per-symbol intent.
         """
         if self._state_store is None:
             return
-        leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
-        if not leverage_rows:
-            return
         instruments = {to_bybit_symbol(i): i for i in self._instruments.values()}
 
-        leverage_by_symbol = _group_leverage_rows(leverage_rows)
+        # ---- Per-symbol leverage drift ----
+        leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
+        if leverage_rows:
+            leverage_by_symbol = _group_leverage_rows(leverage_rows)
+            for symbol, sides in leverage_by_symbol.items():
+                instrument = instruments.get(symbol)
+                if instrument is None:
+                    continue
+                if sides["buy"] is None or sides["sell"] is None:
+                    continue
+                stored = (int(sides["buy"]), int(sides["sell"]))
+                platform = await self.get_leverage(instrument)
+                if platform is None:
+                    continue
+                if platform == stored:
+                    await self._try_clear_recovered_halt(instrument)
+                    continue
+                try:
+                    await self._handle_leverage_drift(
+                        instrument,
+                        stored,
+                        platform,
+                        context="reconciliation",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Leverage drift handling failed for %s during reconcile",
+                        symbol,
+                    )
 
-        for symbol, sides in leverage_by_symbol.items():
+        # ---- Per-symbol position mode drift ----
+        position_mode_rows = await self._state_store.list_adapter_config(
+            _POSITION_MODE_KIND_PREFIX
+        )
+        for full_key, value in position_mode_rows.items():
+            symbol = full_key.removeprefix(_POSITION_MODE_KIND_PREFIX)
+            if "." in symbol:
+                continue  # policy knob rows (position_mode.policy.*)
             instrument = instruments.get(symbol)
             if instrument is None:
                 continue
-            if sides["buy"] is None or sides["sell"] is None:
+            try:
+                stored_mode = PositionMode(value)
+            except ValueError:
                 continue
-            stored = (int(sides["buy"]), int(sides["sell"]))
-            platform = await self.get_leverage(instrument)
-            if platform is None:
-                continue
-            if platform == stored:
+            platform_mode = await self.get_position_mode(instrument)
+            if platform_mode is None:
+                continue  # no open position — mode unreadable, skip
+            if platform_mode is stored_mode:
                 await self._try_clear_recovered_halt(instrument)
                 continue
             try:
-                await self._handle_leverage_drift(
+                await self._handle_position_mode_drift(
                     instrument,
-                    stored,
-                    platform,
+                    stored_mode,
+                    platform_mode,
                     context="reconciliation",
                 )
             except Exception:
                 logger.exception(
-                    "Leverage drift handling failed for %s during reconcile",
+                    "Position mode drift handling failed for %s during reconcile",
                     symbol,
                 )
 
@@ -1006,92 +1339,161 @@ class BybitAdapter(Adapter):
         Margin mode is not persisted intent — it is a static ``BybitConfig``
         value applied separately at connect.
 
-        Instruments with no stored intent are not touched — their platform
-        leverage is whatever it is.  For each symbol with stored intent, its
-        per-symbol ``auto_apply_on_connect`` policy decides whether it is
-        re-applied (default on; unconfigured symbols were never re-applied
-        because they have no stored intent to restore).
+        Instruments with no stored intent are not touched.  For each symbol
+        with stored leverage/position-mode intent, its per-symbol
+        ``auto_apply_on_connect`` policy decides whether it is re-applied
+        (default on).
         """
         if self._state_store is None:
             return
 
-        leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
-        if not leverage_rows:
-            return
-
         instruments = {to_bybit_symbol(i): i for i in self._instruments.values()}
-        leverage_by_symbol = _group_leverage_rows(leverage_rows)
 
-        for symbol, sides in leverage_by_symbol.items():
-            if sides["buy"] is None or sides["sell"] is None:
-                continue
-            buy_leverage = int(sides["buy"])
-            sell_leverage = int(sides["sell"])
-            instrument = instruments.get(symbol)
-            if instrument is None:
-                # Not listed / delisted — skip.  The stored intent is left in
-                # place so the symbol is re-managed if it is re-listed
-                # (Section 9.1); there is no Instrument to emit an event with.
-                logger.warning(
-                    "Skipping stored leverage reapply for unknown/delisted symbol %s",
-                    symbol,
-                )
-                continue
-            auto_apply_raw = await self._policy_knob(instrument, _POLICY_KNOB_AUTO_APPLY)
-            if auto_apply_raw is None:
-                auto_apply = DEFAULT_AUTO_APPLY_ON_CONNECT
-            else:
-                auto_apply = auto_apply_raw == "1"
-            if not auto_apply:
-                continue
-            try:
-                await self.set_leverage(
-                    instrument,
-                    buy_leverage=buy_leverage,
-                    sell_leverage=sell_leverage,
-                )
-                self._publish(
-                    LeverageAppliedEvent(
-                        event_id=_new_id(),
-                        timestamp=_utcnow(),
-                        adapter_name=self.platform_name,
-                        account_id=self.account_id,
-                        correlation_id=None,
-                        instrument=instrument,
+        # ---- Per-symbol leverage reapply ----
+        leverage_rows = await self._state_store.list_adapter_config(_LEVERAGE_KIND_PREFIX)
+        if leverage_rows:
+            leverage_by_symbol = _group_leverage_rows(leverage_rows)
+            for symbol, sides in leverage_by_symbol.items():
+                if sides["buy"] is None or sides["sell"] is None:
+                    continue
+                buy_leverage = int(sides["buy"])
+                sell_leverage = int(sides["sell"])
+                instrument = instruments.get(symbol)
+                if instrument is None:
+                    # Not listed / delisted — skip.  The stored intent is left in
+                    # place so the symbol is re-managed if it is re-listed
+                    # (Section 9.1); there is no Instrument to emit an event with.
+                    logger.warning(
+                        "Skipping stored leverage reapply for unknown/delisted symbol %s",
+                        symbol,
+                    )
+                    continue
+                auto_apply_raw = await self._policy_knob(instrument, _POLICY_KNOB_AUTO_APPLY)
+                if auto_apply_raw is None:
+                    auto_apply = DEFAULT_AUTO_APPLY_ON_CONNECT
+                else:
+                    auto_apply = auto_apply_raw == "1"
+                if not auto_apply:
+                    continue
+                try:
+                    await self.set_leverage(
+                        instrument,
                         buy_leverage=buy_leverage,
                         sell_leverage=sell_leverage,
                     )
+                    self._publish(
+                        LeverageAppliedEvent(
+                            event_id=_new_id(),
+                            timestamp=_utcnow(),
+                            adapter_name=self.platform_name,
+                            account_id=self.account_id,
+                            correlation_id=None,
+                            instrument=instrument,
+                            buy_leverage=buy_leverage,
+                            sell_leverage=sell_leverage,
+                        )
+                    )
+                    await self._write_leverage_audit(
+                        event_type="bybit.leverage.applied",
+                        instrument=instrument,
+                        payload={
+                            "buy_leverage": buy_leverage,
+                            "sell_leverage": sell_leverage,
+                        },
+                    )
+                except Exception as exc:
+                    self._publish(
+                        LeverageApplyFailedEvent(
+                            event_id=_new_id(),
+                            timestamp=_utcnow(),
+                            adapter_name=self.platform_name,
+                            account_id=self.account_id,
+                            correlation_id=None,
+                            instrument=instrument,
+                            buy_leverage=buy_leverage,
+                            sell_leverage=sell_leverage,
+                            reason=str(exc),
+                        )
+                    )
+                    await self._write_leverage_audit(
+                        event_type="bybit.leverage.apply_failed",
+                        instrument=instrument,
+                        payload={
+                            "buy_leverage": buy_leverage,
+                            "sell_leverage": sell_leverage,
+                            "reason": str(exc),
+                        },
+                    )
+
+        # ---- Per-symbol position mode reapply ----
+        position_mode_rows = await self._state_store.list_adapter_config(
+            _POSITION_MODE_KIND_PREFIX
+        )
+        for full_key, value in position_mode_rows.items():
+            symbol = full_key.removeprefix(_POSITION_MODE_KIND_PREFIX)
+            if "." in symbol:
+                continue  # policy knob rows (position_mode.policy.*)
+            instrument = instruments.get(symbol)
+            if instrument is None:
+                logger.warning(
+                    "Skipping stored position mode reapply for unknown/delisted symbol %s",
+                    symbol,
                 )
-                await self._write_leverage_audit(
-                    event_type="bybit.leverage.applied",
-                    instrument=instrument,
-                    payload={
-                        "buy_leverage": buy_leverage,
-                        "sell_leverage": sell_leverage,
-                    },
+                continue
+            try:
+                mode = PositionMode(value)
+            except ValueError:
+                logger.warning(
+                    "Unrecognised stored position mode %r for %s — skipping",
+                    value,
+                    symbol,
                 )
-            except Exception as exc:
+                continue
+            auto_apply_raw = position_mode_rows.get(
+                f"position_mode.policy.{_POLICY_KNOB_AUTO_APPLY}:{symbol}"
+            )
+            auto_apply = (
+                DEFAULT_AUTO_APPLY_ON_CONNECT
+                if auto_apply_raw is None
+                else auto_apply_raw == "1"
+            )
+            if not auto_apply:
+                continue
+            try:
+                await self._apply_position_mode(instrument, mode)
                 self._publish(
-                    LeverageApplyFailedEvent(
+                    PositionModeAppliedEvent(
                         event_id=_new_id(),
                         timestamp=_utcnow(),
                         adapter_name=self.platform_name,
                         account_id=self.account_id,
                         correlation_id=None,
                         instrument=instrument,
-                        buy_leverage=buy_leverage,
-                        sell_leverage=sell_leverage,
+                        mode=mode,
+                    )
+                )
+                await self._write_leverage_audit(
+                    event_type="bybit.position_mode.applied",
+                    instrument=instrument,
+                    payload={"mode": mode.value},
+                )
+            except Exception as exc:
+                self._publish(
+                    PositionModeApplyFailedEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        instrument=instrument,
+                        mode=mode,
                         reason=str(exc),
                     )
                 )
                 await self._write_leverage_audit(
-                    event_type="bybit.leverage.apply_failed",
+                    event_type="bybit.position_mode.apply_failed",
                     instrument=instrument,
-                    payload={
-                        "buy_leverage": buy_leverage,
-                        "sell_leverage": sell_leverage,
-                        "reason": str(exc),
-                    },
+                    payload={"mode": mode.value, "reason": str(exc)},
                 )
 
     async def disconnect(self) -> None:
@@ -1407,11 +1809,13 @@ class BybitAdapter(Adapter):
         category = self._instrument_to_category(order.instrument)
         symbol = to_bybit_symbol(order.instrument)
         client_order_id = order.client_order_id or _new_id()
+        position_idx = await self._resolve_position_idx(order.instrument, order.side)
         payload = build_place_order_payload(
             order,
             category=category,
             symbol=symbol,
             client_order_id=client_order_id,
+            position_idx=position_idx,
         )
         try:
             await self._run_request(self._session.place_order, **payload)

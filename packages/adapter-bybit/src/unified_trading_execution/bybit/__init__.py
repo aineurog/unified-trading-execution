@@ -10,6 +10,6 @@ from __future__ import annotations
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.margin import MarginMode
+from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 
-__all__ = ["BybitAdapter", "BybitConfig", "MarginMode"]
+__all__ = ["BybitAdapter", "BybitConfig", "MarginMode", "PositionMode"]

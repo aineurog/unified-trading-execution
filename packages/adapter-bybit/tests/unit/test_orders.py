@@ -622,6 +622,7 @@ class TestPlaceOrder:
             orderType="Market",
             qty="0.001",
             orderLinkId="c1",
+            positionIdx=0,
         )
         mock_pybit_http.get_open_orders.assert_called_with(
             category="inverse",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.margin import MarginMode
+from unified_trading_execution.bybit.enums import MarginMode
 
 
 class TestMarginMode:
