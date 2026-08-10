@@ -15,7 +15,7 @@ from pybit.exceptions import FailedRequestError
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.margin import MarginMode
+from unified_trading_execution.bybit.enums import MarginMode
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass

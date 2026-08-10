@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from unified_trading_execution.bybit.margin import MarginMode
+from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 from unified_trading_execution.events import Event
 from unified_trading_execution.types.instrument import Instrument
 
@@ -56,3 +56,30 @@ class MarginModeChangedEvent(Event):
 
     previous: MarginMode | None
     current: MarginMode
+
+
+@dataclass(frozen=True, slots=True)
+class PositionModeAppliedEvent(Event):
+    """Stored position mode intent was successfully applied to the platform."""
+
+    instrument: Instrument
+    mode: PositionMode
+
+
+@dataclass(frozen=True, slots=True)
+class PositionModeApplyFailedEvent(Event):
+    """Stored position mode intent could not be applied on connect."""
+
+    instrument: Instrument
+    mode: PositionMode
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class PositionModeDriftEvent(Event):
+    """Platform position mode differs from stored intent."""
+
+    instrument: Instrument
+    stored: PositionMode
+    platform: PositionMode
+    action_taken: Literal["reapplied", "notified", "halted"]

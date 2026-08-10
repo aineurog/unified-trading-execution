@@ -86,6 +86,7 @@ def build_place_order_payload(
     category: str,
     symbol: str,
     client_order_id: str,
+    position_idx: int | None = None,
 ) -> dict[str, Any]:
     """Translate a validated ``UnifiedOrder`` into Bybit ``place_order`` params.
 
@@ -101,6 +102,12 @@ def build_place_order_payload(
         Bybit symbol string (e.g. ``"BTCUSDT"``).
     client_order_id :
         The non-empty client order id to send as ``orderLinkId``.
+    position_idx :
+        Bybit ``positionIdx``: ``0`` = one-way, ``1`` = hedge buy side,
+        ``2`` = hedge sell side.  Required by the platform under hedge mode;
+        the adapter resolves it from the symbol's stored position-mode intent
+        so ``UnifiedOrder`` needs no position-side field.  ``None`` (or ``0``)
+        is fine for one-way symbols.
 
     Raises
     ------
@@ -154,6 +161,9 @@ def build_place_order_payload(
 
     if order.reduce_only and category != "spot":
         payload["reduceOnly"] = "true"
+
+    if category != "spot" and position_idx is not None:
+        payload["positionIdx"] = position_idx
 
     _attach_tp_sl(order, payload, category=category)
 

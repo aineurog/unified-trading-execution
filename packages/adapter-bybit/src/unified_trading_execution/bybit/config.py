@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from unified_trading_execution.bybit.margin import MarginMode
+from unified_trading_execution.bybit.enums import MarginMode
 
 DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS: float = 86400.0
 
