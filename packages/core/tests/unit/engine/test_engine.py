@@ -29,6 +29,7 @@ from unified_trading_execution.events import (
     OrderCancelledEvent,
     OrderModifiedEvent,
     OrderPlacedEvent,
+    ReconciliationCompleteEvent,
 )
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import (
@@ -623,6 +624,83 @@ class TestReconcile:
         await engine.ashutdown()
         with pytest.raises(EngineShutdownError):
             await engine.reconcile()
+
+
+class TestReconcileOnReconnect:
+    """Section 6.1 / 9.4 — a reconnect automatically triggers a reconcile."""
+
+    async def test_initial_connect_does_not_reconcile(self, mock_adapter, event_bus):
+        """The first connect is not a reconnect — no automatic reconcile."""
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+        )
+        completed: list[ReconciliationCompleteEvent] = []
+        event_bus.subscribe(ReconciliationCompleteEvent, completed.append)
+        await eng.connect()
+        assert eng._last_connected is True
+        assert eng._reconcile_task is None  # nothing scheduled
+        assert completed == []
+        await eng.ashutdown()
+
+    async def test_disconnect_then_reconnect_triggers_reconcile(
+        self, engine, mock_adapter, event_bus
+    ):
+        """A False -> True transition (reconnect) schedules a reconcile."""
+        completed: list[ReconciliationCompleteEvent] = []
+        event_bus.subscribe(ReconciliationCompleteEvent, completed.append)
+
+        await mock_adapter.disconnect()
+        assert engine._last_connected is False
+
+        await mock_adapter.connect()
+        assert engine._reconcile_task is not None
+        await engine._reconcile_task  # let the scheduled reconcile finish
+        assert completed, "reconcile should have run on reconnect"
+
+    async def test_reconnect_does_not_stack_reconciles(self, engine, mock_adapter, monkeypatch):
+        """A second reconnect while a reconcile is in flight is not stacked."""
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        original_reconcile = engine.reconcile
+
+        async def _slow_reconcile():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()  # hold the first reconcile open
+            return await original_reconcile()
+
+        monkeypatch.setattr(engine, "reconcile", _slow_reconcile)
+
+        await mock_adapter.disconnect()
+        await mock_adapter.connect()
+        await started.wait()  # first reconcile is now in flight
+
+        await mock_adapter.disconnect()
+        await mock_adapter.connect()
+        assert engine._reconcile_task is not None
+
+        release.set()
+        await engine._reconcile_task
+        assert calls == 1  # second reconnect did not stack a second reconcile
+
+    async def test_reconnect_after_shutdown_is_ignored(self, mock_adapter, event_bus):
+        """Reconnect events arriving after shutdown schedule nothing."""
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+        )
+        await eng.connect()
+        await eng.ashutdown()
+        # Reconnect fires after teardown — must be ignored, not crash.
+        await mock_adapter.connect()
+        assert eng._reconcile_task is None
 
 
 class TestReconcileMismatchCases:
