@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Union
+from typing import Any
 
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument
@@ -37,7 +37,7 @@ class UnifiedOrder:
     instrument: Instrument
     order_type: OrderType
     side: OrderSide
-    quantity: Union[Decimal, int, float, str]
+    quantity: Decimal
     time_in_force: TimeInForce
     client_order_id: str | None = None
     price: Decimal | None = None  # LIMIT, STOP_LIMIT
@@ -48,12 +48,15 @@ class UnifiedOrder:
     stop_loss: TpSlAttachment | None = None
 
     def __post_init__(self) -> None:
-        # Coerce numeric inputs (int/float/str) to Decimal.
-        self.quantity = as_decimal(self.quantity)
+        # Coerce numeric inputs (int/float/str) to Decimal on construction
+        # so users can pass those types without pre-converting.  Callers that
+        # pass a non-Decimal get a mypy arg-type warning — that's expected;
+        # the coercion runs before any validation or downstream code sees it.
+        object.__setattr__(self, "quantity", as_decimal(self.quantity))
         if self.price is not None:
-            self.price = as_decimal(self.price)
+            object.__setattr__(self, "price", as_decimal(self.price))
         if self.stop_price is not None:
-            self.stop_price = as_decimal(self.stop_price)
+            object.__setattr__(self, "stop_price", as_decimal(self.stop_price))
         # Price required for LIMIT and STOP_LIMIT
         if self.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
             if self.price is None:
