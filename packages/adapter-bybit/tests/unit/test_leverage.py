@@ -166,18 +166,10 @@ class TestSetLeverage:
             auto_apply_on_connect=False,
         )
 
-        assert await store.get_adapter_config(
-            "leverage.policy.on_drift:BTCUSDT"
-        ) == "halt"
-        assert await store.get_adapter_config(
-            "leverage.policy.strict_check:BTCUSDT"
-        ) == "1"
-        assert await store.get_adapter_config(
-            "leverage.policy.block_on_open:BTCUSDT"
-        ) == "0"
-        assert await store.get_adapter_config(
-            "leverage.policy.auto_apply:BTCUSDT"
-        ) == "0"
+        assert await store.get_adapter_config("leverage.policy.on_drift:BTCUSDT") == "halt"
+        assert await store.get_adapter_config("leverage.policy.strict_check:BTCUSDT") == "1"
+        assert await store.get_adapter_config("leverage.policy.block_on_open:BTCUSDT") == "0"
+        assert await store.get_adapter_config("leverage.policy.auto_apply:BTCUSDT") == "0"
 
     async def test_policy_resolution_is_per_symbol(
         self,

@@ -211,9 +211,7 @@ class TestReapplyStoredIntent:
 
             await adapter.connect()
 
-            mock_pybit_http.set_margin_mode.assert_called_once_with(
-                setMarginMode="ISOLATED_MARGIN"
-            )
+            mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="ISOLATED_MARGIN")
             mock_pybit_http.set_leverage.assert_called_once_with(
                 category="linear",
                 symbol="BTCUSDT",
@@ -258,9 +256,7 @@ class TestReapplyStoredIntent:
 
             await adapter.connect()
 
-            mock_pybit_http.set_margin_mode.assert_called_once_with(
-                setMarginMode="ISOLATED_MARGIN"
-            )
+            mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="ISOLATED_MARGIN")
             assert collector.of_type(MarginModeChangedEvent) == []
             await adapter.disconnect()
         finally:
