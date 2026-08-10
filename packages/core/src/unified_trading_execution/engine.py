@@ -52,6 +52,7 @@ from unified_trading_execution.state import (
     StateStore,
     reconcile,
 )
+from unified_trading_execution.state.store import SQLiteStateStore, default_state_store_path
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -80,13 +81,19 @@ class Engine:
 
         engine = Engine(
             adapter=BybitAdapter(...),
-            state_store=SQLiteStateStore("path/to/db"),
+            state_store=SQLiteStateStore("path/to/db"),  # optional — see below
             get_reference_price=my_price_fn,  # optional
             event_bus=EventBus(),             # optional (auto-created)
             risk_config=RiskConfig(...),      # optional (sensible defaults)
             halt_config=HaltConfig(...),      # optional (auto-halt enabled)
         )
         await engine.connect()
+
+    ``state_store`` is optional (Section 6.2): when omitted, the engine creates
+    a ``SQLiteStateStore`` at the auto-derived, user-visible default location
+    ``./<project>_data/<platform>_<account>.db`` (relative to the process
+    working directory).  The resolved path is always readable at runtime via
+    ``engine.state_store.path``.
 
     Usage::
 
@@ -98,7 +105,7 @@ class Engine:
     def __init__(
         self,
         adapter: Adapter,
-        state_store: StateStore,
+        state_store: StateStore | None = None,
         *,
         get_reference_price: Callable[[Instrument], Decimal | None] | None = None,
         event_bus: EventBus | None = None,
@@ -106,13 +113,27 @@ class Engine:
         halt_config: HaltConfig | None = None,
     ) -> None:
         self._adapter = adapter
-        self._state_store = state_store
+        # Section 6.2: storage location is optional with a sensible default —
+        # when the user supplies no store, one is created at the auto-derived
+        # ``./<project>_data/<platform>_<account>.db`` location.  Never hidden,
+        # never hardcoded; readable via ``engine.state_store.path``.
+        self._state_store = state_store or SQLiteStateStore(
+            default_state_store_path(
+                adapter.platform_name,
+                adapter.account_id,
+            )
+        )
         self._get_reference_price = get_reference_price
         self._event_bus = event_bus or EventBus()
         self._risk_config = risk_config or RiskConfig()
         self._halt_machine = HaltStateMachine(halt_config)
         self._shutdown = False
+        # Give the adapter access to core-managed resources (halt machine,
+        # event bus, and the automatically-created state store) so adapters
+        # that persist intent (leverage/margin-mode) can use the shared store.
+        self._adapter.attach_state_store(self._state_store)
         self._adapter.attach_halt_machine(self._halt_machine)
+        self._adapter.attach_event_bus(self._event_bus)
 
         # Mutable cached state
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
@@ -478,11 +499,7 @@ class Engine:
         # cleaned up. The order record in audit_events remains immutable.
         for client_order_id in result.orphan_orders_in_local:
             try:
-                conn = self._state_store.conn
-                await conn.execute(
-                    "DELETE FROM orders WHERE client_order_id = ?",
-                    (client_order_id,),
-                )
+                await self._state_store.delete_orders_by_client_ids([client_order_id])
                 logger.info(
                     "Removed orphan order %s from local mirror",
                     client_order_id,
@@ -497,12 +514,7 @@ class Engine:
         if result.partial_fill_discrepancies:
             try:
                 platform_fills = await self._adapter.fetch_fills()
-                conn = self._state_store.conn
-                for cid in platform_fills:
-                    await conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ?",
-                        (cid,),
-                    )
+                await self._state_store.delete_fills_by_client_ids(list(platform_fills))
                 all_fills = [fill for fills in platform_fills.values() for fill in fills]
                 for fill in all_fills:
                     await self._state_store.upsert_fill(fill)

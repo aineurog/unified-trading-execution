@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -135,6 +136,38 @@ class TestSQLiteStoreLifecycle:
         s = SQLiteStateStore(":memory:")
         with pytest.raises(RuntimeError, match="not initialised"):
             _ = s.conn
+
+
+# ============================================================
+# SQLiteStateStore — default location (Section 6.2)
+# ============================================================
+
+
+class TestDefaultStateStorePath:
+    def test_encodes_project_dir_platform_and_account(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        from unified_trading_execution.state.store import default_state_store_path
+
+        path = default_state_store_path("bybit", "acct123")
+        project = tmp_path.name
+        assert os.path.join(f"./{project}_data", "bybit_acct123.db") == path
+
+    def test_slugs_unsafe_identifiers(self, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        from unified_trading_execution.state.store import default_state_store_path
+
+        path = default_state_store_path("Bybit Pro!", "Acct/1")
+        assert path.endswith("bybit_pro_acct_1.db")
+        assert " " not in path
+        assert path.endswith(".db")
+
+    @pytest.mark.asyncio
+    async def test_initialize_creates_parent_dir(self, tmp_path):
+        target = str(tmp_path / "nested" / "dir" / "store.db")
+        s = SQLiteStateStore(target)
+        await s.initialize()
+        assert (tmp_path / "nested" / "dir" / "store.db").exists()
+        await s.close()
 
 
 # ============================================================

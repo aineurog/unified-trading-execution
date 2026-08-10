@@ -15,7 +15,7 @@ from pybit.exceptions import FailedRequestError
 
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
-from unified_trading_execution.bybit.margin import LeverageConfig
+from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass
@@ -124,7 +124,7 @@ async def _make_adapter(
     *,
     on_drift: Literal["reapply", "notify", "halt"] = "reapply",
     seed_leverage: str | None = None,
-    seed_margin: str | None = None,
+    margin_mode: MarginMode = MarginMode.CROSS,
 ) -> tuple[BybitAdapter, SQLiteStateStore]:
     store = SQLiteStateStore(":memory:")
     await store.initialize()
@@ -132,14 +132,17 @@ async def _make_adapter(
         api_key=bybit_config.api_key,
         api_secret=bybit_config.api_secret,
         testnet=bybit_config.testnet,
-        leverage=LeverageConfig(on_drift=on_drift),
+        margin_mode=margin_mode,
     )
     adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
+    await store.set_adapter_config(
+        "leverage.policy.on_drift:BTCUSDT",
+        on_drift,
+    )
     if seed_leverage is not None:
-        await store.set_adapter_config("leverage.BTCUSDT", seed_leverage)
-    if seed_margin is not None:
-        await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
+        await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     return adapter, store
 
 
@@ -166,7 +169,8 @@ class TestReapplyAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.applied"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["leverage"] == 10
+            assert matches[0].payload["buy_leverage"] == 10
+            assert matches[0].payload["sell_leverage"] == 10
             assert matches[0].adapter_name == "bybit"
         finally:
             await adapter.disconnect()
@@ -180,9 +184,10 @@ class TestReapplyAuditTrail:
         adapter, store = await _make_adapter(
             bybit_config,
             seed_leverage="20",
-            seed_margin="isolated",
+            margin_mode=MarginMode.ISOLATED,
         )
         try:
+            # Platform is CROSS; configured mode is ISOLATED → change applied.
             mock_pybit_http.get_account_info.return_value = (
                 {"result": {"marginMode": "REGULAR_MARGIN"}},
                 None,
@@ -198,9 +203,9 @@ class TestReapplyAuditTrail:
             events = await store.query_audit_events()
             matches = [e for e in events if e.event_type == "bybit.margin_mode.changed"]
             assert len(matches) == 1
-            assert matches[0].payload["symbol"] == "BTCUSDT"
             assert matches[0].payload["current"] == "isolated"
-            assert matches[0].payload["leverage"] == 20
+            assert matches[0].payload["previous"] == "cross"
+            assert matches[0].payload["context"] == "connect"
         finally:
             await adapter.disconnect()
             await store.close()
@@ -228,7 +233,8 @@ class TestReapplyAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.apply_failed"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["leverage"] == 10
+            assert matches[0].payload["buy_leverage"] == 10
+            assert matches[0].payload["sell_leverage"] == 10
             reason = matches[0].payload["reason"]
             assert isinstance(reason, str)
             assert "Invalid leverage" in reason
@@ -253,8 +259,10 @@ class TestDriftAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.drift"]
             assert len(matches) == 1
             assert matches[0].payload["symbol"] == "BTCUSDT"
-            assert matches[0].payload["stored_leverage"] == 10
-            assert matches[0].payload["platform_leverage"] == 50
+            assert matches[0].payload["stored_buy"] == 10
+            assert matches[0].payload["stored_sell"] == 10
+            assert matches[0].payload["platform_buy"] == 50
+            assert matches[0].payload["platform_sell"] == 50
             assert matches[0].payload["action_taken"] == "notified"
         finally:
             await store.close()
@@ -279,39 +287,6 @@ class TestDriftAuditTrail:
             matches = [e for e in events if e.event_type == "bybit.leverage.drift"]
             assert len(matches) == 1
             assert matches[0].payload["action_taken"] == "reapplied"
-        finally:
-            await store.close()
-
-    async def test_margin_mode_drift_reapply_written_to_audit(
-        self,
-        bybit_config: BybitConfig,
-        mock_pybit_http: MagicMock,
-    ) -> None:
-        adapter, store = await _make_adapter(
-            bybit_config,
-            seed_leverage="10",
-            seed_margin="isolated",
-        )
-        try:
-            # Platform leverage matches stored intent; account-wide marginMode
-            # is CROSS while stored intent is ISOLATED → drift, reapply.
-            mock_pybit_http.get_positions.return_value = _position(leverage="10")
-            mock_pybit_http.get_account_info.return_value = (
-                {"result": {"marginMode": "REGULAR_MARGIN"}},
-                None,
-                {},
-            )
-            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
-            mock_pybit_http.set_margin_mode.return_value = _ok()
-            mock_pybit_http.set_leverage.return_value = _ok()
-
-            await adapter.reconcile_user_intent()
-
-            events = await store.query_audit_events()
-            matches = [e for e in events if e.event_type == "bybit.margin_mode.changed"]
-            assert len(matches) == 1
-            assert matches[0].payload["current"] == "isolated"
-            assert matches[0].payload["previous"] == "cross"
         finally:
             await store.close()
 

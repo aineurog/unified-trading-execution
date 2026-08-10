@@ -21,7 +21,8 @@ class LeverageAppliedEvent(Event):
     """Stored leverage intent was successfully applied to the platform."""
 
     instrument: Instrument
-    leverage: int
+    buy_leverage: int
+    sell_leverage: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +30,8 @@ class LeverageApplyFailedEvent(Event):
     """Stored leverage intent could not be applied to the platform."""
 
     instrument: Instrument
-    leverage: int
+    buy_leverage: int
+    sell_leverage: int
     reason: str
 
 
@@ -38,15 +40,19 @@ class LeverageDriftEvent(Event):
     """Platform leverage differs from stored intent."""
 
     instrument: Instrument
-    stored_leverage: int
-    platform_leverage: int
+    stored_buy: int
+    stored_sell: int
+    platform_buy: int
+    platform_sell: int
     action_taken: Literal["reapplied", "notified", "halted"]
 
 
 @dataclass(frozen=True, slots=True)
 class MarginModeChangedEvent(Event):
-    """Margin mode was changed for an instrument."""
+    """Account-wide margin mode was changed.
 
-    instrument: Instrument
+    Bybit UTA margin mode is account-wide — no instrument field.
+    """
+
     previous: MarginMode | None
     current: MarginMode

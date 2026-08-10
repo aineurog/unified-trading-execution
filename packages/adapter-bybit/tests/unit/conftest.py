@@ -35,6 +35,11 @@ def mock_pybit_http():
             None,
             {},
         )
+        mock_session.set_margin_mode.return_value = (
+            {"retCode": 0, "retMsg": "OK", "result": {}},
+            None,
+            {},
+        )
         mock_cls.return_value = mock_session
         yield mock_session
 

@@ -10,8 +10,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from typing import TYPE_CHECKING
 
+from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
@@ -23,6 +24,9 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+if TYPE_CHECKING:
+    from unified_trading_execution.state import StateStore
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +193,26 @@ class Adapter(ABC):
         Adapters that enforce adapter-owned user intent (e.g. Bybit leverage
         drift) override this to store the reference so they can enter
         instrument-scoped halts directly. Default no-op.
+        """
+        return None
+
+    def attach_event_bus(self, event_bus: EventBus) -> None:
+        """Let core share its EventBus with the adapter.
+
+        The engine owns the single EventBus and hands it to the adapter via
+        this hook so the adapter can publish translated events (fills,
+        position/balance updates) without ever constructing a bus itself.
+        Default no-op — adapters that publish events override this to store
+        the reference.
+        """
+        return None
+
+    def attach_state_store(self, state_store: StateStore) -> None:
+        """Optional: provide the shared StateStore to the adapter.
+
+        Adapters that persist adapter-owned intent (leverage/margin-mode)
+        may use this hook to store a reference to the engine-managed StateStore.
+        Default no-op so adapters that do not need the store are unaffected.
         """
         return None
 

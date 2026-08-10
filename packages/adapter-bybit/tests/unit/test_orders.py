@@ -596,6 +596,11 @@ class TestPlaceOrder:
             None,
             {},
         )
+        mock_pybit_http.get_positions.return_value = (
+            {"retCode": 0, "result": {"list": []}},
+            None,
+            {},
+        )
         mock_pybit_http.get_open_orders.return_value = (
             {
                 "retCode": 0,

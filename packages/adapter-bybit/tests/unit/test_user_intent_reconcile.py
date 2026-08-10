@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.events import LeverageDriftEvent
-from unified_trading_execution.bybit.margin import LeverageConfig
 from unified_trading_execution.events import EventBus, HaltClearedEvent, HaltEnteredEvent
 from unified_trading_execution.state.halt import HaltConfig, HaltStateMachine
 from unified_trading_execution.state.store import SQLiteStateStore
@@ -121,7 +120,6 @@ async def _make_adapter(
     on_drift: Literal["reapply", "notify", "halt"] = "reapply",
     auto_halt_enabled: bool = True,
     seed_leverage: str | None = None,
-    seed_margin: str | None = None,
 ) -> tuple[BybitAdapter, SQLiteStateStore, HaltStateMachine, _Collector]:
     store = SQLiteStateStore(":memory:")
     await store.initialize()
@@ -130,16 +128,18 @@ async def _make_adapter(
         testnet=True,
         api_key="k",
         api_secret="s",
-        leverage=LeverageConfig(on_drift=on_drift),
     )
     adapter = BybitAdapter(config, event_bus=bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _futures_instrument()}
     halt_machine = HaltStateMachine(HaltConfig(auto_halt_enabled=auto_halt_enabled))
     adapter.attach_halt_machine(halt_machine)
+    await store.set_adapter_config(
+        "leverage.policy.on_drift:BTCUSDT",
+        on_drift,
+    )
     if seed_leverage is not None:
-        await store.set_adapter_config("leverage.BTCUSDT", seed_leverage)
-    if seed_margin is not None:
-        await store.set_adapter_config("margin_mode.BTCUSDT", seed_margin)
+        await store.set_adapter_config("leverage.buy:BTCUSDT", seed_leverage)
+        await store.set_adapter_config("leverage.sell:BTCUSDT", seed_leverage)
     return adapter, store, halt_machine, _Collector(bus)
 
 
@@ -175,8 +175,10 @@ class TestReconcileLeverageDrift:
             drift = collector.of_type(LeverageDriftEvent)
             assert len(drift) == 1
             assert drift[0].action_taken == "reapplied"
-            assert drift[0].stored_leverage == 10
-            assert drift[0].platform_leverage == 50
+            assert drift[0].stored_buy == 10
+            assert drift[0].stored_sell == 10
+            assert drift[0].platform_buy == 50
+            assert drift[0].platform_sell == 50
         finally:
             await store.close()
 
@@ -238,32 +240,6 @@ class TestReconcileLeverageDrift:
             cleared = collector.of_type(HaltClearedEvent)
             assert len(cleared) == 1
             assert cleared[0].scope == "instrument"
-        finally:
-            await store.close()
-
-
-class TestReconcileMarginModeDrift:
-    async def test_margin_mode_drift_reapplies(
-        self,
-        mock_pybit_http: MagicMock,
-    ) -> None:
-        adapter, store, _, _ = await _make_adapter(seed_leverage="20", seed_margin="isolated")
-        try:
-            # Platform reports CROSS (account-wide marginMode) while the stored
-            # intent is ISOLATED → reapply should set the account to isolated.
-            mock_pybit_http.get_account_info.return_value = (
-                {"result": {"marginMode": "REGULAR_MARGIN"}},
-                None,
-                {},
-            )
-            mock_pybit_http.get_positions.return_value = _position(leverage="20")
-            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
-            mock_pybit_http.set_margin_mode.return_value = _ok()
-            mock_pybit_http.set_leverage.return_value = _ok()
-            await adapter.reconcile_user_intent()
-            mock_pybit_http.set_margin_mode.assert_called_once_with(
-                setMarginMode="ISOLATED_MARGIN",
-            )
         finally:
             await store.close()
 

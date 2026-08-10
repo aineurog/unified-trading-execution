@@ -27,6 +27,15 @@ class LeverageExceedsMaxError(UteError):
     """Requested leverage exceeds the platform's maximum for this instrument."""
 
 
+class AsymmetricLeverageError(UteError):
+    """Asymmetric leverage (buy != sell) was requested but is not supported.
+
+    Bybit only permits ``buyLeverage != sellLeverage`` under hedge mode, which
+    v1 does not implement.  Orders are rejected upfront rather than relying on
+    the platform to reject them mid-flight.
+    """
+
+
 class LeverageNotModifiedError(PlatformError):
     """Leverage is already at the requested value — an idempotent no-op (110043)."""
 

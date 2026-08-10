@@ -21,7 +21,7 @@ from unified_trading_execution.bybit.events import (
     LeverageApplyFailedEvent,
     MarginModeChangedEvent,
 )
-from unified_trading_execution.bybit.margin import LeverageConfig, MarginMode
+from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.types.enums import AssetClass
@@ -141,7 +141,6 @@ async def reapply_adapter(
         api_key=bybit_config.api_key,
         api_secret=bybit_config.api_secret,
         testnet=bybit_config.testnet,
-        leverage=LeverageConfig(),
     )
     adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
     adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
@@ -157,7 +156,8 @@ class TestReapplyStoredIntent:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_leverage.return_value = _ok()
@@ -172,38 +172,99 @@ class TestReapplyStoredIntent:
         )
         applied = collector.of_type(LeverageAppliedEvent)
         assert len(applied) == 1
-        assert applied[0].leverage == 10
+        assert applied[0].buy_leverage == 10
+        assert applied[0].sell_leverage == 10
         assert collector.of_type(LeverageApplyFailedEvent) == []
         await adapter.disconnect()
 
-    async def test_reapply_margin_mode_and_leverage_on_connect(
+    async def test_apply_configured_margin_mode_and_leverage_on_connect(
         self,
-        reapply_adapter: tuple[BybitAdapter, SQLiteStateStore, _Collector],
+        bybit_config: BybitConfig,
+        event_bus: EventBus,
         mock_pybit_http: MagicMock,
     ) -> None:
-        adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "20")
-        await store.set_adapter_config("margin_mode.BTCUSDT", "isolated")
-        mock_pybit_http.get_positions.return_value = _flat_position()
-        mock_pybit_http.set_margin_mode.return_value = _ok()
-        mock_pybit_http.set_leverage.return_value = _ok()
-        mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
+        """connect() applies the config margin mode and reapplies stored leverage."""
+        store = SQLiteStateStore(":memory:")
+        await store.initialize()
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "20")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "20")
+        try:
+            config = BybitConfig(
+                api_key=bybit_config.api_key,
+                api_secret=bybit_config.api_secret,
+                testnet=bybit_config.testnet,
+                margin_mode=MarginMode.ISOLATED,
+            )
+            adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
+            adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}
+            collector = _Collector(event_bus)
+            # Platform is CROSS; configured mode is ISOLATED → change applied.
+            mock_pybit_http.get_account_info.return_value = (
+                {"result": {"marginMode": "REGULAR_MARGIN"}},
+                None,
+                {},
+            )
+            mock_pybit_http.get_positions.return_value = _flat_position()
+            mock_pybit_http.set_margin_mode.return_value = _ok()
+            mock_pybit_http.set_leverage.return_value = _ok()
+            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
 
-        await adapter.connect()
+            await adapter.connect()
 
-        mock_pybit_http.set_margin_mode.assert_called_once_with(setMarginMode="ISOLATED_MARGIN")
-        mock_pybit_http.set_leverage.assert_called_once_with(
-            category="linear",
-            symbol="BTCUSDT",
-            buyLeverage="20",
-            sellLeverage="20",
-        )
-        assert len(collector.of_type(LeverageAppliedEvent)) == 1
-        changed = collector.of_type(MarginModeChangedEvent)
-        assert len(changed) == 1
-        assert changed[0].current is MarginMode.ISOLATED
-        assert collector.of_type(LeverageApplyFailedEvent) == []
-        await adapter.disconnect()
+            mock_pybit_http.set_margin_mode.assert_called_once_with(
+                setMarginMode="ISOLATED_MARGIN"
+            )
+            mock_pybit_http.set_leverage.assert_called_once_with(
+                category="linear",
+                symbol="BTCUSDT",
+                buyLeverage="20",
+                sellLeverage="20",
+            )
+            assert len(collector.of_type(LeverageAppliedEvent)) == 1
+            changed = collector.of_type(MarginModeChangedEvent)
+            assert len(changed) == 1
+            assert changed[0].current is MarginMode.ISOLATED
+            assert changed[0].previous is MarginMode.CROSS
+            assert collector.of_type(LeverageApplyFailedEvent) == []
+            await adapter.disconnect()
+        finally:
+            await store.close()
+
+    async def test_apply_configured_margin_mode_is_noop_when_already_set(
+        self,
+        bybit_config: BybitConfig,
+        event_bus: EventBus,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        """When the platform already matches the config mode, no event is emitted."""
+        store = SQLiteStateStore(":memory:")
+        await store.initialize()
+        try:
+            config = BybitConfig(
+                api_key=bybit_config.api_key,
+                api_secret=bybit_config.api_secret,
+                testnet=bybit_config.testnet,
+                margin_mode=MarginMode.ISOLATED,
+            )
+            adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
+            collector = _Collector(event_bus)
+            # Platform already ISOLATED_MARGIN — same as configured → no-op.
+            mock_pybit_http.get_account_info.return_value = (
+                {"result": {"marginMode": "ISOLATED_MARGIN"}},
+                None,
+                {},
+            )
+            mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
+
+            await adapter.connect()
+
+            mock_pybit_http.set_margin_mode.assert_called_once_with(
+                setMarginMode="ISOLATED_MARGIN"
+            )
+            assert collector.of_type(MarginModeChangedEvent) == []
+            await adapter.disconnect()
+        finally:
+            await store.close()
 
     async def test_reapply_failure_emits_event_without_crashing(
         self,
@@ -211,7 +272,8 @@ class TestReapplyStoredIntent:
         mock_pybit_http: MagicMock,
     ) -> None:
         adapter, store, collector = reapply_adapter
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         mock_pybit_http.get_instruments_info.side_effect = _registry_refresh_side_effect
         mock_pybit_http.get_positions.return_value = _flat_position()
         mock_pybit_http.set_leverage.side_effect = FailedRequestError(
@@ -228,7 +290,8 @@ class TestReapplyStoredIntent:
         assert adapter.is_connected is True
         failed = collector.of_type(LeverageApplyFailedEvent)
         assert len(failed) == 1
-        assert failed[0].leverage == 10
+        assert failed[0].buy_leverage == 10
+        assert failed[0].sell_leverage == 10
         assert "Invalid leverage" in failed[0].reason
         assert collector.of_type(LeverageAppliedEvent) == []
         await adapter.disconnect()
@@ -240,7 +303,8 @@ class TestReapplyStoredIntent:
     ) -> None:
         adapter, store, collector = reapply_adapter
         # Stored intent for a symbol not in the registry (delisted / never listed).
-        await store.set_adapter_config("leverage.NOPEUSDT", "10")
+        await store.set_adapter_config("leverage.buy:NOPEUSDT", "10")
+        await store.set_adapter_config("leverage.sell:NOPEUSDT", "10")
 
         await adapter.connect()
 
@@ -258,13 +322,19 @@ class TestReapplyStoredIntent:
     ) -> None:
         store = SQLiteStateStore(":memory:")
         await store.initialize()
-        await store.set_adapter_config("leverage.BTCUSDT", "10")
+        await store.set_adapter_config("leverage.buy:BTCUSDT", "10")
+        await store.set_adapter_config("leverage.sell:BTCUSDT", "10")
         try:
+            # auto_apply_on_connect is a per-symbol policy knob persisted at
+            # set_leverage time; disable it here by seeding the policy row.
+            await store.set_adapter_config(
+                "leverage.policy.auto_apply:BTCUSDT",
+                "0",
+            )
             config = BybitConfig(
                 api_key=bybit_config.api_key,
                 api_secret=bybit_config.api_secret,
                 testnet=bybit_config.testnet,
-                leverage=LeverageConfig(auto_apply_on_connect=False),
             )
             adapter = BybitAdapter(config, event_bus=event_bus, state_store=store)
             adapter._instruments = {("linear", "BTCUSDT"): _linear_instrument()}

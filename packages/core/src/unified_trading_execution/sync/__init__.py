@@ -47,10 +47,14 @@ class SyncEngine:
     Construction:
         engine = SyncEngine(
             adapter=BybitAdapter(...),
-            state_store=SQLiteStateStore("path/to/db"),
+            state_store=SQLiteStateStore("path/to/db"),  # optional — see below
             get_reference_price=my_price_fn,  # optional
         )
         engine.connect()
+
+    ``state_store`` is optional (Section 6.2): when omitted, the underlying
+    async Engine creates one at the auto-derived, user-visible location
+    ``./<project>_data/<platform>_<account>.db``.
 
     Usage:
         order = UnifiedOrder(...)
@@ -65,7 +69,7 @@ class SyncEngine:
     def __init__(
         self,
         adapter: Adapter,
-        state_store: StateStore,
+        state_store: StateStore | None = None,
         *,
         get_reference_price: Callable[[Instrument], Decimal | None] | None = None,
         event_bus: EventBus | None = None,

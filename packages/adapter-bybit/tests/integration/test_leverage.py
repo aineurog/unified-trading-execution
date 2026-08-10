@@ -18,7 +18,7 @@ import pytest
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.errors import LeverageDriftError, LeverageExceedsMaxError
-from unified_trading_execution.bybit.margin import LeverageConfig, MarginMode
+from unified_trading_execution.bybit.margin import MarginMode
 from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.errors import InvalidSymbolError
 from unified_trading_execution.events import EventBus
@@ -63,16 +63,16 @@ async def _set_and_verify(
     instrument: Instrument,
     leverage: int,
 ) -> None:
-    await adapter.set_leverage(instrument, leverage)
-    assert await adapter.get_leverage(instrument) == leverage
+    await adapter.set_leverage(instrument, buy_leverage=leverage)
+    assert await adapter.get_leverage(instrument) == (leverage, leverage)
 
 
 async def _categorise(adapter: BybitAdapter, instrument: Instrument) -> str:
-    return adapter._instrument_to_category(instrument)
+    return str(adapter._instrument_to_category(instrument))
 
 
 async def _symbol(adapter: BybitAdapter, instrument: Instrument) -> str:
-    return to_bybit_symbol(instrument)
+    return str(to_bybit_symbol(instrument))
 
 
 async def _set_leverage_direct(
@@ -156,7 +156,7 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
 
     async def test_set_get_leverage_inverse(
         self,
@@ -172,7 +172,7 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(traded_instrument, original)
+                    await adapter.set_leverage(traded_instrument, buy_leverage=original[0])
 
     async def test_set_leverage_spot_raises(
         self,
@@ -180,7 +180,7 @@ class TestSetGetLeverage:
         spot_instrument: Instrument,
     ) -> None:
         with pytest.raises(InvalidSymbolError):
-            await store_connected_adapter.set_leverage(spot_instrument, 10)
+            await store_connected_adapter.set_leverage(spot_instrument, buy_leverage=10)
 
     async def test_set_leverage_exceeds_max(
         self,
@@ -191,7 +191,7 @@ class TestSetGetLeverage:
         spec = await adapter.fetch_instrument_spec(linear_instrument)
         assert spec.max_leverage is not None
         with pytest.raises(LeverageExceedsMaxError):
-            await adapter.set_leverage(linear_instrument, int(spec.max_leverage) + 1)
+            await adapter.set_leverage(linear_instrument, buy_leverage=int(spec.max_leverage) + 1)
 
     async def test_leverage_symmetric(
         self,
@@ -215,39 +215,61 @@ class TestSetGetLeverage:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
 
 
 class TestMarginMode:
-    async def test_set_margin_mode_cross_to_isolated(
-        self,
-        store_connected_adapter: BybitAdapter,
-        linear_instrument: Instrument,
-    ) -> None:
-        adapter = store_connected_adapter
-        original = await adapter.get_margin_mode(linear_instrument)
-        try:
-            await adapter.set_margin_mode(linear_instrument, MarginMode.ISOLATED, leverage=10)
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.ISOLATED
-        finally:
-            if original is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(linear_instrument, original, leverage=10)
+    """Margin mode is a static ``BybitConfig`` value applied at connect.
 
-    async def test_set_margin_mode_isolated_to_cross(
+    Margin mode is account-wide and configured at adapter construction, not set
+    at runtime.  ``connect()`` applies the configured mode to the platform; the
+    platform value is retrieved with ``get_margin_mode()``.
+    """
+
+    async def test_configured_isolated_applied_on_connect(
+        self,
+        bybit_config: BybitConfig,
+        leverage_store: SQLiteStateStore,
+    ) -> None:
+        config = BybitConfig(
+            api_key=bybit_config.api_key,
+            api_secret=bybit_config.api_secret,
+            testnet=True,
+            margin_mode=MarginMode.ISOLATED,
+        )
+        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=leverage_store)
+        await adapter.connect()
+        try:
+            assert await adapter.get_margin_mode() is MarginMode.ISOLATED
+        finally:
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
+
+    async def test_configured_cross_applied_on_connect(
+        self,
+        bybit_config: BybitConfig,
+        leverage_store: SQLiteStateStore,
+    ) -> None:
+        config = BybitConfig(
+            api_key=bybit_config.api_key,
+            api_secret=bybit_config.api_secret,
+            testnet=True,
+            margin_mode=MarginMode.CROSS,
+        )
+        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=leverage_store)
+        await adapter.connect()
+        try:
+            assert await adapter.get_margin_mode() is MarginMode.CROSS
+        finally:
+            with contextlib.suppress(Exception):
+                await adapter.disconnect()
+
+    async def test_get_margin_mode_reads_platform(
         self,
         store_connected_adapter: BybitAdapter,
-        linear_instrument: Instrument,
     ) -> None:
-        adapter = store_connected_adapter
-        original = await adapter.get_margin_mode(linear_instrument)
-        try:
-            await adapter.set_margin_mode(linear_instrument, MarginMode.CROSS, leverage=10)
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.CROSS
-        finally:
-            if original is not None and original is not MarginMode.CROSS:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(linear_instrument, original, leverage=10)
+        mode = await store_connected_adapter.get_margin_mode()
+        assert mode in (MarginMode.CROSS, MarginMode.ISOLATED, None)
 
 
 class TestReapplyOnConnect:
@@ -263,7 +285,7 @@ class TestReapplyOnConnect:
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 15)
+            await adapter.set_leverage(linear_instrument, buy_leverage=15)
             await adapter.disconnect()
             adapter2 = BybitAdapter(
                 bybit_config,
@@ -271,12 +293,12 @@ class TestReapplyOnConnect:
                 state_store=store,
             )
             await adapter2.connect()
-            assert await adapter2.get_leverage(linear_instrument) == 15
+            assert await adapter2.get_leverage(linear_instrument) == (15, 15)
             await adapter2.disconnect()
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.set_leverage(linear_instrument, original)
+                    await adapter.set_leverage(linear_instrument, buy_leverage=original[0])
                     await adapter.disconnect()
 
     async def test_leverage_apply_failed_on_delisted(
@@ -310,13 +332,17 @@ class TestStrictCheck:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(strict_check=True, on_drift="notify"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(
+                linear_instrument,
+                buy_leverage=10,
+                on_drift="notify",
+                strict_check=True,
+            )
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             qty = await _spec_valid_qty(adapter, linear_instrument)
@@ -334,7 +360,7 @@ class TestStrictCheck:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_strict_check_off_skips_verification(
@@ -355,14 +381,17 @@ class TestStrictCheck:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(strict_check=False),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
-        order = None
+        client_order_id: str | None = None
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(
+                linear_instrument,
+                buy_leverage=10,
+                strict_check=False,
+            )
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             spec = await adapter.fetch_instrument_spec(linear_instrument)
@@ -378,15 +407,16 @@ class TestStrictCheck:
                 client_order_id=random_client_id("scoff"),
                 price=price,
             )
+            client_order_id = order.client_order_id
             result = await adapter.place_order(order)
             assert result.platform_order_id is not None
         finally:
-            if order is not None and order.client_order_id is not None:
+            if client_order_id is not None:
                 with contextlib.suppress(Exception):
-                    await adapter.cancel_order(order.client_order_id)
+                    await adapter.cancel_order(client_order_id)
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
 
@@ -405,23 +435,22 @@ class TestReconcileIntent:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="reapply"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10, on_drift="reapply")
             await _set_leverage_direct(adapter, linear_instrument, 50)
-            assert await adapter.get_leverage(linear_instrument) == 50
+            assert await adapter.get_leverage(linear_instrument) == (50, 50)
 
             await adapter.reconcile_user_intent()
 
-            assert await adapter.get_leverage(linear_instrument) == 10
+            assert await adapter.get_leverage(linear_instrument) == (10, 10)
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_leverage_drift_halt_mode(
@@ -437,14 +466,13 @@ class TestReconcileIntent:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="halt"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         adapter.attach_halt_machine(halt_machine)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10, on_drift="halt")
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
@@ -462,7 +490,7 @@ class TestReconcileIntent:
                 )
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_leverage_drift_notify_mode(
@@ -477,22 +505,21 @@ class TestReconcileIntent:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="notify"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10, on_drift="notify")
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
 
-            assert await adapter.get_leverage(linear_instrument) == 50
+            assert await adapter.get_leverage(linear_instrument) == (50, 50)
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
     async def test_recovery_clears_drift_halt(
@@ -508,14 +535,13 @@ class TestReconcileIntent:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="halt"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         adapter.attach_halt_machine(halt_machine)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10, on_drift="halt")
             await _set_leverage_direct(adapter, linear_instrument, 50)
 
             await adapter.reconcile_user_intent()
@@ -527,101 +553,7 @@ class TestReconcileIntent:
         finally:
             if original is not None:
                 with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original)
-            await adapter.disconnect()
-
-
-class TestReconcileMarginMode:
-    """Phase 6 (Step 14) — margin-mode drift reconciliation on the live platform.
-
-    Margin mode is account-wide, so "drift" here means the account-wide
-    ``set-margin-mode`` was changed out-of-band; reconciliation must restore the
-    stored per-symbol intent.
-    """
-
-    async def test_margin_mode_drift_detected_and_reapplied(
-        self,
-        bybit_config: BybitConfig,
-        linear_instrument: Instrument,
-        leverage_store: SQLiteStateStore,
-    ) -> None:
-        """Drift the account out of isolated out-of-band; reconcile restores it."""
-        store = leverage_store
-        config = BybitConfig(
-            api_key=bybit_config.api_key,
-            api_secret=bybit_config.api_secret,
-            testnet=True,
-            leverage=LeverageConfig(on_drift="reapply"),
-        )
-        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-        await adapter.connect()
-        original_mode = await adapter.get_margin_mode(linear_instrument)
-        original_leverage = await adapter.get_leverage(linear_instrument)
-        try:
-            await adapter.set_margin_mode(linear_instrument, MarginMode.ISOLATED, leverage=10)
-            await _set_margin_mode_direct(adapter, "REGULAR_MARGIN")
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.CROSS
-
-            await adapter.reconcile_user_intent()
-
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.ISOLATED
-        finally:
-            if original_leverage is not None:
-                with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage)
-            if original_mode is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(
-                        linear_instrument,
-                        original_mode,
-                        leverage=original_leverage or 10,
-                    )
-            await adapter.disconnect()
-
-    async def test_margin_mode_drift_preserves_platform_leverage_after_remove(
-        self,
-        bybit_config: BybitConfig,
-        linear_instrument: Instrument,
-        leverage_store: SQLiteStateStore,
-    ) -> None:
-        """remove_leverage leaves margin intent; margin drift reapply must keep
-        the platform's current leverage rather than forcing 1x."""
-        store = leverage_store
-        config = BybitConfig(
-            api_key=bybit_config.api_key,
-            api_secret=bybit_config.api_secret,
-            testnet=True,
-            leverage=LeverageConfig(on_drift="reapply"),
-        )
-        adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-        await adapter.connect()
-        original_mode = await adapter.get_margin_mode(linear_instrument)
-        original_leverage = await adapter.get_leverage(linear_instrument)
-        try:
-            await adapter.set_margin_mode(linear_instrument, MarginMode.ISOLATED, leverage=10)
-            await adapter.remove_leverage(linear_instrument)
-            # Out-of-band: margin to cross AND leverage to 25, no stored leverage.
-            await _set_margin_mode_direct(adapter, "REGULAR_MARGIN")
-            await _set_leverage_direct(adapter, linear_instrument, 25)
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.CROSS
-            assert await adapter.get_leverage(linear_instrument) == 25
-
-            await adapter.reconcile_user_intent()
-
-            # Margin reverted to isolated without forcing leverage back to 1x.
-            assert await adapter.get_margin_mode(linear_instrument) is MarginMode.ISOLATED
-            assert await adapter.get_leverage(linear_instrument) == 25
-        finally:
-            if original_leverage is not None:
-                with contextlib.suppress(Exception):
-                    await _set_leverage_direct(adapter, linear_instrument, original_leverage)
-            if original_mode is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(
-                        linear_instrument,
-                        original_mode,
-                        leverage=original_leverage or 10,
-                    )
+                    await _set_leverage_direct(adapter, linear_instrument, original[0])
             await adapter.disconnect()
 
 
@@ -640,19 +572,18 @@ class TestAuditTrail:
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="reapply"),
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
         original = await adapter.get_leverage(linear_instrument)
         try:
-            await adapter.set_leverage(linear_instrument, 10)
+            await adapter.set_leverage(linear_instrument, buy_leverage=10)
             await adapter.disconnect()
 
             # Reconnect: stored intent reapplied → LeverageAppliedEvent + audit.
             adapter2 = BybitAdapter(config, event_bus=EventBus(), state_store=store)
             await adapter2.connect()
-            assert await adapter2.get_leverage(linear_instrument) == 10
+            assert await adapter2.get_leverage(linear_instrument) == (10, 10)
 
             applied = [
                 e
@@ -661,12 +592,13 @@ class TestAuditTrail:
             ]
             assert len(applied) == 1
             assert applied[0].payload["symbol"] == to_bybit_symbol(linear_instrument)
-            assert applied[0].payload["leverage"] == 10
+            assert applied[0].payload["buy_leverage"] == 10
+            assert applied[0].payload["sell_leverage"] == 10
 
             # Drift out-of-band, reconcile → LeverageDriftEvent + audit.
             await _set_leverage_direct(adapter2, linear_instrument, 50)
             await adapter2.reconcile_user_intent()
-            assert await adapter2.get_leverage(linear_instrument) == 10
+            assert await adapter2.get_leverage(linear_instrument) == (10, 10)
 
             drift = [
                 e
@@ -675,13 +607,15 @@ class TestAuditTrail:
             ]
             assert len(drift) == 1
             assert drift[0].payload["symbol"] == to_bybit_symbol(linear_instrument)
-            assert drift[0].payload["stored_leverage"] == 10
-            assert drift[0].payload["platform_leverage"] == 50
+            assert drift[0].payload["stored_buy"] == 10
+            assert drift[0].payload["platform_buy"] == 50
+            assert drift[0].payload["stored_sell"] == 10
+            assert drift[0].payload["platform_sell"] == 50
             assert drift[0].payload["action_taken"] == "reapplied"
         finally:
             with contextlib.suppress(Exception):
                 if original is not None:
-                    await _set_leverage_direct(adapter2, linear_instrument, original)
+                    await _set_leverage_direct(adapter2, linear_instrument, original[0])
             with contextlib.suppress(Exception):
                 await adapter.disconnect()
             with contextlib.suppress(Exception):
@@ -690,44 +624,29 @@ class TestAuditTrail:
     async def test_margin_mode_events_in_audit_trail(
         self,
         bybit_config: BybitConfig,
-        linear_instrument: Instrument,
         leverage_store: SQLiteStateStore,
     ) -> None:
-        """Margin-mode reapply-on-connect lands in the audit trail."""
+        """Margin mode applied from config on connect lands in the audit trail."""
         store = leverage_store
         config = BybitConfig(
             api_key=bybit_config.api_key,
             api_secret=bybit_config.api_secret,
             testnet=True,
-            leverage=LeverageConfig(on_drift="reapply"),
+            margin_mode=MarginMode.ISOLATED,
         )
         adapter = BybitAdapter(config, event_bus=EventBus(), state_store=store)
         await adapter.connect()
-        original = await adapter.get_margin_mode(linear_instrument)
-        adapter2 = None
         try:
-            await adapter.set_margin_mode(linear_instrument, MarginMode.ISOLATED, leverage=10)
-            await adapter.disconnect()
-
-            adapter2 = BybitAdapter(config, event_bus=EventBus(), state_store=store)
-            await adapter2.connect()
-            assert await adapter2.get_margin_mode(linear_instrument) is MarginMode.ISOLATED
-
             changed = [
                 e
                 for e in await store.query_audit_events()
                 if e.event_type == "bybit.margin_mode.changed"
             ]
-            assert len(changed) == 1
-            assert changed[0].payload["symbol"] == to_bybit_symbol(linear_instrument)
-            assert changed[0].payload["current"] == "isolated"
-            assert changed[0].payload["leverage"] == 10
+            # If the platform already matched ISOLATED, connect is a no-op and
+            # no audit record is written — both outcomes are valid.
+            if changed:
+                assert changed[0].payload["current"] == "isolated"
+                assert changed[0].payload["context"] == "connect"
         finally:
-            if original is not None:
-                with contextlib.suppress(Exception):
-                    await adapter.set_margin_mode(linear_instrument, original, leverage=10)
-            if adapter2 is not None:
-                with contextlib.suppress(Exception):
-                    await adapter2.disconnect()
             with contextlib.suppress(Exception):
                 await adapter.disconnect()

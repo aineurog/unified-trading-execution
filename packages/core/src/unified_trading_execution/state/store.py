@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from abc import ABC, abstractmethod
@@ -31,6 +32,33 @@ from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlA
 from unified_trading_execution.types.position import Balance, Position
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+
+
+def _slug(component: str) -> str:
+    """Sanitize one filename component to `[a-z0-9_]` (pass through junk).
+
+    Keeps the resolved path filesystem-safe regardless of how a platform /
+    account identifier is spelled.
+    """
+    cleaned = "".join(c if c.isalnum() or c == "_" else "_" for c in component).lower()
+    return cleaned.strip("_") or "unknown"
+
+
+def default_state_store_path(platform_name: str, account_id: str) -> str:
+    """Resolve the default ``StateStore`` location per Section 6.2.
+
+    Returns ``./<project>_data/<platform>_<account>.db`` relative to the process
+    working directory, where ``<project>`` is the name of the current working
+    directory itself (predictable and human-inspectable, never hidden or
+    written to a system location).  ``<platform>`` and ``<account>`` are
+    slugified so the resulting filename is always filesystem-safe.
+
+    Example with ``platform_name="bybit"``, ``account_id="acct123"`` and a CWD
+    named ``ute``: ``./ute_data/bybit_acct123.db``.
+    """
+    project = Path.cwd().name
+    filename = f"{_slug(platform_name)}_{_slug(account_id)}.db"
+    return os.path.join(f"./{project}_data", filename)
 
 
 # ============================================================
@@ -91,6 +119,11 @@ class StateStore(ABC):
         """Batched insert — default implementation calls upsert_fill in a loop."""
         for fill in fills:
             await self.upsert_fill(fill)
+
+    @abstractmethod
+    async def delete_orders_by_client_ids(self, client_order_ids: list[str]) -> None: ...
+    @abstractmethod
+    async def delete_fills_by_client_ids(self, client_order_ids: list[str]) -> None: ...
 
     @abstractmethod
     async def write_audit_event(self, event: AuditEvent) -> None: ...
@@ -210,6 +243,12 @@ class SQLiteStateStore(StateStore):
     def __init__(self, db_path: str = ":memory:") -> None:
         self._path = db_path
         self._conn: aiosqlite.Connection | None = None
+        # Single aiosqlite connection ⇒ concurrent writers must not interleave
+        # their `BEGIN`/`COMMIT` spans. Held for the whole duration of every
+        # mutating operation so a second `BEGIN` can never fire while another
+        # transaction is open (the "cannot start a transaction within a
+        # transaction" crash).
+        self._write_lock = asyncio.Lock()
 
     @property
     def path(self) -> str:
@@ -224,6 +263,8 @@ class SQLiteStateStore(StateStore):
     # ---- Lifecycle ----
 
     async def initialize(self) -> None:
+        if self._path != ":memory:":
+            Path(self._path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = await aiosqlite.connect(self._path, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         await self._run_migrations()
@@ -236,9 +277,10 @@ class SQLiteStateStore(StateStore):
     async def flush(self) -> None:
         """Force WAL checkpoint so pending writes are durable on disk."""
         if self._conn is not None:
-            # TRUNCATE mode writes the WAL back into the main DB, then
-            # resets the WAL to zero bytes — ideal for orderly shutdown.
-            await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            async with self._write_lock:
+                # TRUNCATE mode writes the WAL back into the main DB, then
+                # resets the WAL to zero bytes — ideal for orderly shutdown.
+                await self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     async def _run_migrations(self) -> None:
         await self.conn.execute(
@@ -269,130 +311,195 @@ class SQLiteStateStore(StateStore):
     # ---- Upserts ----
 
     async def upsert_position(self, position: Position) -> None:
-        i = _serialise_instrument(position.instrument)
-        now = position.updated_at.isoformat()
-        await self.conn.execute("BEGIN")
-        try:
-            await self.conn.execute(
-                """INSERT OR REPLACE INTO positions
-                   (symbol, quote_currency, asset_class, exchange, currency,
-                    expiry, strike, option_right, multiplier, broker_symbol_override,
-                    quantity, average_entry_price, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    i["symbol"],
-                    i["quote_currency"],
-                    i["asset_class"],
-                    i["exchange"],
-                    i["currency"],
-                    i["expiry"],
-                    i["strike"],
-                    i["option_right"],
-                    i["multiplier"],
-                    i["broker_symbol_override"],
-                    str(position.quantity),
-                    str(position.average_entry_price),
-                    now,
-                ),
-            )
-            await self.conn.execute(
-                """INSERT INTO position_history
-                   (symbol, quote_currency, asset_class, exchange, currency,
-                    expiry, strike, option_right, multiplier, broker_symbol_override,
-                    quantity, average_entry_price, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    i["symbol"],
-                    i["quote_currency"],
-                    i["asset_class"],
-                    i["exchange"],
-                    i["currency"],
-                    i["expiry"],
-                    i["strike"],
-                    i["option_right"],
-                    i["multiplier"],
-                    i["broker_symbol_override"],
-                    str(position.quantity),
-                    str(position.average_entry_price),
-                    now,
-                ),
-            )
-        except BaseException:
-            await self.conn.rollback()
-            raise
-        else:
-            await self.conn.commit()
+        async with self._write_lock:
+            i = _serialise_instrument(position.instrument)
+            now = position.updated_at.isoformat()
+            await self.conn.execute("BEGIN")
+            try:
+                await self.conn.execute(
+                    """INSERT OR REPLACE INTO positions
+                       (symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, broker_symbol_override,
+                        quantity, average_entry_price, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        i["exchange"],
+                        i["currency"],
+                        i["expiry"],
+                        i["strike"],
+                        i["option_right"],
+                        i["multiplier"],
+                        i["broker_symbol_override"],
+                        str(position.quantity),
+                        str(position.average_entry_price),
+                        now,
+                    ),
+                )
+                await self.conn.execute(
+                    """INSERT INTO position_history
+                       (symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, broker_symbol_override,
+                        quantity, average_entry_price, recorded_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        i["exchange"],
+                        i["currency"],
+                        i["expiry"],
+                        i["strike"],
+                        i["option_right"],
+                        i["multiplier"],
+                        i["broker_symbol_override"],
+                        str(position.quantity),
+                        str(position.average_entry_price),
+                        now,
+                    ),
+                )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def upsert_balance(self, balance: Balance) -> None:
-        now = balance.updated_at.isoformat()
-        await self.conn.execute("BEGIN")
-        try:
-            await self.conn.execute(
-                "INSERT OR REPLACE INTO balances (currency, free, used, total, updated_at) VALUES (?,?,?,?,?)",
-                (balance.currency, str(balance.free), str(balance.used), str(balance.total), now),
-            )
-            await self.conn.execute(
-                "INSERT INTO balance_history (currency, free, used, total, recorded_at) VALUES (?,?,?,?,?)",
-                (balance.currency, str(balance.free), str(balance.used), str(balance.total), now),
-            )
-        except BaseException:
-            await self.conn.rollback()
-            raise
-        else:
-            await self.conn.commit()
+        async with self._write_lock:
+            now = balance.updated_at.isoformat()
+            await self.conn.execute("BEGIN")
+            try:
+                await self.conn.execute(
+                    "INSERT OR REPLACE INTO balances (currency, free, used, total, updated_at) VALUES (?,?,?,?,?)",
+                    (
+                        balance.currency,
+                        str(balance.free),
+                        str(balance.used),
+                        str(balance.total),
+                        now,
+                    ),
+                )
+                await self.conn.execute(
+                    "INSERT INTO balance_history (currency, free, used, total, recorded_at) VALUES (?,?,?,?,?)",
+                    (
+                        balance.currency,
+                        str(balance.free),
+                        str(balance.used),
+                        str(balance.total),
+                        now,
+                    ),
+                )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def upsert_order(self, order: OrderRecord) -> None:
-        i = _serialise_instrument(order.instrument)
-        await self.conn.execute(
-            """INSERT OR REPLACE INTO orders
-               (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
-                expiry, strike, option_right, multiplier, broker_symbol_override,
-                order_type, side, quantity, time_in_force, price, stop_price,
-                reduce_only, client_tag,
-                take_profit_trigger, take_profit_limit,
-                stop_loss_trigger, stop_loss_limit,
-                platform_order_id, status, filled_quantity, average_fill_price,
-                correlation_id, created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                order.client_order_id,
-                i["symbol"],
-                i["quote_currency"],
-                i["asset_class"],
-                i["exchange"],
-                i["currency"],
-                i["expiry"],
-                i["strike"],
-                i["option_right"],
-                i["multiplier"],
-                i["broker_symbol_override"],
-                order.order_type.value,
-                order.side.value,
-                str(order.quantity),
-                order.time_in_force.value,
-                str(order.price) if order.price else None,
-                str(order.stop_price) if order.stop_price else None,
-                1 if order.reduce_only else 0,
-                order.client_tag,
-                str(order.take_profit.trigger_price) if order.take_profit else None,
-                str(order.take_profit.limit_price)
-                if order.take_profit and order.take_profit.limit_price
-                else None,
-                str(order.stop_loss.trigger_price) if order.stop_loss else None,
-                str(order.stop_loss.limit_price)
-                if order.stop_loss and order.stop_loss.limit_price
-                else None,
-                order.platform_order_id,
-                order.status.value,
-                str(order.filled_quantity),
-                str(order.average_fill_price) if order.average_fill_price else None,
-                order.correlation_id,
-                order.created_at.isoformat(),
-                order.updated_at.isoformat(),
-            ),
-        )
+        async with self._write_lock:
+            i = _serialise_instrument(order.instrument)
+            await self.conn.execute(
+                """INSERT OR REPLACE INTO orders
+                   (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
+                    expiry, strike, option_right, multiplier, broker_symbol_override,
+                    order_type, side, quantity, time_in_force, price, stop_price,
+                    reduce_only, client_tag,
+                    take_profit_trigger, take_profit_limit,
+                    stop_loss_trigger, stop_loss_limit,
+                    platform_order_id, status, filled_quantity, average_fill_price,
+                    correlation_id, created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    order.client_order_id,
+                    i["symbol"],
+                    i["quote_currency"],
+                    i["asset_class"],
+                    i["exchange"],
+                    i["currency"],
+                    i["expiry"],
+                    i["strike"],
+                    i["option_right"],
+                    i["multiplier"],
+                    i["broker_symbol_override"],
+                    order.order_type.value,
+                    order.side.value,
+                    str(order.quantity),
+                    order.time_in_force.value,
+                    str(order.price) if order.price else None,
+                    str(order.stop_price) if order.stop_price else None,
+                    1 if order.reduce_only else 0,
+                    order.client_tag,
+                    str(order.take_profit.trigger_price) if order.take_profit else None,
+                    str(order.take_profit.limit_price)
+                    if order.take_profit and order.take_profit.limit_price
+                    else None,
+                    str(order.stop_loss.trigger_price) if order.stop_loss else None,
+                    str(order.stop_loss.limit_price)
+                    if order.stop_loss and order.stop_loss.limit_price
+                    else None,
+                    order.platform_order_id,
+                    order.status.value,
+                    str(order.filled_quantity),
+                    str(order.average_fill_price) if order.average_fill_price else None,
+                    order.correlation_id,
+                    order.created_at.isoformat(),
+                    order.updated_at.isoformat(),
+                ),
+            )
 
     async def upsert_fill(self, fill: FillRecord) -> None:
+        async with self._write_lock:
+            i = _serialise_instrument(fill.instrument)
+            await self.conn.execute(
+                """INSERT INTO fills
+                   (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
+                    exchange, currency, expiry, strike, option_right, multiplier,
+                    broker_symbol_override, fill_quantity, fill_price, fill_timestamp,
+                    fee_currency, fee_amount, correlation_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    fill.client_order_id,
+                    fill.platform_fill_id,
+                    i["symbol"],
+                    i["quote_currency"],
+                    i["asset_class"],
+                    i["exchange"],
+                    i["currency"],
+                    i["expiry"],
+                    i["strike"],
+                    i["option_right"],
+                    i["multiplier"],
+                    i["broker_symbol_override"],
+                    str(fill.fill_quantity),
+                    str(fill.fill_price),
+                    fill.fill_timestamp.isoformat(),
+                    fill.fee_currency,
+                    str(fill.fee_amount) if fill.fee_amount else None,
+                    fill.correlation_id,
+                ),
+            )
+
+    async def upsert_fills_batch(self, fills: list[FillRecord]) -> None:
+        """Batched insert for reconciliation writes — single transaction."""
+        async with self._write_lock:
+            await self.conn.execute("BEGIN")
+            try:
+                for fill in fills:
+                    await self.upsert_fill_unlocked(fill)
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
+
+    async def upsert_fill_unlocked(self, fill: FillRecord) -> None:
+        """Non-locking insert of a single fill — callers must hold the write lock.
+
+        Used by ``upsert_fills_batch`` so each row does not re-acquire the lock
+        (the batch already holds it).  Not part of the public ``StateStore`` API.
+        """
         i = _serialise_instrument(fill.instrument)
         await self.conn.execute(
             """INSERT INTO fills
@@ -423,34 +530,48 @@ class SQLiteStateStore(StateStore):
             ),
         )
 
-    async def upsert_fills_batch(self, fills: list[FillRecord]) -> None:
-        """Batched insert for reconciliation writes — single transaction."""
-        await self.conn.execute("BEGIN")
-        try:
-            for fill in fills:
-                await self.upsert_fill(fill)
-        except BaseException:
-            await self.conn.rollback()
-            raise
-        else:
-            await self.conn.commit()
+    # ---- Locked deletes (reconciliation) ----
+
+    async def delete_orders_by_client_ids(self, client_order_ids: list[str]) -> None:
+        """Delete current-state order rows by client id, holding the write lock.
+
+        Used by reconciliation's orphan-in-local resolution.  Bypassing the
+        lock (as raw ``conn`` access did) let these interleave with an open
+        ``BEGIN`` from a concurrent upsert.
+        """
+        async with self._write_lock:
+            for client_order_id in client_order_ids:
+                await self.conn.execute(
+                    "DELETE FROM orders WHERE client_order_id = ?",
+                    (client_order_id,),
+                )
+
+    async def delete_fills_by_client_ids(self, client_order_ids: list[str]) -> None:
+        """Delete current-state fill rows by client id, holding the write lock."""
+        async with self._write_lock:
+            for client_order_id in client_order_ids:
+                await self.conn.execute(
+                    "DELETE FROM fills WHERE client_order_id = ?",
+                    (client_order_id,),
+                )
 
     # ---- Audit trail (append-only) ----
 
     async def write_audit_event(self, event: AuditEvent) -> None:
         """Append a single audit event. Rejects event_id collisions."""
-        await self.conn.execute(
-            "INSERT INTO audit_events (event_id, timestamp, adapter_name, account_id, correlation_id, event_type, payload_json) VALUES (?,?,?,?,?,?,?)",
-            (
-                event.event_id,
-                event.timestamp.isoformat(),
-                event.adapter_name,
-                event.account_id,
-                event.correlation_id,
-                event.event_type,
-                json.dumps(event.payload),
-            ),
-        )
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT INTO audit_events (event_id, timestamp, adapter_name, account_id, correlation_id, event_type, payload_json) VALUES (?,?,?,?,?,?,?)",
+                (
+                    event.event_id,
+                    event.timestamp.isoformat(),
+                    event.adapter_name,
+                    event.account_id,
+                    event.correlation_id,
+                    event.event_type,
+                    json.dumps(event.payload),
+                ),
+            )
 
     async def write_reconciliation_event(self, event: ReconciliationEvent) -> None:
         mismatches_json = json.dumps(
@@ -464,112 +585,121 @@ class SQLiteStateStore(StateStore):
                 for m in event.mismatches
             ]
         )
-        await self.conn.execute(
-            "INSERT INTO reconciliation_events (event_id, timestamp, adapter_name, account_id, correlation_id, mismatches_json, duration_ms) VALUES (?,?,?,?,?,?,?)",
-            (
-                event.event_id,
-                event.timestamp.isoformat(),
-                event.adapter_name,
-                event.account_id,
-                event.correlation_id,
-                mismatches_json,
-                event.duration_ms,
-            ),
-        )
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT INTO reconciliation_events (event_id, timestamp, adapter_name, account_id, correlation_id, mismatches_json, duration_ms) VALUES (?,?,?,?,?,?,?)",
+                (
+                    event.event_id,
+                    event.timestamp.isoformat(),
+                    event.adapter_name,
+                    event.account_id,
+                    event.correlation_id,
+                    mismatches_json,
+                    event.duration_ms,
+                ),
+            )
 
     async def write_halt_event(self, event: HaltEvent) -> None:
         inst = event.instrument
-        await self.conn.execute(
-            "INSERT INTO halt_events (event_id, timestamp, adapter_name, account_id, correlation_id, action, scope, symbol, asset_class, reason, detail, cleared_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                event.event_id,
-                event.timestamp.isoformat(),
-                event.adapter_name,
-                event.account_id,
-                event.correlation_id,
-                event.action,
-                event.scope,
-                inst.symbol if inst else None,
-                inst.asset_class.value if inst else None,
-                event.reason,
-                event.detail,
-                event.cleared_by,
-            ),
-        )
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT INTO halt_events (event_id, timestamp, adapter_name, account_id, correlation_id, action, scope, symbol, asset_class, reason, detail, cleared_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    event.event_id,
+                    event.timestamp.isoformat(),
+                    event.adapter_name,
+                    event.account_id,
+                    event.correlation_id,
+                    event.action,
+                    event.scope,
+                    inst.symbol if inst else None,
+                    inst.asset_class.value if inst else None,
+                    event.reason,
+                    event.detail,
+                    event.cleared_by,
+                ),
+            )
 
     # ---- Single-record reads ----
 
     async def get_position(self, instrument: Instrument) -> Position | None:
-        i = _serialise_instrument(instrument)
-        cursor = await self.conn.execute(
-            "SELECT quantity, average_entry_price, updated_at FROM positions WHERE symbol=? AND asset_class=?",
-            (i["symbol"], i["asset_class"]),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        return Position(
-            instrument=instrument,
-            quantity=Decimal(row["quantity"]),
-            average_entry_price=Decimal(row["average_entry_price"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
+        async with self._write_lock:
+            i = _serialise_instrument(instrument)
+            cursor = await self.conn.execute(
+                "SELECT quantity, average_entry_price, updated_at FROM positions WHERE symbol=? AND asset_class=?",
+                (i["symbol"], i["asset_class"]),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return Position(
+                instrument=instrument,
+                quantity=Decimal(row["quantity"]),
+                average_entry_price=Decimal(row["average_entry_price"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
 
     async def get_balance(self, currency: str) -> Balance | None:
-        cursor = await self.conn.execute(
-            "SELECT free, used, total, updated_at FROM balances WHERE currency=?",
-            (currency,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        return Balance(
-            currency=currency,
-            free=Decimal(row["free"]),
-            used=Decimal(row["used"]),
-            total=Decimal(row["total"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-        )
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT free, used, total, updated_at FROM balances WHERE currency=?",
+                (currency,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return Balance(
+                currency=currency,
+                free=Decimal(row["free"]),
+                used=Decimal(row["used"]),
+                total=Decimal(row["total"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+            )
 
     async def get_order(self, client_order_id: str) -> OrderRecord | None:
-        cursor = await self.conn.execute(
-            "SELECT * FROM orders WHERE client_order_id=?",
-            (client_order_id,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        return self._row_to_order_record(row)
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT * FROM orders WHERE client_order_id=?",
+                (client_order_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return self._row_to_order_record(row)
 
     # ---- Adapter config (key/value, Section 2.1) ----
 
     async def get_adapter_config(self, key: str) -> str | None:
-        cursor = await self.conn.execute(
-            "SELECT value FROM adapter_config WHERE key=?",
-            (key,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        return str(row[0])
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT value FROM adapter_config WHERE key=?",
+                (key,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            return str(row[0])
 
     async def set_adapter_config(self, key: str, value: str) -> None:
         now = datetime.now(tz=UTC).isoformat()
-        await self.conn.execute(
-            "INSERT OR REPLACE INTO adapter_config (key, value, updated_at) VALUES (?, ?, ?)",
-            (key, value, now),
-        )
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO adapter_config (key, value, updated_at) VALUES (?, ?, ?)",
+                (key, value, now),
+            )
 
     async def delete_adapter_config(self, key: str) -> None:
-        await self.conn.execute("DELETE FROM adapter_config WHERE key=?", (key,))
+        async with self._write_lock:
+            await self.conn.execute("DELETE FROM adapter_config WHERE key=?", (key,))
 
     async def list_adapter_config(self, prefix: str) -> dict[str, str]:
-        cursor = await self.conn.execute(
-            "SELECT key, value FROM adapter_config WHERE key LIKE ?",
-            (prefix + "%",),
-        )
-        rows = await cursor.fetchall()
-        return {str(row["key"]): str(row["value"]) for row in rows}
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT key, value FROM adapter_config WHERE key LIKE ?",
+                (prefix + "%",),
+            )
+            rows = await cursor.fetchall()
+            return {str(row["key"]): str(row["value"]) for row in rows}
 
     # ---- Filtered queries ----
 
@@ -594,8 +724,9 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        return [self._row_to_order_record(r) for r in await cursor.fetchall()]
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            return [self._row_to_order_record(r) for r in await cursor.fetchall()]
 
     async def query_fills(
         self,
@@ -618,8 +749,9 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY fill_timestamp DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        return [self._row_to_fill_record(r) for r in await cursor.fetchall()]
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            return [self._row_to_fill_record(r) for r in await cursor.fetchall()]
 
     async def query_positions(
         self,
@@ -642,19 +774,20 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        results: list[Position] = []
-        for row in await cursor.fetchall():
-            inst = _deserialise_instrument(dict(row))
-            results.append(
-                Position(
-                    instrument=inst,
-                    quantity=Decimal(row["quantity"]),
-                    average_entry_price=Decimal(row["average_entry_price"]),
-                    updated_at=datetime.fromisoformat(row["recorded_at"]),
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            results: list[Position] = []
+            for row in await cursor.fetchall():
+                inst = _deserialise_instrument(dict(row))
+                results.append(
+                    Position(
+                        instrument=inst,
+                        quantity=Decimal(row["quantity"]),
+                        average_entry_price=Decimal(row["average_entry_price"]),
+                        updated_at=datetime.fromisoformat(row["recorded_at"]),
+                    )
                 )
-            )
-        return results
+            return results
 
     async def query_balances(
         self,
@@ -677,17 +810,18 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        return [
-            Balance(
-                currency=row["currency"],
-                free=Decimal(row["free"]),
-                used=Decimal(row["used"]),
-                total=Decimal(row["total"]),
-                updated_at=datetime.fromisoformat(row["recorded_at"]),
-            )
-            for row in await cursor.fetchall()
-        ]
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            return [
+                Balance(
+                    currency=row["currency"],
+                    free=Decimal(row["free"]),
+                    used=Decimal(row["used"]),
+                    total=Decimal(row["total"]),
+                    updated_at=datetime.fromisoformat(row["recorded_at"]),
+                )
+                for row in await cursor.fetchall()
+            ]
 
     async def query_reconciliation_events(
         self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
@@ -702,33 +836,34 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        results: list[ReconciliationEvent] = []
-        for row in await cursor.fetchall():
-            mm_data = json.loads(row["mismatches_json"])
-            mismatches = tuple(
-                ReconciliationMismatch(
-                    mismatch_type=m["mismatch_type"],
-                    instrument=_deserialise_instrument(m["instrument"])
-                    if m["instrument"]
-                    else None,
-                    local_value=m["local_value"],
-                    platform_value=m["platform_value"],
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            results: list[ReconciliationEvent] = []
+            for row in await cursor.fetchall():
+                mm_data = json.loads(row["mismatches_json"])
+                mismatches = tuple(
+                    ReconciliationMismatch(
+                        mismatch_type=m["mismatch_type"],
+                        instrument=_deserialise_instrument(m["instrument"])
+                        if m["instrument"]
+                        else None,
+                        local_value=m["local_value"],
+                        platform_value=m["platform_value"],
+                    )
+                    for m in mm_data
                 )
-                for m in mm_data
-            )
-            results.append(
-                ReconciliationEvent(
-                    event_id=row["event_id"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
-                    adapter_name=row["adapter_name"],
-                    account_id=row["account_id"],
-                    correlation_id=row["correlation_id"],
-                    mismatches=mismatches,
-                    duration_ms=row["duration_ms"],
+                results.append(
+                    ReconciliationEvent(
+                        event_id=row["event_id"],
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        adapter_name=row["adapter_name"],
+                        account_id=row["account_id"],
+                        correlation_id=row["correlation_id"],
+                        mismatches=mismatches,
+                        duration_ms=row["duration_ms"],
+                    )
                 )
-            )
-        return results
+            return results
 
     async def query_halt_events(
         self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
@@ -743,38 +878,39 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        results: list[HaltEvent] = []
-        for row in await cursor.fetchall():
-            inst = None
-            if row["symbol"] is not None and row["asset_class"] is not None:
-                inst = Instrument(
-                    symbol=row["symbol"],
-                    quote_currency=None,
-                    asset_class=AssetClass(row["asset_class"]),
-                    exchange=None,
-                    currency=None,
-                    expiry=None,
-                    strike=None,
-                    option_right=None,
-                    multiplier=None,
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            results: list[HaltEvent] = []
+            for row in await cursor.fetchall():
+                inst = None
+                if row["symbol"] is not None and row["asset_class"] is not None:
+                    inst = Instrument(
+                        symbol=row["symbol"],
+                        quote_currency=None,
+                        asset_class=AssetClass(row["asset_class"]),
+                        exchange=None,
+                        currency=None,
+                        expiry=None,
+                        strike=None,
+                        option_right=None,
+                        multiplier=None,
+                    )
+                results.append(
+                    HaltEvent(
+                        event_id=row["event_id"],
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        adapter_name=row["adapter_name"],
+                        account_id=row["account_id"],
+                        correlation_id=row["correlation_id"],
+                        action=row["action"],
+                        scope=row["scope"],
+                        instrument=inst,
+                        reason=row["reason"],
+                        detail=row["detail"],
+                        cleared_by=row["cleared_by"],
+                    )
                 )
-            results.append(
-                HaltEvent(
-                    event_id=row["event_id"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
-                    adapter_name=row["adapter_name"],
-                    account_id=row["account_id"],
-                    correlation_id=row["correlation_id"],
-                    action=row["action"],
-                    scope=row["scope"],
-                    instrument=inst,
-                    reason=row["reason"],
-                    detail=row["detail"],
-                    cleared_by=row["cleared_by"],
-                )
-            )
-        return results
+            return results
 
     async def query_audit_events(
         self, *, start: datetime | None = None, end: datetime | None = None, limit: int = 1000
@@ -794,21 +930,22 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY timestamp DESC LIMIT ?"
         params.append(limit)
-        cursor = await self.conn.execute(query, params)
-        results: list[AuditEvent] = []
-        for row in await cursor.fetchall():
-            results.append(
-                AuditEvent(
-                    event_id=row["event_id"],
-                    timestamp=datetime.fromisoformat(row["timestamp"]),
-                    adapter_name=row["adapter_name"],
-                    account_id=row["account_id"],
-                    correlation_id=row["correlation_id"],
-                    event_type=row["event_type"],
-                    payload=json.loads(row["payload_json"]),
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            results: list[AuditEvent] = []
+            for row in await cursor.fetchall():
+                results.append(
+                    AuditEvent(
+                        event_id=row["event_id"],
+                        timestamp=datetime.fromisoformat(row["timestamp"]),
+                        adapter_name=row["adapter_name"],
+                        account_id=row["account_id"],
+                        correlation_id=row["correlation_id"],
+                        event_type=row["event_type"],
+                        payload=json.loads(row["payload_json"]),
+                    )
                 )
-            )
-        return results
+            return results
 
     # ---- Row deserialisation ----
 
