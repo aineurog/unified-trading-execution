@@ -667,6 +667,28 @@ class TestResolvePositionIdx:
         await self._seed(store, "hedge")
         assert await adapter._resolve_position_idx(_linear_instrument(), OrderSide.SELL) == 2
 
+    async def test_hedge_reduce_only_sell_targets_long_leg(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+    ) -> None:
+        adapter, store = store_adapter
+        await self._seed(store, "hedge")
+        resolved = await adapter._resolve_position_idx(
+            _linear_instrument(), OrderSide.SELL, reduce_only=True
+        )
+        assert resolved == 1
+
+    async def test_hedge_reduce_only_buy_targets_short_leg(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+    ) -> None:
+        adapter, store = store_adapter
+        await self._seed(store, "hedge")
+        resolved = await adapter._resolve_position_idx(
+            _linear_instrument(), OrderSide.BUY, reduce_only=True
+        )
+        assert resolved == 2
+
     async def test_one_way_uses_zero(
         self,
         store_adapter: tuple[BybitAdapter, SQLiteStateStore],
@@ -721,6 +743,7 @@ class TestPlaceOrderPositionIdx:
         side: OrderSide,
         instrument: Instrument,
         mock_pybit_http: MagicMock,
+        reduce_only: bool = False,
     ) -> dict[str, Any]:
         if store is not None and mode is not None:
             await store.set_adapter_config("position_mode.BTCUSDT", mode)
@@ -759,6 +782,7 @@ class TestPlaceOrderPositionIdx:
             quantity=Decimal("0.001"),
             time_in_force=TimeInForce.GTC,
             client_order_id="c1",
+            reduce_only=reduce_only,
         )
         await adapter.place_order(order)
         call = mock_pybit_http.place_order.call_args
@@ -794,6 +818,40 @@ class TestPlaceOrderPositionIdx:
             side=OrderSide.SELL,
             instrument=_linear_instrument(),
             mock_pybit_http=mock_pybit_http,
+        )
+        assert payload["positionIdx"] == 2
+
+    async def test_hedge_reduce_only_sell_payload_targets_long_leg(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        adapter, store = store_adapter
+        payload = await self._place(
+            adapter,
+            store,
+            mode="hedge",
+            side=OrderSide.SELL,
+            instrument=_linear_instrument(),
+            mock_pybit_http=mock_pybit_http,
+            reduce_only=True,
+        )
+        assert payload["positionIdx"] == 1
+
+    async def test_hedge_reduce_only_buy_payload_targets_short_leg(
+        self,
+        store_adapter: tuple[BybitAdapter, SQLiteStateStore],
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        adapter, store = store_adapter
+        payload = await self._place(
+            adapter,
+            store,
+            mode="hedge",
+            side=OrderSide.BUY,
+            instrument=_linear_instrument(),
+            mock_pybit_http=mock_pybit_http,
+            reduce_only=True,
         )
         assert payload["positionIdx"] == 2
 

@@ -683,16 +683,24 @@ class BybitAdapter(Adapter):
             mode=_POSITION_MODE_TO_INT[mode],
         )
 
-    async def _resolve_position_idx(self, instrument: Instrument, side: OrderSide) -> int | None:
+    async def _resolve_position_idx(
+        self,
+        instrument: Instrument,
+        side: OrderSide,
+        *,
+        reduce_only: bool = False,
+    ) -> int | None:
         """Resolve the Bybit ``positionIdx`` for an order on *instrument*.
 
         The stored position-mode intent is the source of truth (Section 6 /
         PLAN_feat_bybit-position-mode): the mode this adapter put the platform
         in is the mode orders must address.  Under hedge mode the order's
-        side picks the leg — Buy opens the long side (1), Sell the short (2);
-        under one-way mode every order carries 0.  ``None`` is returned when
-        the instrument is spot (no position mode), so no ``positionIdx`` is
-        attached at all.
+        side picks the leg, but the leg flips for reduce-only orders: an
+        opening BUY opens the long side (1) and a reduce-only SELL closes that
+        same long (1); an opening SELL opens the short side (2) and a
+        reduce-only BUY closes it (2).  Under one-way mode every order carries
+        0.  ``None`` is returned when the instrument is spot (no position
+        mode), so no ``positionIdx`` is attached at all.
         """
         category = self._instrument_to_category(instrument)
         if category == "spot":
@@ -711,8 +719,10 @@ class BybitAdapter(Adapter):
             mode = PositionMode.ONE_WAY
         if mode is PositionMode.ONE_WAY:
             return 0
-        # Hedge mode: the leg follows the order side.
-        return 1 if side == OrderSide.BUY else 2
+        # Hedge mode: an opening BUY / reduce-only SELL targets the long leg
+        # (1); an opening SELL / reduce-only BUY targets the short leg (2).
+        targets_long = (side == OrderSide.BUY) != reduce_only
+        return 1 if targets_long else 2
 
     async def set_margin_mode(self, mode: MarginMode) -> None:
         """Set the account-wide margin mode on the platform.
@@ -1799,7 +1809,11 @@ class BybitAdapter(Adapter):
         category = self._instrument_to_category(order.instrument)
         symbol = to_bybit_symbol(order.instrument)
         client_order_id = order.client_order_id or _new_id()
-        position_idx = await self._resolve_position_idx(order.instrument, order.side)
+        position_idx = await self._resolve_position_idx(
+            order.instrument,
+            order.side,
+            reduce_only=order.reduce_only,
+        )
         payload = build_place_order_payload(
             order,
             category=category,
