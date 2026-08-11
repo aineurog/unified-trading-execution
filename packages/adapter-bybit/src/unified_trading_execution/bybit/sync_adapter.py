@@ -25,7 +25,14 @@ from __future__ import annotations
 from collections.abc import Coroutine
 from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-from unified_trading_execution.bybit.adapter import BybitAdapter
+from unified_trading_execution.bybit.adapter import (
+    DEFAULT_AUTO_APPLY_ON_CONNECT,
+    DEFAULT_BLOCK_ON_OPEN_POSITION,
+    DEFAULT_LEVERAGE,
+    DEFAULT_ON_DRIFT,
+    DEFAULT_STRICT_CHECK,
+    BybitAdapter,
+)
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import FillRecord, OrderRecord
@@ -83,12 +90,12 @@ class SyncBybitAdapter:
         self,
         instrument: Instrument,
         *,
-        buy_leverage: int = 50,
+        buy_leverage: int = DEFAULT_LEVERAGE,
         sell_leverage: int | None = None,
-        on_drift: Literal["reapply", "notify", "halt"] = "reapply",
-        strict_check: bool = True,
-        block_on_open_position: bool = True,
-        auto_apply_on_connect: bool = True,
+        on_drift: Literal["reapply", "notify", "halt"] = DEFAULT_ON_DRIFT,
+        strict_check: bool = DEFAULT_STRICT_CHECK,
+        block_on_open_position: bool = DEFAULT_BLOCK_ON_OPEN_POSITION,
+        auto_apply_on_connect: bool = DEFAULT_AUTO_APPLY_ON_CONNECT,
     ) -> None:
         """Set leverage for *instrument* on the platform and persist the intent."""
         self._run(
@@ -118,8 +125,8 @@ class SyncBybitAdapter:
         instrument: Instrument,
         mode: str | PositionMode,
         *,
-        on_drift: Literal["reapply", "notify", "halt"] = "reapply",
-        auto_apply_on_connect: bool = True,
+        on_drift: Literal["reapply", "notify", "halt"] = DEFAULT_ON_DRIFT,
+        auto_apply_on_connect: bool = DEFAULT_AUTO_APPLY_ON_CONNECT,
     ) -> None:
         """Set position mode for *instrument* on the platform and persist intent."""
         self._run(
