@@ -296,6 +296,27 @@ class SyncEngine:
         """The state store — for direct access to its path (e.g. backups)."""
         return self._async_engine.state_store
 
+    # ---- Adapter method auto-proxy ----
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy unknown method calls to the underlying adapter.
+
+        Adapter-specific methods (set_leverage, fetch_positions, etc.) are not
+        on the Adapter ABC — they vary by platform.  This delegates to
+        ``getattr(adapter, name)`` at call time; if the adapter has it, the
+        callable is dispatched through ``self.run()`` onto the persistent
+        background loop.  Core never imports adapter code — everything is
+        resolved dynamically.
+        """
+        method = getattr(self._async_engine.adapter, name, None)
+        if callable(method):
+
+            def _proxy(*args: Any, **kwargs: Any) -> Any:
+                return self._run(method(*args, **kwargs))
+
+            return _proxy
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+
     # ---- Internal ----
 
     def _check_not_shutdown(self) -> None:
