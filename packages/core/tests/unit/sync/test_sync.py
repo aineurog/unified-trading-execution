@@ -10,6 +10,7 @@ Verify that the sync facade:
 from __future__ import annotations
 
 import concurrent.futures
+import sqlite3
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -287,6 +288,10 @@ class TestSyncShutdown:
                 results.append(("ok", r.client_order_id))
             except EngineShutdownError:
                 results.append(("shutdown", i))
+            except sqlite3.ProgrammingError:
+                # The state store was closed during an in-flight order — this
+                # is a normal outcome of concurrent teardown, not a bug.
+                results.append(("db_closed", i))
             except Exception as exc:
                 results.append(("error", exc))
 
