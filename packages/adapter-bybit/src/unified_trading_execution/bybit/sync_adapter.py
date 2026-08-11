@@ -22,11 +22,20 @@ Usage::
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Coroutine
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
-import unified_trading_execution as ute
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
+from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.order import FillRecord, OrderRecord
+from unified_trading_execution.types.position import Balance, Position
+
+if TYPE_CHECKING:
+    from unified_trading_execution.adapter import RateLimits
+    from unified_trading_execution.sync import SyncEngine
+
+_T = TypeVar("_T")
 
 
 class SyncBybitAdapter:
@@ -40,7 +49,7 @@ class SyncBybitAdapter:
     position mode, margin mode, snapshots, open orders, fills, rate limits).
     """
 
-    def __init__(self, engine: ute.SyncEngine) -> None:
+    def __init__(self, engine: SyncEngine) -> None:
         self._engine = engine
         adapter = engine.adapter
         if not isinstance(adapter, BybitAdapter):
@@ -72,11 +81,11 @@ class SyncBybitAdapter:
 
     def set_leverage(
         self,
-        instrument: ute.Instrument,
+        instrument: Instrument,
         *,
         buy_leverage: int = 50,
         sell_leverage: int | None = None,
-        on_drift: str = "reapply",
+        on_drift: Literal["reapply", "notify", "halt"] = "reapply",
         strict_check: bool = True,
         block_on_open_position: bool = True,
         auto_apply_on_connect: bool = True,
@@ -94,11 +103,11 @@ class SyncBybitAdapter:
             )
         )
 
-    def get_leverage(self, instrument: ute.Instrument) -> tuple[int, int] | None:
+    def get_leverage(self, instrument: Instrument) -> tuple[int, int] | None:
         """Return the platform's current (buy, sell) leverage for *instrument*."""
         return self._run(self._adapter.get_leverage(instrument))
 
-    def remove_leverage(self, instrument: ute.Instrument) -> None:
+    def remove_leverage(self, instrument: Instrument) -> None:
         """Delete the stored leverage intent for *instrument*."""
         self._run(self._adapter.remove_leverage(instrument))
 
@@ -106,10 +115,10 @@ class SyncBybitAdapter:
 
     def set_position_mode(
         self,
-        instrument: ute.Instrument,
+        instrument: Instrument,
         mode: str | PositionMode,
         *,
-        on_drift: str = "reapply",
+        on_drift: Literal["reapply", "notify", "halt"] = "reapply",
         auto_apply_on_connect: bool = True,
     ) -> None:
         """Set position mode for *instrument* on the platform and persist intent."""
@@ -122,11 +131,11 @@ class SyncBybitAdapter:
             )
         )
 
-    def get_position_mode(self, instrument: ute.Instrument) -> PositionMode | None:
+    def get_position_mode(self, instrument: Instrument) -> PositionMode | None:
         """Return the platform's current position mode for *instrument*."""
         return self._run(self._adapter.get_position_mode(instrument))
 
-    def remove_position_mode(self, instrument: ute.Instrument) -> None:
+    def remove_position_mode(self, instrument: Instrument) -> None:
         """Delete the stored position-mode intent for *instrument*."""
         self._run(self._adapter.remove_position_mode(instrument))
 
@@ -137,9 +146,7 @@ class SyncBybitAdapter:
         mode: str | PositionMode,
     ) -> None:
         """Batch-switch position mode for all symbols of *coin* with no open positions."""
-        self._run(
-            self._adapter.set_position_mode_for_coin(coin, category, mode)
-        )
+        self._run(self._adapter.set_position_mode_for_coin(coin, category, mode))
 
     # ---- margin mode ----
 
@@ -153,27 +160,27 @@ class SyncBybitAdapter:
 
     # ---- snapshots / reads ----
 
-    def fetch_instrument_spec(self, instrument: ute.Instrument) -> ute.InstrumentSpec:
+    def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         """Fetch and cache trading rules for *instrument*."""
         return self._run(self._adapter.fetch_instrument_spec(instrument))
 
-    def get_rate_limits(self) -> ute.RateLimits:
+    def get_rate_limits(self) -> RateLimits:
         """Return the adapter's current rate-limit budget."""
         return self._run(self._adapter.get_rate_limits())
 
-    def fetch_positions(self) -> dict[ute.Instrument, ute.Position]:
+    def fetch_positions(self) -> dict[Instrument, Position]:
         """Fetch all Bybit positions across every applicable category."""
         return self._run(self._adapter.fetch_positions())
 
-    def fetch_balances(self) -> dict[str, ute.Balance]:
+    def fetch_balances(self) -> dict[str, Balance]:
         """Fetch the account's per-coin balance, keyed by currency."""
         return self._run(self._adapter.fetch_balances())
 
-    def fetch_open_orders(self) -> dict[str, ute.OrderRecord]:
+    def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch every open order, keyed by client order id."""
         return self._run(self._adapter.fetch_open_orders())
 
-    def fetch_fills(self) -> dict[str, list[ute.FillRecord]]:
+    def fetch_fills(self) -> dict[str, list[FillRecord]]:
         """Fetch recent fills grouped by client order id."""
         return self._run(self._adapter.fetch_fills())
 
@@ -193,5 +200,5 @@ class SyncBybitAdapter:
 
     # ---- internal ----
 
-    def _run(self, coro: Any) -> Any:
+    def _run(self, coro: Coroutine[Any, Any, _T]) -> _T:
         return self._engine.run(coro)
