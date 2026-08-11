@@ -371,3 +371,57 @@ class TestNoAsyncioRunPerCall:
             assert sync_engine._loop_thread is thread_initial, (
                 "Background thread replaced — loop recreation suspected"
             )
+
+
+# ── adapter method auto-proxy via __getattr__ ─────────────────────────
+
+
+class TestAdapterAutoProxy:
+    """SyncEngine proxies unknown methods to the underlying adapter."""
+
+    def test_proxies_adapter_method(self, sync_engine):
+        """Calls to adapter-specific async methods are dispatched onto the loop."""
+        import asyncio as _asyncio
+
+        adapter = sync_engine._async_engine.adapter
+
+        async def _fake() -> dict:
+            return {"BTC": "fake"}
+
+        adapter.fetch_positions = _fake  # type: ignore[method-assign]
+        result = sync_engine.fetch_positions()
+        assert result == {"BTC": "fake"}
+
+    def test_proxied_call_runs_on_engine_loop(self, sync_engine):
+        """Proxied adapter calls run on the same persistent loop."""
+        import asyncio as _asyncio
+
+        adapter = sync_engine._async_engine.adapter
+        seen: list[_asyncio.AbstractEventLoop | None] = []
+
+        async def _capture_loop() -> dict:
+            seen.append(_asyncio.get_running_loop())
+            return {}
+
+        adapter.fetch_positions = _capture_loop  # type: ignore[method-assign]
+        sync_engine.fetch_positions()
+        assert len(seen) == 1
+        assert seen[0] is sync_engine._loop
+
+    def test_unknown_method_raises_attribute_error(self, sync_engine):
+        """A method that doesn't exist on the adapter raises AttributeError."""
+        with pytest.raises(AttributeError, match="SyncEngine"):
+            sync_engine.nonexistent_method()
+
+    def test_shutdown_blocks_proxied_calls(self, sync_engine):
+        """After shutdown, proxied adapter calls raise EngineShutdownError."""
+
+        async def _fake() -> dict:
+            return {}
+
+        adapter = sync_engine._async_engine.adapter
+        adapter.fetch_positions = _fake  # type: ignore[method-assign]
+        sync_engine.shutdown()
+
+        with pytest.raises(EngineShutdownError):
+            sync_engine.fetch_positions()
