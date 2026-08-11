@@ -46,6 +46,7 @@ from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInFo
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
+
 async def main():
     config = BybitConfig(
         api_key="your-api-key",
@@ -68,6 +69,7 @@ async def main():
     print(f"Order {result.client_order_id} → {result.status.value}")
 
     await adapter.disconnect()
+
 
 asyncio.run(main())
 ```
