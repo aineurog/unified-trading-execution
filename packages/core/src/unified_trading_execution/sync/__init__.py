@@ -122,12 +122,22 @@ class SyncEngine:
         if self._shutdown:
             return
         self._shutdown = True
-        self._async_engine.shutdown()
         if self._loop is not None and not self._loop.is_closed():
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            if self._loop_thread is not None and self._loop_thread.is_alive():
-                self._loop_thread.join(timeout=5)
-            self._loop.close()
+            # Dispatch teardown onto the persistent loop so adapter tasks (e.g.
+            # _monitor_task) are gathered on the same loop they were created on.
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._async_engine.ashutdown(), self._loop
+                )
+                future.result()
+            finally:
+                self._loop.call_soon_threadsafe(self._loop.stop)
+                if self._loop_thread is not None and self._loop_thread.is_alive():
+                    self._loop_thread.join(timeout=5)
+                self._loop.close()
+        else:
+            # Loop never started — no adapter tasks exist; run teardown inline.
+            asyncio.run(self._async_engine.ashutdown())
 
     # ---- Order operations ----
 
@@ -146,6 +156,18 @@ class SyncEngine:
     def get_order(self, client_order_id: str) -> OrderResult | None:
         """Query an order's status from the platform (blocking)."""
         return self._run(self._async_engine.get_order(client_order_id))
+
+    def run(self, coro: Coroutine[Any, Any, _T]) -> _T:
+        """Dispatch an arbitrary coroutine onto the persistent loop (blocking).
+
+        Intended for adapter-specific operations (leverage, position mode,
+        margin mode, position/balance snapshots, ...) that are not part of the
+        engine's generic interface.  Preserves the single-loop guarantee -- the
+        coroutine runs on the exact same thread as every engine operation, so
+        the state store, WebSocket handlers and the adapter's ``_loop`` never
+        diverge.  After ``shutdown()`` this raises ``EngineShutdownError``.
+        """
+        return self._run(coro)
 
     # ---- Instrument metadata ----
 
@@ -263,6 +285,11 @@ class SyncEngine:
     def event_bus(self) -> EventBus:
         """The event bus — subscribe from any thread before connecting."""
         return self._async_engine.event_bus
+
+    @property
+    def adapter(self) -> Adapter:
+        """The underlying async adapter — for low-level platform access."""
+        return self._async_engine.adapter
 
     @property
     def state_store(self) -> StateStore:
