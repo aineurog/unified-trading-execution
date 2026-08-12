@@ -22,6 +22,7 @@ class TimeInForce(StrEnum):
     IOC = "IOC"
     FOK = "FOK"
     DAY = "DAY"
+    GTD = "GTD"  # Good-Til-Date — requires expire_at on UnifiedOrder
 
 
 class OrderStatus(StrEnum):
