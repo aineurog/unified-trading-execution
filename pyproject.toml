@@ -101,4 +101,5 @@ type = "independence"
 modules = [
     "unified_trading_execution.bybit",
     "unified_trading_execution.ctrader",
+    "unified_trading_execution.mt5",
 ]
