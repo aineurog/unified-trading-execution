@@ -64,8 +64,7 @@ config = BybitConfig(
 ```python
 import asyncio
 
-from unified_trading_execution import Engine
-from unified_trading_execution.bybit import BybitAdapter, BybitConfig
+from unified_trading_execution.bybit import BybitEngine, BybitConfig
 from unified_trading_execution.types.enums import (
     AssetClass, OrderSide, OrderType, TimeInForce,
 )
@@ -73,10 +72,9 @@ from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
 async def main():
-    adapter = BybitAdapter(BybitConfig(
+    engine = BybitEngine(BybitConfig(
         api_key="...", api_secret="...", testnet=True,
     ))
-    engine = Engine(adapter)
     await engine.connect()
 
     btc = Instrument(
@@ -86,7 +84,7 @@ async def main():
     )
     await engine.fetch_instrument_spec(btc)
 
-    result = engine.place_order(UnifiedOrder(
+    result = await engine.place_order(UnifiedOrder(
         instrument=btc,
         order_type=OrderType.MARKET,
         side=OrderSide.BUY,
@@ -104,17 +102,18 @@ asyncio.run(main())
 <td>
 
 ```python
-from unified_trading_execution.bybit import BybitAdapter, BybitConfig
-from unified_trading_execution.sync import SyncEngine
+from unified_trading_execution.bybit import (
+    BybitConfig, SyncBybitEngine,
+)
 from unified_trading_execution.types.enums import (
     AssetClass, OrderSide, OrderType, TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
-engine = SyncEngine(BybitAdapter(BybitConfig(
+engine = SyncBybitEngine(BybitConfig(
     api_key="...", api_secret="...", testnet=True,
-)))
+))
 engine.connect()
 
 btc = Instrument(
@@ -140,10 +139,13 @@ engine.shutdown()
 </tr>
 </table>
 
-Both examples are symmetric — an engine wraps the adapter, orders go through
-the risk-check pipeline, and every operation is a single method call on the
-engine.  No separate wrapper objects, no `EventBus` wiring, and no manual
-`Decimal()` construction are needed.
+**One import, one object.** `BybitEngine` and `SyncBybitEngine` combine the
+engine and adapter into a single class.  Construct one with a `BybitConfig`,
+call any method — order lifecycle, leverage management, position mode,
+reconciliation, history — everything is on the engine.
+
+If you need lower-level access, the raw `BybitAdapter` and `Engine` are
+still available.  See [advanced usage](#advanced-usage).
 
 Numeric inputs (`quantity`, `price`, `stop_price`) accept plain numbers:
 
