@@ -46,6 +46,8 @@ class UnifiedOrder:
     client_tag: str | None = None  # user reference, never read by engine
     take_profit: TpSlAttachment | None = None
     stop_loss: TpSlAttachment | None = None
+    position_id: str | None = None  # passthrough — target a specific position leg (hedging)
+    expire_at: datetime | None = None  # required when time_in_force == GTD; UTC, timezone-aware
 
     def __post_init__(self) -> None:
         # Coerce numeric inputs (int/float/str) to Decimal on construction
@@ -73,6 +75,14 @@ class UnifiedOrder:
             raise ValueError(f"price must be > 0, got {self.price}")
         if self.stop_price is not None and self.stop_price <= 0:
             raise ValueError(f"stop_price must be > 0, got {self.stop_price}")
+        # GTD orders require an expiration datetime
+        if self.time_in_force == TimeInForce.GTD:
+            if self.expire_at is None:
+                raise ValueError("expire_at is required when time_in_force == GTD")
+            if self.expire_at.tzinfo is None:
+                raise ValueError("expire_at must be timezone-aware (UTC)")
+            if self.expire_at <= datetime.now(tz=self.expire_at.tzinfo):
+                raise ValueError("expire_at must be in the future")
 
 
 @dataclass(slots=True)
@@ -163,6 +173,7 @@ class FillRecord:
     fee_currency: str | None
     fee_amount: Decimal | None
     correlation_id: str
+    position_id: str | None = None  # passthrough — links fill to a specific position leg (hedging)
 
     def __post_init__(self) -> None:
         if self.fill_timestamp.tzinfo is None:

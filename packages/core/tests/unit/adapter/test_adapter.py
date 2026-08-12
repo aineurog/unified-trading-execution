@@ -151,6 +151,7 @@ class TestAdapterZeroImplementation:
                 "attach_event_bus",
                 "attach_state_store",
                 "reconcile_user_intent",
+                "modify_position_tpsl",
             }
         )
         concrete = []

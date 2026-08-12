@@ -21,6 +21,7 @@ from unified_trading_execution.types.order import (
     OrderModification,
     OrderRecord,
     OrderResult,
+    TpSlAttachment,
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
@@ -153,6 +154,31 @@ class Adapter(ABC):
         (TTL determined by interval_seconds) rather than calling on every dispatch.
         """
         ...
+
+    # ---- Position TP/SL modification (optional) ----
+
+    async def modify_position_tpsl(
+        self,
+        position_id: str,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Modify TP/SL on an existing open position.
+
+        Optional — raises ``NotImplementedError`` by default.  Platforms that
+        support modifying TP/SL on positions (MT5 via ``TRADE_ACTION_SLTP``,
+        IBKR, cTrader) override this method.  At least one of *take_profit*
+        or *stop_loss* must be provided.
+
+        *position_id* is the platform-assigned position identifier (MT5
+        ticket, etc.).  It is **not** the same as ``UnifiedOrder.position_id``
+        (which is a client-side passthrough); it is the platform's own
+        position reference obtained from ``PositionUpdateEvent`` or the
+        state store.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support modifying TP/SL on open positions"
+        )
 
     # ---- Reconciliation data (optional — not required for basic operation) ----
 
