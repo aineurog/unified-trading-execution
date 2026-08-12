@@ -8,7 +8,7 @@ translates in both directions:
 - ``parse_mt5_result(result)`` — MT5 ``OrderSendResult`` → ``OrderResult``
 - ``parse_order_record(ticket)`` — MT5 order query → ``OrderResult``
 
-Order type mapping (direction-specific — 8 MT5 types for 4 unified × 2 sides):
+Order type mapping (direction-specific — 8 MT5 types for 4 unified x 2 sides):
 
 =========== ====== ============================
 Unified     Side   MT5 ``ORDER_TYPE_*``

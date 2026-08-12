@@ -28,15 +28,8 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.errors import (
-    InvalidSymbolError,
-    PlatformConnectionError,
-)
 from unified_trading_execution.events import (
-    ConnectionStateEvent,
     EventBus,
-    FillEvent,
-    PositionUpdateEvent,
 )
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
@@ -69,7 +62,8 @@ def _get_mt5() -> Any:
     except ImportError:
         raise ImportError(
             "MetaTrader5 package is required for MT5 adapter. "
-            "It is only available on Windows. Install with: pip install unified-trading-execution-metatrader[mt5]"
+            "It is only available on Windows. "
+            "Install with: pip install unified-trading-execution-metatrader[mt5]"
         ) from None
     return mt5
 

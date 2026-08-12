@@ -13,8 +13,6 @@ Tests cases:
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestPollOnce:
     """Single poll cycle behaviour."""

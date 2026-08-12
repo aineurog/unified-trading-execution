@@ -11,8 +11,6 @@ Tests cases:
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestMapMT5Error:
     """Test map_mt5_error translation."""

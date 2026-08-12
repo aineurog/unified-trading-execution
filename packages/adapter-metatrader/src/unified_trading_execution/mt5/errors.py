@@ -36,37 +36,37 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10028: PlatformConnectionError,  # TRADE_RETCODE_LOCKED — order locked
     10031: PlatformConnectionError,  # TRADE_RETCODE_CONNECTION — no connection
     # ---- Invalid symbol / params ----
-    10013: InvalidSymbolError,       # TRADE_RETCODE_INVALID — invalid request
-    10014: InvalidSymbolError,       # TRADE_RETCODE_INVALID_VOLUME
-    10015: InvalidSymbolError,       # TRADE_RETCODE_INVALID_PRICE
-    10016: InvalidSymbolError,       # TRADE_RETCODE_INVALID_STOPS
-    10018: InvalidSymbolError,       # TRADE_RETCODE_MARKET_CLOSED
-    10022: InvalidSymbolError,       # TRADE_RETCODE_INVALID_EXPIRATION
-    10034: InvalidSymbolError,       # TRADE_RETCODE_LIMIT_VOLUME
+    10013: InvalidSymbolError,  # TRADE_RETCODE_INVALID — invalid request
+    10014: InvalidSymbolError,  # TRADE_RETCODE_INVALID_VOLUME
+    10015: InvalidSymbolError,  # TRADE_RETCODE_INVALID_PRICE
+    10016: InvalidSymbolError,  # TRADE_RETCODE_INVALID_STOPS
+    10018: InvalidSymbolError,  # TRADE_RETCODE_MARKET_CLOSED
+    10022: InvalidSymbolError,  # TRADE_RETCODE_INVALID_EXPIRATION
+    10034: InvalidSymbolError,  # TRADE_RETCODE_LIMIT_VOLUME
     # ---- Insufficient balance ----
-    10019: InsufficientBalanceError, # TRADE_RETCODE_NO_MONEY
+    10019: InsufficientBalanceError,  # TRADE_RETCODE_NO_MONEY
     # ---- Halted / frozen ----
-    10017: InstrumentHaltedError,    # TRADE_RETCODE_TRADE_DISABLED
-    10029: InstrumentHaltedError,    # TRADE_RETCODE_FROZEN
+    10017: InstrumentHaltedError,  # TRADE_RETCODE_TRADE_DISABLED
+    10029: InstrumentHaltedError,  # TRADE_RETCODE_FROZEN
     # ---- Rate limiting ----
-    10024: RateLimitError,           # TRADE_RETCODE_TOO_MANY_REQUESTS
-    10033: RateLimitError,           # TRADE_RETCODE_LIMIT_ORDERS
+    10024: RateLimitError,  # TRADE_RETCODE_TOO_MANY_REQUESTS
+    10033: RateLimitError,  # TRADE_RETCODE_LIMIT_ORDERS
     # ---- Order not found ----
-    10035: OrderNotFoundError,       # TRADE_RETCODE_INVALID_ORDER
+    10035: OrderNotFoundError,  # TRADE_RETCODE_INVALID_ORDER
     # ---- Generic / catch-all ----
-    10006: PlatformError,            # TRADE_RETCODE_REJECT — generic reject
-    10011: PlatformError,            # TRADE_RETCODE_ERROR — processing error
-    10023: PlatformError,            # TRADE_RETCODE_ORDER_CHANGED
-    10026: PlatformError,            # TRADE_RETCODE_SERVER_DISABLES_AT
-    10027: PlatformError,            # TRADE_RETCODE_CLIENT_DISABLES_AT
-    10030: PlatformError,            # TRADE_RETCODE_INVALID_FILL
-    10032: PlatformError,            # TRADE_RETCODE_ONLY_REAL
+    10006: PlatformError,  # TRADE_RETCODE_REJECT — generic reject
+    10011: PlatformError,  # TRADE_RETCODE_ERROR — processing error
+    10023: PlatformError,  # TRADE_RETCODE_ORDER_CHANGED
+    10026: PlatformError,  # TRADE_RETCODE_SERVER_DISABLES_AT
+    10027: PlatformError,  # TRADE_RETCODE_CLIENT_DISABLES_AT
+    10030: PlatformError,  # TRADE_RETCODE_INVALID_FILL
+    10032: PlatformError,  # TRADE_RETCODE_ONLY_REAL
 }
 
 # Non-trade error codes returned by mt5.last_error() after
 # non-order-send calls (initialize, symbol_info, account_info, etc.).
 _NON_TRADE_ERROR_MAP: dict[int, type[UteError]] = {
-    -1: PlatformError,               # Generic / unknown
+    -1: PlatformError,  # Generic / unknown
     32768: PlatformConnectionError,  # Internal error, copy data failed
     32769: PlatformConnectionError,  # Not initialized
 }

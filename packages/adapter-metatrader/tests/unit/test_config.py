@@ -12,10 +12,6 @@ Tests cases:
 
 from __future__ import annotations
 
-import pytest
-
-from unified_trading_execution.mt5 import MT5Config
-
 
 class TestMT5ConfigValidation:
     """Test MT5Config.__post_init__ validation rules."""

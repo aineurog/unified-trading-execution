@@ -32,7 +32,7 @@ Flow:
 
 from __future__ import annotations
 
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 
 def to_mt5_symbol(instrument: Instrument) -> str:

@@ -13,8 +13,6 @@ Tests cases:
 
 from __future__ import annotations
 
-import pytest
-
 
 class TestToMT5Symbol:
     """Canonical Instrument → MT5 broker symbol string."""
@@ -36,7 +34,7 @@ class TestFromMT5Symbol:
     """MT5 broker symbol string → canonical Instrument."""
 
     def test_parses_simple_form(self) -> None:
-        """"EURUSD" → Instrument("EUR", "USD")."""
+        """ "EURUSD" → Instrument("EUR", "USD")."""
         ...
 
     def test_uses_reverse_alias_table(self) -> None:

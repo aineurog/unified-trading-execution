@@ -45,21 +45,14 @@ class MT5Config:
         for canonical, broker_symbol in self.symbol_alias_table.items():
             if "/" not in canonical:
                 raise ValueError(
-                    f"Symbol alias key must be canonical 'BASE/QUOTE' form, "
-                    f"got {canonical!r}"
+                    f"Symbol alias key must be canonical 'BASE/QUOTE' form, got {canonical!r}"
                 )
             if not broker_symbol:
-                raise ValueError(
-                    f"Broker symbol for alias {canonical!r} must be non-empty"
-                )
+                raise ValueError(f"Broker symbol for alias {canonical!r} must be non-empty")
 
         if self.poll_interval_seconds <= 0:
-            raise ValueError(
-                f"poll_interval_seconds must be > 0, got {self.poll_interval_seconds}"
-            )
+            raise ValueError(f"poll_interval_seconds must be > 0, got {self.poll_interval_seconds}")
 
         ttl = self.instrument_spec_cache_ttl
         if ttl is not None and ttl <= 0:
-            raise ValueError(
-                f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}"
-            )
+            raise ValueError(f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}")

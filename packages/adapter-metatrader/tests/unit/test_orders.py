@@ -1,7 +1,7 @@
 """Unit tests for MT5 order translation (orders.py).
 
 Tests cases:
-    - build_mt5_request: all 8 order type permutations (4 types × 2 sides)
+    - build_mt5_request: all 8 order type permutations (4 types x 2 sides)
     - MARKET BUY/SELL get ORDER_TYPE_BUY/SELL
     - LIMIT BUY/SELL get ORDER_TYPE_BUY_LIMIT/SELL_LIMIT
     - STOP/STOP_LIMIT type mapping
@@ -17,8 +17,6 @@ Tests cases:
 """
 
 from __future__ import annotations
-
-import pytest
 
 
 class TestBuildMT5Request:
