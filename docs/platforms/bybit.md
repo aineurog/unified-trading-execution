@@ -711,17 +711,16 @@ engine.event_bus.subscribe(LeverageDriftEvent, on_drift)
 
 ## Reconciliation data
 
-The adapter implements all four optional data-fetching methods so the engine
-can reconcile its state mirror against the platform:
+The engine can reconcile its state mirror against the platform:
 
 ```python
 # Async
-positions = await adapter.fetch_positions()
-balances = await adapter.fetch_balances()
-orders = await adapter.fetch_open_orders()
-fills = await adapter.fetch_fills()
+positions = await engine.fetch_positions()
+balances = await engine.fetch_balances()
+orders = await engine.fetch_open_orders()
+fills = await engine.fetch_fills()
 
-# Sync — identical API on the engine
+# Sync — identical API
 positions = engine.fetch_positions()
 balances = engine.fetch_balances()
 orders = engine.fetch_open_orders()
@@ -764,27 +763,69 @@ fills = engine.fetch_fills()
 
 ## Working with multiple adapters
 
-One engine instance manages exactly one adapter. To trade on Bybit and another
-platform simultaneously, create two engine instances:
+One engine instance manages exactly one platform.  To trade on Bybit and another
+platform simultaneously, create separate engine instances:
 
 ```python
 # Async
-bybit_engine = Engine(BybitAdapter(BybitConfig(
-    api_key="...", api_secret="...", testnet=True,
-)))
-await bybit_engine.connect()
+from unified_trading_execution.bybit import BybitEngine, BybitConfig
 
-# ctrade_engine = Engine(CTraderAdapter(...))
-# await ctrade_engine.connect()
+bybit = BybitEngine(BybitConfig(api_key="...", api_secret="...", testnet=True))
+await bybit.connect()
 
+# ctrader = CTraderEngine(CTraderConfig(...))
+# await ctrader.connect()
+```
+
+```python
 # Sync
-bybit_engine = SyncEngine(BybitAdapter(BybitConfig(
-    api_key="...", api_secret="...", testnet=True,
-)))
-bybit_engine.connect()
+from unified_trading_execution.bybit import SyncBybitEngine, BybitConfig
 
-# ctrade_engine = SyncEngine(CTraderAdapter(...))
-# ctrade_engine.connect()
+bybit = SyncBybitEngine(BybitConfig(api_key="...", api_secret="...", testnet=True))
+bybit.connect()
+
+# ctrader = SyncCTraderEngine(CTraderConfig(...))
+# ctrader.connect()
 ```
 
 Each engine's state store is naturally scoped to one platform and one account.
+
+## Advanced usage
+
+The `BybitEngine` and `SyncBybitEngine` classes are the recommended path.
+If you need more control — custom adapter pre-configuration, a shared event bus
+across engines, or direct access to raw adapter methods — the two-object pattern
+with `Engine` / `SyncEngine` and `BybitAdapter` is available:
+
+```python
+from unified_trading_execution import Engine
+from unified_trading_execution.bybit import BybitAdapter, BybitConfig
+from unified_trading_execution.events import EventBus
+from unified_trading_execution.state.store import SQLiteStateStore
+
+bus = EventBus()
+store = SQLiteStateStore("my_data.db")
+adapter = BybitAdapter(BybitConfig(api_key="...", api_secret="...", testnet=True))
+
+engine = Engine(adapter, state_store=store, event_bus=bus)
+await engine.connect()
+# use engine for order lifecycle, adapter for platform-specific calls
+await engine.ashutdown()
+```
+
+```python
+from unified_trading_execution.bybit import BybitAdapter, BybitConfig
+from unified_trading_execution.sync import SyncEngine
+
+engine = SyncEngine(BybitAdapter(BybitConfig(
+    api_key="...", api_secret="...", testnet=True,
+)))
+engine.connect()
+engine.shutdown()
+```
+
+You need the two-object path when:
+- Sharing an `EventBus` or `StateStore` across multiple engine instances.
+- Calling the adapter's raw HTTP methods (which bypass the risk pipeline and
+  state mirror — only needed for debugging or custom tooling).
+- Testing with a `MockAdapter` instead of a real adapter.
