@@ -37,10 +37,8 @@ from unified_trading_execution.bybit import BybitConfig
 config = BybitConfig(
     api_key="your-api-key",
     api_secret="your-api-secret",
-    testnet=True,               # False for mainnet
-    demo=False,                 # True for demo subdomain
-    margin_mode="cross",        # or "isolated"
-    platform_name="bybit",
+    testnet=True,
+    margin_mode="cross",
     account_id="bybit-main",
 )
 ```
@@ -65,45 +63,39 @@ config = BybitConfig(
 
 ```python
 import asyncio
-from decimal import Decimal
 
-from unified_trading_execution.bybit import (
-    BybitAdapter, BybitConfig,
-)
-from unified_trading_execution.events import EventBus
+from unified_trading_execution import Engine
+from unified_trading_execution.bybit import BybitAdapter, BybitConfig
 from unified_trading_execution.types.enums import (
-    OrderSide, OrderType, TimeInForce,
+    AssetClass, OrderSide, OrderType, TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
 async def main():
-    config = BybitConfig(
-        api_key="...",
-        api_secret="...",
-        testnet=True,
-    )
-    adapter = BybitAdapter(config, event_bus=EventBus())
-    await adapter.connect()
+    adapter = BybitAdapter(BybitConfig(
+        api_key="...", api_secret="...", testnet=True,
+    ))
+    engine = Engine(adapter)
+    await engine.connect()
 
     btc = Instrument(
         symbol="BTC",
         quote_currency="USDT",
-        asset_class="FUTURES",
+        asset_class=AssetClass.FUTURES,
     )
-    spec = await adapter.fetch_instrument_spec(btc)
+    await engine.fetch_instrument_spec(btc)
 
-    order = UnifiedOrder(
+    result = engine.place_order(UnifiedOrder(
         instrument=btc,
         order_type=OrderType.MARKET,
         side=OrderSide.BUY,
-        quantity=Decimal("0.01"),
+        quantity=0.01,
         time_in_force=TimeInForce.GTC,
-    )
-    result = await adapter.place_order(order)
-    print(f"Order {result.client_order_id} → {result.status.value}")
+    ))
+    print(f"Order {result.client_order_id} -> {result.status.value}")
 
-    await adapter.disconnect()
+    await engine.ashutdown()
 
 asyncio.run(main())
 ```
@@ -112,48 +104,55 @@ asyncio.run(main())
 <td>
 
 ```python
-from decimal import Decimal
-
-from unified_trading_execution.bybit import (
-    BybitAdapter, BybitConfig,
-)
+from unified_trading_execution.bybit import BybitAdapter, BybitConfig
 from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.types.enums import (
-    OrderSide, OrderType, TimeInForce,
+    AssetClass, OrderSide, OrderType, TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
-config = BybitConfig(
+engine = SyncEngine(BybitAdapter(BybitConfig(
     api_key="...", api_secret="...", testnet=True,
-)
-adapter = BybitAdapter(config)
-engine = SyncEngine(adapter)
+)))
 engine.connect()
 
 btc = Instrument(
     symbol="BTC",
     quote_currency="USDT",
-    asset_class="FUTURES",
+    asset_class=AssetClass.FUTURES,
 )
-spec = engine.fetch_instrument_spec(btc)
+engine.fetch_instrument_spec(btc)
 
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.MARKET,
     side=OrderSide.BUY,
-    quantity=Decimal("0.01"),
+    quantity=0.01,
     time_in_force=TimeInForce.GTC,
-)
-result = engine.place_order(order)
-print(f"Order {result.client_order_id} → {result.status.value}")
+))
+print(f"Order {result.client_order_id} -> {result.status.value}")
 
-engine.disconnect()
+engine.shutdown()
 ```
 
 </td>
 </tr>
 </table>
+
+Both examples are symmetric — an engine wraps the adapter, orders go through
+the risk-check pipeline, and every operation is a single method call on the
+engine.  No separate wrapper objects, no `EventBus` wiring, and no manual
+`Decimal()` construction are needed.
+
+Numeric inputs (`quantity`, `price`, `stop_price`) accept plain numbers:
+
+```python
+# These all work
+UnifiedOrder(..., quantity=0.01)
+UnifiedOrder(..., price="65000")
+UnifiedOrder(..., stop_price=64500.50)
+```
 
 ## Connection lifecycle
 
@@ -171,27 +170,15 @@ starts a background connection monitor, applies the configured margin mode, and
 re-applies any stored leverage and position mode intent (see [Leverage
 management](#leverage-management)).
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-await adapter.connect()
-assert adapter.is_connected
-```
+# Async
+await engine.connect()
+assert engine.adapter.is_connected
 
-</td>
-<td>
-
-```python
+# Sync
 engine.connect()
-assert engine.is_connected
+assert engine.adapter.is_connected
 ```
-
-</td>
-</tr>
-</table>
 
 `connect()` is idempotent — calling it on an already-connected adapter is a no-op.
 
@@ -200,27 +187,29 @@ assert engine.is_connected
 Closes the WebSocket, cancels the connection monitor, clears internal caches,
 and publishes `ConnectionStateEvent(connected=False)`.
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-await adapter.disconnect()
-```
+# Async
+await engine.disconnect()
 
-</td>
-<td>
-
-```python
+# Sync
 engine.disconnect()
 ```
 
-</td>
-</tr>
-</table>
-
 `disconnect()` is also idempotent.
+
+### `shutdown()`
+
+Ordered teardown: flushes all audit-trail writes, disconnects the adapter,
+closes the state store, and stops the background event loop (sync). After
+shutdown the engine is permanently unusable.
+
+```python
+# Async
+await engine.ashutdown()
+
+# Sync
+engine.shutdown()
+```
 
 ### Connection monitor
 
@@ -233,8 +222,10 @@ invalidated.
 
 ## Order operations
 
-The adapter implements the four guaranteed order types plus native take-profit
-and stop-loss attachment.
+Orders go through the engine's risk-check pipeline (symbol validity, quantity
+bounds, price sanity, duplicate detection, rate limiting) before reaching the
+platform.  You never call `adapter.place_order()` directly — use
+`engine.place_order()`.
 
 ### Supported order types
 
@@ -249,104 +240,40 @@ and stop-loss attachment.
 
 ### Placing an order
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-from decimal import Decimal
-from unified_trading_execution.types.enums import (
-    OrderSide, OrderType, TimeInForce,
-)
-from unified_trading_execution.types.order import UnifiedOrder
+# Async / Sync — identical API, one calls await, the other doesn't
 
 # Market buy
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.MARKET,
     side=OrderSide.BUY,
-    quantity=Decimal("0.01"),
+    quantity=0.01,
     time_in_force=TimeInForce.GTC,
-)
-result = await adapter.place_order(order)
+))
 
 # Limit sell
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.LIMIT,
     side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
-    price=Decimal("68000"),
+    quantity=0.01,
+    price=68000,
     time_in_force=TimeInForce.GTC,
-)
-result = await adapter.place_order(order)
+))
 
 # Stop-loss (conditional market — derivatives only)
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.STOP,
     side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
-    stop_price=Decimal("65000"),
+    quantity=0.01,
+    stop_price=65000,
     time_in_force=TimeInForce.GTC,
-)
-result = await adapter.place_order(order)
+))
 ```
 
-</td>
-<td>
-
-```python
-from decimal import Decimal
-from unified_trading_execution.types.enums import (
-    OrderSide, OrderType, TimeInForce,
-)
-from unified_trading_execution.types.order import UnifiedOrder
-
-# Market buy
-order = UnifiedOrder(
-    instrument=btc,
-    order_type=OrderType.MARKET,
-    side=OrderSide.BUY,
-    quantity=Decimal("0.01"),
-    time_in_force=TimeInForce.GTC,
-)
-result = engine.place_order(order)
-
-# Limit sell
-order = UnifiedOrder(
-    instrument=btc,
-    order_type=OrderType.LIMIT,
-    side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
-    price=Decimal("68000"),
-    time_in_force=TimeInForce.GTC,
-)
-result = engine.place_order(order)
-
-# Stop-loss (conditional market — derivatives only)
-order = UnifiedOrder(
-    instrument=btc,
-    order_type=OrderType.STOP,
-    side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
-    stop_price=Decimal("65000"),
-    time_in_force=TimeInForce.GTC,
-)
-result = engine.place_order(order)
-```
-
-</td>
-</tr>
-</table>
-
-`place_order` receives a `UnifiedOrder` that has already passed all risk checks
-(the engine runs those before calling the adapter). It translates the order to
-Bybit's REST parameters, dispatches it, re-queries the order by client order
-ID, and returns an `OrderResult`.
-
-The adapter generates a UUID7 `client_order_id` if you do not supply one.
+The engine generates a UUID7 `client_order_id` if you do not supply one.
 If the platform rejects the order, the cached `InstrumentSpec` for that
 instrument is invalidated (forcing a re-fetch on the next access) before the
 mapped error is re-raised.
@@ -356,60 +283,26 @@ mapped error is re-raised.
 Bybit supports native TP/SL attachment at order placement. Pass
 `take_profit` and/or `stop_loss` on the `UnifiedOrder`:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
 from unified_trading_execution.types.order import TpSlAttachment
 
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.LIMIT,
     side=OrderSide.BUY,
-    quantity=Decimal("0.01"),
-    price=Decimal("65000"),
+    quantity=0.01,
+    price=65000,
     time_in_force=TimeInForce.GTC,
     take_profit=TpSlAttachment(
-        trigger_price=Decimal("70000"),
-        limit_price=Decimal("70100"),   # omit for market TP
+        trigger_price=70000,
+        limit_price=70100,            # omit for market TP
     ),
     stop_loss=TpSlAttachment(
-        trigger_price=Decimal("63000"),
-        # no limit_price → market execution
+        trigger_price=63000,
+        # no limit_price -> market execution
     ),
-)
-result = await adapter.place_order(order)
+))
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.types.order import TpSlAttachment
-
-order = UnifiedOrder(
-    instrument=btc,
-    order_type=OrderType.LIMIT,
-    side=OrderSide.BUY,
-    quantity=Decimal("0.01"),
-    price=Decimal("65000"),
-    time_in_force=TimeInForce.GTC,
-    take_profit=TpSlAttachment(
-        trigger_price=Decimal("70000"),
-        limit_price=Decimal("70100"),
-    ),
-    stop_loss=TpSlAttachment(
-        trigger_price=Decimal("63000"),
-    ),
-)
-result = engine.place_order(order)
-```
-
-</td>
-</tr>
-</table>
 
 When at least one TP/SL attachment has a `limit_price`, the Bybit `tpslMode`
 is `Partial` (some legs are limit orders). When both are market (no
@@ -422,80 +315,31 @@ Using it with any other order type raises `UnsupportedOrderTypeError`.
 
 Set `reduce_only=True` to place an order that only reduces an existing position:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-order = UnifiedOrder(
+result = engine.place_order(UnifiedOrder(
     instrument=btc,
     order_type=OrderType.MARKET,
     side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
+    quantity=0.01,
     time_in_force=TimeInForce.GTC,
     reduce_only=True,
-)
-result = await adapter.place_order(order)
+))
 ```
-
-</td>
-<td>
-
-```python
-order = UnifiedOrder(
-    instrument=btc,
-    order_type=OrderType.MARKET,
-    side=OrderSide.SELL,
-    quantity=Decimal("0.01"),
-    time_in_force=TimeInForce.GTC,
-    reduce_only=True,
-)
-result = engine.place_order(order)
-```
-
-</td>
-</tr>
-</table>
 
 `reduce_only` cannot be combined with TP/SL on Bybit — that combination raises
 `UnsupportedOrderTypeError`. `reduce_only` is also unavailable for spot.
 
 ### Modifying an order
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
 from unified_trading_execution.types.order import OrderModification
 
-modification = OrderModification(
+updated = engine.modify_order(OrderModification(
     client_order_id=result.client_order_id,
-    price=Decimal("65500"),
-    quantity=Decimal("0.02"),
-)
-updated = await adapter.modify_order(modification)
+    price=65500,
+    quantity=0.02,
+))
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.types.order import OrderModification
-
-modification = OrderModification(
-    client_order_id=result.client_order_id,
-    price=Decimal("65500"),
-    quantity=Decimal("0.02"),
-)
-updated = engine.modify_order(modification)
-```
-
-</td>
-</tr>
-</table>
 
 The adapter locates the order by `client_order_id` (sent as Bybit's
 `orderLinkId`). Unsupported modification fields raise
@@ -503,59 +347,21 @@ The adapter locates the order by `client_order_id` (sent as Bybit's
 
 ### Cancelling an order
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-cancelled = await adapter.cancel_order(result.client_order_id)
-```
-
-</td>
-<td>
-
 ```python
 cancelled = engine.cancel_order(result.client_order_id)
 ```
-
-</td>
-</tr>
-</table>
 
 Raises `OrderNotFoundError` if Bybit does not know the order.
 
 ### Querying an order
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-order = await adapter.get_order_by_client_id("your-client-order-id")
+order = engine.get_order("your-client-order-id")
 if order is None:
     print("Order not found")
 else:
-    print(f"Status: {order.status.value}, "
-          f"filled: {order.filled_quantity}")
+    print(f"Status: {order.status.value}, filled: {order.filled_quantity}")
 ```
-
-</td>
-<td>
-
-```python
-order = engine.get_order_by_client_id("your-client-order-id")
-if order is None:
-    print("Order not found")
-else:
-    print(f"Status: {order.status.value}, "
-          f"filled: {order.filled_quantity}")
-```
-
-</td>
-</tr>
-</table>
 
 The adapter queries Bybit's open-orders endpoint first, then falls back to the
 two-year order history so filled and cancelled orders remain findable.
@@ -565,45 +371,19 @@ two-year order history so filled and cancelled orders remain findable.
 `fetch_instrument_spec` returns an `InstrumentSpec` with the trading rules for
 a single instrument:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-spec = await adapter.fetch_instrument_spec(btc)
-# InstrumentSpec(
-#     tick_size=Decimal("0.1"),
-#     lot_size=Decimal("0.001"),
-#     min_qty=Decimal("0.001"),
-#     max_qty=Decimal("100"),
-#     min_notional=Decimal("1"),
-#     price_precision=1,
-#     qty_precision=3,
-#     max_leverage=Decimal("100"),  # None for spot
-# )
-```
-
-</td>
-<td>
-
 ```python
 spec = engine.fetch_instrument_spec(btc)
 # InstrumentSpec(
-#     tick_size=Decimal("0.1"),
-#     lot_size=Decimal("0.001"),
-#     min_qty=Decimal("0.001"),
-#     max_qty=Decimal("100"),
-#     min_notional=Decimal("1"),
+#     tick_size=0.1,
+#     lot_size=0.001,
+#     min_qty=0.001,
+#     max_qty=100,
+#     min_notional=1,
 #     price_precision=1,
 #     qty_precision=3,
-#     max_leverage=Decimal("100"),
+#     max_leverage=100,         # None for spot
 # )
 ```
-
-</td>
-</tr>
-</table>
 
 Results are cached for the lifetime of the adapter instance. The cache is
 invalidated in three situations:
@@ -628,50 +408,21 @@ stored and tracked independently so the adapter can detect and correct drift.
 
 ### Setting leverage
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-await adapter.set_leverage(
-    btc,
-    buy_leverage=10,
-    sell_leverage=10,   # must equal buy_leverage
-    on_drift="reapply",
-    strict_check=True,
-    block_on_open_position=True,
-    auto_apply_on_connect=True,
-)
+engine.set_leverage(btc, buy_leverage=10)
 ```
-
-</td>
-<td>
-
-```python
-engine.set_leverage(
-    btc,
-    buy_leverage=10,
-    sell_leverage=10,
-    on_drift="reapply",
-    strict_check=True,
-    block_on_open_position=True,
-    auto_apply_on_connect=True,
-)
-```
-
-</td>
-</tr>
-</table>
 
 | Parameter | Type | Default | Notes |
 |---|---|---|---|
 | `buy_leverage` | `int` | `1` | Long-side leverage |
-| `sell_leverage` | `int` | *(same as buy)* | Short-side leverage. Must equal `buy_leverage` — asymmetric values raise `AsymmetricLeverageError` |
+| `sell_leverage` | `int` | *(same as buy)* | Short-side leverage. Must equal `buy_leverage` in v1 — asymmetric values raise `AsymmetricLeverageError` |
 | `on_drift` | `"reapply" \| "notify" \| "halt"` | `"reapply"` | What to do when platform leverage diverges from stored intent |
 | `strict_check` | `bool` | `True` | Run a pre-order leverage check before every `place_order` call |
 | `block_on_open_position` | `bool` | `True` | Refuse to change leverage while the instrument has an open position |
 | `auto_apply_on_connect` | `bool` | `True` | Re-apply stored leverage on every `connect()` |
+
+`sell_leverage` is optional — it defaults to `buy_leverage`.  In v1 they must
+be equal; asymmetric leverage requires hedge mode (not yet supported).
 
 `set_leverage` validates the request eagerly:
 
@@ -679,8 +430,7 @@ engine.set_leverage(
 - A leverage value above the platform's maximum raises `LeverageExceedsMaxError`.
 - An open position on the instrument raises `PlatformError` when
   `block_on_open_position` is enabled.
-- `buy_leverage != sell_leverage` raises `AsymmetricLeverageError` (asymmetric
-  leverage requires hedge mode, which is not currently supported).
+- `buy_leverage != sell_leverage` raises `AsymmetricLeverageError`.
 
 ### How intent persistence works
 
@@ -706,21 +456,6 @@ that symbol).
 
 ### Reading current leverage
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-leverage = await adapter.get_leverage(btc)
-if leverage is not None:
-    buy_lev, sell_lev = leverage
-    print(f"Buy: {buy_lev}x, Sell: {sell_lev}x")
-```
-
-</td>
-<td>
-
 ```python
 leverage = engine.get_leverage(btc)
 if leverage is not None:
@@ -728,35 +463,15 @@ if leverage is not None:
     print(f"Buy: {buy_lev}x, Sell: {sell_lev}x")
 ```
 
-</td>
-</tr>
-</table>
-
 Returns `(buy, sell)` from the platform's current state, or `None` for spot
 instruments and instruments that have never had a position. In one-way mode
 both sides are always equal.
 
 ### Removing stored intent
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-await adapter.remove_leverage(btc)
-```
-
-</td>
-<td>
-
 ```python
 engine.remove_leverage(btc)
 ```
-
-</td>
-</tr>
-</table>
 
 This drops the stored intent from the state store but does **not** change
 leverage on the platform. The adapter stops managing leverage for this
@@ -788,42 +503,20 @@ The three drift behaviors:
 When a subsequent reconciliation finds the platform has returned to the stored
 value, the halt is cleared automatically and a `HaltClearedEvent` is published.
 
-### Requiring a state store
+### Working with a standalone adapter
 
-Leverage persistence needs the shared `StateStore`. If you construct the
-adapter standalone (without an engine), pass `state_store` to the constructor
-or call `attach_state_store()` before using any leverage methods — otherwise
-they raise `PlatformError`.
-
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
+Leverage persistence needs the shared `StateStore`.  When using the engine,
+this is handled automatically — the engine creates the state store and wires it
+in.  If you construct the adapter standalone (without an engine), pass
+`state_store` to the constructor:
 
 ```python
 from unified_trading_execution.state.store import SQLiteStateStore
 
-store = SQLiteStateStore(path=":memory:")
+store = SQLiteStateStore(path="my_data.db")
 await store.initialize()
-
-adapter = BybitAdapter(
-    config, event_bus=EventBus(), state_store=store,
-)
+adapter = BybitAdapter(config, state_store=store)
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.state.store import SQLiteStateStore
-
-store = SQLiteStateStore(path=":memory:")
-engine = SyncEngine(adapter, state_store=store)
-```
-
-</td>
-</tr>
-</table>
 
 ## Position mode
 
@@ -831,44 +524,22 @@ Bybit supports two position modes per symbol:
 
 | Mode | Bybit value | Description |
 |---|---|---|
-| `ONE_WAY` | `0` | One net position per symbol (buying reduces a short, selling reduces a long) |
-| `HEDGE` | `3` | Independent long and short positions on the same symbol |
+| `one_way` | `0` | One net position per symbol (buying reduces a short, selling reduces a long) |
+| `hedge` | `3` | Independent long and short positions on the same symbol |
 
 ### Setting position mode
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
+```python
+engine.set_position_mode(btc, mode="one_way")
+```
+
+Both the enum and the raw string work — `"one_way"` / `"hedge"` or `PositionMode.ONE_WAY` / `PositionMode.HEDGE`:
 
 ```python
 from unified_trading_execution.bybit import PositionMode
 
-await adapter.set_position_mode(
-    btc,
-    mode=PositionMode.ONE_WAY,   # or "one_way" / "hedge"
-    on_drift="reapply",
-    auto_apply_on_connect=True,
-)
+engine.set_position_mode(btc, mode=PositionMode.HEDGE)
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.bybit import PositionMode
-
-engine.set_position_mode(
-    btc,
-    mode=PositionMode.ONE_WAY,
-    on_drift="reapply",
-    auto_apply_on_connect=True,
-)
-```
-
-</td>
-</tr>
-</table>
 
 The platform enforces that no open position or open order exists on the symbol
 before the switch. If that condition is not met, Bybit returns error 110030
@@ -879,47 +550,15 @@ re-applied on connect.
 
 ### Reading position mode
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-mode = await adapter.get_position_mode(btc)
-```
-
-</td>
-<td>
-
 ```python
 mode = engine.get_position_mode(btc)
 ```
-
-</td>
-</tr>
-</table>
 
 Returns the mode read from the platform's `positionIdx` field, or `None` if
 the symbol has no open position (mode is unreadable from the platform when
 there is no position) or if the symbol is spot.
 
 ### Batch switching by coin
-
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
-```python
-await adapter.set_position_mode_for_coin(
-    coin="BTC",
-    category="linear",
-    mode="one_way",
-)
-```
-
-</td>
-<td>
 
 ```python
 engine.set_position_mode_for_coin(
@@ -928,10 +567,6 @@ engine.set_position_mode_for_coin(
     mode="one_way",
 )
 ```
-
-</td>
-</tr>
-</table>
 
 This calls Bybit's `switch_position_mode` with a `coin` parameter, applying
 the mode to every symbol of that coin with no open positions. Newly listed
@@ -951,7 +586,7 @@ not a runtime-persisted intent.
 config = BybitConfig(
     api_key="...",
     api_secret="...",
-    margin_mode="isolated",   # or "cross"
+    margin_mode="isolated",
 )
 ```
 
@@ -961,29 +596,12 @@ from the previous mode publishes a `MarginModeChangedEvent`.
 
 You can also call it directly at runtime:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
 from unified_trading_execution.bybit import MarginMode
 
-await adapter.set_margin_mode(MarginMode.ISOLATED)
+engine.set_margin_mode("isolated")       # string form
+engine.set_margin_mode(MarginMode.CROSS)  # enum form
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.bybit import MarginMode
-
-engine.set_margin_mode(MarginMode.ISOLATED)
-```
-
-</td>
-</tr>
-</table>
 
 ## Error handling
 
@@ -1075,15 +693,8 @@ without importing adapter code.
 
 ### Subscribing to events
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-from unified_trading_execution.bybit.events import (
-    LeverageDriftEvent,
-)
+from unified_trading_execution.bybit.events import LeverageDriftEvent
 
 def on_drift(event: LeverageDriftEvent) -> None:
     print(
@@ -1093,66 +704,27 @@ def on_drift(event: LeverageDriftEvent) -> None:
         f"action={event.action_taken}"
     )
 
-adapter.event_bus.subscribe(
-    LeverageDriftEvent, on_drift,
-)
+engine.event_bus.subscribe(LeverageDriftEvent, on_drift)
 ```
-
-</td>
-<td>
-
-```python
-from unified_trading_execution.bybit.events import (
-    LeverageDriftEvent,
-)
-
-def on_drift(event: LeverageDriftEvent) -> None:
-    print(
-        f"Leverage drift on {event.instrument.symbol}: "
-        f"stored={event.stored_buy}x, "
-        f"platform={event.platform_buy}x, "
-        f"action={event.action_taken}"
-    )
-
-engine.event_bus.subscribe(
-    LeverageDriftEvent, on_drift,
-)
-```
-
-</td>
-</tr>
-</table>
 
 ## Reconciliation data
 
 The adapter implements all four optional data-fetching methods so the engine
 can reconcile its state mirror against the platform:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
+# Async
 positions = await adapter.fetch_positions()
 balances = await adapter.fetch_balances()
 orders = await adapter.fetch_open_orders()
 fills = await adapter.fetch_fills()
-```
 
-</td>
-<td>
-
-```python
+# Sync — identical API on the engine
 positions = engine.fetch_positions()
 balances = engine.fetch_balances()
 orders = engine.fetch_open_orders()
 fills = engine.fetch_fills()
 ```
-
-</td>
-</tr>
-</table>
 
 - **Positions** cover linear (USDT + USDC settle coins) and inverse. Spot
   holdings are excluded — they have no position concept on Bybit.
@@ -1193,42 +765,24 @@ fills = engine.fetch_fills()
 One engine instance manages exactly one adapter. To trade on Bybit and another
 platform simultaneously, create two engine instances:
 
-<table>
-<tr><th>Async</th><th>Sync</th></tr>
-<tr>
-<td>
-
 ```python
-bybit_config = BybitConfig(
+# Async
+bybit_engine = Engine(BybitAdapter(BybitConfig(
     api_key="...", api_secret="...", testnet=True,
-)
-bybit_adapter = BybitAdapter(bybit_config, event_bus=EventBus())
-bybit_engine = Engine(bybit_adapter, state_store=bybit_store)
-
-# ctrade_engine = Engine(ctrade_adapter, ...)
-
+)))
 await bybit_engine.connect()
+
+# ctrade_engine = Engine(CTraderAdapter(...))
 # await ctrade_engine.connect()
-```
 
-</td>
-<td>
-
-```python
-bybit_config = BybitConfig(
+# Sync
+bybit_engine = SyncEngine(BybitAdapter(BybitConfig(
     api_key="...", api_secret="...", testnet=True,
-)
-bybit_adapter = BybitAdapter(bybit_config)
-bybit_engine = SyncEngine(bybit_adapter, state_store=bybit_store)
-
-# ctrade_engine = SyncEngine(ctrade_adapter, ...)
-
+)))
 bybit_engine.connect()
+
+# ctrade_engine = SyncEngine(CTraderAdapter(...))
 # ctrade_engine.connect()
 ```
-
-</td>
-</tr>
-</table>
 
 Each engine's state store is naturally scoped to one platform and one account.
