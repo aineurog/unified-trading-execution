@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-from unified_trading_execution.types.enums import HaltClearMode
+from unified_trading_execution.types.enums import HaltClearMode, HaltState
 from unified_trading_execution.types.instrument import Instrument
 
 
@@ -65,6 +65,22 @@ class HaltStateMachine:
         if instrument is not None and instrument.symbol in self._instrument_halts:
             return True
         return False
+
+    def get_halt_state(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None = None,
+    ) -> HaltState:
+        """Return the ``HaltState`` enum for the given scope.
+
+        ``HaltState.HALTED`` means new exposure-increasing orders are blocked;
+        ``HaltState.ACTIVE`` means no halt is in effect for that scope.
+        """
+        if scope == "account":
+            return HaltState.HALTED if self._account_halted is not None else HaltState.ACTIVE
+        if instrument is not None and instrument.symbol in self._instrument_halts:
+            return HaltState.HALTED
+        return HaltState.ACTIVE
 
     def can_place_order(self, instrument: Instrument, reduce_only: bool = False) -> bool:
         """Whether a new order can be placed for the given instrument.

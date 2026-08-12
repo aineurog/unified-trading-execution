@@ -45,6 +45,9 @@ class PlatformConnectionError(UteError):
     """Connection to the platform failed or was lost."""
 
 
+ConnectionError = PlatformConnectionError  # canonical name per Section 9.3
+
+
 # ---- Halt errors (Section 6.4) ----
 
 

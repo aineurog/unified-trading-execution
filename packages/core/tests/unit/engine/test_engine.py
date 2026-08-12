@@ -524,19 +524,21 @@ class TestRateLimitTracking:
 
 class TestInstrumentSpecCaching:
     async def test_caches_fetched_spec(self, engine, mock_adapter):
+        """The Engine delegates to the adapter for spec fetching; the adapter's
+        own cache (MockAdapter._instrument_specs) returns the same object."""
         spec1 = await engine.fetch_instrument_spec(_instrument())
         spec2 = await engine.fetch_instrument_spec(_instrument())
-        assert spec1 is spec2  # same object — cached
+        assert spec1 is spec2  # same object — adapter cached
 
-    async def test_uses_cache_for_place_order(self, engine, mock_adapter):
-        # Fetch once to populate cache
-        await engine.fetch_instrument_spec(_instrument())
-        # Add a different spec to the adapter — the engine should use cached
+    async def test_respects_adapter_spec_after_change(self, engine, mock_adapter):
+        """The Engine always consults the adapter for the current spec — it does
+        not hold a stale cache.  When the adapter returns a different spec, the
+        next place_order uses the new spec."""
+        # Add a spec with a high min_qty to the adapter
         mock_adapter.add_instrument_spec(_instrument(), _spec(min_qty=Decimal("100")))
-        # This would fail if it used the adapter directly (min_qty=100 > qty=1)
-        # But it uses cache, so it should pass
-        result = await engine.place_order(_order())
-        assert result.status == OrderStatus.OPEN
+        # The engine must pick up the adapter's current spec; quantity=1 < min_qty=100
+        with pytest.raises(InvalidSymbolError, match="below minimum"):
+            await engine.place_order(_order(quantity=Decimal("1")))
 
 
 # ── state mirror subscriptions ───────────────────────────────────────

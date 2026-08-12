@@ -137,7 +137,6 @@ class Engine:
         self._adapter.attach_event_bus(self._event_bus)
 
         # Mutable cached state
-        self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
         self._known_order_ids: set[str] = set()
         self._rate_limit_budget: int = 0
         self._rate_limit_reset_at: datetime | None = None
@@ -756,11 +755,8 @@ class Engine:
     # ── Internal: instrument spec caching ──────────────────────────
 
     async def _get_or_fetch_spec(self, instrument: Instrument) -> InstrumentSpec:
-        if instrument not in self._instrument_specs:
-            self._instrument_specs[instrument] = await self._adapter.fetch_instrument_spec(
-                instrument
-            )
-        return self._instrument_specs[instrument]
+        """Return the adapter's cached spec — the adapter manages TTL and invalidation."""
+        return await self._adapter.fetch_instrument_spec(instrument)
 
     # ── Internal: reference price resolution ───────────────────────
 

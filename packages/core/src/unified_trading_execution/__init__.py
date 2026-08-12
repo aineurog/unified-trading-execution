@@ -7,6 +7,7 @@ from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import (
     AccountHaltedError,
+    ConnectionError,
     DuplicateOrderIdError,
     EngineShutdownError,
     InstrumentHaltedError,
@@ -108,6 +109,7 @@ __all__ = [
     "HaltEvent",
     # Errors
     "AccountHaltedError",
+    "ConnectionError",
     "PlatformConnectionError",
     "DuplicateOrderIdError",
     "EngineShutdownError",
