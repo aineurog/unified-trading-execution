@@ -161,8 +161,10 @@ class MT5Adapter(Adapter):
 
         1. Acquire the process-global guard — ``mt5.initialize()`` /
            ``mt5.shutdown()`` are per-process singletons.
-        2. ``mt5.initialize(path, login, password, server)`` via
-           ``asyncio.to_thread()``.
+        2. ``mt5.initialize()`` via ``asyncio.to_thread()`` — ``path`` is the
+           only positional parameter; ``login``/``password``/``server`` are
+           passed as keyword arguments (omitting ``path`` auto-detects the
+           terminal).
         3. ``mt5.account_info()`` — resolve the actual account login.
         4. Build the reverse alias table.
         5. Publish ``ConnectionStateEvent(connected=True)``.
@@ -191,13 +193,16 @@ class MT5Adapter(Adapter):
         try:
             mt5 = _get_mt5()
 
-            initialized = await asyncio.to_thread(
-                mt5.initialize,
-                self._config.path,
-                self._config.login,
-                self._config.password,
-                self._config.server,
-            )
+
+            initialize_kwargs: dict[str, Any] = {
+                "login": self._config.login,
+                "password": self._config.password,
+                "server": self._config.server,
+            }
+            if self._config.path is not None:
+                initialize_kwargs["path"] = self._config.path
+
+            initialized = await asyncio.to_thread(mt5.initialize, **initialize_kwargs)
             if not initialized:
                 code, desc = mt5.last_error()
                 raise map_mt5_error(code, desc or "mt5.initialize() failed")

@@ -61,10 +61,9 @@ class TestConnect:
         await adapter.connect()
 
         mock_mt5_module.initialize.assert_called_once_with(
-            adapter._config.path,
-            adapter._config.login,
-            adapter._config.password,
-            adapter._config.server,
+            login=adapter._config.login,
+            password=adapter._config.password,
+            server=adapter._config.server,
         )
         mock_mt5_module.account_info.assert_called_once_with()
 
@@ -81,6 +80,34 @@ class TestConnect:
         assert event.correlation_id is None
         assert isinstance(event.event_id, str) and event.event_id
         assert event.timestamp.tzinfo is not None
+
+        await adapter.disconnect()
+
+    async def test_connect_passes_path_when_configured(
+        self,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """path is forwarded as a keyword argument when MT5Config sets it."""
+        config = MT5Config(
+            login=12345678,
+            password="test-password",
+            server="TestBroker-Demo",
+            path=r"C:\Program Files\MetaTrader 5\terminal64.exe",
+            symbol_alias_table={"EUR/USD": "EURUSD.m"},
+        )
+        adapter = MT5Adapter(config, event_bus=event_bus)
+        await _stub_poll_loop(adapter, monkeypatch)
+
+        await adapter.connect()
+
+        mock_mt5_module.initialize.assert_called_once_with(
+            path=config.path,
+            login=config.login,
+            password=config.password,
+            server=config.server,
+        )
 
         await adapter.disconnect()
 
