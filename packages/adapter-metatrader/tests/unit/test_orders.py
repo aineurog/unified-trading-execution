@@ -24,15 +24,27 @@ from types import SimpleNamespace
 
 import pytest
 
-from unified_trading_execution.errors import InvalidSymbolError, UnsupportedOrderTypeError
+from unified_trading_execution.errors import (
+    InvalidSymbolError,
+    PlatformError,
+    UnsupportedOrderTypeError,
+)
 from unified_trading_execution.mt5.orders import (
     _select_filling,
     build_mt5_cancel_request,
     build_mt5_modify_request,
     build_mt5_request,
     build_mt5_sltp_request,
+    parse_mt5_result,
+    parse_order_record,
 )
-from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import OrderModification, TpSlAttachment, UnifiedOrder
 
@@ -54,6 +66,11 @@ def mt5_constants(mock_mt5_module) -> None:
     mock_mt5_module.ORDER_TYPE_SELL_STOP = 5
     mock_mt5_module.ORDER_TYPE_BUY_STOP_LIMIT = 6
     mock_mt5_module.ORDER_TYPE_SELL_STOP_LIMIT = 7
+    mock_mt5_module.TRADE_RETCODE_PLACED = 10008
+    mock_mt5_module.TRADE_RETCODE_DONE = 10009
+    mock_mt5_module.TRADE_RETCODE_DONE_PARTIAL = 10010
+    mock_mt5_module.TRADE_RETCODE_NO_CHANGES = 10025
+    mock_mt5_module.TRADE_RETCODE_REJECT = 10006
 
 
 def _instrument() -> Instrument:
@@ -333,17 +350,118 @@ class TestBuildMT5SltpRequest:
 class TestParseMT5Result:
     """OrderSendResult → OrderResult parsing."""
 
-    def test_placed_result(self) -> None:
-        """TRADE_RETCODE_PLACED → OrderResult."""
-        ...
+    def _result(self, **fields) -> SimpleNamespace:
+        defaults = {
+            "retcode": 10008,
+            "deal": 0,
+            "order": 987,
+            "volume": 0.0,
+            "price": 0.0,
+            "bid": 0.0,
+            "ask": 0.0,
+            "comment": "",
+            "request": {},
+        }
+        defaults.update(fields)
+        return SimpleNamespace(**defaults)
 
-    def test_done_result(self) -> None:
-        """TRADE_RETCODE_DONE → OrderResult with filled status."""
-        ...
+    def test_placed_result(self, mock_mt5_module, mt5_constants) -> None:
+        """TRADE_RETCODE_PLACED → OrderResult with order ticket."""
+        result = parse_mt5_result(
+            self._result(retcode=mock_mt5_module.TRADE_RETCODE_PLACED, order=987),
+            "c1",
+            mt5_module=mock_mt5_module,
+        )
+        assert result.client_order_id == "c1"
+        assert result.platform_order_id == "987"
+        assert result.status == OrderStatus.OPEN
+        assert result.filled_quantity == Decimal("0")
 
-    def test_rejected_result_raises(self) -> None:
+    def test_done_result(self, mock_mt5_module, mt5_constants) -> None:
+        """TRADE_RETCODE_DONE → OrderResult with filled status and deal ticket."""
+        result = parse_mt5_result(
+            self._result(
+                retcode=mock_mt5_module.TRADE_RETCODE_DONE,
+                order=0,
+                deal=321,
+                volume=0.5,
+                price=1.2345,
+            ),
+            "c1",
+            mt5_module=mock_mt5_module,
+        )
+        assert result.status == OrderStatus.FILLED
+        assert result.platform_order_id == "321"
+        assert result.filled_quantity == Decimal("0.5")
+        assert result.average_fill_price == Decimal("1.2345")
+
+    def test_none_result_raises(self, mock_mt5_module) -> None:
+        """None result raises via error mapping."""
+        mock_mt5_module.last_error.return_value = (10013, "invalid request")
+        with pytest.raises(InvalidSymbolError):
+            parse_mt5_result(None, "c1", mt5_module=mock_mt5_module)
+
+    def test_rejected_result_raises(self, mock_mt5_module, mt5_constants) -> None:
         """TRADE_RETCODE_REJECT raises via error mapping."""
-        ...
+        mock_mt5_module.last_error.return_value = (
+            mock_mt5_module.TRADE_RETCODE_REJECT,
+            "order rejected",
+        )
+        with pytest.raises(PlatformError):
+            parse_mt5_result(
+                self._result(retcode=mock_mt5_module.TRADE_RETCODE_REJECT),
+                "c1",
+                mt5_module=mock_mt5_module,
+            )
+
+
+class TestParseOrderRecord:
+    """MT5 order tuple → OrderResult parsing."""
+
+    def _order_tuple(self, **fields) -> SimpleNamespace:
+        defaults = {
+            "ticket": 555,
+            "state": 1,
+            "volume": 0.5,
+            "volume_current": 0.5,
+            "price_open": 1.2345,
+            "time_setup": 1700000000,
+            "time_done": 0,
+        }
+        defaults.update(fields)
+        return SimpleNamespace(**defaults)
+
+    def test_none_and_empty_return_none(self, mock_mt5_module) -> None:
+        """None and empty tuple → None."""
+        assert parse_order_record(None, "c1", mt5_module=mock_mt5_module) is None
+        assert parse_order_record((), "c1", mt5_module=mock_mt5_module) is None
+
+    def test_pending_order(self, mock_mt5_module) -> None:
+        """ORDER_STATE_PLACED → OPEN with zero filled."""
+        record = parse_order_record(self._order_tuple(), "c1", mt5_module=mock_mt5_module)
+        assert record is not None
+        assert record.client_order_id == "c1"
+        assert record.platform_order_id == "555"
+        assert record.status == OrderStatus.OPEN
+        assert record.filled_quantity == Decimal("0")
+        assert record.average_fill_price is None
+
+    def test_filled_order(self, mock_mt5_module) -> None:
+        """ORDER_STATE_FILLED → FILLED with full volume; no avg price from order record."""
+        record = parse_order_record(
+            self._order_tuple(state=4, volume_current=0.0, time_done=1700000100),
+            "c1",
+            mt5_module=mock_mt5_module,
+        )
+        assert record is not None
+        assert record.status == OrderStatus.FILLED
+        assert record.filled_quantity == Decimal("0.5")
+        assert record.average_fill_price is None
+
+    def test_unknown_state_raises(self, mock_mt5_module) -> None:
+        """Unknown ORDER_STATE → PlatformError."""
+        with pytest.raises(PlatformError):
+            parse_order_record(self._order_tuple(state=99), "c1", mt5_module=mock_mt5_module)
 
 
 class TestSelectFilling:
