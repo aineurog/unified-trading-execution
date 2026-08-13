@@ -43,8 +43,19 @@ def to_mt5_symbol(instrument: Instrument) -> str:
     table via ``_with_broker_override``), it is returned directly.
     Otherwise, the base translation is applied: the symbol and quote currency
     are concatenated (e.g., ``"EUR"`` + ``"USD"`` → ``"EURUSD"``).
+
+    Raises ``ValueError`` if ``quote_currency`` is missing and no broker
+    override is set — aliasing is mandatory for such instruments.
     """
-    raise NotImplementedError
+    override = instrument.broker_symbol_override
+    if override is not None:
+        return override
+    if instrument.quote_currency is None:
+        raise ValueError(
+            f"Instrument {instrument.symbol!r} has no quote_currency and no "
+            "broker_symbol_override — cannot build MT5 symbol"
+        )
+    return f"{instrument.symbol}{instrument.quote_currency}"
 
 
 def from_mt5_symbol(
@@ -66,7 +77,15 @@ def from_mt5_symbol(
     Raw parsing of unlisted symbols is not supported — add the mapping to
     ``MT5Config.symbol_alias_table`` instead.
     """
-    raise NotImplementedError
+    table = reverse_alias_table if reverse_alias_table is not None else {}
+    if mt5_symbol not in table:
+        raise ValueError(
+            f"MT5 symbol {mt5_symbol!r} is not in the reverse alias table — "
+            "add it to MT5Config.symbol_alias_table instead"
+        )
+    canonical = table[mt5_symbol]
+    symbol, sep, quote = canonical.partition("/")
+    return symbol, quote if sep else None
 
 
 def build_reverse_alias_table(alias_table: dict[str, str]) -> dict[str, str]:
@@ -75,4 +94,4 @@ def build_reverse_alias_table(alias_table: dict[str, str]) -> dict[str, str]:
     Forward: ``{"EUR/USD": "EURUSD.m"}``
     Reverse: ``{"EURUSD.m": "EUR/USD"}`` .
     """
-    raise NotImplementedError
+    return {v: k for k, v in alias_table.items()}
