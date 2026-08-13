@@ -155,7 +155,10 @@ def build_mt5_cancel_request(
     mt5_module: Any,
 ) -> dict[str, Any]:
     """Build an MT5 ``TRADE_ACTION_REMOVE`` request dict for *ticket*."""
-    raise NotImplementedError
+    return {
+        "action": mt5_module.TRADE_ACTION_REMOVE,
+        "ticket": ticket,
+    }
 
 
 def build_mt5_sltp_request(

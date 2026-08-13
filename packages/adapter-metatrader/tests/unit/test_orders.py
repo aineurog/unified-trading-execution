@@ -27,6 +27,7 @@ import pytest
 from unified_trading_execution.errors import InvalidSymbolError, UnsupportedOrderTypeError
 from unified_trading_execution.mt5.orders import (
     _select_filling,
+    build_mt5_cancel_request,
     build_mt5_modify_request,
     build_mt5_request,
 )
@@ -40,6 +41,7 @@ def mt5_constants(mock_mt5_module) -> None:
     """Populate the mock MT5 module with the standard constant values."""
     mock_mt5_module.TRADE_ACTION_DEAL = 1
     mock_mt5_module.TRADE_ACTION_MODIFY = 2
+    mock_mt5_module.TRADE_ACTION_REMOVE = 3
     mock_mt5_module.TRADE_ACTION_PENDING = 5
     mock_mt5_module.ORDER_TIME_SPECIFIED = 2
     mock_mt5_module.ORDER_TYPE_BUY = 0
@@ -287,9 +289,11 @@ class TestBuildMT5ModifyRequest:
 class TestBuildMT5CancelRequest:
     """Cancel → TRADE_ACTION_REMOVE translation."""
 
-    def test_cancel_request(self) -> None:
+    def test_cancel_request(self, mock_mt5_module, mt5_constants) -> None:
         """Cancel request has TRADE_ACTION_REMOVE and correct ticket."""
-        ...
+        request = build_mt5_cancel_request(456, mt5_module=mock_mt5_module)
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_REMOVE
+        assert request["ticket"] == 456
 
 
 class TestBuildMT5SltpRequest:
