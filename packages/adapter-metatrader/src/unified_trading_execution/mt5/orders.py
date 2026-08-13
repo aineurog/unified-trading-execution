@@ -86,8 +86,10 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
     elif order.order_type == OrderType.STOP_LIMIT:
         if order.price is None or order.stop_price is None:
             raise ValueError(f"price and stop_price are required for {order.order_type}")
-        request["price"] = float(order.price)
-        request["stoplimit"] = float(order.stop_price)
+        # MT5 stop-limit: `price` = trigger (stop) level, `stoplimit` = limit price.
+        # Unified `price` is the limit price and `stop_price` is the trigger.
+        request["price"] = float(order.stop_price)
+        request["stoplimit"] = float(order.price)
 
     if order.take_profit is not None:
         if order.take_profit.limit_price is not None:
@@ -114,6 +116,7 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
 def build_mt5_modify_request(
     modification: OrderModification,
     ticket: int,
+    order_type: OrderType,
     *,
     mt5_module: Any,
 ) -> dict[str, Any]:
@@ -121,7 +124,11 @@ def build_mt5_modify_request(
     request dict.
 
     *ticket* is the MT5 order ticket obtained from the ``client_order_id → ticket``
-    mapping.  *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
+    mapping.  *order_type* is the existing order's type (LIMIT, STOP or
+    STOP_LIMIT) — it decides which request field a price carries: MT5 puts the
+    trigger in ``price`` and the limit price in ``stoplimit`` (the latter only
+    for STOP_LIMIT orders).  *mt5_module* is the lazily-imported
+    ``MetaTrader5`` module reference.
 
     Raises ``UnsupportedOrderTypeError`` if *modification* sets ``quantity``
     (MT5 cannot modify quantity — cancel and re-place is required).
@@ -133,13 +140,19 @@ def build_mt5_modify_request(
 
     request: dict[str, Any] = {
         "action": mt5_module.TRADE_ACTION_MODIFY,
-        "ticket": ticket,
+        "order": ticket,
     }
 
-    if modification.price is not None:
-        request["price"] = float(modification.price)
-    if modification.stop_price is not None:
-        request["stoplimit"] = float(modification.stop_price)
+    if order_type == OrderType.STOP_LIMIT:
+        if modification.stop_price is not None:
+            request["price"] = float(modification.stop_price)
+        if modification.price is not None:
+            request["stoplimit"] = float(modification.price)
+    else:
+        if modification.price is not None:
+            request["price"] = float(modification.price)
+        if modification.stop_price is not None:
+            request["price"] = float(modification.stop_price)
     if modification.take_profit is not None:
         if modification.take_profit.limit_price is not None:
             raise UnsupportedOrderTypeError(
@@ -161,10 +174,14 @@ def build_mt5_cancel_request(
     *,
     mt5_module: Any,
 ) -> dict[str, Any]:
-    """Build an MT5 ``TRADE_ACTION_REMOVE`` request dict for *ticket*."""
+    """Build an MT5 ``TRADE_ACTION_REMOVE`` request dict for *ticket*.
+
+    The request targets the order via the ``order`` field ("Order ticket. It
+    is used for modifying pending orders").
+    """
     return {
         "action": mt5_module.TRADE_ACTION_REMOVE,
-        "ticket": ticket,
+        "order": ticket,
     }
 
 
