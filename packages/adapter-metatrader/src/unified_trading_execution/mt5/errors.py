@@ -98,4 +98,10 @@ def check_mt5_result(result: Any, description: str = "") -> None:
     ``mt5.last_error()``.  This helper calls ``mt5.last_error()`` when
     *result* indicates failure and raises the mapped exception.
     """
-    raise NotImplementedError
+    import unified_trading_execution.mt5.adapter as _mt5_adapter
+
+    mt5 = _mt5_adapter._get_mt5()
+    if result is None or (hasattr(result, "__len__") and len(result) == 0):
+        code, desc = mt5.last_error()
+        if code != 0:
+            raise map_mt5_error(code, desc or description)
