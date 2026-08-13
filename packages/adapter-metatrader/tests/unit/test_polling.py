@@ -307,6 +307,38 @@ class TestPollOnce:
         assert balances[0].balance.free == Decimal("1050.00")
         assert balances[0].balance.used == Decimal("0")
 
+    async def test_balance_float_rounding_satisfies_invariant(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """Float account values (production shape) never break free+used==total.
+
+        MT5 reports ``margin``, ``equity``, and ``margin_free`` as three
+        independent floats; ``margin_free = equity - margin`` can round such
+        that ``Decimal(str())`` of all three no longer satisfies the core
+        Balance invariant.  ``_process_balance`` must derive one field from
+        the others so the invariant holds exactly.
+        """
+        adapter._build_reverse_alias()
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = _PAST
+
+        mock_mt5_module.account_info.return_value = MagicMock(
+            currency="USD",
+            margin=222.22,
+            equity=9876.54,
+            margin_free=9876.54 - 222.22,  # 9654.320000000002 as a float
+        )
+
+        balances: list[BalanceUpdateEvent] = []
+        event_bus.subscribe(BalanceUpdateEvent, balances.append)
+        await adapter._poll_once()
+
+        assert len(balances) == 1
+        b = balances[0].balance
+        assert b.free + b.used == b.total  # invariant holds exactly
+
     async def test_no_event_when_nothing_changed(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:

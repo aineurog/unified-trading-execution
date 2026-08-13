@@ -606,13 +606,20 @@ class MT5Adapter(Adapter):
 
     def _process_balance(self, account: Any, now: datetime) -> None:
         """Translate ``account_info()`` into a ``Balance`` and publish changes."""
+        # MT5 reports ``equity``, ``margin``, and ``margin_free`` as three
+        # independent floats (``margin_free`` is derived as ``equity - margin``).
+        # Reconstructing all three via ``Decimal(str(float))`` can break the
+        # core invariant ``free + used == total`` on tiny float-rounding
+        # errors (``Balance.__post_init__`` enforces exact Decimal equality),
+        # so derive ``free`` from the two primary reported values instead of
+        # using the raw ``margin_free``.
+        used = Decimal(str(account.margin))
+        total = Decimal(str(account.equity))
         balance = Balance(
             currency=str(account.currency),
-            # MT5 accounting: equity = margin + margin_free exactly, which
-            # satisfies the core invariant free + used == total.
-            free=Decimal(str(account.margin_free)),
-            used=Decimal(str(account.margin)),
-            total=Decimal(str(account.equity)),
+            free=total - used,
+            used=used,
+            total=total,
             updated_at=now,
         )
         # Diff on monetary fields only — updated_at is snapshot metadata and
