@@ -193,7 +193,6 @@ class MT5Adapter(Adapter):
         try:
             mt5 = _get_mt5()
 
-
             initialize_kwargs: dict[str, Any] = {
                 "login": self._config.login,
                 "password": self._config.password,
