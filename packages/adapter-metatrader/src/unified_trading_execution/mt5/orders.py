@@ -176,7 +176,18 @@ def build_mt5_sltp_request(
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
     """
-    raise NotImplementedError
+    if take_profit is None and stop_loss is None:
+        raise ValueError("at least one of take_profit or stop_loss must be provided")
+
+    request: dict[str, Any] = {
+        "action": mt5_module.TRADE_ACTION_SLTP,
+        "position": int(position_id),
+    }
+    if take_profit is not None:
+        request["tp"] = take_profit
+    if stop_loss is not None:
+        request["sl"] = stop_loss
+    return request
 
 
 def parse_mt5_result(result: Any, *, mt5_module: Any) -> OrderResult:

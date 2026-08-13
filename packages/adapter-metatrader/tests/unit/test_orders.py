@@ -30,6 +30,7 @@ from unified_trading_execution.mt5.orders import (
     build_mt5_cancel_request,
     build_mt5_modify_request,
     build_mt5_request,
+    build_mt5_sltp_request,
 )
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument
@@ -43,6 +44,7 @@ def mt5_constants(mock_mt5_module) -> None:
     mock_mt5_module.TRADE_ACTION_MODIFY = 2
     mock_mt5_module.TRADE_ACTION_REMOVE = 3
     mock_mt5_module.TRADE_ACTION_PENDING = 5
+    mock_mt5_module.TRADE_ACTION_SLTP = 6
     mock_mt5_module.ORDER_TIME_SPECIFIED = 2
     mock_mt5_module.ORDER_TYPE_BUY = 0
     mock_mt5_module.ORDER_TYPE_SELL = 1
@@ -299,9 +301,33 @@ class TestBuildMT5CancelRequest:
 class TestBuildMT5SltpRequest:
     """TP/SL → TRADE_ACTION_SLTP translation."""
 
-    def test_sltp_request(self) -> None:
+    def test_sltp_request(self, mock_mt5_module, mt5_constants) -> None:
         """SLTP request has TRADE_ACTION_SLTP and correct position_id."""
-        ...
+        request = build_mt5_sltp_request(
+            "789",
+            take_profit=1.3,
+            stop_loss=1.0,
+            mt5_module=mock_mt5_module,
+        )
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_SLTP
+        assert request["position"] == 789
+        assert request["tp"] == 1.3
+        assert request["sl"] == 1.0
+
+    def test_sltp_accepts_only_one_level(self, mock_mt5_module, mt5_constants) -> None:
+        """SLTP request with only take_profit or only stop_loss."""
+        request = build_mt5_sltp_request("789", take_profit=1.3, mt5_module=mock_mt5_module)
+        assert request["tp"] == 1.3
+        assert "sl" not in request
+
+        request = build_mt5_sltp_request("789", stop_loss=1.0, mt5_module=mock_mt5_module)
+        assert request["sl"] == 1.0
+        assert "tp" not in request
+
+    def test_sltp_requires_at_least_one_level(self, mock_mt5_module, mt5_constants) -> None:
+        """SLTP request without any level raises ValueError."""
+        with pytest.raises(ValueError):
+            build_mt5_sltp_request("789", mt5_module=mock_mt5_module)
 
 
 class TestParseMT5Result:
