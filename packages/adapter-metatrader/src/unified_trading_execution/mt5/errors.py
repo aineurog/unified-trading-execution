@@ -103,5 +103,6 @@ def check_mt5_result(result: Any, description: str = "") -> None:
     mt5 = _mt5_adapter._get_mt5()
     if result is None or (hasattr(result, "__len__") and len(result) == 0):
         code, desc = mt5.last_error()
-        if code != 0:
+        # Success is RES_S_OK (1) in the wrapper, not the MQL-native 0.
+        if code != 0 and code != mt5.RES_S_OK:
             raise map_mt5_error(code, desc or description)

@@ -237,7 +237,9 @@ def parse_mt5_result(
     status = _RETCODE_STATUS_MAP.get(result.retcode)
     if status is None:
         code, desc = mt5_module.last_error()
-        if code == 0:
+        # A stale success code (0 or RES_S_OK=1) means no error context —
+        # the unmapped retcode itself is the failure.
+        if code == 0 or code == mt5_module.RES_S_OK:
             code = result.retcode
         raise map_mt5_error(code, desc or result.comment) from None
 
