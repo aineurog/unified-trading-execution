@@ -27,10 +27,12 @@ import threading
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from uuid_extensions import uuid7
+
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.events import (
-    EventBus,
-)
+from unified_trading_execution.errors import PlatformConnectionError
+from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
+from unified_trading_execution.mt5.errors import map_mt5_error
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -66,6 +68,14 @@ def _get_mt5() -> Any:
             "Install with: pip install unified-trading-execution-metatrader[mt5]"
         ) from None
     return mt5
+
+
+def _new_id() -> str:
+    return str(uuid7())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -134,23 +144,143 @@ class MT5Adapter(Adapter):
     # Connection lifecycle
     # ------------------------------------------------------------------
 
+    def attach_event_bus(self, event_bus: EventBus) -> None:
+        """Store the engine's shared event bus so the adapter can publish events.
+
+        The engine owns the single ``EventBus`` and hands it to the adapter
+        via this hook (see ``Engine.__init__``).  Overriding the ABC default
+        so ``MT5Engine``-constructed adapters publish correctly even when no
+        bus was passed to ``MT5Adapter.__init__``.
+        """
+        self._event_bus = event_bus
+
     async def connect(self) -> None:
         """Initialize the MT5 terminal connection and start the polling loop.
+
+        Connection lifecycle:
+
+        1. Acquire the process-global guard — ``mt5.initialize()`` /
+           ``mt5.shutdown()`` are per-process singletons.
+        2. ``mt5.initialize()`` via ``asyncio.to_thread()`` — ``path`` is the
+           only positional parameter; ``login``/``password``/``server`` are
+           passed as keyword arguments (omitting ``path`` auto-detects the
+           terminal).
+        3. ``mt5.account_info()`` — resolve the actual account login.
+        4. Build the reverse alias table.
+        5. Publish ``ConnectionStateEvent(connected=True)``.
+        6. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
+
+        The guard is held for the lifetime of the connection and released by
+        ``disconnect()``.  On any failure the guard is released and a
+        ``PlatformConnectionError`` is raised.
 
         Raises ``PlatformConnectionError`` if:
         - Another adapter is already connected in this process
         - ``mt5.initialize()`` fails
         - ``account_info()`` returns ``None`` after successful initialize
         """
-        raise NotImplementedError
+        if self._connected:
+            return
+
+        # Acquire the process-global connection guard.  Only one adapter may
+        # hold it — MetaTrader5's initialize()/shutdown() are process-wide.
+        if not _connected_lock.acquire(blocking=False):
+            raise PlatformConnectionError(
+                "another MT5 adapter is already connected in this process — "
+                "MetaTrader5.initialize()/shutdown() is a process-wide singleton"
+            )
+
+        try:
+            mt5 = _get_mt5()
+
+            initialize_kwargs: dict[str, Any] = {
+                "login": self._config.login,
+                "password": self._config.password,
+                "server": self._config.server,
+            }
+            if self._config.path is not None:
+                initialize_kwargs["path"] = self._config.path
+
+            initialized = await asyncio.to_thread(mt5.initialize, **initialize_kwargs)
+            if not initialized:
+                code, desc = mt5.last_error()
+                raise map_mt5_error(code, desc or "mt5.initialize() failed")
+
+            account_info = await asyncio.to_thread(mt5.account_info)
+            if account_info is None:
+                code, desc = mt5.last_error()
+                raise map_mt5_error(
+                    code,
+                    desc or "mt5.account_info() returned None after initialize",
+                )
+
+            self._account_login = int(account_info.login)
+            self._build_reverse_alias()
+            self._connected = True
+            self._publish_connection_state(True)
+            self._poll_task = asyncio.create_task(self._poll_loop())
+        except Exception as exc:
+            self._connected = False
+            self._account_login = None
+            self._poll_task = None
+            _connected_lock.release()
+            raise PlatformConnectionError(f"failed to connect to MT5 terminal: {exc}") from exc
+
+    def _publish(self, event: Event) -> None:
+        """Publish onto the engine's bus, requiring it was wired first."""
+        if self._event_bus is None:
+            raise RuntimeError(
+                "event_bus not wired — construct via MT5Engine or call attach_event_bus() first"
+            )
+        self._event_bus.publish(event)
+
+    def _publish_connection_state(self, connected: bool) -> None:
+        self._publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                connected=connected,
+            )
+        )
 
     async def disconnect(self) -> None:
         """Cancel the polling loop and shut down the MT5 terminal connection.
 
-        Publishes ``ConnectionStateEvent(connected=False)``.
-        Releases the process-global connection guard.
+        Connection teardown (see mt5.md Step 10):
+
+        1. Cancel ``_poll_task`` and await its cancellation.
+        2. ``mt5.shutdown()`` via ``asyncio.to_thread()``.
+        3. Release the process-global guard.
+        4. Publish ``ConnectionStateEvent(connected=False)``.
+
+        Idempotent — safe to call when already disconnected; a second call
+        is a no-op.  Teardown of the local state (flags, guard, event) always
+        runs even if ``mt5.shutdown()`` itself fails, so a failed shutdown
+        never leaves the process-global connection permanently reserved.
         """
-        raise NotImplementedError
+        if not self._connected:
+            return
+
+        # 1. Cancel the background polling loop and wait for it to stop.
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            await asyncio.gather(self._poll_task, return_exceptions=True)
+            self._poll_task = None
+
+        try:
+            # 2. Shut down the process-global terminal connection.
+            mt5 = _get_mt5()
+            await asyncio.to_thread(mt5.shutdown)
+        finally:
+            # 3-4. Release the guard and report the state change regardless
+            # of whether shutdown() succeeded.
+            self._connected = False
+            self._account_login = None
+            _connected_lock.release()
+            self._publish_connection_state(False)
 
     @property
     def is_connected(self) -> bool:
