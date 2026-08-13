@@ -14,10 +14,13 @@ Tests cases:
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import namedtuple
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
@@ -36,7 +39,7 @@ _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
 
 Mt5Order = namedtuple(
     "Mt5Order",
-    ["ticket", "time_setup", "time_done", "state", "volume", "volume_current", "symbol"],
+    ["ticket", "time_setup", "time_done", "state", "volume_initial", "volume_current", "symbol"],
 )
 Mt5Position = namedtuple(
     "Mt5Position",
@@ -92,7 +95,7 @@ class TestPollOnce:
                 time_setup=int(_PAST.timestamp()),
                 time_done=0,
                 state=1,
-                volume=0.1,
+                volume_initial=0.1,
                 volume_current=0.1,
                 symbol="EURUSD.m",
             ),
@@ -164,7 +167,7 @@ class TestPollOnce:
                 time_setup=int(_PAST.timestamp()),
                 time_done=0,
                 state=1,
-                volume=0.1,
+                volume_initial=0.1,
                 volume_current=0.1,
                 symbol="EURUSD.m",
             ),
@@ -192,7 +195,7 @@ class TestPollOnce:
                 time_setup=int(_PAST.timestamp()),
                 time_done=0,
                 state=1,
-                volume=0.1,
+                volume_initial=0.1,
                 volume_current=0.1,
                 symbol="EURUSD.m",
             ),
@@ -382,14 +385,67 @@ class TestPollOnce:
 class TestPollLoop:
     """Background polling loop lifecycle."""
 
-    async def test_respects_poll_interval(self) -> None:
+    async def test_respects_poll_interval(self, adapter: MT5Adapter) -> None:
         """Cycles are spaced by poll_interval_seconds."""
-        ...
+        adapter._connected = True
+        intervals: list[float] = []
 
-    async def test_survives_cycle_exception(self) -> None:
+        async def fake_sleep(interval: float) -> None:
+            intervals.append(interval)
+            if len(intervals) >= 2:
+                adapter._connected = False
+
+        with (
+            patch.object(adapter, "_poll_once", new=AsyncMock()),
+            patch("asyncio.sleep", new=fake_sleep),
+        ):
+            await adapter._poll_loop()
+
+        assert intervals == [adapter._config.poll_interval_seconds] * 2
+
+    async def test_survives_cycle_exception(
+        self, adapter: MT5Adapter, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """Exception in one cycle doesn't kill the loop."""
-        ...
+        adapter._connected = True
+        calls = 0
 
-    async def test_cancelled_cleanly(self) -> None:
+        async def flaky_poll() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("boom")
+
+        async def fake_sleep(_interval: float) -> None:
+            if calls >= 2:
+                adapter._connected = False
+
+        with (
+            caplog.at_level(logging.WARNING, logger="unified_trading_execution.mt5.adapter"),
+            patch.object(adapter, "_poll_once", new=flaky_poll),
+            patch("asyncio.sleep", new=fake_sleep),
+        ):
+            await adapter._poll_loop()
+
+        assert calls == 2
+        assert "Poll cycle failed" in caplog.text
+
+    async def test_cancelled_cleanly(self, adapter: MT5Adapter) -> None:
         """Cancelling the task stops the loop without errors."""
-        ...
+        adapter._connected = True
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_sleep(_interval: float) -> None:
+            started.set()
+            await release.wait()
+
+        with (
+            patch.object(adapter, "_poll_once", new=AsyncMock()),
+            patch("asyncio.sleep", new=blocking_sleep),
+        ):
+            task = asyncio.create_task(adapter._poll_loop())
+            await asyncio.wait_for(started.wait(), timeout=1)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task

@@ -23,6 +23,7 @@ This module contains no business logic, no retry policy, no risk decisions.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -57,6 +58,8 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
@@ -468,7 +471,15 @@ class MT5Adapter(Adapter):
         a single ``to_thread()`` block, then diffs against last-known state
         and publishes events for any changes.
         """
-        raise NotImplementedError
+        while self._connected:
+            try:
+                await self._poll_once()
+            except Exception:
+                logger.warning(
+                    "Poll cycle failed; last-known state preserved. Continuing.",
+                    exc_info=True,
+                )
+            await asyncio.sleep(self._config.poll_interval_seconds)
 
     async def _poll_once(self) -> None:
         """One complete poll cycle.
@@ -534,7 +545,14 @@ class MT5Adapter(Adapter):
         """
         netted = self._net_positions(positions, instruments, now)
         for instrument, position in netted.items():
-            if self._last_positions.get(instrument) != position:
+            previous = self._last_positions.get(instrument)
+            # Diff on quantity/price only — updated_at is snapshot metadata
+            # and must not make an unchanged position look "changed".
+            if (
+                previous is None
+                or previous.quantity != position.quantity
+                or previous.average_entry_price != position.average_entry_price
+            ):
                 self._publish_position(position)
         for instrument in self._last_positions:
             if instrument not in netted:
@@ -597,7 +615,16 @@ class MT5Adapter(Adapter):
             total=Decimal(str(account.equity)),
             updated_at=now,
         )
-        if self._last_balance != balance:
+        # Diff on monetary fields only — updated_at is snapshot metadata and
+        # must not make an unchanged balance look "changed".
+        last = self._last_balance
+        if (
+            last is None
+            or last.currency != balance.currency
+            or last.free != balance.free
+            or last.used != balance.used
+            or last.total != balance.total
+        ):
             self._publish(
                 BalanceUpdateEvent(
                     event_id=_new_id(),
@@ -773,8 +800,12 @@ class MT5Adapter(Adapter):
         )
 
     def _check_mt5_error(self) -> None:
-        """Check ``mt5.last_error()`` and raise the mapped exception if non-zero."""
+        """Check ``mt5.last_error()`` and raise the mapped exception if it's a failure.
+
+        Success is ``RES_S_OK`` (1) in the Python wrapper — not the MQL-native
+        0 — so both are accepted as "no error".
+        """
         mt5 = _get_mt5()
         code, desc = mt5.last_error()
-        if code != 0:
+        if code != 0 and code != mt5.RES_S_OK:
             raise map_mt5_error(code, desc)
