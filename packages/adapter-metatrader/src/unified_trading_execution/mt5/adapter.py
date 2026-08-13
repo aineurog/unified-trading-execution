@@ -245,10 +245,38 @@ class MT5Adapter(Adapter):
     async def disconnect(self) -> None:
         """Cancel the polling loop and shut down the MT5 terminal connection.
 
-        Publishes ``ConnectionStateEvent(connected=False)``.
-        Releases the process-global connection guard.
+        Connection teardown (see mt5.md Step 10):
+
+        1. Cancel ``_poll_task`` and await its cancellation.
+        2. ``mt5.shutdown()`` via ``asyncio.to_thread()``.
+        3. Release the process-global guard.
+        4. Publish ``ConnectionStateEvent(connected=False)``.
+
+        Idempotent — safe to call when already disconnected; a second call
+        is a no-op.  Teardown of the local state (flags, guard, event) always
+        runs even if ``mt5.shutdown()`` itself fails, so a failed shutdown
+        never leaves the process-global connection permanently reserved.
         """
-        raise NotImplementedError
+        if not self._connected:
+            return
+
+        # 1. Cancel the background polling loop and wait for it to stop.
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            await asyncio.gather(self._poll_task, return_exceptions=True)
+            self._poll_task = None
+
+        try:
+            # 2. Shut down the process-global terminal connection.
+            mt5 = _get_mt5()
+            await asyncio.to_thread(mt5.shutdown)
+        finally:
+            # 3-4. Release the guard and report the state change regardless
+            # of whether shutdown() succeeded.
+            self._connected = False
+            self._account_login = None
+            _connected_lock.release()
+            self._publish_connection_state(False)
 
     @property
     def is_connected(self) -> bool:

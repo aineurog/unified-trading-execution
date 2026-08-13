@@ -44,17 +44,6 @@ async def _stub_poll_loop(adapter: MT5Adapter, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr(adapter, "_poll_loop", _never)
 
 
-async def _teardown(adapter: MT5Adapter) -> None:
-    """Undo a successful connect — disconnect() is implemented in Step 10."""
-    if adapter._poll_task is not None:
-        adapter._poll_task.cancel()
-        await asyncio.gather(adapter._poll_task, return_exceptions=True)
-        adapter._poll_task = None
-    if adapter._connected:
-        _connected_lock.release()
-        adapter._connected = False
-
-
 class TestConnect:
     """MT5Adapter.connect() lifecycle."""
 
@@ -93,7 +82,7 @@ class TestConnect:
         assert isinstance(event.event_id, str) and event.event_id
         assert event.timestamp.tzinfo is not None
 
-        await _teardown(adapter)
+        await adapter.disconnect()
 
     async def test_initialize_failure(
         self,
@@ -148,7 +137,7 @@ class TestConnect:
         assert other.is_connected is False
         assert adapter.is_connected is True
 
-        await _teardown(adapter)
+        await adapter.disconnect()
 
     async def test_starts_polling_loop(
         self,
@@ -163,20 +152,68 @@ class TestConnect:
         assert adapter._poll_task is not None
         assert not adapter._poll_task.done()
 
-        await _teardown(adapter)
+        await adapter.disconnect()
 
 
 class TestDisconnect:
     """MT5Adapter.disconnect() lifecycle."""
 
-    def test_cancels_polling_and_shuts_down(self) -> None:
+    async def test_cancels_polling_and_shuts_down(
+        self,
+        adapter,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
         """Polling loop cancelled, mt5.shutdown() called, guard released."""
-        ...
+        await _stub_poll_loop(adapter, monkeypatch)
+        await adapter.connect()
+        assert adapter._poll_task is not None and not adapter._poll_task.done()
 
-    def test_publishes_disconnection_event(self) -> None:
+        await adapter.disconnect()
+
+        mock_mt5_module.shutdown.assert_called_once_with()
+        assert adapter._poll_task is None
+        assert adapter.is_connected is False
+
+        # Guard was released — a fresh acquire succeeds.
+        assert _connected_lock.acquire(blocking=False)
+        _connected_lock.release()
+
+    async def test_publishes_disconnection_event(
+        self,
+        adapter,
+        event_bus,
+        monkeypatch,
+    ) -> None:
         """disconnect() publishes ConnectionStateEvent(connected=False)."""
-        ...
+        await _stub_poll_loop(adapter, monkeypatch)
+        await adapter.connect()
+        events = _collect_events(event_bus)
 
-    def test_idempotent(self) -> None:
+        await adapter.disconnect()
+
+        assert len(events) == 1
+        event = events[0]
+        assert event.connected is False
+        assert event.adapter_name == "metatrader"
+        assert event.correlation_id is None
+        assert event.timestamp.tzinfo is not None
+
+    async def test_idempotent(
+        self,
+        adapter,
+        mock_mt5_module,
+        event_bus,
+        monkeypatch,
+    ) -> None:
         """Calling disconnect twice is safe."""
-        ...
+        await _stub_poll_loop(adapter, monkeypatch)
+        await adapter.connect()
+        await adapter.disconnect()
+        events = _collect_events(event_bus)
+
+        await adapter.disconnect()
+
+        assert adapter.is_connected is False
+        assert events == []
+        mock_mt5_module.shutdown.assert_called_once_with()
