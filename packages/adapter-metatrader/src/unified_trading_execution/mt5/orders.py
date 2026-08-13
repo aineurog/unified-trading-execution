@@ -119,7 +119,34 @@ def build_mt5_modify_request(
     Raises ``UnsupportedOrderTypeError`` if *modification* sets ``quantity``
     (MT5 cannot modify quantity — cancel and re-place is required).
     """
-    raise NotImplementedError
+    if modification.quantity is not None:
+        raise UnsupportedOrderTypeError(
+            "quantity modification is not supported by MT5 — cancel and re-place"
+        )
+
+    request: dict[str, Any] = {
+        "action": mt5_module.TRADE_ACTION_MODIFY,
+        "ticket": ticket,
+    }
+
+    if modification.price is not None:
+        request["price"] = float(modification.price)
+    if modification.stop_price is not None:
+        request["stoplimit"] = float(modification.stop_price)
+    if modification.take_profit is not None:
+        if modification.take_profit.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+            )
+        request["tp"] = float(modification.take_profit.trigger_price)
+    if modification.stop_loss is not None:
+        if modification.stop_loss.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
+            )
+        request["sl"] = float(modification.stop_loss.trigger_price)
+
+    return request
 
 
 def build_mt5_cancel_request(

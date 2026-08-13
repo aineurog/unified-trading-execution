@@ -25,16 +25,21 @@ from types import SimpleNamespace
 import pytest
 
 from unified_trading_execution.errors import InvalidSymbolError, UnsupportedOrderTypeError
-from unified_trading_execution.mt5.orders import _select_filling, build_mt5_request
+from unified_trading_execution.mt5.orders import (
+    _select_filling,
+    build_mt5_modify_request,
+    build_mt5_request,
+)
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument
-from unified_trading_execution.types.order import TpSlAttachment, UnifiedOrder
+from unified_trading_execution.types.order import OrderModification, TpSlAttachment, UnifiedOrder
 
 
 @pytest.fixture
 def mt5_constants(mock_mt5_module) -> None:
     """Populate the mock MT5 module with the standard constant values."""
     mock_mt5_module.TRADE_ACTION_DEAL = 1
+    mock_mt5_module.TRADE_ACTION_MODIFY = 2
     mock_mt5_module.TRADE_ACTION_PENDING = 5
     mock_mt5_module.ORDER_TIME_SPECIFIED = 2
     mock_mt5_module.ORDER_TYPE_BUY = 0
@@ -221,17 +226,62 @@ class TestBuildMT5Request:
 class TestBuildMT5ModifyRequest:
     """OrderModification → TRADE_ACTION_MODIFY translation."""
 
-    def test_price_change(self) -> None:
+    def test_price_change(self, mock_mt5_module, mt5_constants) -> None:
         """Modifying price sets the PRICE field."""
-        ...
+        request = build_mt5_modify_request(
+            OrderModification(client_order_id="c1", price=Decimal("1.2000")),
+            ticket=123,
+            mt5_module=mock_mt5_module,
+        )
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
+        assert request["ticket"] == 123
+        assert request["price"] == 1.2
 
-    def test_stop_price_change(self) -> None:
+    def test_stop_price_change(self, mock_mt5_module, mt5_constants) -> None:
         """Modifying stop_price sets the STOPLIMIT field."""
-        ...
+        request = build_mt5_modify_request(
+            OrderModification(client_order_id="c1", stop_price=Decimal("1.1500")),
+            ticket=123,
+            mt5_module=mock_mt5_module,
+        )
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
+        assert request["ticket"] == 123
+        assert request["stoplimit"] == 1.15
 
-    def test_quantity_change_unsupported(self) -> None:
+    def test_tp_sl_change(self, mock_mt5_module, mt5_constants) -> None:
+        """Modifying take_profit and stop_loss sets the TP and SL fields."""
+        request = build_mt5_modify_request(
+            OrderModification(
+                client_order_id="c1",
+                take_profit=TpSlAttachment(Decimal("1.3000")),
+                stop_loss=TpSlAttachment(Decimal("1.0000")),
+            ),
+            ticket=123,
+            mt5_module=mock_mt5_module,
+        )
+        assert request["tp"] == 1.3
+        assert request["sl"] == 1.0
+
+    def test_tp_sl_limit_price_unsupported(self, mock_mt5_module, mt5_constants) -> None:
+        """TP/SL modification with limit_price raises UnsupportedOrderTypeError."""
+        with pytest.raises(UnsupportedOrderTypeError):
+            build_mt5_modify_request(
+                OrderModification(
+                    client_order_id="c1",
+                    stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010")),
+                ),
+                ticket=123,
+                mt5_module=mock_mt5_module,
+            )
+
+    def test_quantity_change_unsupported(self, mock_mt5_module, mt5_constants) -> None:
         """Modifying quantity raises UnsupportedOrderTypeError."""
-        ...
+        with pytest.raises(UnsupportedOrderTypeError):
+            build_mt5_modify_request(
+                OrderModification(client_order_id="c1", quantity=Decimal("0.2")),
+                ticket=123,
+                mt5_module=mock_mt5_module,
+            )
 
 
 class TestBuildMT5CancelRequest:
