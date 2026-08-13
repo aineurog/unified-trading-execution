@@ -32,7 +32,8 @@ def mock_mt5_module():
         mock_mt5 = MagicMock()
         mock_mt5.initialize.return_value = True
         mock_mt5.account_info.return_value = MagicMock(login=12345678)
-        mock_mt5.last_error.return_value = (0, "")
+        mock_mt5.RES_S_OK = 1
+        mock_mt5.last_error.return_value = (1, "")
         mock_mt5.symbols_get.return_value = []
         mock_get.return_value = mock_mt5
         yield mock_mt5
