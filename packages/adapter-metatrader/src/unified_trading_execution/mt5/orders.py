@@ -38,9 +38,17 @@ Platform limitations:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
-from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
+from unified_trading_execution.errors import (
+    InvalidSymbolError,
+    PlatformError,
+    UnsupportedOrderTypeError,
+)
+from unified_trading_execution.mt5.errors import map_mt5_error
+from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.order import OrderModification, OrderResult, UnifiedOrder
 
 
@@ -53,8 +61,54 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
     - Converting the instrument to the MT5 symbol string
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
+
+    Raises ``UnsupportedOrderTypeError`` if a TP/SL attachment carries a
+    ``limit_price`` (MT5 TP/SL are price levels, not orders).
     """
-    raise NotImplementedError
+    request: dict[str, Any] = {
+        "action": (
+            mt5_module.TRADE_ACTION_DEAL
+            if order.order_type == OrderType.MARKET
+            else mt5_module.TRADE_ACTION_PENDING
+        ),
+        "type": _ORDER_TYPE_MAP[(order.order_type, order.side)],
+        "volume": float(order.quantity),
+    }
+
+    if order.order_type == OrderType.LIMIT:
+        if order.price is None:
+            raise ValueError(f"price is required for {order.order_type}")
+        request["price"] = float(order.price)
+    elif order.order_type == OrderType.STOP:
+        if order.stop_price is None:
+            raise ValueError(f"stop_price is required for {order.order_type}")
+        request["price"] = float(order.stop_price)
+    elif order.order_type == OrderType.STOP_LIMIT:
+        if order.price is None or order.stop_price is None:
+            raise ValueError(f"price and stop_price are required for {order.order_type}")
+        request["price"] = float(order.price)
+        request["stoplimit"] = float(order.stop_price)
+
+    if order.take_profit is not None:
+        if order.take_profit.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+            )
+        request["tp"] = float(order.take_profit.trigger_price)
+    if order.stop_loss is not None:
+        if order.stop_loss.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
+            )
+        request["sl"] = float(order.stop_loss.trigger_price)
+
+    if order.time_in_force == TimeInForce.GTD:
+        if order.expire_at is None:
+            raise ValueError("expire_at is required when time_in_force == GTD")
+        request["type_time"] = mt5_module.ORDER_TIME_SPECIFIED
+        request["expiration"] = int(order.expire_at.timestamp())
+
+    return request
 
 
 def build_mt5_modify_request(
@@ -72,7 +126,34 @@ def build_mt5_modify_request(
     Raises ``UnsupportedOrderTypeError`` if *modification* sets ``quantity``
     (MT5 cannot modify quantity — cancel and re-place is required).
     """
-    raise NotImplementedError
+    if modification.quantity is not None:
+        raise UnsupportedOrderTypeError(
+            "quantity modification is not supported by MT5 — cancel and re-place"
+        )
+
+    request: dict[str, Any] = {
+        "action": mt5_module.TRADE_ACTION_MODIFY,
+        "ticket": ticket,
+    }
+
+    if modification.price is not None:
+        request["price"] = float(modification.price)
+    if modification.stop_price is not None:
+        request["stoplimit"] = float(modification.stop_price)
+    if modification.take_profit is not None:
+        if modification.take_profit.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+            )
+        request["tp"] = float(modification.take_profit.trigger_price)
+    if modification.stop_loss is not None:
+        if modification.stop_loss.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
+            )
+        request["sl"] = float(modification.stop_loss.trigger_price)
+
+    return request
 
 
 def build_mt5_cancel_request(
@@ -81,7 +162,10 @@ def build_mt5_cancel_request(
     mt5_module: Any,
 ) -> dict[str, Any]:
     """Build an MT5 ``TRADE_ACTION_REMOVE`` request dict for *ticket*."""
-    raise NotImplementedError
+    return {
+        "action": mt5_module.TRADE_ACTION_REMOVE,
+        "ticket": ticket,
+    }
 
 
 def build_mt5_sltp_request(
@@ -99,33 +183,148 @@ def build_mt5_sltp_request(
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
     """
-    raise NotImplementedError
+    if take_profit is None and stop_loss is None:
+        raise ValueError("at least one of take_profit or stop_loss must be provided")
+
+    request: dict[str, Any] = {
+        "action": mt5_module.TRADE_ACTION_SLTP,
+        "position": int(position_id),
+    }
+    if take_profit is not None:
+        request["tp"] = take_profit
+    if stop_loss is not None:
+        request["sl"] = stop_loss
+    return request
 
 
-def parse_mt5_result(result: Any, *, mt5_module: Any) -> OrderResult:
+def parse_mt5_result(
+    result: Any,
+    client_order_id: str,
+    *,
+    mt5_module: Any,
+) -> OrderResult:
     """Parse an ``OrderSendResult`` named tuple from MT5 into an ``OrderResult``.
 
-    *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
-    Calls ``mt5.last_error()`` if the result indicates failure.
+    *client_order_id* is the engine's order id this result belongs to — MT5
+    never returns it, so the caller supplies it.  *mt5_module* is the
+    lazily-imported ``MetaTrader5`` module reference.
+
+    Raises the mapped exception (via ``map_mt5_error``) when the result
+    retcode indicates failure, using ``mt5.last_error()`` for the code and
+    description.
     """
-    raise NotImplementedError
+    if result is None:
+        code, desc = mt5_module.last_error()
+        raise map_mt5_error(code, desc) from None
+
+    status = _RETCODE_STATUS_MAP.get(result.retcode)
+    if status is None:
+        code, desc = mt5_module.last_error()
+        if code == 0:
+            code = result.retcode
+        raise map_mt5_error(code, desc or result.comment) from None
+
+    now = datetime.now(tz=UTC)
+    filled = (
+        Decimal(str(result.volume))
+        if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+        else Decimal("0")
+    )
+    if result.order is None or result.order == 0:
+        platform_order_id = str(result.deal) if result.deal else None
+    else:
+        platform_order_id = str(result.order)
+    return OrderResult(
+        client_order_id=client_order_id,
+        platform_order_id=platform_order_id,
+        status=status,
+        filled_quantity=filled,
+        average_fill_price=_decimal_or_none(result.price)
+        if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
+        else None,
+        created_at=now,
+        updated_at=now,
+    )
 
 
-def parse_order_record(order_tuple: Any, *, mt5_module: Any) -> OrderResult | None:
+def parse_order_record(
+    order_tuple: Any,
+    client_order_id: str,
+    *,
+    mt5_module: Any,
+) -> OrderResult | None:
     """Parse an MT5 order tuple (from ``orders_get()`` / ``order_get()``)
     into an ``OrderResult``.
 
-    Returns ``None`` if the tuple is empty or ``None``.
-    *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
+    Returns ``None`` if the tuple is empty or ``None``.  *client_order_id*
+    is the engine's order id this record belongs to — MT5 never returns it,
+    so the caller supplies it.  *mt5_module* is the lazily-imported
+    ``MetaTrader5`` module reference.
     """
-    raise NotImplementedError
+    if order_tuple is None or (hasattr(order_tuple, "__len__") and len(order_tuple) == 0):
+        return None
+
+    status = _ORDER_STATE_STATUS_MAP.get(order_tuple.state)
+    if status is None:
+        raise PlatformError(f"Unknown MT5 order state {order_tuple.state}")
+    if order_tuple.ticket is None:
+        raise PlatformError("MT5 order record is missing ticket")
+
+    volume = Decimal(str(order_tuple.volume))
+    volume_current = Decimal(str(order_tuple.volume_current))
+    filled = volume - volume_current
+
+    return OrderResult(
+        client_order_id=client_order_id,
+        platform_order_id=str(order_tuple.ticket),
+        status=status,
+        filled_quantity=filled,
+        average_fill_price=None,
+        created_at=datetime.fromtimestamp(order_tuple.time_setup, tz=UTC),
+        updated_at=datetime.fromtimestamp(order_tuple.time_done or order_tuple.time_setup, tz=UTC),
+    )
+
+
+def _decimal_or_none(raw: object) -> Decimal | None:
+    if raw is None or raw == "":
+        return None
+    return Decimal(str(raw))
+
+
+# TRADE_RETCODE_* success codes → unified OrderStatus.  Anything not in this
+# map is a failure and is routed through map_mt5_error() instead.
+_RETCODE_STATUS_MAP: dict[int, OrderStatus] = {
+    10008: OrderStatus.OPEN,  # TRADE_RETCODE_PLACED
+    10009: OrderStatus.FILLED,  # TRADE_RETCODE_DONE
+    10010: OrderStatus.PARTIALLY_FILLED,  # TRADE_RETCODE_DONE_PARTIAL
+    10025: OrderStatus.OPEN,  # TRADE_RETCODE_NO_CHANGES
+}
+
+# ORDER_STATE_* → unified OrderStatus for order records from orders_get().
+_ORDER_STATE_STATUS_MAP: dict[int, OrderStatus] = {
+    1: OrderStatus.OPEN,  # ORDER_STATE_PLACED
+    2: OrderStatus.CANCELLED,  # ORDER_STATE_CANCELED
+    3: OrderStatus.PARTIALLY_FILLED,  # ORDER_STATE_PARTIAL
+    4: OrderStatus.FILLED,  # ORDER_STATE_FILLED
+    5: OrderStatus.REJECTED,  # ORDER_STATE_REJECTED
+    6: OrderStatus.EXPIRED,  # ORDER_STATE_EXPIRED
+}
 
 
 # ---- Internal helpers (implement these) ----
 
 
-_ORDER_TYPE_MAP: dict[tuple[OrderType, OrderSide], int] = {}
-"""Populate with the 8 (type, side) → MT5 ORDER_TYPE_* int mappings."""
+_ORDER_TYPE_MAP: dict[tuple[OrderType, OrderSide], int] = {
+    (OrderType.MARKET, OrderSide.BUY): 0,  # ORDER_TYPE_BUY
+    (OrderType.MARKET, OrderSide.SELL): 1,  # ORDER_TYPE_SELL
+    (OrderType.LIMIT, OrderSide.BUY): 2,  # ORDER_TYPE_BUY_LIMIT
+    (OrderType.LIMIT, OrderSide.SELL): 3,  # ORDER_TYPE_SELL_LIMIT
+    (OrderType.STOP, OrderSide.BUY): 4,  # ORDER_TYPE_BUY_STOP
+    (OrderType.STOP, OrderSide.SELL): 5,  # ORDER_TYPE_SELL_STOP
+    (OrderType.STOP_LIMIT, OrderSide.BUY): 6,  # ORDER_TYPE_BUY_STOP_LIMIT
+    (OrderType.STOP_LIMIT, OrderSide.SELL): 7,  # ORDER_TYPE_SELL_STOP_LIMIT
+}
+"""The 8 (type, side) → MT5 ``ORDER_TYPE_*`` int mappings."""
 
 
 def _select_filling(symbol_info: Any, tif: TimeInForce, *, mt5_module: Any) -> int:
@@ -134,4 +333,25 @@ def _select_filling(symbol_info: Any, tif: TimeInForce, *, mt5_module: Any) -> i
     Falls back through preference order when the ideal mode is unsupported.
     Raises ``InvalidSymbolError`` if no compatible filling mode exists.
     """
-    raise NotImplementedError
+    ideal = _IDEAL_FILLING[tif]
+    for mode in _FILLING_FALLBACK[ideal]:
+        if symbol_info.filling_mode & (1 << mode):
+            return mode
+    raise InvalidSymbolError(
+        f"symbol has no filling mode compatible with time_in_force={tif.value}"
+    )
+
+
+_IDEAL_FILLING: dict[TimeInForce, int] = {
+    TimeInForce.FOK: 0,  # ORDER_FILLING_FOK
+    TimeInForce.IOC: 1,  # ORDER_FILLING_IOC
+    TimeInForce.GTC: 2,  # ORDER_FILLING_RETURN
+    TimeInForce.DAY: 2,
+    TimeInForce.GTD: 2,
+}
+
+_FILLING_FALLBACK: dict[int, tuple[int, ...]] = {
+    0: (0, 1, 2),  # FOK → FOK, IOC, RETURN
+    1: (1, 0, 2),  # IOC → IOC, FOK, RETURN
+    2: (2, 1, 0),  # RETURN → RETURN, IOC, FOK
+}
