@@ -25,16 +25,29 @@ from __future__ import annotations
 import asyncio
 import threading
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.errors import PlatformConnectionError
-from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
+from unified_trading_execution.events import (
+    BalanceUpdateEvent,
+    ConnectionStateEvent,
+    Event,
+    EventBus,
+    FillEvent,
+    PositionUpdateEvent,
+)
 from unified_trading_execution.mt5.errors import map_mt5_error
+from unified_trading_execution.mt5.symbols import from_mt5_symbol
 from unified_trading_execution.types.enums import AssetClass, OrderType
-from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.instrument import (
+    Instrument,
+    InstrumentSpec,
+    _with_broker_override,
+)
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -78,6 +91,22 @@ def _utcnow() -> datetime:
     return datetime.now(UTC)
 
 
+# MT5 symbol market-path segment → canonical AssetClass.  The mapping is
+# broker-dependent (the segment names come from the broker's own market tree);
+# an unrecognized path is an error, never a silent default.
+_PATH_ASSET_CLASS: dict[str, AssetClass] = {
+    "FOREX": AssetClass.MARGIN_FX,
+    "METALS": AssetClass.MARGIN_FX,  # spot metals (XAUUSD) trade as quoted pairs on margin
+    "INDICES": AssetClass.CFD,  # index CFDs
+    "STOCKS": AssetClass.STOCK,
+    "CRYPTOCURRENCIES": AssetClass.SPOT,
+    "CRYPTO": AssetClass.SPOT,
+    "FUTURES": AssetClass.FUTURES,
+    "BONDS": AssetClass.BOND,
+    "FUNDS": AssetClass.FUND,
+}
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -108,12 +137,18 @@ class MT5Adapter(Adapter):
         self._order_id_to_ticket: dict[str, int] = {}
         self._ticket_to_order_id: dict[int, str] = {}
 
-        # Last known state snapshots (keyed by ticket for orders, by
-        # position ticket for positions, by currency for balances).
+        # Last known state snapshots.  Orders are keyed by MT5 ticket (raw
+        # tuples), positions are NETTED per instrument (one Position per
+        # instrument regardless of netting/hedging mode), and balance is the
+        # single-currency account balance.
         self._last_orders: dict[int, object] = {}
-        self._last_positions: dict[int, object] = {}
-        self._last_balance: object | None = None
+        self._last_positions: dict[Instrument, Position] = {}
+        self._last_balance: Balance | None = None
         self._last_deal_time: datetime = datetime.now(tz=UTC)
+
+        # Broker symbol → canonical Instrument cache for inbound reconstruction.
+        # Populated lazily on first sighting via symbol_info().path.
+        self._symbol_to_instrument: dict[str, Instrument] = {}
 
         # Instrument spec cache: Instrument → (InstrumentSpec, fetched_at)
         self._spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
@@ -438,10 +473,254 @@ class MT5Adapter(Adapter):
     async def _poll_once(self) -> None:
         """One complete poll cycle.
 
-        Fetches all state in a single ``asyncio.to_thread()`` call
-        for efficiency (single GIL handoff per cycle).
+        Fetches orders, positions, balance, and new deals inside a single
+        ``asyncio.to_thread()`` block (one GIL handoff per cycle), diffs
+        each dataset against the last-known state, and publishes
+        ``FillEvent`` / ``PositionUpdateEvent`` / ``BalanceUpdateEvent``
+        for changes.  Order diffs only update internal state — order
+        lifecycle events are the engine's responsibility (Section 6.1),
+        never the polling loop's.
+
+        A single-cycle failure (e.g. a snapshot call returned ``None``)
+        raises so ``_poll_loop`` can log and continue.  Last-known state is
+        only committed after the full cycle succeeds, so a failed cycle
+        never corrupts the diff baseline.
         """
-        raise NotImplementedError
+        mt5 = _get_mt5()
+
+        def _fetch_snapshot() -> tuple[Any, ...]:
+            now = _utcnow()
+            orders = mt5.orders_get()
+            positions = mt5.positions_get()
+            account = mt5.account_info()
+            deals = mt5.history_deals_get(self._last_deal_time, now)
+            self._check_mt5_error()
+            instruments = self._resolve_poll_instruments(mt5, positions, deals)
+            return orders, positions, account, deals, instruments, now
+
+        orders, positions, account, deals, instruments, now = await asyncio.to_thread(
+            _fetch_snapshot
+        )
+
+        self._process_orders(orders)
+        self._process_positions(positions, instruments, now)
+        self._process_balance(account, now)
+        self._process_fills(deals, instruments, account, now)
+
+    def _process_orders(self, orders: Any) -> None:
+        """Update the last-known open-order snapshot; publish nothing.
+
+        ``orders_get()`` returns only live (non-final) orders, so simply
+        replacing ``_last_orders`` both detects new/updated orders and
+        drops filled/cancelled ones.
+        """
+        new_state: dict[int, object] = {}
+        for order in orders or ():
+            new_state[order.ticket] = order
+        self._last_orders = new_state
+
+    def _process_positions(
+        self,
+        positions: Any,
+        instruments: dict[str, Instrument],
+        now: datetime,
+    ) -> None:
+        """Net position legs per instrument and publish changes.
+
+        Hedging-mode accounts return one position tuple per leg; they are
+        netted into a single ``Position`` per instrument before the diff.
+        A position that disappears from ``positions_get()`` is published as
+        a flat (quantity 0) position so the mirror learns of the close.
+        """
+        netted = self._net_positions(positions, instruments, now)
+        for instrument, position in netted.items():
+            if self._last_positions.get(instrument) != position:
+                self._publish_position(position)
+        for instrument in self._last_positions:
+            if instrument not in netted:
+                previous = self._last_positions[instrument]
+                closed = Position(
+                    instrument=instrument,
+                    quantity=Decimal("0"),
+                    average_entry_price=previous.average_entry_price,
+                    updated_at=now,
+                )
+                self._publish_position(closed)
+        self._last_positions = netted
+
+    def _net_positions(
+        self,
+        positions: Any,
+        instruments: dict[str, Instrument],
+        now: datetime,
+    ) -> dict[Instrument, Position]:
+        """Net raw ``positions_get()`` legs into one ``Position`` per instrument.
+
+        Signed quantity follows the core convention: BUY leg = +volume,
+        SELL leg = -volume.  The average entry price is the volume-weighted
+        average across the legs.
+        """
+        legs_by_symbol: dict[str, list[Any]] = {}
+        for position in positions or ():
+            legs_by_symbol.setdefault(position.symbol, []).append(position)
+
+        result: dict[Instrument, Position] = {}
+        for symbol, legs in legs_by_symbol.items():
+            instrument = instruments[symbol]
+            net_quantity = Decimal("0")
+            weighted_price = Decimal("0")
+            total_volume = Decimal("0")
+            for leg in legs:
+                volume = Decimal(str(leg.volume))
+                # POSITION_TYPE_BUY = 0, POSITION_TYPE_SELL = 1.
+                quantity = volume if leg.type == 0 else -volume
+                net_quantity += quantity
+                total_volume += volume
+                weighted_price += volume * Decimal(str(leg.price_open))
+            average = weighted_price / total_volume if total_volume else Decimal("0")
+            result[instrument] = Position(
+                instrument=instrument,
+                quantity=net_quantity,
+                average_entry_price=average,
+                updated_at=now,
+            )
+        return result
+
+    def _process_balance(self, account: Any, now: datetime) -> None:
+        """Translate ``account_info()`` into a ``Balance`` and publish changes."""
+        balance = Balance(
+            currency=str(account.currency),
+            # MT5 accounting: equity = margin + margin_free exactly, which
+            # satisfies the core invariant free + used == total.
+            free=Decimal(str(account.margin_free)),
+            used=Decimal(str(account.margin)),
+            total=Decimal(str(account.equity)),
+            updated_at=now,
+        )
+        if self._last_balance != balance:
+            self._publish(
+                BalanceUpdateEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    balance=balance,
+                )
+            )
+        self._last_balance = balance
+
+    def _process_fills(
+        self,
+        deals: Any,
+        instruments: dict[str, Instrument],
+        account: Any,
+        now: datetime,
+    ) -> None:
+        """Publish a ``FillEvent`` for each new fill since ``_last_deal_time``.
+
+        Only DEAL_TYPE_BUY (0) / DEAL_TYPE_SELL (1) deals are fills —
+        DEAL_TYPE_IN/OUT are non-trading balance operations.  Deal times are
+        second-granular, so ``_last_deal_time`` is advanced to the newest
+        deal time seen (strictly-greater diffing) to avoid re-reporting.
+        """
+        new_deal_time = self._last_deal_time
+        for deal in deals or ():
+            deal_time = datetime.fromtimestamp(int(deal.time), tz=UTC)
+            if deal_time <= self._last_deal_time:
+                continue
+            if deal.type not in (0, 1):
+                continue
+            volume = Decimal(str(deal.volume))
+            price = Decimal(str(deal.price))
+            if volume <= 0 or price <= 0:
+                continue
+            fill = self._build_fill(deal, instruments, account)
+            self._publish(
+                FillEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=fill.correlation_id,
+                    fill=fill,
+                )
+            )
+            if deal_time > new_deal_time:
+                new_deal_time = deal_time
+        self._last_deal_time = new_deal_time
+
+    def _build_fill(
+        self,
+        deal: Any,
+        instruments: dict[str, Instrument],
+        account: Any,
+    ) -> FillRecord:
+        """Build a ``FillRecord`` from one MT5 deal tuple.
+
+        MT5 deals carry no client order id — the ``order`` ticket is resolved
+        through the ``client_order_id → ticket`` mapping recorded by
+        ``place_order``; an unknown ticket (order placed from the terminal)
+        yields an empty ``client_order_id``.
+        """
+        client_order_id = self._ticket_to_order_id.get(deal.order, "")
+        fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
+        return FillRecord(
+            client_order_id=client_order_id,
+            platform_fill_id=str(deal.ticket),
+            instrument=instruments[deal.symbol],
+            fill_quantity=Decimal(str(deal.volume)),
+            fill_price=Decimal(str(deal.price)),
+            fill_timestamp=datetime.fromtimestamp(int(deal.time), tz=UTC),
+            fee_currency=str(account.currency) if fee else None,
+            fee_amount=fee if fee else None,
+            correlation_id=client_order_id,
+            position_id=str(deal.position_id) if deal.position_id else None,
+        )
+
+    def _resolve_poll_instruments(
+        self,
+        mt5: Any,
+        positions: Any,
+        deals: Any,
+    ) -> dict[str, Instrument]:
+        """Resolve canonical ``Instrument`` for every symbol reported by
+        positions and deals.  Cached — a symbol is resolved only on its
+        first sighting.
+        """
+        symbols: set[str] = set()
+        for position in positions or ():
+            symbols.add(position.symbol)
+        for deal in deals or ():
+            symbols.add(deal.symbol)
+        return {symbol: self._resolve_instrument(symbol, mt5) for symbol in symbols}
+
+    def _resolve_instrument(self, mt5_symbol: str, mt5: Any) -> Instrument:
+        """Build the canonical ``Instrument`` for an MT5 symbol.
+
+        Combines ``from_mt5_symbol()`` (symbol/quote from the reverse alias
+        table) with ``symbol_info().path`` (asset class).  Must only be
+        called from within a ``to_thread()`` block — ``symbol_info()`` is an
+        MT5 IPC call.
+        """
+        cached = self._symbol_to_instrument.get(mt5_symbol)
+        if cached is not None:
+            return cached
+        symbol, quote = from_mt5_symbol(mt5_symbol, self._reverse_alias)
+        info = mt5.symbol_info(mt5_symbol)
+        if info is None:
+            code, desc = mt5.last_error()
+            raise map_mt5_error(
+                code,
+                desc or f"mt5.symbol_info() returned None for {mt5_symbol}",
+            )
+        asset_class = self._asset_class_from_path(info.path)
+        instrument = _with_broker_override(
+            Instrument(symbol=symbol, quote_currency=quote, asset_class=asset_class),
+            mt5_symbol,
+        )
+        self._symbol_to_instrument[mt5_symbol] = instrument
+        return instrument
 
     # ------------------------------------------------------------------
     # Internal helpers (implement these)
@@ -459,6 +738,18 @@ class MT5Adapter(Adapter):
         """Build the reverse alias table from ``MT5Config.symbol_alias_table``."""
         self._reverse_alias = {v: k for k, v in self._config.symbol_alias_table.items()}
 
+    def _publish_position(self, position: Position) -> None:
+        self._publish(
+            PositionUpdateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                position=position,
+            )
+        )
+
     def _asset_class_from_path(self, path: str) -> AssetClass:
         """Derive the canonical ``AssetClass`` from an MT5 symbol's market path.
 
@@ -472,8 +763,18 @@ class MT5Adapter(Adapter):
         The exact mapping is broker-dependent; raise ``ValueError`` for an
         unrecognized path rather than defaulting to a wrong asset class.
         """
-        raise NotImplementedError
+        upper = path.upper()
+        for segment, asset_class in _PATH_ASSET_CLASS.items():
+            if segment in upper:
+                return asset_class
+        raise ValueError(
+            f"Unrecognized MT5 symbol path {path!r} — cannot derive asset class. "
+            "Add a mapping to _PATH_ASSET_CLASS."
+        )
 
     def _check_mt5_error(self) -> None:
         """Check ``mt5.last_error()`` and raise the mapped exception if non-zero."""
-        raise NotImplementedError
+        mt5 = _get_mt5()
+        code, desc = mt5.last_error()
+        if code != 0:
+            raise map_mt5_error(code, desc)
