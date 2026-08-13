@@ -171,8 +171,8 @@ class TestBuildMT5Request:
             mt5_module=mock_mt5_module,
         )
         assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY_STOP_LIMIT
-        assert request["price"] == 1.25
-        assert request["stoplimit"] == 1.2
+        assert request["stoplimit"] == 1.25
+        assert request["price"] == 1.2
 
     def test_stop_limit_sell(self, mock_mt5_module, mt5_constants) -> None:
         """STOP_LIMIT SELL → ORDER_TYPE_SELL_STOP_LIMIT."""
@@ -186,8 +186,8 @@ class TestBuildMT5Request:
             mt5_module=mock_mt5_module,
         )
         assert request["type"] == mock_mt5_module.ORDER_TYPE_SELL_STOP_LIMIT
-        assert request["price"] == 0.95
-        assert request["stoplimit"] == 1.0
+        assert request["stoplimit"] == 0.95
+        assert request["price"] == 1.0
 
     def test_tp_sl_as_native_fields(self, mock_mt5_module, mt5_constants) -> None:
         """Take profit and stop loss are set as sl/tp fields on the request."""
@@ -248,26 +248,48 @@ class TestBuildMT5ModifyRequest:
     """OrderModification → TRADE_ACTION_MODIFY translation."""
 
     def test_price_change(self, mock_mt5_module, mt5_constants) -> None:
-        """Modifying price sets the PRICE field."""
+        """Modifying a LIMIT order's price sets the PRICE field."""
         request = build_mt5_modify_request(
             OrderModification(client_order_id="c1", price=Decimal("1.2000")),
             ticket=123,
+            order_type=OrderType.LIMIT,
             mt5_module=mock_mt5_module,
         )
         assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
-        assert request["ticket"] == 123
+        assert request["order"] == 123
         assert request["price"] == 1.2
 
-    def test_stop_price_change(self, mock_mt5_module, mt5_constants) -> None:
-        """Modifying stop_price sets the STOPLIMIT field."""
+    def test_stop_price_change_for_stop(self, mock_mt5_module, mt5_constants) -> None:
+        """Modifying a STOP order's trigger sets the PRICE field (MT5 stores the
+        trigger in price for plain stops)."""
         request = build_mt5_modify_request(
             OrderModification(client_order_id="c1", stop_price=Decimal("1.1500")),
             ticket=123,
+            order_type=OrderType.STOP,
             mt5_module=mock_mt5_module,
         )
         assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
-        assert request["ticket"] == 123
-        assert request["stoplimit"] == 1.15
+        assert request["order"] == 123
+        assert request["price"] == 1.15
+        assert "stoplimit" not in request
+
+    def test_stop_price_change_for_stop_limit(self, mock_mt5_module, mt5_constants) -> None:
+        """Modifying a STOP_LIMIT order's trigger sets the PRICE field and its
+        limit price sets STOPLIMIT."""
+        request = build_mt5_modify_request(
+            OrderModification(
+                client_order_id="c1",
+                price=Decimal("1.3000"),
+                stop_price=Decimal("1.1500"),
+            ),
+            ticket=123,
+            order_type=OrderType.STOP_LIMIT,
+            mt5_module=mock_mt5_module,
+        )
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
+        assert request["order"] == 123
+        assert request["price"] == 1.15
+        assert request["stoplimit"] == 1.3
 
     def test_tp_sl_change(self, mock_mt5_module, mt5_constants) -> None:
         """Modifying take_profit and stop_loss sets the TP and SL fields."""
@@ -278,6 +300,7 @@ class TestBuildMT5ModifyRequest:
                 stop_loss=TpSlAttachment(Decimal("1.0000")),
             ),
             ticket=123,
+            order_type=OrderType.LIMIT,
             mt5_module=mock_mt5_module,
         )
         assert request["tp"] == 1.3
@@ -292,6 +315,7 @@ class TestBuildMT5ModifyRequest:
                     stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010")),
                 ),
                 ticket=123,
+                order_type=OrderType.LIMIT,
                 mt5_module=mock_mt5_module,
             )
 
@@ -301,6 +325,7 @@ class TestBuildMT5ModifyRequest:
             build_mt5_modify_request(
                 OrderModification(client_order_id="c1", quantity=Decimal("0.2")),
                 ticket=123,
+                order_type=OrderType.LIMIT,
                 mt5_module=mock_mt5_module,
             )
 
@@ -309,10 +334,10 @@ class TestBuildMT5CancelRequest:
     """Cancel → TRADE_ACTION_REMOVE translation."""
 
     def test_cancel_request(self, mock_mt5_module, mt5_constants) -> None:
-        """Cancel request has TRADE_ACTION_REMOVE and correct ticket."""
+        """Cancel request has TRADE_ACTION_REMOVE and correct order ticket."""
         request = build_mt5_cancel_request(456, mt5_module=mock_mt5_module)
         assert request["action"] == mock_mt5_module.TRADE_ACTION_REMOVE
-        assert request["ticket"] == 456
+        assert request["order"] == 456
 
 
 class TestBuildMT5SltpRequest:
