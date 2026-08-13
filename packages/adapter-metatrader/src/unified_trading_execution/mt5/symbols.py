@@ -1,33 +1,34 @@
 """Instrument ↔ MetaTrader 5 symbol translation.
 
 MT5 brokers use non-standard symbol suffixes (``EURUSD.m``, ``EURUSDpro``,
-``EURUSD+``).  The adapter translates between core's canonical
-``Instrument`` objects and broker-specific MT5 symbol strings.
+``EURUSD+``).  The adapter translates between core's canonical types and
+broker-specific MT5 symbol strings.
 
-The translation has two layers:
+This module is **pure string logic** — it makes no terminal calls and never
+guesses an asset class.  The asset class is derived separately by the adapter
+from ``mt5.symbol_info().path`` (the broker's market tree, e.g. ``"Forex\\EURUSD"``,
+``"Metals\\XAUUSD"``, ``"Stocks\\AAPL"``), which is the only authoritative source.
 
-1. **Base translation** (always applied)
-   - Convert ``Instrument`` to its raw MT5 symbol string.
-   - Example: ``Instrument(symbol="EUR", quote_currency="USD")`` → ``"EURUSD"``
-
-2. **Alias table overlay** (applied when ``broker_symbol_override`` is set)
-   - Before base translation, ``_with_broker_override()`` is called to set
-     the platform-specific literal string.
-   - ``to_mt5_symbol()`` checks ``broker_symbol_override`` first; if set,
-     returns it directly, bypassing the base translation.
-
-Flow:
+Translation contract:
 
 **Outbound (canonical → broker):**
-    1. User creates ``Instrument(symbol="EUR", quote_currency="USD", ...)``
-    2. Adapter looks up ``str(instrument)`` → ``"EUR/USD"`` in the alias table
-    3. Finds ``"EURUSD.m"`` → calls ``_with_broker_override(instrument, "EURUSD.m")``
-    4. ``to_mt5_symbol(instrument)`` returns ``"EURUSD.m"``
+
+    1. Adapter looks up ``str(instrument)`` (``"EUR/USD"``) in the alias table.
+    2. Finds ``"EURUSD.m"`` → calls ``_with_broker_override(instrument, "EURUSD.m")``.
+    3. ``to_mt5_symbol(instrument)`` returns ``"EURUSD.m"``.
 
 **Inbound (broker → canonical):**
-    1. Polling loop receives a position with symbol ``"EURUSD.m"``
-    2. ``from_mt5_symbol("EURUSD.m")`` looks up reverse alias table
-    3. Finds ``"EUR/USD"`` → reconstructs canonical ``Instrument``
+
+    1. Polling loop receives a position with symbol ``"EURUSD.m"``.
+    2. ``from_mt5_symbol("EURUSD.m", reverse_alias_table)`` returns the
+       ``(symbol, quote_currency)`` pair ``("EUR", "USD")``.
+    3. The adapter derives ``asset_class`` from ``symbol_info().path`` and
+       constructs the full ``Instrument``.
+
+Aliasing is **mandatory**: a broker symbol that is not present in the alias
+table is an error, not a silent best-effort parse.  Raw parsing of MT5 symbols
+is deliberately NOT supported — suffixes are not standardized, and many symbols
+are not currency pairs at all (``US500``, ``AAPL``).
 """
 
 from __future__ import annotations
@@ -49,18 +50,21 @@ def to_mt5_symbol(instrument: Instrument) -> str:
 def from_mt5_symbol(
     mt5_symbol: str,
     reverse_alias_table: dict[str, str] | None = None,
-) -> Instrument:
-    """Convert an MT5 broker symbol string back to a canonical ``Instrument``.
+) -> tuple[str, str | None]:
+    """Convert an MT5 broker symbol string to a canonical ``(symbol, quote)`` pair.
 
-    If *reverse_alias_table* is provided and *mt5_symbol* is found in it,
-    the canonical form is parsed from the value (e.g., ``"EUR/USD"`` →
-    ``Instrument(symbol="EUR", quote_currency="USD")``).
+    Looks up *mt5_symbol* in *reverse_alias_table* (mapping broker symbol →
+    canonical ``"EUR/USD"`` shorthand) and splits the value on ``"/"`` into
+    ``(symbol, quote_currency)``.
 
-    Otherwise, the raw MT5 symbol is parsed heuristically — the adapter
-    attempts to split the symbol into base and quote components based on
-    common broker conventions.
+    Asset class is **not** derived here — it comes from the adapter via
+    ``symbol_info().path``.  This function returns only the currency pair
+    components; the adapter combines them with the asset class to build the
+    full ``Instrument``.
 
-    Raises ``ValueError`` if the symbol cannot be parsed.
+    Raises ``ValueError`` if *mt5_symbol* is not in *reverse_alias_table*.
+    Raw parsing of unlisted symbols is not supported — add the mapping to
+    ``MT5Config.symbol_alias_table`` instead.
     """
     raise NotImplementedError
 

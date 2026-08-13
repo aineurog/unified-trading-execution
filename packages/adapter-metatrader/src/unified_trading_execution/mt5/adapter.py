@@ -31,7 +31,7 @@ from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.events import (
     EventBus,
 )
-from unified_trading_execution.types.enums import OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -328,6 +328,21 @@ class MT5Adapter(Adapter):
     def _build_reverse_alias(self) -> None:
         """Build the reverse alias table from ``MT5Config.symbol_alias_table``."""
         self._reverse_alias = {v: k for k, v in self._config.symbol_alias_table.items()}
+
+    def _asset_class_from_path(self, path: str) -> AssetClass:
+        """Derive the canonical ``AssetClass`` from an MT5 symbol's market path.
+
+        ``symbol_info().path`` is the broker's market tree (e.g. ``"Forex\\EURUSD"``,
+        ``"Metals\\XAUUSD"``, ``"Indices\\US500"``, ``"Stocks\\AAPL"``).  This is
+        the authoritative source for asset class — never guessed from the symbol
+        string.  Used by the inbound reconstruction path: ``symbol_info()`` gives
+        the path, ``from_mt5_symbol()`` gives the ``(symbol, quote)`` pair, and this
+        function completes the ``Instrument``.
+
+        The exact mapping is broker-dependent; raise ``ValueError`` for an
+        unrecognized path rather than defaulting to a wrong asset class.
+        """
+        raise NotImplementedError
 
     def _check_mt5_error(self) -> None:
         """Check ``mt5.last_error()`` and raise the mapped exception if non-zero."""

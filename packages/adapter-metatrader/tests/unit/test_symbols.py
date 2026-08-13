@@ -4,9 +4,9 @@ Tests cases:
     - to_mt5_symbol: concatenates symbol + quote currency
     - to_mt5_symbol: returns broker_symbol_override directly when set
     - to_mt5_symbol: handles 3-letter and non-standard currency codes
-    - from_mt5_symbol: parses simple concatenated form ("EURUSD")
-    - from_mt5_symbol: uses reverse alias table when provided
-    - from_mt5_symbol: raises ValueError on unparseable symbols
+    - from_mt5_symbol: splits canonical shorthand from reverse alias table
+    - from_mt5_symbol: returns None quote when shorthand has no quote
+    - from_mt5_symbol: raises ValueError when symbol not in reverse table
     - build_reverse_alias_table: swaps keys/values
     - build_reverse_alias_table: empty dict → empty dict
 """
@@ -31,18 +31,18 @@ class TestToMT5Symbol:
 
 
 class TestFromMT5Symbol:
-    """MT5 broker symbol string → canonical Instrument."""
+    """MT5 broker symbol string → canonical (symbol, quote) pair."""
 
-    def test_parses_simple_form(self) -> None:
-        """ "EURUSD" → Instrument("EUR", "USD")."""
+    def test_splits_canonical_shorthand(self) -> None:
+        """Reverse alias "EURUSD.m" → "EUR/USD" → ("EUR", "USD")."""
         ...
 
-    def test_uses_reverse_alias_table(self) -> None:
-        """Reverse alias lookup takes priority over heuristic parsing."""
+    def test_quote_none_when_no_separator(self) -> None:
+        """Canonical value without "/" → ("SYMBOL", None)."""
         ...
 
-    def test_raises_on_unparseable(self) -> None:
-        """Unparseable symbol raises ValueError."""
+    def test_raises_when_symbol_not_in_table(self) -> None:
+        """Symbol missing from reverse table raises ValueError (no raw parsing)."""
         ...
 
 
