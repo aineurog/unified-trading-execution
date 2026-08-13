@@ -18,53 +18,204 @@ Tests cases:
 
 from __future__ import annotations
 
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from types import SimpleNamespace
+
+import pytest
+
+from unified_trading_execution.errors import InvalidSymbolError, UnsupportedOrderTypeError
+from unified_trading_execution.mt5.orders import _select_filling, build_mt5_request
+from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
+from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.order import TpSlAttachment, UnifiedOrder
+
+
+@pytest.fixture
+def mt5_constants(mock_mt5_module) -> None:
+    """Populate the mock MT5 module with the standard constant values."""
+    mock_mt5_module.TRADE_ACTION_DEAL = 1
+    mock_mt5_module.TRADE_ACTION_PENDING = 5
+    mock_mt5_module.ORDER_TIME_SPECIFIED = 2
+    mock_mt5_module.ORDER_TYPE_BUY = 0
+    mock_mt5_module.ORDER_TYPE_SELL = 1
+    mock_mt5_module.ORDER_TYPE_BUY_LIMIT = 2
+    mock_mt5_module.ORDER_TYPE_SELL_LIMIT = 3
+    mock_mt5_module.ORDER_TYPE_BUY_STOP = 4
+    mock_mt5_module.ORDER_TYPE_SELL_STOP = 5
+    mock_mt5_module.ORDER_TYPE_BUY_STOP_LIMIT = 6
+    mock_mt5_module.ORDER_TYPE_SELL_STOP_LIMIT = 7
+
+
+def _instrument() -> Instrument:
+    return Instrument(symbol="EUR/USD", asset_class=AssetClass.MARGIN_FX, quote_currency="USD")
+
+
+def _order(
+    order_type: OrderType,
+    side: OrderSide,
+    *,
+    price: Decimal | None = None,
+    stop_price: Decimal | None = None,
+    time_in_force: TimeInForce = TimeInForce.GTC,
+    take_profit: TpSlAttachment | None = None,
+    stop_loss: TpSlAttachment | None = None,
+    expire_at: datetime | None = None,
+) -> UnifiedOrder:
+    return UnifiedOrder(
+        instrument=_instrument(),
+        order_type=order_type,
+        side=side,
+        quantity=Decimal("0.1"),
+        time_in_force=time_in_force,
+        price=price,
+        stop_price=stop_price,
+        take_profit=take_profit,
+        stop_loss=stop_loss,
+        expire_at=expire_at,
+    )
+
 
 class TestBuildMT5Request:
     """UnifiedOrder → MqlTradeRequest translation."""
 
-    def test_market_buy(self) -> None:
+    def test_market_buy(self, mock_mt5_module, mt5_constants) -> None:
         """MARKET BUY → ORDER_TYPE_BUY."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.MARKET, OrderSide.BUY), mt5_module=mock_mt5_module
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_DEAL
+        assert "price" not in request
 
-    def test_market_sell(self) -> None:
+    def test_market_sell(self, mock_mt5_module, mt5_constants) -> None:
         """MARKET SELL → ORDER_TYPE_SELL."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.MARKET, OrderSide.SELL), mt5_module=mock_mt5_module
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_SELL
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_DEAL
 
-    def test_limit_buy(self) -> None:
+    def test_limit_buy(self, mock_mt5_module, mt5_constants) -> None:
         """LIMIT BUY → ORDER_TYPE_BUY_LIMIT."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.LIMIT, OrderSide.BUY, price=Decimal("1.1000")),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY_LIMIT
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_PENDING
+        assert request["price"] == 1.1
 
-    def test_limit_sell(self) -> None:
+    def test_limit_sell(self, mock_mt5_module, mt5_constants) -> None:
         """LIMIT SELL → ORDER_TYPE_SELL_LIMIT."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.LIMIT, OrderSide.SELL, price=Decimal("1.1000")),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_SELL_LIMIT
+        assert request["price"] == 1.1
 
-    def test_stop_buy(self) -> None:
+    def test_stop_buy(self, mock_mt5_module, mt5_constants) -> None:
         """STOP BUY → ORDER_TYPE_BUY_STOP."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.STOP, OrderSide.BUY, stop_price=Decimal("1.2000")),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY_STOP
+        assert request["price"] == 1.2
 
-    def test_stop_sell(self) -> None:
+    def test_stop_sell(self, mock_mt5_module, mt5_constants) -> None:
         """STOP SELL → ORDER_TYPE_SELL_STOP."""
-        ...
+        request = build_mt5_request(
+            _order(OrderType.STOP, OrderSide.SELL, stop_price=Decimal("1.0000")),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_SELL_STOP
+        assert request["price"] == 1.0
 
-    def test_stop_limit_buy(self) -> None:
+    def test_stop_limit_buy(self, mock_mt5_module, mt5_constants) -> None:
         """STOP_LIMIT BUY → ORDER_TYPE_BUY_STOP_LIMIT."""
-        ...
+        request = build_mt5_request(
+            _order(
+                OrderType.STOP_LIMIT,
+                OrderSide.BUY,
+                price=Decimal("1.2500"),
+                stop_price=Decimal("1.2000"),
+            ),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY_STOP_LIMIT
+        assert request["price"] == 1.25
+        assert request["stoplimit"] == 1.2
 
-    def test_stop_limit_sell(self) -> None:
+    def test_stop_limit_sell(self, mock_mt5_module, mt5_constants) -> None:
         """STOP_LIMIT SELL → ORDER_TYPE_SELL_STOP_LIMIT."""
-        ...
+        request = build_mt5_request(
+            _order(
+                OrderType.STOP_LIMIT,
+                OrderSide.SELL,
+                price=Decimal("0.9500"),
+                stop_price=Decimal("1.0000"),
+            ),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type"] == mock_mt5_module.ORDER_TYPE_SELL_STOP_LIMIT
+        assert request["price"] == 0.95
+        assert request["stoplimit"] == 1.0
 
-    def test_tp_sl_as_native_fields(self) -> None:
+    def test_tp_sl_as_native_fields(self, mock_mt5_module, mt5_constants) -> None:
         """Take profit and stop loss are set as sl/tp fields on the request."""
-        ...
+        request = build_mt5_request(
+            _order(
+                OrderType.LIMIT,
+                OrderSide.BUY,
+                price=Decimal("1.1000"),
+                take_profit=TpSlAttachment(Decimal("1.3000")),
+                stop_loss=TpSlAttachment(Decimal("1.0000")),
+            ),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["tp"] == 1.3
+        assert request["sl"] == 1.0
 
-    def test_tpsl_attachment_limit_price_unsupported(self) -> None:
+    def test_tpsl_attachment_limit_price_unsupported(self, mock_mt5_module, mt5_constants) -> None:
         """TpSlAttachment with limit_price raises UnsupportedOrderTypeError."""
-        ...
+        with pytest.raises(UnsupportedOrderTypeError):
+            build_mt5_request(
+                _order(
+                    OrderType.LIMIT,
+                    OrderSide.BUY,
+                    price=Decimal("1.1000"),
+                    take_profit=TpSlAttachment(Decimal("1.3000"), Decimal("1.2990")),
+                ),
+                mt5_module=mock_mt5_module,
+            )
+        with pytest.raises(UnsupportedOrderTypeError):
+            build_mt5_request(
+                _order(
+                    OrderType.LIMIT,
+                    OrderSide.BUY,
+                    price=Decimal("1.1000"),
+                    stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010")),
+                ),
+                mt5_module=mock_mt5_module,
+            )
 
-    def test_gtd_sets_expiration_fields(self) -> None:
+    def test_gtd_sets_expiration_fields(self, mock_mt5_module, mt5_constants) -> None:
         """GTD orders include type_time and expiration in the request."""
-        ...
+        expire_at = datetime.now(UTC) + timedelta(days=1)
+        request = build_mt5_request(
+            _order(
+                OrderType.LIMIT,
+                OrderSide.BUY,
+                price=Decimal("1.1000"),
+                time_in_force=TimeInForce.GTD,
+                expire_at=expire_at,
+            ),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type_time"] == mock_mt5_module.ORDER_TIME_SPECIFIED
+        assert request["expiration"] == int(expire_at.timestamp())
 
 
 class TestBuildMT5ModifyRequest:
@@ -118,10 +269,79 @@ class TestParseMT5Result:
 class TestSelectFilling:
     """Filling mode selection per symbol info and TIF."""
 
-    def test_selects_ideal_mode_when_available(self) -> None:
+    def test_selects_ideal_mode_when_available(self, mock_mt5_module) -> None:
         """Preferred filling mode matches TIF and is supported."""
-        ...
+        # ORDER_FILLING_FOK=0, ORDER_FILLING_IOC=1, ORDER_FILLING_RETURN=2
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b001), TimeInForce.FOK, mt5_module=mock_mt5_module
+            )
+            == 0
+        )
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b010), TimeInForce.IOC, mt5_module=mock_mt5_module
+            )
+            == 1
+        )
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b100), TimeInForce.GTC, mt5_module=mock_mt5_module
+            )
+            == 2
+        )
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b100), TimeInForce.DAY, mt5_module=mock_mt5_module
+            )
+            == 2
+        )
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b100), TimeInForce.GTD, mt5_module=mock_mt5_module
+            )
+            == 2
+        )
 
-    def test_falls_back_when_ideal_unsupported(self) -> None:
+    def test_falls_back_when_ideal_unsupported(self, mock_mt5_module) -> None:
         """Fallback chain when ideal filling mode is not in bitmask."""
-        ...
+        # FOK → [FOK, IOC, RETURN]: ideal unset, falls to IOC
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b010), TimeInForce.FOK, mt5_module=mock_mt5_module
+            )
+            == 1
+        )
+        # FOK → [FOK, IOC, RETURN]: falls all the way to RETURN
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b100), TimeInForce.FOK, mt5_module=mock_mt5_module
+            )
+            == 2
+        )
+        # IOC → [IOC, FOK, RETURN]: ideal unset, falls to FOK
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b001), TimeInForce.IOC, mt5_module=mock_mt5_module
+            )
+            == 0
+        )
+        # RETURN (GTC) → [RETURN, IOC, FOK]: ideal unset, falls to IOC
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b010), TimeInForce.GTC, mt5_module=mock_mt5_module
+            )
+            == 1
+        )
+        # RETURN (GTC) → [RETURN, IOC, FOK]: falls all the way to FOK
+        assert (
+            _select_filling(
+                SimpleNamespace(filling_mode=0b001), TimeInForce.GTC, mt5_module=mock_mt5_module
+            )
+            == 0
+        )
+        # No compatible mode at all → InvalidSymbolError
+        with pytest.raises(InvalidSymbolError):
+            _select_filling(
+                SimpleNamespace(filling_mode=0b000), TimeInForce.IOC, mt5_module=mock_mt5_module
+            )

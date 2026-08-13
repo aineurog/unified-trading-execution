@@ -40,6 +40,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from unified_trading_execution.errors import InvalidSymbolError, UnsupportedOrderTypeError
 from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.order import OrderModification, OrderResult, UnifiedOrder
 
@@ -53,8 +54,54 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
     - Converting the instrument to the MT5 symbol string
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
+
+    Raises ``UnsupportedOrderTypeError`` if a TP/SL attachment carries a
+    ``limit_price`` (MT5 TP/SL are price levels, not orders).
     """
-    raise NotImplementedError
+    request: dict[str, Any] = {
+        "action": (
+            mt5_module.TRADE_ACTION_DEAL
+            if order.order_type == OrderType.MARKET
+            else mt5_module.TRADE_ACTION_PENDING
+        ),
+        "type": _ORDER_TYPE_MAP[(order.order_type, order.side)],
+        "volume": float(order.quantity),
+    }
+
+    if order.order_type == OrderType.LIMIT:
+        if order.price is None:
+            raise ValueError(f"price is required for {order.order_type}")
+        request["price"] = float(order.price)
+    elif order.order_type == OrderType.STOP:
+        if order.stop_price is None:
+            raise ValueError(f"stop_price is required for {order.order_type}")
+        request["price"] = float(order.stop_price)
+    elif order.order_type == OrderType.STOP_LIMIT:
+        if order.price is None or order.stop_price is None:
+            raise ValueError(f"price and stop_price are required for {order.order_type}")
+        request["price"] = float(order.price)
+        request["stoplimit"] = float(order.stop_price)
+
+    if order.take_profit is not None:
+        if order.take_profit.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+            )
+        request["tp"] = float(order.take_profit.trigger_price)
+    if order.stop_loss is not None:
+        if order.stop_loss.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
+            )
+        request["sl"] = float(order.stop_loss.trigger_price)
+
+    if order.time_in_force == TimeInForce.GTD:
+        if order.expire_at is None:
+            raise ValueError("expire_at is required when time_in_force == GTD")
+        request["type_time"] = mt5_module.ORDER_TIME_SPECIFIED
+        request["expiration"] = int(order.expire_at.timestamp())
+
+    return request
 
 
 def build_mt5_modify_request(
@@ -124,8 +171,17 @@ def parse_order_record(order_tuple: Any, *, mt5_module: Any) -> OrderResult | No
 # ---- Internal helpers (implement these) ----
 
 
-_ORDER_TYPE_MAP: dict[tuple[OrderType, OrderSide], int] = {}
-"""Populate with the 8 (type, side) → MT5 ORDER_TYPE_* int mappings."""
+_ORDER_TYPE_MAP: dict[tuple[OrderType, OrderSide], int] = {
+    (OrderType.MARKET, OrderSide.BUY): 0,  # ORDER_TYPE_BUY
+    (OrderType.MARKET, OrderSide.SELL): 1,  # ORDER_TYPE_SELL
+    (OrderType.LIMIT, OrderSide.BUY): 2,  # ORDER_TYPE_BUY_LIMIT
+    (OrderType.LIMIT, OrderSide.SELL): 3,  # ORDER_TYPE_SELL_LIMIT
+    (OrderType.STOP, OrderSide.BUY): 4,  # ORDER_TYPE_BUY_STOP
+    (OrderType.STOP, OrderSide.SELL): 5,  # ORDER_TYPE_SELL_STOP
+    (OrderType.STOP_LIMIT, OrderSide.BUY): 6,  # ORDER_TYPE_BUY_STOP_LIMIT
+    (OrderType.STOP_LIMIT, OrderSide.SELL): 7,  # ORDER_TYPE_SELL_STOP_LIMIT
+}
+"""The 8 (type, side) → MT5 ``ORDER_TYPE_*`` int mappings."""
 
 
 def _select_filling(symbol_info: Any, tif: TimeInForce, *, mt5_module: Any) -> int:
@@ -134,4 +190,25 @@ def _select_filling(symbol_info: Any, tif: TimeInForce, *, mt5_module: Any) -> i
     Falls back through preference order when the ideal mode is unsupported.
     Raises ``InvalidSymbolError`` if no compatible filling mode exists.
     """
-    raise NotImplementedError
+    ideal = _IDEAL_FILLING[tif]
+    for mode in _FILLING_FALLBACK[ideal]:
+        if symbol_info.filling_mode & (1 << mode):
+            return mode
+    raise InvalidSymbolError(
+        f"symbol has no filling mode compatible with time_in_force={tif.value}"
+    )
+
+
+_IDEAL_FILLING: dict[TimeInForce, int] = {
+    TimeInForce.FOK: 0,  # ORDER_FILLING_FOK
+    TimeInForce.IOC: 1,  # ORDER_FILLING_IOC
+    TimeInForce.GTC: 2,  # ORDER_FILLING_RETURN
+    TimeInForce.DAY: 2,
+    TimeInForce.GTD: 2,
+}
+
+_FILLING_FALLBACK: dict[int, tuple[int, ...]] = {
+    0: (0, 1, 2),  # FOK → FOK, IOC, RETURN
+    1: (1, 0, 2),  # IOC → IOC, FOK, RETURN
+    2: (2, 1, 0),  # RETURN → RETURN, IOC, FOK
+}
