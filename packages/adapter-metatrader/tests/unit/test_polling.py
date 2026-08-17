@@ -22,6 +22,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
     Event,
@@ -412,6 +413,205 @@ class TestPollOnce:
             Decimal("0.5") * Decimal("1.1") + Decimal("0.3") * Decimal("1.105")
         ) / Decimal("0.8")
         assert netted.average_entry_price == expected_avg
+
+    async def test_same_second_deals_both_published(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """Two deals stamped in the same second are both reported.
+
+        Time-only diffing would drop the second (its time is not strictly
+        greater than the first); monotonic ticket dedup catches both.
+        """
+        adapter._build_reverse_alias()
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = (
+            Mt5Deal(
+                ticket=3001,
+                order=1001,
+                time=_DEAL_TIME,
+                type=0,
+                entry=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price=1.1010,
+                commission=0.0,
+                fee=0.0,
+                position_id=2001,
+            ),
+            Mt5Deal(
+                ticket=3002,
+                order=1001,
+                time=_DEAL_TIME,
+                type=0,
+                entry=1,
+                symbol="EURUSD.m",
+                volume=0.2,
+                price=1.1020,
+                commission=0.0,
+                fee=0.0,
+                position_id=2001,
+            ),
+        )
+        adapter._last_deal_time = _PAST
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+
+        fills: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, fills.append)
+        await adapter._poll_once()
+
+        assert len(fills) == 2
+        assert adapter._last_deal_ticket == 3002
+
+    async def test_deals_not_re_published_on_refetch(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """The same deal re-fetched next cycle is not published twice."""
+        adapter._build_reverse_alias()
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        mock_mt5_module.history_deals_get.return_value = (
+            Mt5Deal(
+                ticket=3001,
+                order=1001,
+                time=_DEAL_TIME,
+                type=0,
+                entry=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price=1.1010,
+                commission=0.0,
+                fee=0.0,
+                position_id=2001,
+            ),
+        )
+        adapter._last_deal_time = _PAST
+
+        fills: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, fills.append)
+        await adapter._poll_once()
+        await adapter._poll_once()
+
+        assert len(fills) == 1
+        assert adapter._last_deal_ticket == 3001
+
+    async def test_none_snapshot_call_raises_immediately(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """An intermediate ``None`` is caught before later calls reset last_error.
+
+        Previously a single end-of-snapshot check saw only the final call's
+        status and an ``orders_get()`` failure could slip through as "no data".
+        """
+        adapter._build_reverse_alias()
+        mock_mt5_module.orders_get.return_value = None
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = ()
+        mock_mt5_module.last_error.return_value = (10011, "processing error")
+        adapter._last_deal_time = _PAST
+
+        with pytest.raises(PlatformError):
+            await adapter._poll_once()
+
+    async def test_positions_baseline_committed_before_publish(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """A publish failure mid-cycle leaves the baseline advanced — no re-report."""
+        adapter._build_reverse_alias()
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = _PAST
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        mock_mt5_module.positions_get.return_value = (
+            Mt5Position(
+                ticket=2001,
+                time=_DEAL_TIME,
+                time_update=_DEAL_TIME,
+                type=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price_open=1.1000,
+            ),
+        )
+
+        with (
+            patch.object(adapter, "_publish_position", side_effect=RuntimeError("boom")),
+            pytest.raises(RuntimeError),
+        ):
+            await adapter._poll_once()
+
+        assert len(adapter._last_positions) == 1
+
+    async def test_bad_symbol_isolated_not_whole_cycle(
+        self,
+        mock_mt5_module: MagicMock,
+        adapter: MT5Adapter,
+        event_bus: EventBus,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """One unresolvable symbol doesn't silence events for the rest."""
+        adapter._reverse_alias = {"EURUSD.m": "EUR/USD", "CRYPTOX.m": "CRYPTO/USD"}
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = _PAST
+
+        def _symbol_info(symbol: str) -> MagicMock:
+            if symbol == "CRYPTOX.m":
+                return MagicMock(path="Other\\CryptoX")
+            return MagicMock(path="Forex\\EURUSD")
+
+        mock_mt5_module.symbol_info.side_effect = _symbol_info
+        mock_mt5_module.positions_get.return_value = (
+            Mt5Position(
+                ticket=2001,
+                time=_DEAL_TIME,
+                time_update=_DEAL_TIME,
+                type=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price_open=1.1000,
+            ),
+            Mt5Position(
+                ticket=2002,
+                time=_DEAL_TIME,
+                time_update=_DEAL_TIME,
+                type=0,
+                symbol="CRYPTOX.m",
+                volume=0.5,
+                price_open=60000.0,
+            ),
+        )
+
+        positions: list[PositionUpdateEvent] = []
+        event_bus.subscribe(PositionUpdateEvent, positions.append)
+        with caplog.at_level(logging.WARNING, logger="unified_trading_execution.mt5.adapter"):
+            await adapter._poll_once()
+
+        assert len(positions) == 1  # only EURUSD.m survives
+        assert positions[0].position.instrument.symbol == "EUR"
+        assert "CRYPTOX.m" in adapter._failed_symbols
+        assert "CRYPTOX.m" in caplog.text
+
+
+class TestAssetClassFromPath:
+    """Asset-class derivation from symbol_info().path."""
+
+    def test_first_segment_wins_over_substring(self, adapter: MT5Adapter) -> None:
+        """'Stocks\\CryptoMining' is STOCK — substring 'CRYPTO' must not match."""
+        assert adapter._asset_class_from_path("Stocks\\CryptoMining\\CRPT") == AssetClass.STOCK
+        assert adapter._asset_class_from_path("Forex\\EURUSD") == AssetClass.MARGIN_FX
+        assert adapter._asset_class_from_path("Metals\\XAUUSD") == AssetClass.MARGIN_FX
+
+    def test_unrecognized_first_segment_raises(self, adapter: MT5Adapter) -> None:
+        """Unknown first segment raises — never a silent default."""
+        with pytest.raises(ValueError):
+            adapter._asset_class_from_path("Strange\\EURUSD")
 
 
 class TestPollLoop:

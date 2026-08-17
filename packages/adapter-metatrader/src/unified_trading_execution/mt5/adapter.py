@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.errors import PlatformConnectionError
+from unified_trading_execution.errors import PlatformConnectionError, UteError
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
     ConnectionStateEvent,
@@ -148,10 +148,12 @@ class MT5Adapter(Adapter):
         self._last_positions: dict[Instrument, Position] = {}
         self._last_balance: Balance | None = None
         self._last_deal_time: datetime = datetime.now(tz=UTC)
+        self._last_deal_ticket: int = 0
 
         # Broker symbol → canonical Instrument cache for inbound reconstruction.
         # Populated lazily on first sighting via symbol_info().path.
         self._symbol_to_instrument: dict[str, Instrument] = {}
+        self._failed_symbols: set[str] = set()
 
         # Instrument spec cache: Instrument → (InstrumentSpec, fetched_at)
         self._spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
@@ -492,20 +494,24 @@ class MT5Adapter(Adapter):
         lifecycle events are the engine's responsibility (Section 6.1),
         never the polling loop's.
 
-        A single-cycle failure (e.g. a snapshot call returned ``None``)
-        raises so ``_poll_loop`` can log and continue.  Last-known state is
-        only committed after the full cycle succeeds, so a failed cycle
-        never corrupts the diff baseline.
+        A single-cycle failure raises so ``_poll_loop`` can log and
+        continue.  Baselines are committed per-dataset as each processor
+        runs (baseline first, then publish), so a failure mid-cycle never
+        causes the *next* cycle to re-report unchanged state — earlier
+        datasets may already be committed when a later one fails.
         """
         mt5 = _get_mt5()
 
         def _fetch_snapshot() -> tuple[Any, ...]:
             now = _utcnow()
             orders = mt5.orders_get()
+            self._check_call_result("orders_get", orders)
             positions = mt5.positions_get()
+            self._check_call_result("positions_get", positions)
             account = mt5.account_info()
+            self._check_call_result("account_info", account)
             deals = mt5.history_deals_get(self._last_deal_time, now)
-            self._check_mt5_error()
+            self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, positions, deals)
             return orders, positions, account, deals, instruments, now
 
@@ -544,8 +550,13 @@ class MT5Adapter(Adapter):
         a flat (quantity 0) position so the mirror learns of the close.
         """
         netted = self._net_positions(positions, instruments, now)
+        previous_positions = self._last_positions
+        # Commit the baseline from the fetched snapshot *before* publishing —
+        # a mid-cycle publish failure must not leave a stale baseline that
+        # makes the next cycle re-report the same state.
+        self._last_positions = netted
         for instrument, position in netted.items():
-            previous = self._last_positions.get(instrument)
+            previous = previous_positions.get(instrument)
             # Diff on quantity/price only — updated_at is snapshot metadata
             # and must not make an unchanged position look "changed".
             if (
@@ -554,9 +565,9 @@ class MT5Adapter(Adapter):
                 or previous.average_entry_price != position.average_entry_price
             ):
                 self._publish_position(position)
-        for instrument in self._last_positions:
+        for instrument in previous_positions:
             if instrument not in netted:
-                previous = self._last_positions[instrument]
+                previous = previous_positions[instrument]
                 closed = Position(
                     instrument=instrument,
                     quantity=Decimal("0"),
@@ -564,7 +575,6 @@ class MT5Adapter(Adapter):
                     updated_at=now,
                 )
                 self._publish_position(closed)
-        self._last_positions = netted
 
     def _net_positions(
         self,
@@ -584,7 +594,9 @@ class MT5Adapter(Adapter):
 
         result: dict[Instrument, Position] = {}
         for symbol, legs in legs_by_symbol.items():
-            instrument = instruments[symbol]
+            instrument = instruments.get(symbol)
+            if instrument is None:
+                continue
             net_quantity = Decimal("0")
             weighted_price = Decimal("0")
             total_volume = Decimal("0")
@@ -625,6 +637,7 @@ class MT5Adapter(Adapter):
         # Diff on monetary fields only — updated_at is snapshot metadata and
         # must not make an unchanged balance look "changed".
         last = self._last_balance
+        self._last_balance = balance
         if (
             last is None
             or last.currency != balance.currency
@@ -642,7 +655,6 @@ class MT5Adapter(Adapter):
                     balance=balance,
                 )
             )
-        self._last_balance = balance
 
     def _process_fills(
         self,
@@ -654,16 +666,28 @@ class MT5Adapter(Adapter):
         """Publish a ``FillEvent`` for each new fill since ``_last_deal_time``.
 
         Only DEAL_TYPE_BUY (0) / DEAL_TYPE_SELL (1) deals are fills —
-        DEAL_TYPE_IN/OUT are non-trading balance operations.  Deal times are
-        second-granular, so ``_last_deal_time`` is advanced to the newest
-        deal time seen (strictly-greater diffing) to avoid re-reporting.
+        DEAL_TYPE_IN/OUT are non-trading balance operations.  Deal
+        timestamps are second-granular, so exact dedup uses the monotonic
+        deal ticket (``_last_deal_ticket``): a deal is new iff its time is
+        not older than the window *and* its ticket exceeds the last seen.
+        This both catches same-second deals that time alone would miss and
+        prevents re-reporting already-published fills.
+
+        The ticket/time baseline is committed immediately after each
+        successful publish, so an exception mid-loop re-tries only the
+        unpublished deals — no duplicates for the ones already reported.
         """
-        new_deal_time = self._last_deal_time
         for deal in deals or ():
             deal_time = datetime.fromtimestamp(int(deal.time), tz=UTC)
-            if deal_time <= self._last_deal_time:
+            if deal_time < self._last_deal_time:
                 continue
             if deal.type not in (0, 1):
+                continue
+            if deal.ticket <= self._last_deal_ticket:
+                continue
+            if deal.symbol not in instruments:
+                # Unresolvable symbol — already warned at resolve time; skip
+                # its fills so one bad symbol can't fail the whole cycle.
                 continue
             volume = Decimal(str(deal.volume))
             price = Decimal(str(deal.price))
@@ -680,9 +704,10 @@ class MT5Adapter(Adapter):
                     fill=fill,
                 )
             )
-            if deal_time > new_deal_time:
-                new_deal_time = deal_time
-        self._last_deal_time = new_deal_time
+            if deal.ticket > self._last_deal_ticket:
+                self._last_deal_ticket = deal.ticket
+            if deal_time > self._last_deal_time:
+                self._last_deal_time = deal_time
 
     def _build_fill(
         self,
@@ -721,13 +746,30 @@ class MT5Adapter(Adapter):
         """Resolve canonical ``Instrument`` for every symbol reported by
         positions and deals.  Cached — a symbol is resolved only on its
         first sighting.
+
+        Unresolvable symbols (unknown broker path, ``symbol_info()``
+        failure) are skipped with a one-time warning per symbol rather than
+        failing the whole cycle — one bad symbol must not silence events for
+        every other instrument.
         """
         symbols: set[str] = set()
         for position in positions or ():
             symbols.add(position.symbol)
         for deal in deals or ():
             symbols.add(deal.symbol)
-        return {symbol: self._resolve_instrument(symbol, mt5) for symbol in symbols}
+        resolved: dict[str, Instrument] = {}
+        for symbol in symbols:
+            try:
+                resolved[symbol] = self._resolve_instrument(symbol, mt5)
+            except (ValueError, UteError) as exc:
+                if symbol not in self._failed_symbols:
+                    self._failed_symbols.add(symbol)
+                    logger.warning(
+                        "Skipping symbol %s — cannot build Instrument: %s",
+                        symbol,
+                        exc,
+                    )
+        return resolved
 
     def _resolve_instrument(self, mt5_symbol: str, mt5: Any) -> Instrument:
         """Build the canonical ``Instrument`` for an MT5 symbol.
@@ -797,22 +839,26 @@ class MT5Adapter(Adapter):
         The exact mapping is broker-dependent; raise ``ValueError`` for an
         unrecognized path rather than defaulting to a wrong asset class.
         """
-        upper = path.upper()
-        for segment, asset_class in _PATH_ASSET_CLASS.items():
-            if segment in upper:
-                return asset_class
-        raise ValueError(
-            f"Unrecognized MT5 symbol path {path!r} — cannot derive asset class. "
-            "Add a mapping to _PATH_ASSET_CLASS."
-        )
+        # Match on the first path component only — substring containment
+        # could misclassify e.g. "Stocks\\CryptoMining" as SPOT.
+        segment = path.upper().split("\\")[0].split("/")[0]
+        asset_class = _PATH_ASSET_CLASS.get(segment)
+        if asset_class is None:
+            raise ValueError(
+                f"Unrecognized MT5 symbol path {path!r} — cannot derive asset class. "
+                "Add a mapping to _PATH_ASSET_CLASS."
+            )
+        return asset_class
 
-    def _check_mt5_error(self) -> None:
-        """Check ``mt5.last_error()`` and raise the mapped exception if it's a failure.
+    def _check_call_result(self, call_name: str, result: Any) -> None:
+        """Raise the mapped MT5 error if *result* is ``None``.
 
-        Success is ``RES_S_OK`` (1) in the Python wrapper — not the MQL-native
-        0 — so both are accepted as "no error".
+        Must be called immediately after the corresponding MT5 call — a
+        later successful call would reset ``last_error()`` and hide the
+        failure.  Empty tuples are valid "no data" for orders/positions/
+        deals, so only ``None`` is treated as failure.
         """
-        mt5 = _get_mt5()
-        code, desc = mt5.last_error()
-        if code != 0 and code != mt5.RES_S_OK:
-            raise map_mt5_error(code, desc)
+        if result is None:
+            mt5 = _get_mt5()
+            code, desc = mt5.last_error()
+            raise map_mt5_error(code, desc or f"{call_name}() returned None")
