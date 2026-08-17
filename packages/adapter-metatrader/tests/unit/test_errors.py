@@ -3,13 +3,15 @@
 Tests cases:
     - Every mapped TRADE_RETCODE_* produces the correct exception type
     - Unmapped codes fall through to PlatformError with raw context
-    - Non-trade error codes (initialize, symbol_info, etc.) map correctly
+    - Non-trade RES_E_* codes (auth, IPC, generic) map to typed exceptions
     - map_mt5_error returns exception instances (not classes)
     - check_mt5_result raises on None / empty tuple / failure codes
     - check_mt5_result passes through on success return codes
 """
 
 from __future__ import annotations
+
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -52,11 +54,33 @@ class TestMapMT5Error:
         assert isinstance(ctx, dict)
         assert ctx.get("mt5_error_code") == 99999
 
-    def test_non_trade_code_initialization_error(self) -> None:
-        """Non-trade codes (-1, 32768, 32769) map correctly."""
-        assert isinstance(map_mt5_error(-1), PlatformError)
-        assert isinstance(map_mt5_error(32768), PlatformConnectionError)
-        assert isinstance(map_mt5_error(32769), PlatformConnectionError)
+    def test_non_trade_codes_map_to_typed_errors(self, mock_mt5_module: MagicMock) -> None:
+        """The wrapper's RES_E_* codes map to correctly typed exceptions.
+
+        Built from the wrapper's named constants — auth and IPC failures are
+        retryable connection errors, generic negatives stay PlatformError.
+        """
+        cases: list[tuple[int, type[UteError]]] = [
+            (mock_mt5_module.RES_E_FAIL, PlatformError),
+            (mock_mt5_module.RES_E_INVALID_PARAMS, PlatformError),
+            (mock_mt5_module.RES_E_AUTH_FAILED, PlatformConnectionError),
+            (mock_mt5_module.RES_E_UNSUPPORTED, PlatformError),
+            (mock_mt5_module.RES_E_AUTO_TRADING_DISABLED, PlatformConnectionError),
+            (mock_mt5_module.RES_E_INTERNAL_FAIL_INIT, PlatformConnectionError),
+            (mock_mt5_module.RES_E_INTERNAL_FAIL_CONNECT, PlatformConnectionError),
+            (mock_mt5_module.RES_E_INTERNAL_FAIL_TIMEOUT, PlatformConnectionError),
+        ]
+        for code, expected in cases:
+            assert isinstance(map_mt5_error(code, "desc"), expected)
+
+    def test_legacy_32768_codes_fall_through(self) -> None:
+        """The old 32768/32769 code space is no longer mapped → PlatformError."""
+        for code in (32768, 32769):
+            err = map_mt5_error(code, "legacy")
+            assert isinstance(err, PlatformError)
+            ctx = err.platform_error
+            assert isinstance(ctx, dict)
+            assert ctx.get("mt5_error_code") == code
 
     def test_returns_instance_not_class(self) -> None:
         """map_mt5_error returns an exception instance."""

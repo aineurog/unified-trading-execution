@@ -7,6 +7,10 @@ description: str)``.  Every code must be translated into an exception from
 Non-error return codes (``TRADE_RETCODE_PLACED``, ``TRADE_RETCODE_DONE``,
 ``TRADE_RETCODE_DONE_PARTIAL``, ``TRADE_RETCODE_NO_CHANGES``) are not mapped
 — they indicate success and should never reach this function.
+
+The Python wrapper reports success as ``RES_S_OK`` (=1), not the MQL-native
+0, and errors as the negative ``RES_E_*`` codes.  The non-trade mapping is
+built from the wrapper's named constants (``_build_non_trade_error_map``).
 """
 
 from __future__ import annotations
@@ -63,13 +67,30 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10032: PlatformError,  # TRADE_RETCODE_ONLY_REAL
 }
 
-# Non-trade error codes returned by mt5.last_error() after
-# non-order-send calls (initialize, symbol_info, account_info, etc.).
-_NON_TRADE_ERROR_MAP: dict[int, type[UteError]] = {
-    -1: PlatformError,  # Generic / unknown
-    32768: PlatformConnectionError,  # Internal error, copy data failed
-    32769: PlatformConnectionError,  # Not initialized
-}
+
+def _build_non_trade_error_map(mt5: Any) -> dict[int, type[UteError]]:
+    """Map ``last_error()`` codes (the wrapper's negative ``RES_E_*`` space).
+
+    Built from the wrapper's named constants so the mapping stays in sync
+    with the installed MetaTrader5 module instead of raw ints.  Codes not
+    listed fall through to ``PlatformError`` with full context.
+    """
+    return {
+        mt5.RES_E_FAIL: PlatformError,  # generic failure
+        mt5.RES_E_INVALID_PARAMS: PlatformError,  # invalid arguments
+        mt5.RES_E_NO_MEMORY: PlatformError,  # no memory condition
+        mt5.RES_E_NOT_FOUND: PlatformError,  # no history
+        mt5.RES_E_INVALID_VERSION: PlatformError,  # invalid version
+        mt5.RES_E_AUTH_FAILED: PlatformConnectionError,  # authorization failed
+        mt5.RES_E_UNSUPPORTED: PlatformError,  # unsupported method
+        mt5.RES_E_AUTO_TRADING_DISABLED: PlatformConnectionError,  # auto-trading off
+        mt5.RES_E_INTERNAL_FAIL: PlatformConnectionError,  # IPC general failure
+        mt5.RES_E_INTERNAL_FAIL_SEND: PlatformConnectionError,  # IPC send failed
+        mt5.RES_E_INTERNAL_FAIL_RECEIVE: PlatformConnectionError,  # IPC recv failed
+        mt5.RES_E_INTERNAL_FAIL_INIT: PlatformConnectionError,  # IPC initialization
+        mt5.RES_E_INTERNAL_FAIL_CONNECT: PlatformConnectionError,  # IPC no ipc
+        mt5.RES_E_INTERNAL_FAIL_TIMEOUT: PlatformConnectionError,  # IPC timeout
+    }
 
 
 def map_mt5_error(error_code: int, description: str = "") -> UteError:
@@ -82,7 +103,11 @@ def map_mt5_error(error_code: int, description: str = "") -> UteError:
     Codes not in the map become ``PlatformError`` with the raw
     ``mt5_error_code`` and ``mt5_description`` carried as context.
     """
-    exc_type = _TRADE_RETCODE_MAP.get(error_code) or _NON_TRADE_ERROR_MAP.get(error_code)
+    exc_type = _TRADE_RETCODE_MAP.get(error_code)
+    if exc_type is None:
+        import unified_trading_execution.mt5.adapter as _mt5_adapter
+
+        exc_type = _build_non_trade_error_map(_mt5_adapter._get_mt5()).get(error_code)
     if exc_type is not None:
         return exc_type(description or f"MT5 error {error_code}")
     return PlatformError(
