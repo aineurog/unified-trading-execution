@@ -447,7 +447,7 @@ class TestParseOrderRecord:
         defaults = {
             "ticket": 555,
             "state": 1,
-            "volume": 0.5,
+            "volume_initial": 0.5,
             "volume_current": 0.5,
             "price_open": 1.2345,
             "time_setup": 1700000000,
