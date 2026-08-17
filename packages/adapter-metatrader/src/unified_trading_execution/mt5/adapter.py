@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Any
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.errors import PlatformConnectionError
+from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
     ConnectionStateEvent,
@@ -42,7 +42,7 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
 )
 from unified_trading_execution.mt5.errors import map_mt5_error
-from unified_trading_execution.mt5.symbols import from_mt5_symbol
+from unified_trading_execution.mt5.symbols import from_mt5_symbol, to_mt5_symbol
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import (
     Instrument,
@@ -92,6 +92,18 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _decimal_places(value: Decimal) -> int:
+    """Number of fractional digits in a ``Decimal``'s stored representation.
+
+    ``Decimal("0.01")`` → 2, ``Decimal("0.1")`` → 1, ``Decimal("500")`` → 0.
+    Used to derive ``InstrumentSpec.qty_precision`` from MT5's volume step.
+    """
+    exponent = value.as_tuple().exponent
+    if not isinstance(exponent, int):
+        return 0
+    return max(0, -exponent)
 
 
 # MT5 symbol market-path segment → canonical AssetClass.  The mapping is
@@ -404,7 +416,40 @@ class MT5Adapter(Adapter):
         - Order rejection due to invalid symbol / market closed
         - ``symbol_info()`` returning ``None`` on re-fetch (symbol delisted)
         """
-        raise NotImplementedError
+        cached = self._spec_cache.get(instrument)
+        if cached is not None:
+            spec, fetched_at = cached
+            ttl = self._config.instrument_spec_cache_ttl
+            if ttl is None or (_utcnow() - fetched_at).total_seconds() < ttl:
+                return spec
+            self._spec_cache.pop(instrument, None)
+
+        mt5_symbol = self._config.symbol_alias_table.get(str(instrument)) or to_mt5_symbol(
+            instrument
+        )
+        mt5 = _get_mt5()
+        info = await asyncio.to_thread(mt5.symbol_info, mt5_symbol)
+        if info is None:
+            _, desc = mt5.last_error()
+            detail = desc or "symbol not found on this broker"
+            raise InvalidSymbolError(f"MT5 symbol {mt5_symbol!r} is not available: {detail}")
+        if info.trade_mode == 0:  # SYMBOL_TRADE_MODE_DISABLED
+            raise InvalidSymbolError(
+                f"MT5 symbol {mt5_symbol!r} is not tradable (trade mode disabled)"
+            )
+
+        volume_step = Decimal(str(info.volume_step))
+        spec = InstrumentSpec(
+            tick_size=Decimal(str(info.trade_tick_size)),
+            lot_size=volume_step,
+            min_qty=Decimal(str(info.volume_min)),
+            max_qty=Decimal(str(info.volume_max)),
+            min_notional=Decimal("0"),
+            price_precision=int(info.digits),
+            qty_precision=_decimal_places(volume_step),
+        )
+        self._spec_cache[instrument] = (spec, _utcnow())
+        return spec
 
     # ------------------------------------------------------------------
     # Capability reporting
