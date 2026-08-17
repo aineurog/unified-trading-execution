@@ -49,7 +49,14 @@ from unified_trading_execution.errors import (
 )
 from unified_trading_execution.mt5.errors import map_mt5_error
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
-from unified_trading_execution.types.order import OrderModification, OrderResult, UnifiedOrder
+from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.order import (
+    OrderModification,
+    OrderRecord,
+    OrderResult,
+    TpSlAttachment,
+    UnifiedOrder,
+)
 
 
 def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]:
@@ -310,6 +317,106 @@ def _decimal_or_none(raw: object) -> Decimal | None:
     return Decimal(str(raw))
 
 
+def _price_stop_price(
+    order_type: OrderType,
+    order_tuple: Any,
+) -> tuple[Decimal | None, Decimal | None]:
+    """Extract ``(price, stop_price)`` from an MT5 order tuple.
+
+    MT5 stores order prices by type: LIMIT keeps the limit price in
+    ``price_open``; STOP keeps its trigger in ``price_open``; STOP_LIMIT
+    keeps the trigger in ``price_open`` and the limit price in
+    ``price_stoplimit``.  A zero value means "not set" and maps to ``None``.
+    """
+    if order_type == OrderType.LIMIT:
+        return _positive_or_none(order_tuple.price_open), None
+    if order_type == OrderType.STOP:
+        return None, _positive_or_none(order_tuple.price_open)
+    if order_type == OrderType.STOP_LIMIT:
+        return (
+            _positive_or_none(order_tuple.price_stoplimit),
+            _positive_or_none(order_tuple.price_open),
+        )
+    return None, None
+
+
+def _positive_or_none(raw: object) -> Decimal | None:
+    value = _decimal_or_none(raw)
+    if value is None or value <= 0:
+        return None
+    return value
+
+
+def _tp_sl_attachment(raw: object) -> TpSlAttachment | None:
+    """Build a ``TpSlAttachment`` from an MT5 ``tp``/``sl`` price level.
+
+    MT5 TP/SL are plain price levels (no limit price).  A zero level means
+    "not set" and maps to ``None``.
+    """
+    value = _positive_or_none(raw)
+    if value is None:
+        return None
+    return TpSlAttachment(trigger_price=value)
+
+
+def build_order_record(
+    order_tuple: Any,
+    client_order_id: str,
+    instrument: Instrument,
+) -> OrderRecord:
+    """Build a full ``OrderRecord`` from an MT5 ``orders_get()`` tuple.
+
+    Unlike ``parse_order_record`` (which returns the lightweight
+    ``OrderResult``), this reconstructs the complete auditable record —
+    instrument, type, side, quantity, price levels, TP/SL, status — so
+    ``fetch_open_orders()`` can return ``dict[str, OrderRecord]``.
+
+    Raises ``PlatformError`` for an unrecognized order type, state, or
+    time-in-force value.
+    """
+    if order_tuple.ticket is None:
+        raise PlatformError("MT5 order record is missing ticket")
+
+    unified = _MT5_ORDER_TYPE_TO_UNIFIED.get(order_tuple.type)
+    if unified is None:
+        raise PlatformError(f"Unknown MT5 order type {order_tuple.type}")
+    order_type, side = unified
+
+    status = _ORDER_STATE_STATUS_MAP.get(order_tuple.state)
+    if status is None:
+        raise PlatformError(f"Unknown MT5 order state {order_tuple.state}")
+
+    tif = _ORDER_TIME_TIF_MAP.get(order_tuple.type_time)
+    if tif is None:
+        raise PlatformError(f"Unknown MT5 order time-in-force {order_tuple.type_time}")
+
+    volume = Decimal(str(order_tuple.volume_initial))
+    volume_current = Decimal(str(order_tuple.volume_current))
+    price, stop_price = _price_stop_price(order_type, order_tuple)
+
+    return OrderRecord(
+        instrument=instrument,
+        order_type=order_type,
+        side=side,
+        quantity=volume,
+        time_in_force=tif,
+        client_order_id=client_order_id,
+        price=price,
+        stop_price=stop_price,
+        reduce_only=False,
+        client_tag=None,
+        take_profit=_tp_sl_attachment(order_tuple.tp),
+        stop_loss=_tp_sl_attachment(order_tuple.sl),
+        platform_order_id=str(order_tuple.ticket),
+        status=status,
+        filled_quantity=volume - volume_current,
+        average_fill_price=None,
+        correlation_id=client_order_id,
+        created_at=datetime.fromtimestamp(order_tuple.time_setup, tz=UTC),
+        updated_at=datetime.fromtimestamp(order_tuple.time_done or order_tuple.time_setup, tz=UTC),
+    )
+
+
 # TRADE_RETCODE_* success codes → unified OrderStatus.  Anything not in this
 # map is a failure and is routed through map_mt5_error() instead.
 _RETCODE_STATUS_MAP: dict[int, OrderStatus] = {
@@ -320,13 +427,29 @@ _RETCODE_STATUS_MAP: dict[int, OrderStatus] = {
 }
 
 # ORDER_STATE_* → unified OrderStatus for order records from orders_get().
+# ENUM_ORDER_STATE has 10 members.  The three REQUEST_* and STARTED states
+# are transient but can legitimately appear in orders_get() (an order being
+# placed/modified/cancelled is still an active order) — treat them as OPEN
+# so a transient snapshot never fails the whole reconciliation fetch.
 _ORDER_STATE_STATUS_MAP: dict[int, OrderStatus] = {
+    0: OrderStatus.OPEN,  # ORDER_STATE_STARTED
     1: OrderStatus.OPEN,  # ORDER_STATE_PLACED
     2: OrderStatus.CANCELLED,  # ORDER_STATE_CANCELED
     3: OrderStatus.PARTIALLY_FILLED,  # ORDER_STATE_PARTIAL
     4: OrderStatus.FILLED,  # ORDER_STATE_FILLED
     5: OrderStatus.REJECTED,  # ORDER_STATE_REJECTED
     6: OrderStatus.EXPIRED,  # ORDER_STATE_EXPIRED
+    7: OrderStatus.OPEN,  # ORDER_STATE_REQUEST_ADD
+    8: OrderStatus.OPEN,  # ORDER_STATE_REQUEST_MODIFY
+    9: OrderStatus.OPEN,  # ORDER_STATE_REQUEST_CANCEL
+}
+
+# MT5 ORDER_TIME_* → unified TimeInForce for order records from orders_get().
+_ORDER_TIME_TIF_MAP: dict[int, TimeInForce] = {
+    0: TimeInForce.GTC,  # ORDER_TIME_GTC
+    1: TimeInForce.DAY,  # ORDER_TIME_DAY
+    2: TimeInForce.GTD,  # ORDER_TIME_SPECIFIED
+    3: TimeInForce.GTD,  # ORDER_TIME_SPECIFIED_DAY
 }
 
 
@@ -344,6 +467,12 @@ _ORDER_TYPE_MAP: dict[tuple[OrderType, OrderSide], int] = {
     (OrderType.STOP_LIMIT, OrderSide.SELL): 7,  # ORDER_TYPE_SELL_STOP_LIMIT
 }
 """The 8 (type, side) → MT5 ``ORDER_TYPE_*`` int mappings."""
+
+# MT5 ORDER_TYPE_* int → (unified OrderType, OrderSide) — the inverse of
+# ``_ORDER_TYPE_MAP``, for reconstructing order records from orders_get().
+_MT5_ORDER_TYPE_TO_UNIFIED: dict[int, tuple[OrderType, OrderSide]] = {
+    mt5_code: (order_type, side) for (order_type, side), mt5_code in _ORDER_TYPE_MAP.items()
+}
 
 
 def _select_filling(symbol_info: Any, tif: TimeInForce, *, mt5_module: Any) -> int:

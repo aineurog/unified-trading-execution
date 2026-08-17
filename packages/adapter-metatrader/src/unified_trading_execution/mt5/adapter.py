@@ -46,6 +46,7 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
 )
 from unified_trading_execution.mt5.errors import map_mt5_error
+from unified_trading_execution.mt5.orders import build_order_record
 from unified_trading_execution.mt5.symbols import from_mt5_symbol, to_mt5_symbol
 from unified_trading_execution.types.enums import AssetClass, OrderType
 from unified_trading_execution.types.instrument import (
@@ -433,18 +434,7 @@ class MT5Adapter(Adapter):
                 return spec
             self._spec_cache.pop(instrument, None)
 
-        # Resolve the broker symbol.  ``str(instrument)`` only produces a
-        # "BASE/QUOTE" shorthand for pairs (forex/crypto/perp) — it raises
-        # ``ValueError`` for stocks, CFDs, bonds, funds, and dated futures.
-        # Those non-pair instruments resolve via ``to_mt5_symbol`` (which
-        # honours ``broker_symbol_override``); guard the alias lookup so a
-        # non-pair instrument never fails on ``str()`` itself.
-        try:
-            alias_key = str(instrument)
-        except ValueError:
-            alias_key = None
-        aliased = self._config.symbol_alias_table.get(alias_key) if alias_key is not None else None
-        mt5_symbol = aliased or to_mt5_symbol(instrument)
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
         mt5 = _get_mt5()
         info = await asyncio.to_thread(mt5.symbol_info, mt5_symbol)
         if info is None:
@@ -496,7 +486,12 @@ class MT5Adapter(Adapter):
         (typically ~1 request per second per symbol for order operations).
         Configurable in a future revision.
         """
-        raise NotImplementedError
+        return RateLimits(
+            requests_per_interval=1,
+            interval_seconds=1.0,
+            remaining=1,
+            reset_at=_utcnow(),
+        )
 
     # ------------------------------------------------------------------
     # Reconciliation data (optional ABC methods)
@@ -509,19 +504,89 @@ class MT5Adapter(Adapter):
         returning — core sees one ``Position`` per instrument regardless
         of the account's netting/hedging mode.
         """
-        raise NotImplementedError
+        mt5 = _get_mt5()
+
+        def _fetch() -> dict[Instrument, Position]:
+            positions = mt5.positions_get()
+            self._check_call_result("positions_get", positions)
+            instruments = self._resolve_poll_instruments(mt5, positions, ())
+            return self._net_positions(positions, instruments, _utcnow())
+
+        return await asyncio.to_thread(_fetch)
 
     async def fetch_balances(self) -> dict[str, Balance]:
         """Fetch account balances via ``mt5.account_info()``."""
-        raise NotImplementedError
+        mt5 = _get_mt5()
+
+        def _fetch() -> dict[str, Balance]:
+            account = mt5.account_info()
+            self._check_call_result("account_info", account)
+            balance = self._build_balance(account, _utcnow())
+            return {balance.currency: balance}
+
+        return await asyncio.to_thread(_fetch)
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
-        """Fetch all open orders via ``mt5.orders_get()``."""
-        raise NotImplementedError
+        """Fetch all open orders via ``mt5.orders_get()``.
+
+        Keyed by ``client_order_id``; an order placed outside the engine
+        (unknown ticket) falls back to the platform order id as a stable
+        non-colliding key so it can still be reconciled.  Orders whose
+        symbol cannot be resolved are skipped with a warning.
+        """
+        mt5 = _get_mt5()
+
+        def _fetch() -> dict[str, OrderRecord]:
+            orders = mt5.orders_get()
+            self._check_call_result("orders_get", orders)
+            instruments = self._resolve_poll_instruments(mt5, orders, ())
+            result: dict[str, OrderRecord] = {}
+            for order in orders or ():
+                instrument = instruments.get(order.symbol)
+                if instrument is None:
+                    continue
+                client_order_id = self._ticket_to_order_id.get(order.ticket, "")
+                record = build_order_record(order, client_order_id, instrument)
+                key = record.client_order_id or record.platform_order_id or ""
+                result[key] = record
+            return result
+
+        return await asyncio.to_thread(_fetch)
 
     async def fetch_fills(self) -> dict[str, list[FillRecord]]:
-        """Fetch recent fills via ``mt5.history_deals_get()``."""
-        raise NotImplementedError
+        """Fetch recent fills via ``mt5.history_deals_get()``.
+
+        Only trading deals (DEAL_TYPE_BUY/SELL) are fills; balance
+        operations (DEAL_TYPE_IN/OUT) are excluded.  Results are grouped by
+        ``client_order_id``.  Unlike the polling loop, this read does not
+        advance the fill baseline — reconciliation must not disturb the
+        poll loop's dedup state.
+        """
+        mt5 = _get_mt5()
+
+        def _fetch() -> dict[str, list[FillRecord]]:
+            account = mt5.account_info()
+            self._check_call_result("account_info", account)
+            deals = mt5.history_deals_get(self._last_deal_time, _utcnow())
+            self._check_call_result("history_deals_get", deals)
+            instruments = self._resolve_poll_instruments(mt5, (), deals)
+            result: dict[str, list[FillRecord]] = {}
+            for deal in deals or ():
+                if deal.type not in (0, 1):
+                    continue
+                if deal.symbol not in instruments:
+                    continue
+                volume = Decimal(str(deal.volume))
+                price = Decimal(str(deal.price))
+                if volume <= 0 or price <= 0:
+                    # Same guard as the poll loop: a non-positive deal would
+                    # violate FillRecord's fill_quantity/fill_price > 0.
+                    continue
+                fill = self._build_fill(deal, instruments, account)
+                result.setdefault(fill.client_order_id, []).append(fill)
+            return result
+
+        return await asyncio.to_thread(_fetch)
 
     # ------------------------------------------------------------------
     # Polling loop (adapter-internal)
@@ -677,24 +742,30 @@ class MT5Adapter(Adapter):
             )
         return result
 
-    def _process_balance(self, account: Any, now: datetime) -> None:
-        """Translate ``account_info()`` into a ``Balance`` and publish changes."""
-        # MT5 reports ``equity``, ``margin``, and ``margin_free`` as three
-        # independent floats (``margin_free`` is derived as ``equity - margin``).
-        # Reconstructing all three via ``Decimal(str(float))`` can break the
-        # core invariant ``free + used == total`` on tiny float-rounding
-        # errors (``Balance.__post_init__`` enforces exact Decimal equality),
-        # so derive ``free`` from the two primary reported values instead of
-        # using the raw ``margin_free``.
+    def _build_balance(self, account: Any, now: datetime) -> Balance:
+        """Reconstruct a ``Balance`` from an ``account_info()`` snapshot.
+
+        MT5 reports ``equity``, ``margin``, and ``margin_free`` as three
+        independent floats.  Reconstructing all three via
+        ``Decimal(str(float))`` can break the core invariant
+        ``free + used == total`` on tiny float-rounding errors
+        (``Balance.__post_init__`` enforces exact Decimal equality), so
+        derive ``free`` from the two primary reported values instead of
+        using the raw ``margin_free``.
+        """
         used = Decimal(str(account.margin))
         total = Decimal(str(account.equity))
-        balance = Balance(
+        return Balance(
             currency=str(account.currency),
             free=total - used,
             used=used,
             total=total,
             updated_at=now,
         )
+
+    def _process_balance(self, account: Any, now: datetime) -> None:
+        """Translate ``account_info()`` into a ``Balance`` and publish changes."""
+        balance = self._build_balance(account, now)
         # Diff on monetary fields only — updated_at is snapshot metadata and
         # must not make an unchanged balance look "changed".
         last = self._last_balance
@@ -864,8 +935,25 @@ class MT5Adapter(Adapter):
     # ------------------------------------------------------------------
 
     def _resolve_mt5_symbol(self, instrument: Instrument) -> str:
-        """Apply the alias table and return the MT5 broker symbol string."""
-        raise NotImplementedError
+        """Apply the alias table and return the MT5 broker symbol string.
+
+        The alias table is authoritative per D-8: an entry for the
+        instrument's shorthand wins over any pre-set
+        ``broker_symbol_override``.  ``str()`` only produces a "BASE/QUOTE"
+        shorthand for pairs (forex/crypto/perp) — it raises ``ValueError``
+        for stocks, CFDs, bonds, funds, and dated futures, so the alias
+        lookup is guarded and those instruments resolve via
+        ``to_mt5_symbol`` (which honours ``broker_symbol_override`` and
+        finally falls back to ``symbol + quote_currency``).
+        """
+        try:
+            alias_key = str(instrument)
+        except ValueError:
+            alias_key = None
+        override = self._config.symbol_alias_table.get(alias_key) if alias_key is not None else None
+        if override is not None:
+            instrument = _with_broker_override(instrument, override)
+        return to_mt5_symbol(instrument)
 
     def _invalidate_spec_cache(self, instrument: Instrument) -> None:
         """Remove a cached ``InstrumentSpec``, forcing a re-fetch on next access."""
