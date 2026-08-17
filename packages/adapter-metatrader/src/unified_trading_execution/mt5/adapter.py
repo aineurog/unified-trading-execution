@@ -102,9 +102,12 @@ def _decimal_places(value: Decimal) -> int:
     """Number of fractional digits in a ``Decimal``'s stored representation.
 
     ``Decimal("0.01")`` → 2, ``Decimal("0.1")`` → 1, ``Decimal("500")`` → 0.
-    Used to derive ``InstrumentSpec.qty_precision`` from MT5's volume step.
+    Normalizes first so whole-number steps like ``Decimal("1.0")`` (from
+    ``Decimal(str(1.0))``) report 0, not 1.  Used to derive
+    ``InstrumentSpec.qty_precision`` from MT5's volume step.
     """
-    exponent = value.as_tuple().exponent
+    normalized = value.normalize()
+    exponent = normalized.as_tuple().exponent
     if not isinstance(exponent, int):
         return 0
     return max(0, -exponent)
@@ -430,9 +433,18 @@ class MT5Adapter(Adapter):
                 return spec
             self._spec_cache.pop(instrument, None)
 
-        mt5_symbol = self._config.symbol_alias_table.get(str(instrument)) or to_mt5_symbol(
-            instrument
-        )
+        # Resolve the broker symbol.  ``str(instrument)`` only produces a
+        # "BASE/QUOTE" shorthand for pairs (forex/crypto/perp) — it raises
+        # ``ValueError`` for stocks, CFDs, bonds, funds, and dated futures.
+        # Those non-pair instruments resolve via ``to_mt5_symbol`` (which
+        # honours ``broker_symbol_override``); guard the alias lookup so a
+        # non-pair instrument never fails on ``str()`` itself.
+        try:
+            alias_key = str(instrument)
+        except ValueError:
+            alias_key = None
+        aliased = self._config.symbol_alias_table.get(alias_key) if alias_key is not None else None
+        mt5_symbol = aliased or to_mt5_symbol(instrument)
         mt5 = _get_mt5()
         info = await asyncio.to_thread(mt5.symbol_info, mt5_symbol)
         if info is None:
