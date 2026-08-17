@@ -988,12 +988,17 @@ class MT5Adapter(Adapter):
     ) -> FillRecord:
         """Build a ``FillRecord`` from one MT5 deal tuple.
 
-        MT5 deals carry no client order id — the ``order`` ticket is resolved
-        through the ``client_order_id → ticket`` mapping recorded by
-        ``place_order``; an unknown ticket (order placed from the terminal)
-        yields an empty ``client_order_id``.
+        MT5 deals carry no client order id, so the id is recovered from the
+        ``ticket → client_order_id`` mapping recorded by ``place_order``.  A
+        pending order's deal references its order ticket (``deal.order``); a
+        market order's deal has ``deal.order == 0`` and is instead keyed by
+        the deal ticket itself (``deal.ticket``), which is what ``place_order``
+        recorded for market executions.  An unknown ticket (order placed from
+        the terminal) yields an empty ``client_order_id``.
         """
-        client_order_id = self._ticket_to_order_id.get(deal.order, "")
+        client_order_id = self._ticket_to_order_id.get(deal.order) or self._ticket_to_order_id.get(
+            deal.ticket, ""
+        )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
         return FillRecord(
             client_order_id=client_order_id,
