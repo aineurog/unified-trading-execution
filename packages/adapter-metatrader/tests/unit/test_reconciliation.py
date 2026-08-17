@@ -477,6 +477,24 @@ class TestFetchFills:
 
         assert fills == {}
 
+    async def test_non_positive_volume_or_price_deal_skipped(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A zero/negative-volume or -price deal must not violate FillRecord's
+        fill_quantity/fill_price > 0 invariant — skip it like the poll loop."""
+        _prepared(adapter)
+        _set_eurusd_symbol_info(mock_mt5_module)
+        adapter._ticket_to_order_id = {1001: "client-abc"}
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = (
+            self._deal(volume=0.0),
+            self._deal(ticket=3002, price=0.0),
+        )
+
+        fills = await adapter.fetch_fills()
+
+        assert fills == {}
+
     async def test_history_deals_get_none_raises_platform_error(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:

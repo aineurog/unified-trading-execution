@@ -576,6 +576,12 @@ class MT5Adapter(Adapter):
                     continue
                 if deal.symbol not in instruments:
                     continue
+                volume = Decimal(str(deal.volume))
+                price = Decimal(str(deal.price))
+                if volume <= 0 or price <= 0:
+                    # Same guard as the poll loop: a non-positive deal would
+                    # violate FillRecord's fill_quantity/fill_price > 0.
+                    continue
                 fill = self._build_fill(deal, instruments, account)
                 result.setdefault(fill.client_order_id, []).append(fill)
             return result
