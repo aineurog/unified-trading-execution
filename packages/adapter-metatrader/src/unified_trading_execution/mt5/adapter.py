@@ -34,7 +34,10 @@ from uuid_extensions import uuid7
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.errors import (
     InvalidSymbolError,
+    OrderNotFoundError,
     PlatformConnectionError,
+    PlatformError,
+    UnsupportedOrderTypeError,
     UteError,
 )
 from unified_trading_execution.events import (
@@ -46,9 +49,19 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
 )
 from unified_trading_execution.mt5.errors import map_mt5_error
-from unified_trading_execution.mt5.orders import build_order_record
+from unified_trading_execution.mt5.orders import (
+    _MT5_ORDER_TYPE_TO_UNIFIED,
+    _select_filling,
+    build_mt5_cancel_request,
+    build_mt5_modify_request,
+    build_mt5_request,
+    build_mt5_sltp_request,
+    build_order_record,
+    parse_mt5_result,
+    parse_order_record,
+)
 from unified_trading_execution.mt5.symbols import from_mt5_symbol, to_mt5_symbol
-from unified_trading_execution.types.enums import AssetClass, OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType
 from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
@@ -350,21 +363,74 @@ class MT5Adapter(Adapter):
     # Order operations
     # ------------------------------------------------------------------
 
+    def _ticket_for_order(self, client_order_id: str) -> int:
+        """Return the MT5 ticket recorded for *client_order_id*.
+
+        Raises ``OrderNotFoundError`` when the id was never placed by this
+        engine (no ticket mapping exists).
+        """
+        ticket = self._order_id_to_ticket.get(client_order_id)
+        if ticket is None:
+            raise OrderNotFoundError(
+                f"no known MT5 ticket for client_order_id {client_order_id!r} — "
+                "the order was not placed by this engine"
+            )
+        return ticket
+
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
         """Translate and submit a fully-validated order to MT5.
 
         - Resolves the MT5 symbol via the alias table.
-        - For MARKET orders: fetches current bid/ask from ``symbol_info_tick()``.
+        - For MARKET orders: fetches current bid/ask from ``symbol_info_tick()``
+          so the deal goes in at the live quote.
         - Selects the filling mode per symbol.
         - Calls ``mt5.order_send()`` via ``asyncio.to_thread()``.
         - Maps errors via ``map_mt5_error()``.
-        - Records the ``client_order_id → ticket`` mapping.
+        - Records the ``client_order_id → ticket`` mapping on success.
+
+        A missing ``client_order_id`` is generated (UUID7) so the ticket
+        mapping always has a stable key.  A rejection invalidates the cached
+        instrument spec — stale rules are a common cause (Section 17.3).
 
         Raises:
-            InvalidSymbolError: symbol unknown to this broker, or market closed.
-            UnsupportedOrderTypeError: TP/SL with limit_price set (not natively supported).
+            InvalidSymbolError: symbol unknown to this broker, or no filling
+                mode compatible with the requested time_in_force.
+            UnsupportedOrderTypeError: TP/SL with limit_price set (not
+                natively supported).
+            UteError subclasses: mapped ``order_send`` retcode failures.
         """
-        raise NotImplementedError
+        mt5_symbol = self._resolve_mt5_symbol(order.instrument)
+        client_order_id = order.client_order_id or _new_id()
+        mt5 = _get_mt5()
+
+        def _submit() -> OrderResult:
+            info = mt5.symbol_info(mt5_symbol)
+            if info is None:
+                code, desc = mt5.last_error()
+                raise map_mt5_error(code, desc or f"symbol_info() failed for {mt5_symbol}")
+            request = build_mt5_request(order, mt5_module=mt5)
+            request["symbol"] = mt5_symbol
+            if order.order_type == OrderType.MARKET:
+                tick = mt5.symbol_info_tick(mt5_symbol)
+                if tick is None:
+                    code, desc = mt5.last_error()
+                    raise map_mt5_error(code, desc or f"no market quote for {mt5_symbol}")
+                request["price"] = float(tick.ask if order.side == OrderSide.BUY else tick.bid)
+            request["type_filling"] = _select_filling(info, order.time_in_force, mt5_module=mt5)
+            result = mt5.order_send(request)
+            return parse_mt5_result(result, client_order_id, mt5_module=mt5)
+
+        try:
+            result = await asyncio.to_thread(_submit)
+        except UteError:
+            self._invalidate_spec_cache(order.instrument)
+            raise
+
+        if result.platform_order_id is not None:
+            ticket = int(result.platform_order_id)
+            self._order_id_to_ticket[client_order_id] = ticket
+            self._ticket_to_order_id[ticket] = client_order_id
+        return result
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
         """Modify an existing pending order via ``TRADE_ACTION_MODIFY``.
@@ -373,9 +439,32 @@ class MT5Adapter(Adapter):
         Cannot change: quantity — raises ``UnsupportedOrderTypeError``
         (MT5 limitation — cancel and re-place is required).
 
-        Looks up the MT5 ticket from ``client_order_id``.
+        The current order type is queried live via ``order_get()`` because
+        MT5 stores the limit price in ``price`` and a stop-limit's limit
+        price in ``stoplimit`` — the request must know which field to use.
         """
-        raise NotImplementedError
+        ticket = self._ticket_for_order(modification.client_order_id)
+        mt5 = _get_mt5()
+
+        def _modify() -> OrderResult:
+            existing = mt5.order_get(ticket=ticket)
+            if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
+                code, desc = mt5.last_error()
+                raise map_mt5_error(code, desc or f"order {ticket} not found for modification")
+            unified = _MT5_ORDER_TYPE_TO_UNIFIED.get(existing.type)
+            if unified is None:
+                raise PlatformError(f"Unknown MT5 order type {existing.type}")
+            order_type, _ = unified
+            request = build_mt5_modify_request(
+                modification,
+                ticket,
+                order_type,
+                mt5_module=mt5,
+            )
+            result = mt5.order_send(request)
+            return parse_mt5_result(result, modification.client_order_id, mt5_module=mt5)
+
+        return await asyncio.to_thread(_modify)
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel an existing order by ``client_order_id``.
@@ -383,15 +472,40 @@ class MT5Adapter(Adapter):
         Looks up the MT5 ticket, then calls ``TRADE_ACTION_REMOVE``.
         Raises ``OrderNotFoundError`` if unknown.
         """
-        raise NotImplementedError
+        ticket = self._ticket_for_order(client_order_id)
+        mt5 = _get_mt5()
+
+        def _cancel() -> OrderResult:
+            request = build_mt5_cancel_request(ticket, mt5_module=mt5)
+            result = mt5.order_send(request)
+            return parse_mt5_result(result, client_order_id, mt5_module=mt5)
+
+        return await asyncio.to_thread(_cancel)
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by ``client_order_id``.
 
         Looks up the MT5 ticket, then calls ``mt5.order_get(ticket=...)``.
-        Returns ``None`` if not found in the mapping or on the platform.
+        Returns ``None`` if the id is unknown to the engine or the order is
+        no longer active (filled/cancelled/expired).
         """
-        raise NotImplementedError
+        ticket = self._order_id_to_ticket.get(client_order_id)
+        if ticket is None:
+            return None
+        mt5 = _get_mt5()
+
+        def _query() -> OrderResult | None:
+            existing = mt5.order_get(ticket=ticket)
+            if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
+                code, desc = mt5.last_error()
+                # No error (0 / RES_S_OK) or "order not found" (10035) means the
+                # order is simply no longer active — that is None, not a failure.
+                if code == 0 or code == mt5.RES_S_OK or code == 10035:
+                    return None
+                raise map_mt5_error(code, desc or "order_get() failed")
+            return parse_order_record(existing, client_order_id, mt5_module=mt5)
+
+        return await asyncio.to_thread(_query)
 
     # ------------------------------------------------------------------
     # Position TP/SL modification
@@ -407,8 +521,33 @@ class MT5Adapter(Adapter):
 
         *position_id* is the MT5 position ticket (as a string).  At least
         one of *take_profit* or *stop_loss* must be provided.
+
+        Raises ``UnsupportedOrderTypeError`` if an attachment carries a
+        ``limit_price`` — MT5 TP/SL are price levels, not orders.
         """
-        raise NotImplementedError
+        if take_profit is not None and take_profit.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+            )
+        if stop_loss is not None and stop_loss.limit_price is not None:
+            raise UnsupportedOrderTypeError(
+                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
+            )
+        mt5 = _get_mt5()
+
+        def _modify() -> None:
+            request = build_mt5_sltp_request(
+                position_id,
+                take_profit=float(take_profit.trigger_price) if take_profit is not None else None,
+                stop_loss=float(stop_loss.trigger_price) if stop_loss is not None else None,
+                mt5_module=mt5,
+            )
+            result = mt5.order_send(request)
+            # parse_mt5_result raises the mapped error on a failed retcode; the
+            # returned OrderResult is discarded — the method is a convenience.
+            parse_mt5_result(result, position_id, mt5_module=mt5)
+
+        await asyncio.to_thread(_modify)
 
     # ------------------------------------------------------------------
     # Instrument metadata
@@ -849,12 +988,17 @@ class MT5Adapter(Adapter):
     ) -> FillRecord:
         """Build a ``FillRecord`` from one MT5 deal tuple.
 
-        MT5 deals carry no client order id — the ``order`` ticket is resolved
-        through the ``client_order_id → ticket`` mapping recorded by
-        ``place_order``; an unknown ticket (order placed from the terminal)
-        yields an empty ``client_order_id``.
+        MT5 deals carry no client order id, so the id is recovered from the
+        ``ticket → client_order_id`` mapping recorded by ``place_order``.  A
+        pending order's deal references its order ticket (``deal.order``); a
+        market order's deal has ``deal.order == 0`` and is instead keyed by
+        the deal ticket itself (``deal.ticket``), which is what ``place_order``
+        recorded for market executions.  An unknown ticket (order placed from
+        the terminal) yields an empty ``client_order_id``.
         """
-        client_order_id = self._ticket_to_order_id.get(deal.order, "")
+        client_order_id = self._ticket_to_order_id.get(deal.order) or self._ticket_to_order_id.get(
+            deal.ticket, ""
+        )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
         return FillRecord(
             client_order_id=client_order_id,

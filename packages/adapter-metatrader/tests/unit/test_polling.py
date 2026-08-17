@@ -234,6 +234,35 @@ class TestPollOnce:
         assert fills[0].fill.fill_quantity == Decimal("0.1")
         assert fills[0].fill.position_id == "2001"
 
+    def test_market_order_fill_attributed_by_deal_ticket(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A market order's fill (``deal.order == 0``) is attributed via the
+        deal ticket — ``place_order`` records the deal ticket, not an order
+        ticket, for market executions."""
+        adapter._build_reverse_alias()
+        adapter._ticket_to_order_id = {3001: "client-1"}  # market order → deal ticket
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        deal = Mt5Deal(
+            ticket=3001,
+            order=0,  # market execution has no order ticket
+            time=_DEAL_TIME,
+            type=0,
+            entry=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price=1.1010,
+            commission=0.0,
+            fee=0.0,
+            position_id=2001,
+        )
+
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (), (deal,))
+        fill = adapter._build_fill(deal, instruments, _account())
+
+        assert fill.client_order_id == "client-1"
+        assert fill.correlation_id == "client-1"
+
     async def test_detects_position_change(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:

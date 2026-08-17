@@ -296,7 +296,7 @@ def parse_order_record(
     if order_tuple.ticket is None:
         raise PlatformError("MT5 order record is missing ticket")
 
-    volume = Decimal(str(order_tuple.volume))
+    volume = Decimal(str(order_tuple.volume_initial))
     volume_current = Decimal(str(order_tuple.volume_current))
     filled = volume - volume_current
 
