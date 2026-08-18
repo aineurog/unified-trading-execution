@@ -494,6 +494,9 @@ class TestCancelOrder:
         result = await adapter.cancel_order("client-abc")
 
         assert result.client_order_id == "client-abc"
+        # A cancel produces no deal, so parse_mt5_result would report OPEN;
+        # the adapter must report the order as CANCELLED.
+        assert result.status == OrderStatus.CANCELLED
         request = _request(mock_mt5_module)
         assert request["action"] == mock_mt5_module.TRADE_ACTION_REMOVE
         assert request["order"] == 1001

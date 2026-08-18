@@ -26,6 +26,7 @@ import asyncio
 import logging
 import threading
 import time
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -64,7 +65,12 @@ from unified_trading_execution.mt5.orders import (
     parse_order_record,
 )
 from unified_trading_execution.mt5.symbols import from_mt5_symbol, to_mt5_symbol
-from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
@@ -498,7 +504,12 @@ class MT5Adapter(Adapter):
         def _cancel() -> OrderResult:
             request = build_mt5_cancel_request(ticket, mt5_module=mt5)
             result = mt5.order_send(request)
-            return parse_mt5_result(result, client_order_id, mt5_module=mt5)
+            parsed = parse_mt5_result(result, client_order_id, mt5_module=mt5)
+            # A successful REMOVE produces no deal, so parse_mt5_result maps it
+            # to the generic "pending order" status (OPEN) — but the order is
+            # gone.  Override to CANCELLED so the engine persists the correct
+            # lifecycle status.
+            return replace(parsed, status=OrderStatus.CANCELLED)
 
         return await asyncio.to_thread(_cancel)
 
