@@ -26,6 +26,7 @@ import pytest
 
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.mt5 import MT5Adapter
+from unified_trading_execution.mt5.adapter import _DEAL_QUERY_BACKLOG_SECONDS
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -505,6 +506,30 @@ class TestFetchFills:
 
         with pytest.raises(PlatformError):
             await adapter.fetch_fills()
+
+    async def test_server_offset_deal_reported_with_real_utc_timestamp(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """fetch_fills shifts its query into the server-as-epoch basis and
+        reports server-as-epoch deals with real-UTC timestamps."""
+        _prepared(adapter)
+        _set_eurusd_symbol_info(mock_mt5_module)
+        offset = 10800
+        adapter._server_time_offset = offset
+        adapter._ticket_to_order_id = {1001: "client-abc"}
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = (
+            self._deal(time=_DEAL_TIME + offset),
+        )
+
+        fills = await adapter.fetch_fills()
+
+        fill = fills["client-abc"][0]
+        assert fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+        call_args = mock_mt5_module.history_deals_get.call_args.args
+        assert call_args[0] == (
+            int(adapter._last_deal_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS
+        )
 
 
 class TestResolveMt5Symbol:

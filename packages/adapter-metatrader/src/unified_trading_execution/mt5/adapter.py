@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -79,6 +80,15 @@ from unified_trading_execution.types.order import (
 from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
+
+# Deal stamps are second-granular: rewind `from` and pad `to` so edge fills
+# are never clipped; the ticket/time dedup in _process_fills absorbs extras.
+_DEAL_QUERY_BACKLOG_SECONDS = 5
+_DEAL_QUERY_FORWARD_SECONDS = 10
+
+# Offset probe: bounded symbol scan; reject impossible offsets (>±24h).
+_MAX_OFFSET_PROBE_SYMBOLS = 20
+_MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
 
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
@@ -183,6 +193,10 @@ class MT5Adapter(Adapter):
         self._last_balance: Balance | None = None
         self._last_deal_time: datetime = datetime.now(tz=UTC)
         self._last_deal_ticket: int = 0
+
+        # Server-as-epoch minus real-UTC epoch (seconds); measured from a live
+        # tick and refreshed each poll cycle — see _server_time_offset_seconds.
+        self._server_time_offset: int = 0
 
         # Broker symbol → canonical Instrument cache for inbound reconstruction.
         # Populated lazily on first sighting via symbol_info().path.
@@ -712,7 +726,9 @@ class MT5Adapter(Adapter):
         def _fetch() -> dict[str, list[FillRecord]]:
             account = mt5.account_info()
             self._check_call_result("account_info", account)
-            deals = mt5.history_deals_get(self._last_deal_time, _utcnow())
+            deals = mt5.history_deals_get(
+                *self._server_deal_window(mt5, self._last_deal_time, _utcnow())
+            )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
             result: dict[str, list[FillRecord]] = {}
@@ -781,7 +797,14 @@ class MT5Adapter(Adapter):
             self._check_call_result("positions_get", positions)
             account = mt5.account_info()
             self._check_call_result("account_info", account)
-            deals = mt5.history_deals_get(self._last_deal_time, now)
+            # Probe the server-time offset from symbols that are actively
+            # trading this cycle (positions/orders).
+            probes = tuple({o.symbol for o in orders or ()} | {p.symbol for p in positions or ()})
+            deals = mt5.history_deals_get(
+                *self._server_deal_window(
+                    mt5, self._last_deal_time, now, candidates=probes
+                )
+            )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, positions, deals)
             return orders, positions, account, deals, instruments, now
@@ -955,7 +978,12 @@ class MT5Adapter(Adapter):
         unpublished deals — no duplicates for the ones already reported.
         """
         for deal in deals or ():
-            deal_time = datetime.fromtimestamp(int(deal.time), tz=UTC)
+            # deal.time is server-as-epoch (shifted by the server offset);
+            # normalize back to real UTC so the baseline and FillEvent
+            # timestamps stay in the same basis as _utcnow().
+            deal_time = datetime.fromtimestamp(
+                int(deal.time) - self._server_time_offset, tz=UTC
+            )
             if deal_time < self._last_deal_time:
                 continue
             if deal.type not in (0, 1):
@@ -1012,11 +1040,72 @@ class MT5Adapter(Adapter):
             instrument=instruments[deal.symbol],
             fill_quantity=Decimal(str(deal.volume)),
             fill_price=Decimal(str(deal.price)),
-            fill_timestamp=datetime.fromtimestamp(int(deal.time), tz=UTC),
+            fill_timestamp=datetime.fromtimestamp(
+                int(deal.time) - self._server_time_offset, tz=UTC
+            ),
             fee_currency=str(account.currency) if fee else None,
             fee_amount=fee if fee else None,
             correlation_id=client_order_id,
             position_id=str(deal.position_id) if deal.position_id else None,
+        )
+
+    def _server_time_offset_seconds(
+        self,
+        mt5: Any,
+        *,
+        candidates: tuple[str, ...] = (),
+    ) -> int:
+        """Server-as-epoch minus real-UTC epoch (seconds).
+
+        MT5 stamps ``deal.time`` / ``tick.time_msc`` in the server's timezone
+        as if they were Unix epochs (a 06:58 UTC deal on a UTC+3 broker reads
+        09:58), so ``history_deals_get`` windows and deal times must be shifted
+        by this offset.
+
+        Measured live from any tick (``time_msc/1000 - time.time()``), hence
+        broker-agnostic; re-measured each poll cycle (DST-safe), falling back
+        to the last-known value (0) when no tick exists — safe, since no new
+        deals occur while the market is closed.  Values beyond ±24h are
+        rejected as corrupt.
+        """
+        probes = list(candidates)
+        if not probes:
+            probes = [
+                symbol.name
+                for symbol in (mt5.symbols_get() or ())[:_MAX_OFFSET_PROBE_SYMBOLS]
+            ]
+        for symbol in probes:
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                continue
+            time_msc = tick.time_msc
+            if not time_msc:
+                continue
+            offset = int(time_msc / 1000) - int(time.time())
+            if abs(offset) > _MAX_SERVER_TIME_OFFSET_SECONDS:
+                continue
+            self._server_time_offset = offset
+            break
+        return self._server_time_offset
+
+    def _server_deal_window(
+        self,
+        mt5: Any,
+        from_time: datetime,
+        to_time: datetime,
+        *,
+        candidates: tuple[str, ...] = (),
+    ) -> tuple[int, int]:
+        """Build a ``history_deals_get`` window in the server-as-epoch basis.
+
+        Deal timestamps are stored shifted by the server offset, so the query
+        window must be shifted by the same amount (plus small margins to absorb
+        second-granularity rounding).  Returns ``(from_epoch, to_epoch)`` ints.
+        """
+        offset = self._server_time_offset_seconds(mt5, candidates=candidates)
+        return (
+            int(from_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS,
+            int(to_time.timestamp()) + offset + _DEAL_QUERY_FORWARD_SECONDS,
         )
 
     def _resolve_poll_instruments(

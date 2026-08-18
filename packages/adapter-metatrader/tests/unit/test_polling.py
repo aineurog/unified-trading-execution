@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import namedtuple
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -31,6 +32,10 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
 )
 from unified_trading_execution.mt5 import MT5Adapter
+from unified_trading_execution.mt5.adapter import (
+    _DEAL_QUERY_BACKLOG_SECONDS,
+    _DEAL_QUERY_FORWARD_SECONDS,
+)
 from unified_trading_execution.types.enums import AssetClass
 
 # Fixed timestamps for deterministic deal/position diffs — deal times are
@@ -526,6 +531,69 @@ class TestPollOnce:
 
         assert len(fills) == 1
         assert adapter._last_deal_ticket == 3001
+
+    async def test_server_offset_deal_normalized_to_real_utc(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """A deal stored server-as-epoch (real time + server offset) is
+        published with a real-UTC ``fill_timestamp`` and advances
+        ``_last_deal_time`` to real UTC — never the shifted stamp."""
+        adapter._build_reverse_alias()
+        offset = 10800  # e.g. a UTC+3 broker
+        adapter._server_time_offset = offset
+        server_stamp = _DEAL_TIME + offset  # how the terminal stores it
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = (
+            Mt5Deal(
+                ticket=3001,
+                order=1001,
+                time=server_stamp,
+                type=0,
+                entry=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price=1.1010,
+                commission=0.0,
+                fee=0.0,
+                position_id=2001,
+            ),
+        )
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        adapter._last_deal_time = _PAST
+
+        fills: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, fills.append)
+        await adapter._poll_once()
+
+        assert len(fills) == 1
+        assert fills[0].fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+        assert adapter._last_deal_time == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+
+    async def test_history_window_shifted_by_server_offset(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """``history_deals_get`` is queried in the server-as-epoch basis: the
+        window is shifted by the server offset and padded by the margins."""
+        adapter._build_reverse_alias()
+        offset = 7200
+        adapter._server_time_offset = offset
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = ()
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        adapter._last_deal_time = _PAST
+
+        await adapter._poll_once()
+
+        call_args = mock_mt5_module.history_deals_get.call_args.args
+        assert call_args[0] == (
+            int(_PAST.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS
+        )
+        expected_to = int(time.time()) + offset + _DEAL_QUERY_FORWARD_SECONDS
+        assert expected_to - 1 <= call_args[1] <= expected_to + 1
 
     async def test_none_snapshot_call_raises_immediately(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
