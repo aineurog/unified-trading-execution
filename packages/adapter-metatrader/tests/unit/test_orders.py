@@ -59,6 +59,7 @@ def mt5_constants(mock_mt5_module) -> None:
     mock_mt5_module.TRADE_ACTION_PENDING = 5
     mock_mt5_module.TRADE_ACTION_SLTP = 6
     mock_mt5_module.ORDER_TIME_SPECIFIED = 2
+    mock_mt5_module.ORDER_TIME_DAY = 1
     mock_mt5_module.ORDER_TYPE_BUY = 0
     mock_mt5_module.ORDER_TYPE_SELL = 1
     mock_mt5_module.ORDER_TYPE_BUY_LIMIT = 2
@@ -244,6 +245,19 @@ class TestBuildMT5Request:
         assert request["type_time"] == mock_mt5_module.ORDER_TIME_SPECIFIED
         assert request["expiration"] == int(expire_at.timestamp())
 
+    def test_day_sets_type_time(self, mock_mt5_module, mt5_constants) -> None:
+        """DAY orders set type_time = ORDER_TIME_DAY (not GTC)."""
+        request = build_mt5_request(
+            _order(
+                OrderType.LIMIT,
+                OrderSide.BUY,
+                price=Decimal("1.1000"),
+                time_in_force=TimeInForce.DAY,
+            ),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["type_time"] == mock_mt5_module.ORDER_TIME_DAY
+
 
 class TestBuildMT5ModifyRequest:
     """OrderModification → TRADE_ACTION_MODIFY translation."""
@@ -293,7 +307,8 @@ class TestBuildMT5ModifyRequest:
         assert request["stoplimit"] == 1.3
 
     def test_tp_sl_change(self, mock_mt5_module, mt5_constants) -> None:
-        """Modifying take_profit and stop_loss sets the TP and SL fields."""
+        """Modifying take_profit and stop_loss sets the TP and SL fields — and
+        re-sends the current order price (MT5 requires it on every modify)."""
         request = build_mt5_modify_request(
             OrderModification(
                 client_order_id="c1",
@@ -303,8 +318,30 @@ class TestBuildMT5ModifyRequest:
             ticket=123,
             order_type=OrderType.LIMIT,
             mt5_module=mock_mt5_module,
+            current_price=Decimal("1.1457"),
         )
+        assert request["price"] == 1.1457
         assert request["tp"] == 1.3
+        assert request["sl"] == 1.0
+
+    def test_tp_sl_only_for_stop_limit_keeps_both_prices(
+        self, mock_mt5_module, mt5_constants
+    ) -> None:
+        """A TP/SL-only modify on a STOP_LIMIT keeps trigger (price) and limit
+        (stoplimit) from the current order."""
+        request = build_mt5_modify_request(
+            OrderModification(
+                client_order_id="c1",
+                stop_loss=TpSlAttachment(Decimal("1.0000")),
+            ),
+            ticket=123,
+            order_type=OrderType.STOP_LIMIT,
+            mt5_module=mock_mt5_module,
+            current_price=Decimal("1.3000"),
+            current_stop_price=Decimal("1.1500"),
+        )
+        assert request["price"] == 1.15
+        assert request["stoplimit"] == 1.3
         assert request["sl"] == 1.0
 
     def test_tp_sl_limit_price_unsupported(self, mock_mt5_module, mt5_constants) -> None:
@@ -420,6 +457,44 @@ class TestParseMT5Result:
         assert result.platform_order_id == "321"
         assert result.filled_quantity == Decimal("0.5")
         assert result.average_fill_price == Decimal("1.2345")
+
+    def test_done_without_deal_is_placed_pending(self, mock_mt5_module, mt5_constants) -> None:
+        """TRADE_RETCODE_DONE without a deal = placed pending order, not a fill.
+
+        The wrapper reports DONE for every successful request; a pending
+        order has deal == 0 and must map to OPEN (a real fill always has a
+        deal ticket).
+        """
+        result = parse_mt5_result(
+            self._result(
+                retcode=mock_mt5_module.TRADE_RETCODE_DONE,
+                order=987,
+                deal=0,
+                volume=0.5,
+                price=1.2345,
+            ),
+            "c1",
+            mt5_module=mock_mt5_module,
+        )
+        assert result.status == OrderStatus.OPEN
+        assert result.platform_order_id == "987"
+        assert result.filled_quantity == Decimal("0")
+        assert result.average_fill_price is None
+
+    def test_placed_with_deal_is_filled(self, mock_mt5_module, mt5_constants) -> None:
+        """TRADE_RETCODE_PLACED with a deal = executed immediately, so FILLED."""
+        result = parse_mt5_result(
+            self._result(
+                retcode=mock_mt5_module.TRADE_RETCODE_PLACED,
+                deal=321,
+                volume=0.5,
+                price=1.2345,
+            ),
+            "c1",
+            mt5_module=mock_mt5_module,
+        )
+        assert result.status == OrderStatus.FILLED
+        assert result.filled_quantity == Decimal("0.5")
 
     def test_none_result_raises(self, mock_mt5_module) -> None:
         """None result raises via error mapping."""

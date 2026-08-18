@@ -111,7 +111,9 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
             )
         request["sl"] = float(order.stop_loss.trigger_price)
 
-    if order.time_in_force == TimeInForce.GTD:
+    if order.time_in_force == TimeInForce.DAY:
+        request["type_time"] = mt5_module.ORDER_TIME_DAY
+    elif order.time_in_force == TimeInForce.GTD:
         if order.expire_at is None:
             raise ValueError("expire_at is required when time_in_force == GTD")
         request["type_time"] = mt5_module.ORDER_TIME_SPECIFIED
@@ -126,6 +128,8 @@ def build_mt5_modify_request(
     order_type: OrderType,
     *,
     mt5_module: Any,
+    current_price: Decimal | None = None,
+    current_stop_price: Decimal | None = None,
 ) -> dict[str, Any]:
     """Translate an ``OrderModification`` into an MT5 ``TRADE_ACTION_MODIFY``
     request dict.
@@ -134,15 +138,29 @@ def build_mt5_modify_request(
     mapping.  *order_type* is the existing order's type (LIMIT, STOP or
     STOP_LIMIT) — it decides which request field a price carries: MT5 puts the
     trigger in ``price`` and the limit price in ``stoplimit`` (the latter only
-    for STOP_LIMIT orders).  *mt5_module* is the lazily-imported
-    ``MetaTrader5`` module reference.
+    for STOP_LIMIT orders).  *current_price* / *current_stop_price* are the
+    existing order's unified ``(price, stop_price)`` — MT5 requires the order's
+    price fields on every modify request, so a TP/SL-only change re-sends the
+    current prices.  The adapter supplies them from the live ``orders_get()``
+    record.  *mt5_module* is the lazily-imported ``MetaTrader5`` module
+    reference.
 
     Raises ``UnsupportedOrderTypeError`` if *modification* sets ``quantity``
-    (MT5 cannot modify quantity — cancel and re-place is required).
+    (MT5 cannot modify quantity — cancel and re-place is required) or a TP/SL
+    attachment carries a ``limit_price`` (MT5 TP/SL are price levels, not
+    orders).
     """
     if modification.quantity is not None:
         raise UnsupportedOrderTypeError(
             "quantity modification is not supported by MT5 — cancel and re-place"
+        )
+    if modification.take_profit is not None and modification.take_profit.limit_price is not None:
+        raise UnsupportedOrderTypeError(
+            "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+        )
+    if modification.stop_loss is not None and modification.stop_loss.limit_price is not None:
+        raise UnsupportedOrderTypeError(
+            "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
         )
 
     request: dict[str, Any] = {
@@ -151,26 +169,32 @@ def build_mt5_modify_request(
     }
 
     if order_type == OrderType.STOP_LIMIT:
-        if modification.stop_price is not None:
-            request["price"] = float(modification.stop_price)
-        if modification.price is not None:
-            request["stoplimit"] = float(modification.price)
-    else:
-        if modification.price is not None:
-            request["price"] = float(modification.price)
-        if modification.stop_price is not None:
-            request["price"] = float(modification.stop_price)
-    if modification.take_profit is not None:
-        if modification.take_profit.limit_price is not None:
-            raise UnsupportedOrderTypeError(
-                "take_profit.limit_price is not supported by MT5 — take profit is a price level"
+        trigger = (
+            modification.stop_price if modification.stop_price is not None else current_stop_price
+        )
+        limit = modification.price if modification.price is not None else current_price
+        if trigger is None or limit is None:
+            raise PlatformError(
+                f"no trigger/limit price available for STOP_LIMIT modify of order {ticket}"
             )
+        request["price"] = float(trigger)
+        request["stoplimit"] = float(limit)
+    elif order_type == OrderType.STOP:
+        trigger = (
+            modification.stop_price if modification.stop_price is not None else current_stop_price
+        )
+        if trigger is None:
+            raise PlatformError(f"no trigger price available for STOP modify of order {ticket}")
+        request["price"] = float(trigger)
+    else:
+        price = modification.price if modification.price is not None else current_price
+        if price is None:
+            raise PlatformError(f"no price available for LIMIT modify of order {ticket}")
+        request["price"] = float(price)
+
+    if modification.take_profit is not None:
         request["tp"] = float(modification.take_profit.trigger_price)
     if modification.stop_loss is not None:
-        if modification.stop_loss.limit_price is not None:
-            raise UnsupportedOrderTypeError(
-                "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
-            )
         request["sl"] = float(modification.stop_loss.trigger_price)
 
     return request
@@ -233,6 +257,12 @@ def parse_mt5_result(
     never returns it, so the caller supplies it.  *mt5_module* is the
     lazily-imported ``MetaTrader5`` module reference.
 
+    The status is only ``FILLED`` / ``PARTIALLY_FILLED`` when a deal was
+    actually executed (``result.deal`` set).  The wrapper reports
+    ``TRADE_RETCODE_DONE`` for every successful request — including a
+    *placed* pending order, which has ``deal == 0`` and must map to
+    ``OPEN``, not ``FILLED``.
+
     Raises the mapped exception (via ``map_mt5_error``) when the result
     retcode indicates failure, using ``mt5.last_error()`` for the code and
     description.
@@ -253,12 +283,22 @@ def parse_mt5_result(
             desc = result.comment or f"MT5 trade retcode {result.retcode}"
         raise map_mt5_error(code, desc or result.comment) from None
 
+    executed = bool(result.deal)
+    if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED) and not executed:
+        # TRADE_RETCODE_DONE with no deal = a pending order was placed
+        # (or an order modified/cancelled) — not a fill.
+        status = OrderStatus.OPEN
+    if status == OrderStatus.OPEN and executed:
+        # A placed order that executed immediately is a real fill.
+        status = OrderStatus.FILLED
+
     now = datetime.now(tz=UTC)
-    filled = (
-        Decimal(str(result.volume))
-        if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
-        else Decimal("0")
-    )
+    if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED):
+        filled = Decimal(str(result.volume))
+        average_fill_price = _decimal_or_none(result.price)
+    else:
+        filled = Decimal("0")
+        average_fill_price = None
     if result.order is None or result.order == 0:
         platform_order_id = str(result.deal) if result.deal else None
     else:
@@ -268,9 +308,7 @@ def parse_mt5_result(
         platform_order_id=platform_order_id,
         status=status,
         filled_quantity=filled,
-        average_fill_price=_decimal_or_none(result.price)
-        if status in (OrderStatus.FILLED, OrderStatus.PARTIALLY_FILLED)
-        else None,
+        average_fill_price=average_fill_price,
         created_at=now,
         updated_at=now,
     )
@@ -282,7 +320,7 @@ def parse_order_record(
     *,
     mt5_module: Any,
 ) -> OrderResult | None:
-    """Parse an MT5 order tuple (from ``orders_get()`` / ``order_get()``)
+    """Parse a single MT5 order tuple (from ``orders_get()``)
     into an ``OrderResult``.
 
     Returns ``None`` if the tuple is empty or ``None``.  *client_order_id*

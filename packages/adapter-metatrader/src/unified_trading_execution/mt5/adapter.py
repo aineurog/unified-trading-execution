@@ -51,6 +51,7 @@ from unified_trading_execution.events import (
 from unified_trading_execution.mt5.errors import map_mt5_error
 from unified_trading_execution.mt5.orders import (
     _MT5_ORDER_TYPE_TO_UNIFIED,
+    _price_stop_price,
     _select_filling,
     build_mt5_cancel_request,
     build_mt5_modify_request,
@@ -447,19 +448,23 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _modify() -> OrderResult:
-            existing = mt5.orders_get(ticket=ticket)
-            if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
+            existing_orders = mt5.orders_get(ticket=ticket)
+            if existing_orders is None or len(existing_orders) == 0:
                 code, desc = mt5.last_error()
                 raise map_mt5_error(code, desc or f"order {ticket} not found for modification")
+            existing = existing_orders[0]
             unified = _MT5_ORDER_TYPE_TO_UNIFIED.get(existing.type)
             if unified is None:
                 raise PlatformError(f"Unknown MT5 order type {existing.type}")
             order_type, _ = unified
+            current_price, current_stop_price = _price_stop_price(order_type, existing)
             request = build_mt5_modify_request(
                 modification,
                 ticket,
                 order_type,
                 mt5_module=mt5,
+                current_price=current_price,
+                current_stop_price=current_stop_price,
             )
             result = mt5.order_send(request)
             return parse_mt5_result(result, modification.client_order_id, mt5_module=mt5)
@@ -485,9 +490,10 @@ class MT5Adapter(Adapter):
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by ``client_order_id``.
 
-        Looks up the MT5 ticket, then calls ``mt5.orders_get(ticket=...)``.
-        Returns ``None`` if the id is unknown to the engine or the order is
-        no longer active (filled/cancelled/expired).
+        Looks up the MT5 ticket, then calls ``mt5.orders_get(ticket=...)``
+        (the Python wrapper has no singular ``order_get``).  Returns
+        ``None`` if the id is unknown to the engine or the order is no
+        longer active (filled/cancelled/expired).
         """
         ticket = self._order_id_to_ticket.get(client_order_id)
         if ticket is None:
@@ -495,15 +501,15 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _query() -> OrderResult | None:
-            existing = mt5.orders_get(ticket=ticket)
-            if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
+            existing_orders = mt5.orders_get(ticket=ticket)
+            if existing_orders is None or len(existing_orders) == 0:
                 code, desc = mt5.last_error()
                 # No error (0 / RES_S_OK) or "order not found" (10035) means the
                 # order is simply no longer active — that is None, not a failure.
                 if code == 0 or code == mt5.RES_S_OK or code == 10035:
                     return None
                 raise map_mt5_error(code, desc or "orders_get() failed")
-            return parse_order_record(existing, client_order_id, mt5_module=mt5)
+            return parse_order_record(existing_orders[0], client_order_id, mt5_module=mt5)
 
         return await asyncio.to_thread(_query)
 

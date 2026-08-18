@@ -11,10 +11,10 @@ Tests cases:
     - place_order: symbol_info / tick failures raise mapped errors
     - place_order: incompatible filling mode raises InvalidSymbolError
     - place_order: TP/SL limit_price raises UnsupportedOrderTypeError
-    - modify_order: order type resolved live via order_get()
+    - modify_order: order type resolved live via orders_get()
     - modify_order: price → price, stop_price → price (STOP), stoplimit (STOP_LIMIT)
     - modify_order: unknown client id raises OrderNotFoundError
-    - modify_order: order_get failure / unknown type raise mapped errors
+    - modify_order: orders_get failure / unknown type raise mapped errors
     - cancel_order: TRADE_ACTION_REMOVE with correct ticket
     - get_order_by_client_id: unknown id / inactive order → None
     - get_order_by_client_id: active order → OrderResult; real error raises
@@ -362,7 +362,7 @@ class TestModifyOrder:
     ) -> None:
         """A LIMIT order's price change sets the price field."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = self._order_tuple()
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(),)
         _send_success(mock_mt5_module)
 
         result = await adapter.modify_order(
@@ -370,7 +370,7 @@ class TestModifyOrder:
         )
 
         assert result.client_order_id == "client-abc"
-        mock_mt5_module.order_get.assert_called_once_with(ticket=1001)
+        mock_mt5_module.orders_get.assert_called_once_with(ticket=1001)
         request = _request(mock_mt5_module)
         assert request["action"] == mock_mt5_module.TRADE_ACTION_MODIFY
         assert request["order"] == 1001
@@ -381,7 +381,7 @@ class TestModifyOrder:
     ) -> None:
         """A STOP order's trigger change goes in the price field."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = self._order_tuple(type=4)  # BUY_STOP
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(type=4),)  # BUY_STOP
         _send_success(mock_mt5_module)
 
         await adapter.modify_order(
@@ -397,7 +397,7 @@ class TestModifyOrder:
     ) -> None:
         """A STOP_LIMIT order maps trigger→price and limit→stoplimit."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = self._order_tuple(type=6)  # BUY_STOP_LIMIT
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(type=6),)  # BUY_STOP_LIMIT
         _send_success(mock_mt5_module)
 
         await adapter.modify_order(
@@ -412,6 +412,28 @@ class TestModifyOrder:
         assert request["price"] == 1.15
         assert request["stoplimit"] == 1.3
 
+    async def test_tpsl_only_modify_keeps_current_price(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A TP/SL-only modification re-sends the current order price — MT5
+        rejects a modify request that omits the price field."""
+        await self._registered(adapter)
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(),)  # BUY_LIMIT @1.1000
+        _send_success(mock_mt5_module)
+
+        await adapter.modify_order(
+            OrderModification(
+                client_order_id="client-abc",
+                take_profit=TpSlAttachment(Decimal("1.2000")),
+                stop_loss=TpSlAttachment(Decimal("1.0500")),
+            )
+        )
+
+        request = _request(mock_mt5_module)
+        assert request["price"] == 1.1
+        assert request["tp"] == 1.2
+        assert request["sl"] == 1.05
+
     async def test_unknown_client_id_raises(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
@@ -424,9 +446,9 @@ class TestModifyOrder:
     async def test_order_get_none_raises(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """order_get() returning None maps to an error."""
+        """orders_get() returning None maps to an error."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = None
+        mock_mt5_module.orders_get.return_value = None
         mock_mt5_module.last_error.return_value = (10035, "invalid order")
 
         with pytest.raises(OrderNotFoundError):
@@ -439,7 +461,7 @@ class TestModifyOrder:
     ) -> None:
         """An order with an unmapped MT5 type raises PlatformError."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = self._order_tuple(type=99)
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(type=99),)
 
         with pytest.raises(PlatformError):
             await adapter.modify_order(
@@ -451,7 +473,7 @@ class TestModifyOrder:
     ) -> None:
         """modify_order with a quantity change raises UnsupportedOrderTypeError."""
         await self._registered(adapter)
-        mock_mt5_module.order_get.return_value = self._order_tuple()
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(),)
 
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_order(
@@ -515,14 +537,14 @@ class TestGetOrderByClientId:
         result = await adapter.get_order_by_client_id("unknown")
 
         assert result is None
-        mock_mt5_module.order_get.assert_not_called()
+        mock_mt5_module.orders_get.assert_not_called()
 
     async def test_inactive_order_returns_none(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """order_get() returning None with no error means the order is gone."""
+        """orders_get() returning an empty tuple with no error means gone."""
         adapter._order_id_to_ticket["client-abc"] = 1001
-        mock_mt5_module.order_get.return_value = None
+        mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.last_error.return_value = (0, "")
 
         assert await adapter.get_order_by_client_id("client-abc") is None
@@ -530,9 +552,9 @@ class TestGetOrderByClientId:
     async def test_inactive_order_res_ok_returns_none(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """order_get() returning None with RES_S_OK (no error) → None."""
+        """orders_get() empty with RES_S_OK (no error) → None."""
         adapter._order_id_to_ticket["client-abc"] = 1001
-        mock_mt5_module.order_get.return_value = None
+        mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.last_error.return_value = (1, "")
 
         assert await adapter.get_order_by_client_id("client-abc") is None
@@ -540,9 +562,9 @@ class TestGetOrderByClientId:
     async def test_order_not_found_returns_none(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """order_get() returning None with 10035 (order not found) → None."""
+        """orders_get() empty with 10035 (order not found) → None."""
         adapter._order_id_to_ticket["client-abc"] = 1001
-        mock_mt5_module.order_get.return_value = None
+        mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.last_error.return_value = (10035, "invalid order")
 
         assert await adapter.get_order_by_client_id("client-abc") is None
@@ -552,7 +574,7 @@ class TestGetOrderByClientId:
     ) -> None:
         """An active order returns an OrderResult with OPEN status."""
         adapter._order_id_to_ticket["client-abc"] = 1001
-        mock_mt5_module.order_get.return_value = self._order_tuple()
+        mock_mt5_module.orders_get.return_value = (self._order_tuple(),)
 
         result = await adapter.get_order_by_client_id("client-abc")
 
@@ -565,9 +587,9 @@ class TestGetOrderByClientId:
     async def test_real_error_raises(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """order_get() None with a genuine error code raises the mapped error."""
+        """orders_get() None with a genuine error code raises the mapped error."""
         adapter._order_id_to_ticket["client-abc"] = 1001
-        mock_mt5_module.order_get.return_value = None
+        mock_mt5_module.orders_get.return_value = None
         mock_mt5_module.last_error.return_value = (-2, "invalid params")
 
         with pytest.raises(PlatformError):
