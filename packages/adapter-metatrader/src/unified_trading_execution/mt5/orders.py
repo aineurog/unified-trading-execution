@@ -314,11 +314,22 @@ def parse_mt5_result(
     )
 
 
+def from_mt5_epoch(epoch: int, server_time_offset: int = 0) -> datetime:
+    """Convert an MT5 server-as-epoch timestamp to a real-UTC ``datetime``.
+
+    MT5 stamps ``time_setup`` / ``time_done`` / ``deal.time`` in the server's
+    timezone as if they were Unix epochs; subtracting the server offset (see
+    ``MT5Adapter._server_time_offset_seconds``) yields the real-UTC instant.
+    """
+    return datetime.fromtimestamp(int(epoch) - server_time_offset, tz=UTC)
+
+
 def parse_order_record(
     order_tuple: Any,
     client_order_id: str,
     *,
     mt5_module: Any,
+    server_time_offset: int = 0,
 ) -> OrderResult | None:
     """Parse a single MT5 order tuple (from ``orders_get()``)
     into an ``OrderResult``.
@@ -326,7 +337,8 @@ def parse_order_record(
     Returns ``None`` if the tuple is empty or ``None``.  *client_order_id*
     is the engine's order id this record belongs to — MT5 never returns it,
     so the caller supplies it.  *mt5_module* is the lazily-imported
-    ``MetaTrader5`` module reference.
+    ``MetaTrader5`` module reference.  *server_time_offset* is the server
+    timezone offset so ``created_at``/``updated_at`` come out in real UTC.
     """
     if order_tuple is None or (hasattr(order_tuple, "__len__") and len(order_tuple) == 0):
         return None
@@ -347,8 +359,10 @@ def parse_order_record(
         status=status,
         filled_quantity=filled,
         average_fill_price=None,
-        created_at=datetime.fromtimestamp(order_tuple.time_setup, tz=UTC),
-        updated_at=datetime.fromtimestamp(order_tuple.time_done or order_tuple.time_setup, tz=UTC),
+        created_at=from_mt5_epoch(order_tuple.time_setup, server_time_offset),
+        updated_at=from_mt5_epoch(
+            order_tuple.time_done or order_tuple.time_setup, server_time_offset
+        ),
     )
 
 
@@ -404,6 +418,8 @@ def build_order_record(
     order_tuple: Any,
     client_order_id: str,
     instrument: Instrument,
+    *,
+    server_time_offset: int = 0,
 ) -> OrderRecord:
     """Build a full ``OrderRecord`` from an MT5 ``orders_get()`` tuple.
 
@@ -411,6 +427,7 @@ def build_order_record(
     ``OrderResult``), this reconstructs the complete auditable record —
     instrument, type, side, quantity, price levels, TP/SL, status — so
     ``fetch_open_orders()`` can return ``dict[str, OrderRecord]``.
+    *server_time_offset* keeps ``created_at``/``updated_at`` in real UTC.
 
     Raises ``PlatformError`` for an unrecognized order type, state, or
     time-in-force value.
@@ -453,8 +470,10 @@ def build_order_record(
         filled_quantity=volume - volume_current,
         average_fill_price=None,
         correlation_id=client_order_id,
-        created_at=datetime.fromtimestamp(order_tuple.time_setup, tz=UTC),
-        updated_at=datetime.fromtimestamp(order_tuple.time_done or order_tuple.time_setup, tz=UTC),
+        created_at=from_mt5_epoch(order_tuple.time_setup, server_time_offset),
+        updated_at=from_mt5_epoch(
+            order_tuple.time_done or order_tuple.time_setup, server_time_offset
+        ),
     )
 
 

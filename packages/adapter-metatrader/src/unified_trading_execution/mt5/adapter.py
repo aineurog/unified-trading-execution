@@ -59,6 +59,7 @@ from unified_trading_execution.mt5.orders import (
     build_mt5_request,
     build_mt5_sltp_request,
     build_order_record,
+    from_mt5_epoch,
     parse_mt5_result,
     parse_order_record,
 )
@@ -523,7 +524,13 @@ class MT5Adapter(Adapter):
                 if code == 0 or code == mt5.RES_S_OK or code == 10035:
                     return None
                 raise map_mt5_error(code, desc or "orders_get() failed")
-            return parse_order_record(existing_orders[0], client_order_id, mt5_module=mt5)
+            self._server_time_offset_seconds(mt5)
+            return parse_order_record(
+                existing_orders[0],
+                client_order_id,
+                mt5_module=mt5,
+                server_time_offset=self._server_time_offset,
+            )
 
         return await asyncio.to_thread(_query)
 
@@ -698,6 +705,7 @@ class MT5Adapter(Adapter):
         def _fetch() -> dict[str, OrderRecord]:
             orders = mt5.orders_get()
             self._check_call_result("orders_get", orders)
+            self._server_time_offset_seconds(mt5)
             instruments = self._resolve_poll_instruments(mt5, orders, ())
             result: dict[str, OrderRecord] = {}
             for order in orders or ():
@@ -705,7 +713,12 @@ class MT5Adapter(Adapter):
                 if instrument is None:
                     continue
                 client_order_id = self._ticket_to_order_id.get(order.ticket, "")
-                record = build_order_record(order, client_order_id, instrument)
+                record = build_order_record(
+                    order,
+                    client_order_id,
+                    instrument,
+                    server_time_offset=self._server_time_offset,
+                )
                 key = record.client_order_id or record.platform_order_id or ""
                 result[key] = record
             return result
@@ -981,9 +994,7 @@ class MT5Adapter(Adapter):
             # deal.time is server-as-epoch (shifted by the server offset);
             # normalize back to real UTC so the baseline and FillEvent
             # timestamps stay in the same basis as _utcnow().
-            deal_time = datetime.fromtimestamp(
-                int(deal.time) - self._server_time_offset, tz=UTC
-            )
+            deal_time = from_mt5_epoch(deal.time, self._server_time_offset)
             if deal_time < self._last_deal_time:
                 continue
             if deal.type not in (0, 1):
@@ -1040,9 +1051,7 @@ class MT5Adapter(Adapter):
             instrument=instruments[deal.symbol],
             fill_quantity=Decimal(str(deal.volume)),
             fill_price=Decimal(str(deal.price)),
-            fill_timestamp=datetime.fromtimestamp(
-                int(deal.time) - self._server_time_offset, tz=UTC
-            ),
+            fill_timestamp=from_mt5_epoch(deal.time, self._server_time_offset),
             fee_currency=str(account.currency) if fee else None,
             fee_amount=fee if fee else None,
             correlation_id=client_order_id,

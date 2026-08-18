@@ -579,6 +579,22 @@ class TestParseOrderRecord:
         with pytest.raises(PlatformError):
             parse_order_record(self._order_tuple(state=99), "c1", mt5_module=mock_mt5_module)
 
+    def test_server_time_offset_normalizes_timestamps(self, mock_mt5_module) -> None:
+        """``server_time_offset`` shifts server-as-epoch stamps to real UTC."""
+        offset = 10800
+        record = parse_order_record(
+            self._order_tuple(
+                time_setup=1700000000 + offset,
+                time_done=1700000100 + offset,
+            ),
+            "c1",
+            mt5_module=mock_mt5_module,
+            server_time_offset=offset,
+        )
+        assert record is not None
+        assert record.created_at == datetime.fromtimestamp(1700000000, tz=UTC)
+        assert record.updated_at == datetime.fromtimestamp(1700000100, tz=UTC)
+
 
 class TestSelectFilling:
     """Filling mode selection per symbol info and TIF."""
