@@ -26,6 +26,7 @@ import pytest
 
 from unified_trading_execution.errors import (
     InvalidSymbolError,
+    PlatformConnectionError,
     PlatformError,
     UnsupportedOrderTypeError,
 )
@@ -435,6 +436,21 @@ class TestParseMT5Result:
         with pytest.raises(PlatformError):
             parse_mt5_result(
                 self._result(retcode=mock_mt5_module.TRADE_RETCODE_REJECT),
+                "c1",
+                mt5_module=mock_mt5_module,
+            )
+
+    def test_stale_success_uses_retcode_and_comment(self, mock_mt5_module) -> None:
+        """A stale RES_S_OK last_error must not mask the real retcode message.
+
+        When the wrapper reports success (RES_S_OK=1) but the trade retcode
+        is a failure, the raised error carries the retcode and its comment
+        instead of the misleading "Success".
+        """
+        mock_mt5_module.last_error.return_value = (1, "Success")
+        with pytest.raises(PlatformConnectionError, match="AutoTrading disabled"):
+            parse_mt5_result(
+                self._result(retcode=10027, comment="AutoTrading disabled by client"),
                 "c1",
                 mt5_module=mock_mt5_module,
             )

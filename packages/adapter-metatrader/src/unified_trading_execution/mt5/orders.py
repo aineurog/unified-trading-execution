@@ -244,10 +244,13 @@ def parse_mt5_result(
     status = _RETCODE_STATUS_MAP.get(result.retcode)
     if status is None:
         code, desc = mt5_module.last_error()
-        # A stale success code (0 or RES_S_OK=1) means no error context —
-        # the unmapped retcode itself is the failure.
+        # A stale success code (0 or RES_S_OK=1) means the wrapper's
+        # last_error() has no context — the trade retcode and its comment
+        # are the real signal.  Use the comment so the raised error carries
+        # the actual broker message instead of "Success".
         if code == 0 or code == mt5_module.RES_S_OK:
             code = result.retcode
+            desc = result.comment or f"MT5 trade retcode {result.retcode}"
         raise map_mt5_error(code, desc or result.comment) from None
 
     now = datetime.now(tz=UTC)
