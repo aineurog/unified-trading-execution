@@ -67,6 +67,9 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
     - Resolving the filling mode per symbol (set ``request["type_filling"]``)
     - Converting the instrument to the MT5 symbol string
 
+    ``UnifiedOrder.position_id`` is passed through as the ``position`` field
+    so a leg-specific close (hedging mode) targets the right position.
+
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
 
     Raises ``UnsupportedOrderTypeError`` if a TP/SL attachment carries a
@@ -81,6 +84,10 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
         "type": _ORDER_TYPE_MAP[(order.order_type, order.side)],
         "volume": float(order.quantity),
     }
+
+    if order.position_id is not None:
+        # Hedging passthrough (D-1): target a specific position leg to close.
+        request["position"] = int(order.position_id)
 
     if order.order_type == OrderType.LIMIT:
         if order.price is None:
