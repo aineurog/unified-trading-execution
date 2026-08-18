@@ -439,7 +439,7 @@ class MT5Adapter(Adapter):
         Cannot change: quantity — raises ``UnsupportedOrderTypeError``
         (MT5 limitation — cancel and re-place is required).
 
-        The current order type is queried live via ``order_get()`` because
+        The current order type is queried live via ``orders_get()`` because
         MT5 stores the limit price in ``price`` and a stop-limit's limit
         price in ``stoplimit`` — the request must know which field to use.
         """
@@ -447,7 +447,7 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _modify() -> OrderResult:
-            existing = mt5.order_get(ticket=ticket)
+            existing = mt5.orders_get(ticket=ticket)
             if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
                 code, desc = mt5.last_error()
                 raise map_mt5_error(code, desc or f"order {ticket} not found for modification")
@@ -485,7 +485,7 @@ class MT5Adapter(Adapter):
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by ``client_order_id``.
 
-        Looks up the MT5 ticket, then calls ``mt5.order_get(ticket=...)``.
+        Looks up the MT5 ticket, then calls ``mt5.orders_get(ticket=...)``.
         Returns ``None`` if the id is unknown to the engine or the order is
         no longer active (filled/cancelled/expired).
         """
@@ -495,14 +495,14 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _query() -> OrderResult | None:
-            existing = mt5.order_get(ticket=ticket)
+            existing = mt5.orders_get(ticket=ticket)
             if existing is None or (hasattr(existing, "__len__") and len(existing) == 0):
                 code, desc = mt5.last_error()
                 # No error (0 / RES_S_OK) or "order not found" (10035) means the
                 # order is simply no longer active — that is None, not a failure.
                 if code == 0 or code == mt5.RES_S_OK or code == 10035:
                     return None
-                raise map_mt5_error(code, desc or "order_get() failed")
+                raise map_mt5_error(code, desc or "orders_get() failed")
             return parse_order_record(existing, client_order_id, mt5_module=mt5)
 
         return await asyncio.to_thread(_query)
