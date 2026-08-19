@@ -344,7 +344,7 @@ class MT5Adapter(Adapter):
 
             self._account_login = int(account_info.login)
             self._build_reverse_alias()
-            self._select_aliased_symbols(mt5)
+            await asyncio.to_thread(self._select_aliased_symbols, mt5)
             self._connected = True
             self._publish_connection_state(True)
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -1279,9 +1279,7 @@ class MT5Adapter(Adapter):
             try:
                 self._ensure_symbol_selected(broker_symbol, mt5)
             except UteError as exc:
-                logger.warning(
-                    "Cannot select symbol %s in Market Watch: %s", broker_symbol, exc
-                )
+                logger.warning("Cannot select symbol %s in Market Watch: %s", broker_symbol, exc)
 
     def _resolve_mt5_symbol(self, instrument: Instrument) -> str:
         """Apply the alias table and return the MT5 broker symbol string.

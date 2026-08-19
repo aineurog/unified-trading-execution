@@ -28,9 +28,7 @@ from unified_trading_execution.mt5 import MT5Adapter
 class TestEnsureSymbolSelected:
     """_ensure_symbol_selected — selection, caching, error paths."""
 
-    def test_selects_and_caches(
-        self, adapter: MT5Adapter, mock_mt5_module: MagicMock
-    ) -> None:
+    def test_selects_and_caches(self, adapter: MT5Adapter, mock_mt5_module: MagicMock) -> None:
         """A symbol not yet selected is added to Market Watch and cached."""
         adapter._ensure_symbol_selected("EURUSD.m", mock_mt5_module)
 
@@ -96,4 +94,3 @@ class TestEnsureSymbolSelected:
         adapter._ensure_symbol_selected("FAKEUSD", mock_mt5_module)
 
         mock_mt5_module.symbol_select.assert_not_called()
-

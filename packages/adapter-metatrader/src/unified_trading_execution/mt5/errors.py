@@ -92,6 +92,7 @@ def _build_non_trade_error_map(mt5: Any) -> dict[int, type[UteError]]:
         mt5.RES_E_INTERNAL_FAIL_TIMEOUT: PlatformConnectionError,  # IPC timeout
     }
 
+
 _SYMBOL_ERROR_MAP: dict[int, type[UteError]] = {
     4301: InvalidSymbolError,  # ERR_UNKNOWN_SYMBOL — not on this broker
     4302: PlatformError,  # ERR_MARKET_NOT_SELECTED — not in Market Watch
