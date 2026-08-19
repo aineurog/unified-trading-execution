@@ -294,15 +294,46 @@ class TestPlaceOrder:
             await adapter.place_order(_order())
 
     async def test_tick_none_raises(
-        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+        self,
+        mock_mt5_module: MagicMock,
+        adapter: MT5Adapter,
+        mt5_constants,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """No market quote for a MARKET order maps to an error."""
+        monkeypatch.setattr("unified_trading_execution.mt5.adapter.time.sleep", lambda _: None)
         _set_symbol_info(mock_mt5_module)
         mock_mt5_module.symbol_info_tick.return_value = None
         mock_mt5_module.last_error.return_value = (10018, "market closed")
 
         with pytest.raises(InvalidSymbolError):
             await adapter.place_order(_order(OrderType.MARKET, OrderSide.BUY, price=None))
+
+    async def test_selects_symbol_in_market_watch_before_submit(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """place_order selects the symbol before building/sending the request."""
+        _set_symbol_info(mock_mt5_module)
+        _send_success(mock_mt5_module)
+
+        await adapter.place_order(_order())
+
+        mock_mt5_module.symbol_select.assert_called_once_with("EURUSD.m", True)
+        assert "EURUSD.m" in adapter._selected_symbols
+        mock_mt5_module.order_send.assert_called_once()
+
+    async def test_unknown_symbol_selection_raises(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A symbol the broker does not provide raises InvalidSymbolError."""
+        mock_mt5_module.symbol_select.return_value = False
+        mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+
+        with pytest.raises(InvalidSymbolError, match="unknown symbol"):
+            await adapter.place_order(_order())
+
+        mock_mt5_module.order_send.assert_not_called()
+        assert "EURUSD.m" in adapter._failed_symbols
 
     async def test_no_compatible_filling_mode_raises(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants

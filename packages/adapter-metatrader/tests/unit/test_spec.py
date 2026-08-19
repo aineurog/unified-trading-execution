@@ -61,6 +61,17 @@ class TestFetchInstrumentSpec:
         assert spec.qty_precision == 2
         assert spec.max_leverage is None
 
+    async def test_selects_symbol_before_fetch(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """The symbol is selected in Market Watch before symbol_info() runs."""
+        mock_mt5_module.symbol_info.return_value = _spec_info()
+
+        await adapter.fetch_instrument_spec(_instrument())
+
+        mock_mt5_module.symbol_select.assert_called_once_with("EURUSD.m", True)
+        mock_mt5_module.symbol_info.assert_called_once_with("EURUSD.m")
+
     async def test_whole_number_volume_step_zero_qty_precision(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:

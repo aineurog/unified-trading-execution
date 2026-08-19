@@ -97,6 +97,11 @@ _DEAL_QUERY_FORWARD_SECONDS = 10
 _MAX_OFFSET_PROBE_SYMBOLS = 20
 _MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
 
+# After symbol_select() the terminal subscribes to quotes asynchronously —
+# symbol_info_tick() can briefly return None.  MARKET orders retry the fetch.
+_MARKET_TICK_RETRIES = 3
+_MARKET_TICK_RETRY_DELAY_SECONDS = 0.1
+
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
 
@@ -124,6 +129,28 @@ def _get_mt5() -> Any:
 
 def _new_id() -> str:
     return str(uuid7())
+
+
+def _wait_for_market_tick(
+    mt5: Any,
+    mt5_symbol: str,
+    *,
+    retries: int = _MARKET_TICK_RETRIES,
+    delay: float = _MARKET_TICK_RETRY_DELAY_SECONDS,
+) -> Any:
+    """Fetch a live tick, retrying briefly after Market Watch selection.
+
+    ``symbol_select()`` subscribes asynchronously — the terminal may not
+    have the first quote the instant after selection.  Returns the first
+    non-``None`` tick, or ``None`` if every retry came back empty (market
+    closed / no data).
+    """
+    for _ in range(retries):
+        tick = mt5.symbol_info_tick(mt5_symbol)
+        if tick is not None:
+            return tick
+        time.sleep(delay)
+    return None
 
 
 def _utcnow() -> datetime:
@@ -210,6 +237,10 @@ class MT5Adapter(Adapter):
         self._symbol_to_instrument: dict[str, Instrument] = {}
         self._failed_symbols: set[str] = set()
 
+        # Symbols selected in Market Watch this session.  MT5 streams real-time
+        # quotes only for selected symbols — see _ensure_symbol_selected().
+        self._selected_symbols: set[str] = set()
+
         # Instrument spec cache: Instrument → (InstrumentSpec, fetched_at)
         self._spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
 
@@ -262,8 +293,10 @@ class MT5Adapter(Adapter):
            terminal).
         3. ``mt5.account_info()`` — resolve the actual account login.
         4. Build the reverse alias table.
-        5. Publish ``ConnectionStateEvent(connected=True)``.
-        6. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
+        5. Select every aliased symbol in Market Watch (``symbol_select``)
+           so quotes stream for all configured instruments.
+        6. Publish ``ConnectionStateEvent(connected=True)``.
+        7. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
 
         The guard is held for the lifetime of the connection and released by
         ``disconnect()``.  On any failure the guard is released and a
@@ -311,6 +344,7 @@ class MT5Adapter(Adapter):
 
             self._account_login = int(account_info.login)
             self._build_reverse_alias()
+            await asyncio.to_thread(self._select_aliased_symbols, mt5)
             self._connected = True
             self._publish_connection_state(True)
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -403,6 +437,8 @@ class MT5Adapter(Adapter):
         """Translate and submit a fully-validated order to MT5.
 
         - Resolves the MT5 symbol via the alias table.
+        - Ensures the symbol is selected in Market Watch so real-time quotes
+          flow (``symbol_select``); a broker-missing symbol raises early.
         - For MARKET orders: fetches current bid/ask from ``symbol_info_tick()``
           so the deal goes in at the live quote.
         - Selects the filling mode per symbol.
@@ -426,6 +462,7 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _submit() -> OrderResult:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
             info = mt5.symbol_info(mt5_symbol)
             if info is None:
                 code, desc = mt5.last_error()
@@ -433,7 +470,7 @@ class MT5Adapter(Adapter):
             request = build_mt5_request(order, mt5_module=mt5)
             request["symbol"] = mt5_symbol
             if order.order_type == OrderType.MARKET:
-                tick = mt5.symbol_info_tick(mt5_symbol)
+                tick = _wait_for_market_tick(mt5, mt5_symbol)
                 if tick is None:
                     code, desc = mt5.last_error()
                     raise map_mt5_error(code, desc or f"no market quote for {mt5_symbol}")
@@ -613,6 +650,7 @@ class MT5Adapter(Adapter):
 
         mt5_symbol = self._resolve_mt5_symbol(instrument)
         mt5 = _get_mt5()
+        await asyncio.to_thread(self._ensure_symbol_selected, mt5_symbol, mt5)
         info = await asyncio.to_thread(mt5.symbol_info, mt5_symbol)
         if info is None:
             _, desc = mt5.last_error()
@@ -1135,10 +1173,12 @@ class MT5Adapter(Adapter):
         positions and deals.  Cached — a symbol is resolved only on its
         first sighting.
 
-        Unresolvable symbols (unknown broker path, ``symbol_info()``
-        failure) are skipped with a one-time warning per symbol rather than
-        failing the whole cycle — one bad symbol must not silence events for
-        every other instrument.
+        Unresolvable symbols are skipped rather than failing the whole cycle
+        — one bad symbol must not silence events for every other instrument.
+        Permanent failures (unknown broker symbol, unrecognized asset-class
+        path, trade disabled) are remembered in ``_failed_symbols`` and
+        reported once; transient failures (e.g. a flaky ``symbol_select``
+        IPC call) are logged and retried on the next cycle.
         """
         symbols: set[str] = set()
         for position in positions or ():
@@ -1149,7 +1189,7 @@ class MT5Adapter(Adapter):
         for symbol in symbols:
             try:
                 resolved[symbol] = self._resolve_instrument(symbol, mt5)
-            except (ValueError, UteError) as exc:
+            except (ValueError, InvalidSymbolError) as exc:
                 if symbol not in self._failed_symbols:
                     self._failed_symbols.add(symbol)
                     logger.warning(
@@ -1157,6 +1197,12 @@ class MT5Adapter(Adapter):
                         symbol,
                         exc,
                     )
+            except UteError as exc:
+                logger.warning(
+                    "Temporarily skipping symbol %s — will retry next cycle: %s",
+                    symbol,
+                    exc,
+                )
         return resolved
 
     def _resolve_instrument(self, mt5_symbol: str, mt5: Any) -> Instrument:
@@ -1171,6 +1217,7 @@ class MT5Adapter(Adapter):
         if cached is not None:
             return cached
         symbol, quote = from_mt5_symbol(mt5_symbol, self._reverse_alias)
+        self._ensure_symbol_selected(mt5_symbol, mt5)
         info = mt5.symbol_info(mt5_symbol)
         if info is None:
             code, desc = mt5.last_error()
@@ -1189,6 +1236,50 @@ class MT5Adapter(Adapter):
     # ------------------------------------------------------------------
     # Internal helpers (implement these)
     # ------------------------------------------------------------------
+
+    def _ensure_symbol_selected(self, mt5_symbol: str, mt5: Any) -> None:
+        """Make sure *mt5_symbol* is selected in Market Watch so quotes flow.
+
+        MT5 streams real-time ticks only for symbols present in Market Watch:
+        ``symbol_info_tick()`` returns ``None`` and ``order_send()`` can reject
+        requests for symbols that are not selected.  ``symbol_select()`` is
+        idempotent, so already-selected symbols are skipped via
+        ``_selected_symbols``, and symbols the broker does not provide are
+        remembered in ``_failed_symbols`` to avoid re-issuing the IPC call
+        every poll cycle.
+
+        Must be called from within a ``to_thread()`` block (or wrapped) —
+        ``symbol_select()`` is an MT5 IPC call.
+
+        Raises:
+            InvalidSymbolError: the symbol does not exist for this broker.
+            PlatformError: ``symbol_select()`` failed for another reason
+                (transient) — not cached, so a later call retries.
+        """
+        if mt5_symbol in self._selected_symbols or mt5_symbol in self._failed_symbols:
+            return
+        if not mt5.symbol_select(mt5_symbol, True):
+            code, desc = mt5.last_error()
+            error = map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
+            if isinstance(error, InvalidSymbolError):
+                self._failed_symbols.add(mt5_symbol)
+            raise error
+        self._selected_symbols.add(mt5_symbol)
+
+    def _select_aliased_symbols(self, mt5: Any) -> None:
+        """Eagerly select every aliased symbol in Market Watch at connect.
+
+        Guarantees the poll loop's very first cycle sees live quotes and that
+        orders for aliased instruments never hit the "not selected" terminal
+        error.  A symbol the broker does not provide is logged and recorded in
+        ``_failed_symbols`` — it must not fail the whole connection; the lazy
+        ``_ensure_symbol_selected()`` path will surface real errors on use.
+        """
+        for broker_symbol in self._config.symbol_alias_table.values():
+            try:
+                self._ensure_symbol_selected(broker_symbol, mt5)
+            except UteError as exc:
+                logger.warning("Cannot select symbol %s in Market Watch: %s", broker_symbol, exc)
 
     def _resolve_mt5_symbol(self, instrument: Instrument) -> str:
         """Apply the alias table and return the MT5 broker symbol string.

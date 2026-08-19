@@ -93,6 +93,14 @@ def _build_non_trade_error_map(mt5: Any) -> dict[int, type[UteError]]:
     }
 
 
+_SYMBOL_ERROR_MAP: dict[int, type[UteError]] = {
+    4301: InvalidSymbolError,  # ERR_UNKNOWN_SYMBOL — not on this broker
+    4302: PlatformError,  # ERR_MARKET_NOT_SELECTED — not in Market Watch
+    4303: PlatformError,  # ERR_SYMBOL_PROP_UNDEFINED — invalid property id
+    5040: InvalidSymbolError,  # ERR_INVALID_STRING_PARAMETER — bad symbol name
+}
+
+
 def map_mt5_error(error_code: int, description: str = "") -> UteError:
     """Translate an MT5 error code into a unified exception.
 
@@ -104,6 +112,8 @@ def map_mt5_error(error_code: int, description: str = "") -> UteError:
     ``mt5_error_code`` and ``mt5_description`` carried as context.
     """
     exc_type = _TRADE_RETCODE_MAP.get(error_code)
+    if exc_type is None:
+        exc_type = _SYMBOL_ERROR_MAP.get(error_code)
     if exc_type is None:
         import unified_trading_execution.mt5.adapter as _mt5_adapter
 

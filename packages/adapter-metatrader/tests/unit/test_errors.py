@@ -75,6 +75,21 @@ class TestMapMT5Error:
         for code, expected in cases:
             assert isinstance(map_mt5_error(code, "desc"), expected)
 
+    def test_symbol_error_codes_map(self) -> None:
+        """MQL GetLastError codes surfaced by symbol_select/symbol_info map.
+
+        4301 (unknown symbol) and 5040 (invalid string) are invalid-symbol
+        conditions; 4302/4303 stay generic PlatformError.
+        """
+        cases: list[tuple[int, type[UteError]]] = [
+            (4301, InvalidSymbolError),
+            (5040, InvalidSymbolError),
+            (4302, PlatformError),
+            (4303, PlatformError),
+        ]
+        for code, expected in cases:
+            assert isinstance(map_mt5_error(code, "desc"), expected)
+
     def test_legacy_32768_codes_fall_through(self) -> None:
         """The old 32768/32769 code space is no longer mapped → PlatformError."""
         for code in (32768, 32769):

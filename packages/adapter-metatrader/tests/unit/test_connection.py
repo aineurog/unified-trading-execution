@@ -72,6 +72,9 @@ class TestConnect:
         assert adapter._reverse_alias == {"EURUSD.m": "EUR/USD"}
         assert adapter._poll_task is not None and not adapter._poll_task.done()
 
+        mock_mt5_module.symbol_select.assert_called_once_with("EURUSD.m", True)
+        assert adapter._selected_symbols == {"EURUSD.m"}
+
         assert len(events) == 1
         event = events[0]
         assert event.connected is True
@@ -108,6 +111,63 @@ class TestConnect:
             password=config.password,
             server=config.server,
         )
+
+        await adapter.disconnect()
+
+    async def test_eagerly_selects_all_aliased_symbols(
+        self,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """connect() selects every broker symbol in the alias table."""
+        config = MT5Config(
+            login=12345678,
+            password="test-password",
+            server="TestBroker-Demo",
+            symbol_alias_table={"EUR/USD": "EURUSD.m", "XAU/USD": "XAUUSD"},
+        )
+        adapter = MT5Adapter(config, event_bus=event_bus)
+        await _stub_poll_loop(adapter, monkeypatch)
+
+        await adapter.connect()
+
+        mock_mt5_module.symbol_select.assert_any_call("EURUSD.m", True)
+        mock_mt5_module.symbol_select.assert_any_call("XAUUSD", True)
+        assert adapter._selected_symbols == {"EURUSD.m", "XAUUSD"}
+
+        await adapter.disconnect()
+
+    async def test_eager_selection_tolerates_missing_symbol(
+        self,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A broker-missing aliased symbol must not fail the whole connect."""
+        config = MT5Config(
+            login=12345678,
+            password="test-password",
+            server="TestBroker-Demo",
+            symbol_alias_table={"EUR/USD": "EURUSD.m", "FAKE/USD": "FAKEUSD"},
+        )
+        adapter = MT5Adapter(config, event_bus=event_bus)
+        await _stub_poll_loop(adapter, monkeypatch)
+
+        def _symbol_select(symbol: str, enable: bool) -> bool:
+            return symbol != "FAKEUSD"
+
+        mock_mt5_module.symbol_select.side_effect = _symbol_select
+        mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+
+        with caplog.at_level("WARNING", logger="unified_trading_execution.mt5.adapter"):
+            await adapter.connect()
+
+        assert adapter.is_connected is True
+        mock_mt5_module.symbol_select.assert_any_call("FAKEUSD", True)
+        assert "FAKEUSD" in adapter._failed_symbols
+        assert "FAKEUSD" in caplog.text
 
         await adapter.disconnect()
 
