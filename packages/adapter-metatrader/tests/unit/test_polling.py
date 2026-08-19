@@ -22,6 +22,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from uuid_extensions import uuid7
 
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.events import (
@@ -36,6 +37,7 @@ from unified_trading_execution.mt5.adapter import (
     _DEAL_QUERY_BACKLOG_SECONDS,
     _DEAL_QUERY_FORWARD_SECONDS,
 )
+from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import AssetClass
 
 # Fixed timestamps for deterministic deal/position diffs — deal times are
@@ -45,7 +47,17 @@ _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
 
 Mt5Order = namedtuple(
     "Mt5Order",
-    ["ticket", "time_setup", "time_done", "state", "volume_initial", "volume_current", "symbol"],
+    [
+        "ticket",
+        "time_setup",
+        "time_done",
+        "state",
+        "volume_initial",
+        "volume_current",
+        "symbol",
+        "comment",
+    ],
+    defaults=[""],
 )
 Mt5Position = namedtuple(
     "Mt5Position",
@@ -65,7 +77,9 @@ Mt5Deal = namedtuple(
         "commission",
         "fee",
         "position_id",
+        "comment",
     ],
+    defaults=[""],
 )
 
 
@@ -267,6 +281,37 @@ class TestPollOnce:
 
         assert fill.client_order_id == "client-1"
         assert fill.correlation_id == "client-1"
+
+    def test_fill_comment_attributed_before_ticket_maps(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A deal carrying the engine's UTE: tag attributes the fill by comment
+        even when the ticket maps are empty (fresh process after a restart)."""
+        adapter._build_reverse_alias()
+        cid = str(uuid7())
+        comment = encode_client_order_id(cid)
+        assert comment is not None
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        deal = Mt5Deal(
+            ticket=3001,
+            order=0,  # market execution has no order ticket
+            time=_DEAL_TIME,
+            type=0,
+            entry=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price=1.1010,
+            commission=0.0,
+            fee=0.0,
+            position_id=2001,
+            comment=comment,
+        )
+
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (), (deal,))
+        fill = adapter._build_fill(deal, instruments, _account())
+
+        assert fill.client_order_id == cid
+        assert fill.correlation_id == cid
 
     async def test_detects_position_change(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus

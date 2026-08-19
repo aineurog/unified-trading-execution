@@ -23,10 +23,12 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
+from uuid_extensions import uuid7
 
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.mt5 import MT5Adapter
 from unified_trading_execution.mt5.adapter import _DEAL_QUERY_BACKLOG_SECONDS
+from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -57,7 +59,9 @@ Mt5Order = namedtuple(
         "type_time",
         "time_expiration",
         "position_id",
+        "comment",
     ],
+    defaults=[""],
 )
 Mt5Position = namedtuple(
     "Mt5Position",
@@ -77,7 +81,9 @@ Mt5Deal = namedtuple(
         "commission",
         "fee",
         "position_id",
+        "comment",
     ],
+    defaults=[""],
 )
 
 
@@ -331,6 +337,35 @@ class TestFetchOpenOrders:
         assert "1001" in records
         assert records["1001"].client_order_id == ""
 
+    async def test_comment_recovers_client_id_without_ticket_map(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A UTE:-tagged order keys by its decoded client_order_id even with an
+        empty ticket map (fresh process after a restart)."""
+        _prepared(adapter)
+        _set_eurusd_symbol_info(mock_mt5_module)
+        cid = str(uuid7())
+        comment = encode_client_order_id(cid)
+        assert comment is not None
+        mock_mt5_module.orders_get.return_value = (_order(comment=comment),)
+
+        records = await adapter.fetch_open_orders()
+
+        assert cid in records
+        assert records[cid].platform_order_id == "1001"
+
+    async def test_foreign_comment_keys_by_platform_id(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A non-UTE comment falls back to the ticket-map / platform key."""
+        _prepared(adapter)
+        _set_eurusd_symbol_info(mock_mt5_module)
+        mock_mt5_module.orders_get.return_value = (_order(comment="manual trade"),)
+
+        records = await adapter.fetch_open_orders()
+
+        assert "1001" in records
+
     async def test_unresolvable_symbol_skipped(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
@@ -446,6 +481,24 @@ class TestFetchFills:
         assert fill.fill_quantity == Decimal("0.1")
         assert fill.fill_price == Decimal("1.1")
         assert fill.fee_amount is None
+
+    async def test_comment_recovers_fill_client_id(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A UTE:-tagged deal groups under its decoded client_order_id even
+        with an empty ticket map (fresh process after a restart)."""
+        _prepared(adapter)
+        _set_eurusd_symbol_info(mock_mt5_module)
+        cid = str(uuid7())
+        comment = encode_client_order_id(cid)
+        assert comment is not None
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = (self._deal(comment=comment),)
+
+        fills = await adapter.fetch_fills()
+
+        assert list(fills) == [cid]
+        assert fills[cid][0].platform_fill_id == "3001"
 
     async def test_does_not_advance_poll_baseline(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter

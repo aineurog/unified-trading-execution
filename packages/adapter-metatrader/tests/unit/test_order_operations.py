@@ -39,6 +39,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.mt5 import MT5Adapter
+from unified_trading_execution.mt5.comments import decode_comment
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -73,7 +74,9 @@ Mt5Order = namedtuple(
         "type_time",
         "time_expiration",
         "position_id",
+        "comment",
     ],
+    defaults=[""],
 )
 
 
@@ -184,6 +187,34 @@ class TestPlaceOrder:
         assert request["symbol"] == "EURUSD.m"
         assert request["price"] == 1.1002
         assert request["type_filling"] == 2  # ORDER_FILLING_RETURN
+
+    async def test_place_packs_uuid_into_comment(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A uuid client_order_id is losslessly packed into the order comment."""
+        _set_symbol_info(mock_mt5_module)
+        _set_tick(mock_mt5_module)
+        _send_success(mock_mt5_module)
+        order = _order(OrderType.MARKET, OrderSide.BUY, price=None, client_order_id=None)
+
+        result = await adapter.place_order(order)
+
+        request = _request(mock_mt5_module)
+        assert decode_comment(request["comment"]) == result.client_order_id
+
+    async def test_place_non_uuid_id_omits_comment(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A non-encodable client_order_id leaves the request commentless."""
+        _set_symbol_info(mock_mt5_module)
+        _set_tick(mock_mt5_module)
+        _send_success(mock_mt5_module)
+        order = _order(OrderType.MARKET, OrderSide.BUY, price=None, client_order_id="custom-1")
+
+        await adapter.place_order(order)
+
+        request = _request(mock_mt5_module)
+        assert "comment" not in request
 
     async def test_market_sell_uses_bid(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants

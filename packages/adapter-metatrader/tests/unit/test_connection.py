@@ -16,13 +16,16 @@ Tests cases:
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
+from uuid_extensions import uuid7
 
 from unified_trading_execution.errors import PlatformConnectionError
 from unified_trading_execution.events import ConnectionStateEvent
 from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.mt5.adapter import _connected_lock
+from unified_trading_execution.mt5.comments import encode_client_order_id
 
 
 def _collect_events(event_bus) -> list[ConnectionStateEvent]:
@@ -136,6 +139,53 @@ class TestConnect:
         mock_mt5_module.symbol_select.assert_any_call("XAUUSD", True)
         assert adapter._selected_symbols == {"EURUSD.m", "XAUUSD"}
 
+        await adapter.disconnect()
+
+    async def test_connect_recovers_order_mappings_from_comments(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """Open orders and recent deals carrying UTE: comments repopulate the
+        client_order_id ↔ ticket maps on connect."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        cid = str(uuid7())
+        comment = encode_client_order_id(cid)
+        assert comment is not None
+        mock_mt5_module.symbols_get.return_value = ()
+        mock_mt5_module.orders_get.return_value = (SimpleNamespace(ticket=5001, comment=comment),)
+        mock_mt5_module.history_deals_get.return_value = (
+            SimpleNamespace(ticket=6001, order=5001, comment=comment),
+        )
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {cid: 5001}
+        assert adapter._ticket_to_order_id == {5001: cid}
+        await adapter.disconnect()
+
+    async def test_connect_recovery_ignores_foreign_comments(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """Foreign (manual/broker) comments and empty history leave the maps
+        empty — recovery must never fail the connection."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        mock_mt5_module.symbols_get.return_value = ()
+        mock_mt5_module.orders_get.return_value = (
+            SimpleNamespace(ticket=5001, comment="manual trade"),
+        )
+        mock_mt5_module.history_deals_get.return_value = ()
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {}
+        assert adapter._ticket_to_order_id == {}
         await adapter.disconnect()
 
     async def test_eager_selection_tolerates_missing_symbol(
