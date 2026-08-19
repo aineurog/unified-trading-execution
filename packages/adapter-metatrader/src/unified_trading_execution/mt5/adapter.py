@@ -825,9 +825,7 @@ class MT5Adapter(Adapter):
             # trading this cycle (positions/orders).
             probes = tuple({o.symbol for o in orders or ()} | {p.symbol for p in positions or ()})
             deals = mt5.history_deals_get(
-                *self._server_deal_window(
-                    mt5, self._last_deal_time, now, candidates=probes
-                )
+                *self._server_deal_window(mt5, self._last_deal_time, now, candidates=probes)
             )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, positions, deals)
@@ -1091,8 +1089,7 @@ class MT5Adapter(Adapter):
         probes = list(candidates)
         if not probes:
             probes = [
-                symbol.name
-                for symbol in (mt5.symbols_get() or ())[:_MAX_OFFSET_PROBE_SYMBOLS]
+                symbol.name for symbol in (mt5.symbols_get() or ())[:_MAX_OFFSET_PROBE_SYMBOLS]
             ]
         for symbol in probes:
             tick = mt5.symbol_info_tick(symbol)

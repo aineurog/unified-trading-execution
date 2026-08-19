@@ -589,9 +589,7 @@ class TestPollOnce:
         await adapter._poll_once()
 
         call_args = mock_mt5_module.history_deals_get.call_args.args
-        assert call_args[0] == (
-            int(_PAST.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS
-        )
+        assert call_args[0] == (int(_PAST.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS)
         expected_to = int(time.time()) + offset + _DEAL_QUERY_FORWARD_SECONDS
         assert expected_to - 1 <= call_args[1] <= expected_to + 1
 
