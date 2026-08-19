@@ -41,6 +41,8 @@ class TestMapMT5Error:
             (10017, InstrumentHaltedError),  # TRADE_RETCODE_TRADE_DISABLED
             (10019, InsufficientBalanceError),  # TRADE_RETCODE_NO_MONEY
             (10024, RateLimitError),  # TRADE_RETCODE_TOO_MANY_REQUESTS
+            (10026, PlatformConnectionError),  # TRADE_RETCODE_SERVER_DISABLES_AT
+            (10027, PlatformConnectionError),  # TRADE_RETCODE_CLIENT_DISABLES_AT
             (10035, OrderNotFoundError),  # TRADE_RETCODE_INVALID_ORDER
         ]
         for code, expected in cases:

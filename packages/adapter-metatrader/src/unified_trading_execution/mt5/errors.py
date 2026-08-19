@@ -61,8 +61,8 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10006: PlatformError,  # TRADE_RETCODE_REJECT — generic reject
     10011: PlatformError,  # TRADE_RETCODE_ERROR — processing error
     10023: PlatformError,  # TRADE_RETCODE_ORDER_CHANGED
-    10026: PlatformError,  # TRADE_RETCODE_SERVER_DISABLES_AT
-    10027: PlatformError,  # TRADE_RETCODE_CLIENT_DISABLES_AT
+    10026: PlatformConnectionError,  # TRADE_RETCODE_SERVER_DISABLES_AT — auto-trading off
+    10027: PlatformConnectionError,  # TRADE_RETCODE_CLIENT_DISABLES_AT — auto-trading off
     10030: PlatformError,  # TRADE_RETCODE_INVALID_FILL
     10032: PlatformError,  # TRADE_RETCODE_ONLY_REAL
 }
