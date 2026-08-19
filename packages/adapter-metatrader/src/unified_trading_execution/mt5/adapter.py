@@ -27,7 +27,7 @@ import logging
 import threading
 import time
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -50,6 +50,7 @@ from unified_trading_execution.events import (
     FillEvent,
     PositionUpdateEvent,
 )
+from unified_trading_execution.mt5.comments import decode_comment, encode_client_order_id
 from unified_trading_execution.mt5.errors import map_mt5_error
 from unified_trading_execution.mt5.orders import (
     _MT5_ORDER_TYPE_TO_UNIFIED,
@@ -93,6 +94,9 @@ logger = logging.getLogger(__name__)
 _DEAL_QUERY_BACKLOG_SECONDS = 5
 _DEAL_QUERY_FORWARD_SECONDS = 10
 
+# Order-mapping recovery scans MT5 history back this far for ``UTE:`` comments.
+_RECOVERY_DEAL_LOOKBACK_SECONDS = 24 * 60 * 60
+
 # Offset probe: bounded symbol scan; reject impossible offsets (>±24h).
 _MAX_OFFSET_PROBE_SYMBOLS = 20
 _MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
@@ -117,7 +121,7 @@ def _get_mt5() -> Any:
     """Lazy-import ``MetaTrader5``.  Raises ``ImportError`` with a clear
     message on non-Windows platforms."""
     try:
-        import MetaTrader5 as mt5  # type: ignore[import-not-found]
+        import MetaTrader5 as mt5
     except ImportError:
         raise ImportError(
             "MetaTrader5 package is required for MT5 adapter. "
@@ -295,8 +299,10 @@ class MT5Adapter(Adapter):
         4. Build the reverse alias table.
         5. Select every aliased symbol in Market Watch (``symbol_select``)
            so quotes stream for all configured instruments.
-        6. Publish ``ConnectionStateEvent(connected=True)``.
-        7. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
+        6. Recover ``client_order_id → ticket`` maps from ``UTE:`` order
+           comments so pre-restart orders can still be managed.
+        7. Publish ``ConnectionStateEvent(connected=True)``.
+        8. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
 
         The guard is held for the lifetime of the connection and released by
         ``disconnect()``.  On any failure the guard is released and a
@@ -345,6 +351,7 @@ class MT5Adapter(Adapter):
             self._account_login = int(account_info.login)
             self._build_reverse_alias()
             await asyncio.to_thread(self._select_aliased_symbols, mt5)
+            await asyncio.to_thread(self._recover_order_mappings, mt5)
             self._connected = True
             self._publish_connection_state(True)
             self._poll_task = asyncio.create_task(self._poll_loop())
@@ -469,6 +476,15 @@ class MT5Adapter(Adapter):
                 raise map_mt5_error(code, desc or f"symbol_info() failed for {mt5_symbol}")
             request = build_mt5_request(order, mt5_module=mt5)
             request["symbol"] = mt5_symbol
+            comment = encode_client_order_id(client_order_id)
+            if comment is not None:
+                request["comment"] = comment
+            else:
+                logger.warning(
+                    "client_order_id %r is not encodable in an MT5 comment — "
+                    "the id won't be recoverable after a restart",
+                    client_order_id,
+                )
             if order.order_type == OrderType.MARKET:
                 tick = _wait_for_market_tick(mt5, mt5_symbol)
                 if tick is None:
@@ -761,7 +777,9 @@ class MT5Adapter(Adapter):
                 instrument = instruments.get(order.symbol)
                 if instrument is None:
                     continue
-                client_order_id = self._ticket_to_order_id.get(order.ticket, "")
+                client_order_id = decode_comment(order.comment) or self._ticket_to_order_id.get(
+                    order.ticket, ""
+                )
                 record = build_order_record(
                     order,
                     client_order_id,
@@ -1080,16 +1098,20 @@ class MT5Adapter(Adapter):
     ) -> FillRecord:
         """Build a ``FillRecord`` from one MT5 deal tuple.
 
-        MT5 deals carry no client order id, so the id is recovered from the
-        ``ticket → client_order_id`` mapping recorded by ``place_order``.  A
-        pending order's deal references its order ticket (``deal.order``); a
-        market order's deal has ``deal.order == 0`` and is instead keyed by
-        the deal ticket itself (``deal.ticket``), which is what ``place_order``
-        recorded for market executions.  An unknown ticket (order placed from
-        the terminal) yields an empty ``client_order_id``.
+        The ``client_order_id`` is recovered from the deal's comment when it
+        carries our ``UTE:`` tag (the engine's own orders, recoverable even
+        after a restart).  MT5 deals otherwise carry no client order id, so
+        it falls back to the ``ticket → client_order_id`` mapping recorded
+        by ``place_order``: a pending order's deal references its order
+        ticket (``deal.order``); a market order's deal has ``deal.order == 0``
+        and is instead keyed by the deal ticket itself (``deal.ticket``).
+        An unknown ticket (order placed from the terminal) yields an empty
+        ``client_order_id``.
         """
-        client_order_id = self._ticket_to_order_id.get(deal.order) or self._ticket_to_order_id.get(
-            deal.ticket, ""
+        client_order_id = (
+            decode_comment(deal.comment)
+            or self._ticket_to_order_id.get(deal.order)
+            or self._ticket_to_order_id.get(deal.ticket, "")
         )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
         return FillRecord(
@@ -1280,6 +1302,60 @@ class MT5Adapter(Adapter):
                 self._ensure_symbol_selected(broker_symbol, mt5)
             except UteError as exc:
                 logger.warning("Cannot select symbol %s in Market Watch: %s", broker_symbol, exc)
+
+    def _recover_order_mappings(self, mt5: Any) -> None:
+        """Rebuild ``client_order_id ↔ ticket`` maps from MT5 comments.
+
+        Runs once at ``connect()`` so orders placed before a restart can
+        still be modified/cancelled and their fills attributed.  Every open
+        order and every deal in the recent history window is scanned for our
+        ``UTE:`` comment tag (see ``comments.py``).  Idempotent, and never
+        fails the connection — a scan error is logged and skipped, leaving
+        the in-memory maps as they are (best-effort by design).
+        """
+        recovered = 0
+        try:
+            orders = mt5.orders_get()
+        except Exception as exc:
+            logger.warning("Order-mapping recovery: orders_get() failed: %s", exc)
+            orders = None
+        if not isinstance(orders, (tuple, list)):
+            orders = ()
+        for order in orders:
+            recovered += self._record_mapping(decode_comment(order.comment), order.ticket)
+
+        try:
+            from_epoch, to_epoch = self._server_deal_window(
+                mt5,
+                _utcnow() - timedelta(seconds=_RECOVERY_DEAL_LOOKBACK_SECONDS),
+                _utcnow(),
+            )
+            deals = mt5.history_deals_get(from_epoch, to_epoch)
+        except Exception as exc:
+            logger.warning("Order-mapping recovery: history scan failed: %s", exc)
+            deals = None
+        if not isinstance(deals, (tuple, list)):
+            deals = ()
+        for deal in deals:
+            recovered += self._record_mapping(
+                decode_comment(deal.comment), deal.order or deal.ticket
+            )
+
+        if recovered:
+            logger.info(
+                "Recovered %d client_order_id ↔ ticket mapping(s) from MT5 comments", recovered
+            )
+
+    def _record_mapping(self, client_order_id: str | None, ticket: int) -> int:
+        """Record a recovered ``client_order_id → ticket`` pair if unknown.
+
+        Returns 1 when a new mapping was added, otherwise 0.
+        """
+        if client_order_id is None or client_order_id in self._order_id_to_ticket:
+            return 0
+        self._order_id_to_ticket[client_order_id] = ticket
+        self._ticket_to_order_id[ticket] = client_order_id
+        return 1
 
     def _resolve_mt5_symbol(self, instrument: Instrument) -> str:
         """Apply the alias table and return the MT5 broker symbol string.
