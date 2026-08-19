@@ -60,6 +60,7 @@ module = [
     "unified_trading_execution.ctrader.*",
     "uuid_extensions",
     "pybit.*",
+    "MetaTrader5",
 ]
 ignore_missing_imports = true
 

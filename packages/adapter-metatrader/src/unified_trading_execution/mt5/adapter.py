@@ -121,7 +121,7 @@ def _get_mt5() -> Any:
     """Lazy-import ``MetaTrader5``.  Raises ``ImportError`` with a clear
     message on non-Windows platforms."""
     try:
-        import MetaTrader5 as mt5  # type: ignore[import-untyped]
+        import MetaTrader5 as mt5
     except ImportError:
         raise ImportError(
             "MetaTrader5 package is required for MT5 adapter. "
@@ -350,7 +350,7 @@ class MT5Adapter(Adapter):
 
             self._account_login = int(account_info.login)
             self._build_reverse_alias()
-            self._select_aliased_symbols(mt5)
+            await asyncio.to_thread(self._select_aliased_symbols, mt5)
             await asyncio.to_thread(self._recover_order_mappings, mt5)
             self._connected = True
             self._publish_connection_state(True)
@@ -1108,9 +1108,11 @@ class MT5Adapter(Adapter):
         An unknown ticket (order placed from the terminal) yields an empty
         ``client_order_id``.
         """
-        client_order_id = decode_comment(deal.comment) or self._ticket_to_order_id.get(
-            deal.order
-        ) or self._ticket_to_order_id.get(deal.ticket, "")
+        client_order_id = (
+            decode_comment(deal.comment)
+            or self._ticket_to_order_id.get(deal.order)
+            or self._ticket_to_order_id.get(deal.ticket, "")
+        )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
         return FillRecord(
             client_order_id=client_order_id,

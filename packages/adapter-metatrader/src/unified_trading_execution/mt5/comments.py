@@ -34,9 +34,7 @@ _UUID_PAYLOAD_LENGTH = 22
 
 # Canonical lowercase hyphenated UUID — guarantees a byte-identical round
 # trip (no casing/variant normalization drift).
-_CANONICAL_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_CANONICAL_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 _ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 _ALPHABET_INDEX = {char: i for i, char in enumerate(_ALPHABET)}
