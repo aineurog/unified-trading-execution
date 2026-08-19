@@ -518,9 +518,7 @@ class TestFetchFills:
         adapter._server_time_offset = offset
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
-        mock_mt5_module.history_deals_get.return_value = (
-            self._deal(time=_DEAL_TIME + offset),
-        )
+        mock_mt5_module.history_deals_get.return_value = (self._deal(time=_DEAL_TIME + offset),)
 
         fills = await adapter.fetch_fills()
 

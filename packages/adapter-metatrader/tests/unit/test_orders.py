@@ -89,6 +89,7 @@ def _order(
     take_profit: TpSlAttachment | None = None,
     stop_loss: TpSlAttachment | None = None,
     expire_at: datetime | None = None,
+    position_id: str | None = None,
 ) -> UnifiedOrder:
     return UnifiedOrder(
         instrument=_instrument(),
@@ -101,6 +102,7 @@ def _order(
         take_profit=take_profit,
         stop_loss=stop_loss,
         expire_at=expire_at,
+        position_id=position_id,
     )
 
 
@@ -115,6 +117,17 @@ class TestBuildMT5Request:
         assert request["type"] == mock_mt5_module.ORDER_TYPE_BUY
         assert request["action"] == mock_mt5_module.TRADE_ACTION_DEAL
         assert "price" not in request
+
+    def test_position_id_passthrough(self, mock_mt5_module, mt5_constants) -> None:
+        """position_id targets a specific hedge leg via the ``position`` field."""
+        request = build_mt5_request(
+            _order(OrderType.MARKET, OrderSide.SELL, position_id="123456"),
+            mt5_module=mock_mt5_module,
+        )
+        assert request["position"] == 123456
+        assert "position" not in build_mt5_request(
+            _order(OrderType.MARKET, OrderSide.BUY), mt5_module=mock_mt5_module
+        )
 
     def test_market_sell(self, mock_mt5_module, mt5_constants) -> None:
         """MARKET SELL → ORDER_TYPE_SELL."""
