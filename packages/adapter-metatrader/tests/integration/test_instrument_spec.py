@@ -79,4 +79,3 @@ async def test_spec_cached_across_calls(connected_adapter: MT5Adapter) -> None:
     first = await connected_adapter.fetch_instrument_spec(_EURUSD)
     second = await connected_adapter.fetch_instrument_spec(_EURUSD)
     assert first is second
-

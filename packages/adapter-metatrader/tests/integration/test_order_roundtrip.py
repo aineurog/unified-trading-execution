@@ -143,19 +143,22 @@ async def test_order_roundtrip(
         # Rest away from market so the order stays open for modify/cancel.
         reference = bid if side == OrderSide.SELL else ask
         kwargs["price"] = await spec_price(
-            connected_adapter, _INSTRUMENT,
+            connected_adapter,
+            _INSTRUMENT,
             reference * (Decimal("1.05") if side == OrderSide.SELL else Decimal("0.95")),
         )
     elif order_type == OrderType.STOP:
         reference = ask if side == OrderSide.BUY else bid
         kwargs["stop_price"] = await spec_price(
-            connected_adapter, _INSTRUMENT,
+            connected_adapter,
+            _INSTRUMENT,
             reference * (Decimal("1.005") if side == OrderSide.BUY else Decimal("0.995")),
         )
     elif order_type == OrderType.STOP_LIMIT:
         reference = ask if side == OrderSide.BUY else bid
         stop = await spec_price(
-            connected_adapter, _INSTRUMENT,
+            connected_adapter,
+            _INSTRUMENT,
             reference * (Decimal("1.005") if side == OrderSide.BUY else Decimal("0.995")),
         )
         kwargs["stop_price"] = stop
@@ -180,7 +183,8 @@ async def test_order_roundtrip(
         if order_type == OrderType.LIMIT:
             # Move the limit further from the market so it stays pending.
             new_price = await spec_price(
-                connected_adapter, _INSTRUMENT,
+                connected_adapter,
+                _INSTRUMENT,
                 (order.price or Decimal("0"))
                 * (Decimal("0.99") if side == OrderSide.BUY else Decimal("1.01")),
             )
@@ -191,7 +195,8 @@ async def test_order_roundtrip(
         else:
             # Move the stop further from the market so it stays untriggered.
             new_stop = await spec_price(
-                connected_adapter, _INSTRUMENT,
+                connected_adapter,
+                _INSTRUMENT,
                 (order.stop_price or Decimal("0"))
                 * (Decimal("1.006") if side == OrderSide.BUY else Decimal("0.994")),
             )

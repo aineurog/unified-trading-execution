@@ -114,4 +114,3 @@ async def test_hedging_nets_and_closes_leg(connected_adapter: MT5Adapter) -> Non
         assert position.quantity == -qty
     finally:
         await cleanup_adapter(connected_adapter)
-
