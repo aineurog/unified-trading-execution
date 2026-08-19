@@ -693,6 +693,48 @@ class TestPollOnce:
         assert "CRYPTOX.m" in adapter._failed_symbols
         assert "CRYPTOX.m" in caplog.text
 
+    async def test_transient_selection_failure_retried_next_cycle(
+        self,
+        mock_mt5_module: MagicMock,
+        adapter: MT5Adapter,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A transient symbol_select failure is retried — not blacklisted.
+
+        ``_resolve_poll_instruments`` caches permanent errors (unknown symbol /
+        unrecognized path) in ``_failed_symbols`` but lets transient
+        ``UteError`` subclasses retry next cycle, so one flaky IPC call doesn't
+        skip the symbol for the rest of the session.
+        """
+        adapter._reverse_alias = {"GOLD.m": "XAU/USD"}
+        position = Mt5Position(
+            ticket=2001,
+            time=_DEAL_TIME,
+            time_update=_DEAL_TIME,
+            type=0,
+            symbol="GOLD.m",
+            volume=0.1,
+            price_open=1.1000,
+        )
+
+        # First sighting: symbol_select() flakily fails with a transient code.
+        mock_mt5_module.symbol_select.side_effect = [False, True]
+        mock_mt5_module.last_error.side_effect = [(4302, "not selected"), (1, "")]
+        mock_mt5_module.symbol_info.return_value = MagicMock(path="Metals\\XAUUSD")
+
+        with caplog.at_level(logging.WARNING, logger="unified_trading_execution.mt5.adapter"):
+            resolved = adapter._resolve_poll_instruments(mock_mt5_module, (position,), ())
+
+        assert resolved == {}
+        assert "GOLD.m" not in adapter._failed_symbols
+        assert "retry next cycle" in caplog.text
+
+        # Next cycle the symbol resolves normally — not blacklisted.
+        resolved = adapter._resolve_poll_instruments(mock_mt5_module, (position,), ())
+
+        assert "GOLD.m" in resolved
+        assert resolved["GOLD.m"].symbol == "XAU"
+
 
 class TestAssetClassFromPath:
     """Asset-class derivation from symbol_info().path."""

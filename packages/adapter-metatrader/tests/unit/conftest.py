@@ -49,6 +49,7 @@ def mock_mt5_module():
         mock_mt5.RES_E_INTERNAL_FAIL_TIMEOUT = -10005
         mock_mt5.last_error.return_value = (1, "")
         mock_mt5.symbols_get.return_value = []
+        mock_mt5.symbol_select.return_value = True
         mock_get.return_value = mock_mt5
         yield mock_mt5
 
