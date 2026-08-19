@@ -148,7 +148,7 @@ class TestConnect:
         mock_mt5_module,
         monkeypatch,
     ) -> None:
-        """Open orders and recent deals carrying UTE: comments repopulate the
+        """Open orders and recent deals carrying U: comments repopulate the
         client_order_id ↔ ticket maps on connect."""
         await _stub_poll_loop(adapter, monkeypatch)
         cid = str(uuid7())
@@ -186,6 +186,137 @@ class TestConnect:
 
         assert adapter._order_id_to_ticket == {}
         assert adapter._ticket_to_order_id == {}
+        await adapter.disconnect()
+
+
+class _StubStore:
+    """Minimal duck-typed StateStore: query_orders with optional failure."""
+
+    def __init__(self, records: tuple | list, *, error: Exception | None = None) -> None:
+        self._records = records
+        self._error = error
+
+    async def query_orders(self, **kwargs):
+        if self._error is not None:
+            raise self._error
+        return list(self._records)
+
+
+class TestConnectStateStoreSeeding:
+    """connect() seeds client_order_id ↔ ticket maps from the state store."""
+
+    async def test_seeds_mappings_from_store(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """Records in the store populate the maps on connect."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        adapter.attach_state_store(
+            _StubStore(
+                (
+                    SimpleNamespace(client_order_id="cid-1", platform_order_id="5001"),
+                    SimpleNamespace(client_order_id="cid-2", platform_order_id="5002"),
+                )
+            )
+        )
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {"cid-1": 5001, "cid-2": 5002}
+        assert adapter._ticket_to_order_id == {5001: "cid-1", 5002: "cid-2"}
+        await adapter.disconnect()
+
+    async def test_seeding_tolerates_empty_client_id(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """Records without a client_order_id are skipped, not fatal."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        adapter.attach_state_store(
+            _StubStore((SimpleNamespace(client_order_id="", platform_order_id="5001"),))
+        )
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {}
+        await adapter.disconnect()
+
+    async def test_seeding_skips_non_numeric_platform_id(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """A non-numeric platform_order_id is skipped with a warning."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        adapter.attach_state_store(
+            _StubStore(
+                (
+                    SimpleNamespace(client_order_id="cid-1", platform_order_id="not-a-ticket"),
+                    SimpleNamespace(client_order_id="cid-2", platform_order_id="5002"),
+                )
+            )
+        )
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {"cid-2": 5002}
+        await adapter.disconnect()
+
+    async def test_seeding_failure_never_fails_connect(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A failing store query is logged and skipped — connect survives."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        adapter.attach_state_store(_StubStore((), error=RuntimeError("db locked")))
+
+        await adapter.connect()
+
+        assert adapter.is_connected is True
+        assert "state-store query failed" in caplog.text
+        await adapter.disconnect()
+
+    async def test_store_mapping_beats_rewritten_comment(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """A store entry is never overwritten by a (possibly rewritten)
+        comment scan — the store is authoritative."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        cid = str(uuid7())
+        comment = encode_client_order_id(cid)
+        assert comment is not None
+        adapter.attach_state_store(
+            _StubStore((SimpleNamespace(client_order_id=cid, platform_order_id="5001"),))
+        )
+        # The open order's comment decodes to the same id but a DIFFERENT
+        # ticket — a broker rewrite would have changed the stored comment's
+        # payload.  The store's ticket must win.
+        mock_mt5_module.symbols_get.return_value = ()
+        mock_mt5_module.orders_get.return_value = (
+            SimpleNamespace(ticket=6001, comment=comment),
+        )
+        mock_mt5_module.history_deals_get.return_value = ()
+
+        await adapter.connect()
+
+        assert adapter._order_id_to_ticket == {cid: 5001}
+        assert adapter._ticket_to_order_id == {5001: cid}
         await adapter.disconnect()
 
     async def test_eager_selection_tolerates_missing_symbol(

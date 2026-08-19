@@ -285,7 +285,7 @@ class TestPollOnce:
     def test_fill_comment_attributed_before_ticket_maps(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A deal carrying the engine's UTE: tag attributes the fill by comment
+        """A deal carrying the engine's U: tag attributes the fill by comment
         even when the ticket maps are empty (fresh process after a restart)."""
         adapter._build_reverse_alias()
         cid = str(uuid7())

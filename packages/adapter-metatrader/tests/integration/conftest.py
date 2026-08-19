@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import contextlib
 import os
+import tempfile
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -22,6 +24,7 @@ import pytest
 
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5 import MT5Adapter, MT5Config
+from unified_trading_execution.state import SQLiteStateStore
 
 
 def _load_env_files() -> None:
@@ -111,9 +114,22 @@ async def connected_adapter(
     mt5_config: MT5Config,
     event_bus: EventBus,
 ) -> AsyncIterator[MT5Adapter]:
-    """An MT5Adapter connected to a real MT5 terminal — cleaned up after."""
+    """An MT5Adapter connected to a real MT5 terminal — cleaned up after.
+
+    A throwaway ``SQLiteStateStore`` is attached so ``connect()`` exercises
+    the state-store mapping seeding on every integration test, mirroring how
+    the engine wires the adapter (``Engine.__init__`` → ``attach_state_store``).
+    """
+    store_path = Path(tempfile.gettempdir()) / f"ute_mt5_it_{uuid.uuid4().hex}.db"
+    store = SQLiteStateStore(str(store_path))
+    await store.initialize()
     adapter = MT5Adapter(mt5_config, event_bus=event_bus)
+    adapter.attach_state_store(store)
     await adapter.connect()
     yield adapter
     with contextlib.suppress(Exception):
         await adapter.disconnect()
+    with contextlib.suppress(Exception):
+        await store.close()
+    with contextlib.suppress(Exception):
+        store_path.unlink()

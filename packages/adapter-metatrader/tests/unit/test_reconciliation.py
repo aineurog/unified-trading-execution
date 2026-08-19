@@ -340,7 +340,7 @@ class TestFetchOpenOrders:
     async def test_comment_recovers_client_id_without_ticket_map(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A UTE:-tagged order keys by its decoded client_order_id even with an
+        """A U:-tagged order keys by its decoded client_order_id even with an
         empty ticket map (fresh process after a restart)."""
         _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
@@ -357,7 +357,7 @@ class TestFetchOpenOrders:
     async def test_foreign_comment_keys_by_platform_id(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A non-UTE comment falls back to the ticket-map / platform key."""
+        """A non-U: comment falls back to the ticket-map / platform key."""
         _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(comment="manual trade"),)
@@ -485,7 +485,7 @@ class TestFetchFills:
     async def test_comment_recovers_fill_client_id(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A UTE:-tagged deal groups under its decoded client_order_id even
+        """A U:-tagged deal groups under its decoded client_order_id even
         with an empty ticket map (fresh process after a restart)."""
         _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)

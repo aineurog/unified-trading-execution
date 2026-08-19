@@ -1,18 +1,23 @@
 """Pack ``client_order_id`` into an MT5 order comment and recover it later.
 
-MT5 order comments are limited to 29 characters (measured empirically via
-``order_send`` — a longer comment is rejected with ``-2 Invalid "comment"
-argument``; the "31 characters" figure in the MT5 docs is the terminal UI
-limit, not what the trade API enforces).  A 36-character uuid7
+MT5 order comments are limited to 29 characters at the client side (the
+MetaTrader5 Python package rejects a longer comment with ``-2 Invalid
+"comment" argument`` before the request reaches the server — measured
+empirically; the platform's own slot allows 31).  A 36-character uuid7
 ``client_order_id`` therefore cannot be stored raw.  A UUID is exactly 16
 bytes; base62 (``0-9A-Za-z``, 62 symbols ≈ 5.95 bits/char) packs those 16
-bytes into 22 characters.  With a ``UTE:`` marker prefix the full comment
-is 26 characters — inside the 29-char limit, lossless, and collision-free.
+bytes into 22 characters.  With a ``U:`` marker prefix the full comment is
+24 characters — inside every known limit with room to spare, lossless, and
+collision-free.
 
 The comment travels atomically with ``order_send`` and survives in MT5
 history (orders, positions and deals all inherit it), so a restarted
 engine can rebuild its ``client_order_id → ticket`` maps by scanning MT5
-itself — no database required.
+itself.  It is best-effort by design: brokers may rewrite or truncate
+comments, so the authoritative mapping for engine-placed orders lives in
+the state store (see ``_seed_mappings_from_state_store`` in ``adapter.py``);
+the comment is a redundant cross-check and the fallback for orders placed
+outside the engine.
 
 Only canonical lowercase hyphenated UUIDs are encodable.  Any other
 ``client_order_id`` (user-supplied custom strings, upper-case UUIDs) is
@@ -28,7 +33,7 @@ import uuid
 # MT5 order comment limit enforced by the trade API (measured: 29 chars).
 _COMMENT_MAX_LENGTH = 29
 
-_UUID_PREFIX = "UTE:"
+_UUID_PREFIX = "U:"
 # base62 width for exactly 16 bytes: ceil(128 / log2(62)) = 22.
 _UUID_PAYLOAD_LENGTH = 22
 
