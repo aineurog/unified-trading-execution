@@ -41,7 +41,8 @@ from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import AssetClass
 
 # Fixed timestamps for deterministic deal/position diffs — deal times are
-# second-granular and _last_deal_time is advanced to the newest deal seen.
+# second-granular and _last_deal_time (a raw server-as-epoch int) is advanced
+# to the newest deal seen.
 _PAST = datetime(2024, 1, 1, tzinfo=UTC)
 _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
 
@@ -148,7 +149,7 @@ class TestPollOnce:
             ),
         )
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         with patch("asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread:
             await adapter._poll_once()
@@ -173,7 +174,7 @@ class TestPollOnce:
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         captured: list[Event] = []
         event_bus.subscribe(Event, captured.append)
@@ -205,7 +206,7 @@ class TestPollOnce:
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         adapter._ticket_to_order_id = {1001: "client-1"}
 
         # Baseline: one open pending order.
@@ -321,7 +322,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
 
         positions: list[PositionUpdateEvent] = []
@@ -366,7 +367,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         balances: list[BalanceUpdateEvent] = []
         event_bus.subscribe(BalanceUpdateEvent, balances.append)
@@ -402,7 +403,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         mock_mt5_module.account_info.return_value = MagicMock(
             currency="USD",
@@ -427,7 +428,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -458,7 +459,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -533,7 +534,7 @@ class TestPollOnce:
                 position_id=2001,
             ),
         )
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
 
         fills: list[FillEvent] = []
@@ -567,7 +568,7 @@ class TestPollOnce:
                 position_id=2001,
             ),
         )
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         fills: list[FillEvent] = []
         event_bus.subscribe(FillEvent, fills.append)
@@ -581,8 +582,8 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """A deal stored server-as-epoch (real time + server offset) is
-        published with a real-UTC ``fill_timestamp`` and advances
-        ``_last_deal_time`` to real UTC — never the shifted stamp."""
+        published with a real-UTC ``fill_timestamp`` and advances the dedup
+        baseline ``_last_deal_time`` in the raw server-as-epoch basis."""
         adapter._build_reverse_alias()
         offset = 10800  # e.g. a UTC+3 broker
         adapter._server_time_offset = offset
@@ -606,7 +607,7 @@ class TestPollOnce:
             ),
         )
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         fills: list[FillEvent] = []
         event_bus.subscribe(FillEvent, fills.append)
@@ -614,7 +615,7 @@ class TestPollOnce:
 
         assert len(fills) == 1
         assert fills[0].fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
-        assert adapter._last_deal_time == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+        assert adapter._last_deal_time == _DEAL_TIME + offset
 
     async def test_history_window_shifted_by_server_offset(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
@@ -629,12 +630,12 @@ class TestPollOnce:
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp()) + offset
 
         await adapter._poll_once()
 
         call_args = mock_mt5_module.history_deals_get.call_args.args
-        assert call_args[0] == (int(_PAST.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS)
+        assert call_args[0] == (adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS)
         expected_to = int(time.time()) + offset + _DEAL_QUERY_FORWARD_SECONDS
         assert expected_to - 1 <= call_args[1] <= expected_to + 1
 
@@ -652,7 +653,7 @@ class TestPollOnce:
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
         mock_mt5_module.last_error.return_value = (10011, "processing error")
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         with pytest.raises(PlatformError):
             await adapter._poll_once()
@@ -665,7 +666,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -699,7 +700,7 @@ class TestPollOnce:
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         def _symbol_info(symbol: str) -> MagicMock:
             if symbol == "CRYPTOX.m":

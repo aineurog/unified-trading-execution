@@ -183,6 +183,7 @@ def _decimal_places(value: Decimal) -> int:
 _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "FOREX": AssetClass.MARGIN_FX,
     "METALS": AssetClass.MARGIN_FX,  # spot metals (XAUUSD) trade as quoted pairs on margin
+    "COMMODITIES": AssetClass.MARGIN_FX,  # spot metals grouped under Commodities on some brokers
     "INDICES": AssetClass.CFD,  # index CFDs
     "STOCKS": AssetClass.STOCK,
     "CRYPTOCURRENCIES": AssetClass.SPOT,
@@ -235,7 +236,11 @@ class MT5Adapter(Adapter):
         self._last_orders: dict[int, object] = {}
         self._last_positions: dict[Instrument, Position] = {}
         self._last_balance: Balance | None = None
-        self._last_deal_time: datetime = datetime.now(tz=UTC)
+        # Deal dedup baseline in the server-as-epoch basis (raw deal.time).
+        # Anchored lazily on the first window build after the server offset is
+        # measured, then advanced to the newest deal seen.  Keeping it in the
+        # raw basis makes dedup immune to offset-measurement jitter.
+        self._last_deal_time: int | None = None
         self._last_deal_ticket: int = 0
 
         # Server-as-epoch minus real-UTC epoch (seconds); measured from a live
@@ -824,9 +829,7 @@ class MT5Adapter(Adapter):
         def _fetch() -> dict[str, list[FillRecord]]:
             account = mt5.account_info()
             self._check_call_result("account_info", account)
-            deals = mt5.history_deals_get(
-                *self._server_deal_window(mt5, self._last_deal_time, _utcnow())
-            )
+            deals = mt5.history_deals_get(*self._server_deal_window(mt5, _utcnow()))
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
             result: dict[str, list[FillRecord]] = {}
@@ -898,9 +901,7 @@ class MT5Adapter(Adapter):
             # Probe the server-time offset from symbols that are actively
             # trading this cycle (positions/orders).
             probes = tuple({o.symbol for o in orders or ()} | {p.symbol for p in positions or ()})
-            deals = mt5.history_deals_get(
-                *self._server_deal_window(mt5, self._last_deal_time, now, candidates=probes)
-            )
+            deals = mt5.history_deals_get(*self._server_deal_window(mt5, now, candidates=probes))
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, positions, deals)
             return orders, positions, account, deals, instruments, now
@@ -1069,16 +1070,23 @@ class MT5Adapter(Adapter):
         This both catches same-second deals that time alone would miss and
         prevents re-reporting already-published fills.
 
+        The time baseline (``_last_deal_time``) is kept in the raw
+        server-as-epoch basis — never the offset-converted value — so a
+        jittering offset measurement between cycles cannot reorder deals
+        relative to the baseline.
+
         The ticket/time baseline is committed immediately after each
         successful publish, so an exception mid-loop re-tries only the
         unpublished deals — no duplicates for the ones already reported.
         """
         for deal in deals or ():
-            # deal.time is server-as-epoch (shifted by the server offset);
-            # normalize back to real UTC so the baseline and FillEvent
-            # timestamps stay in the same basis as _utcnow().
-            deal_time = from_mt5_epoch(deal.time, self._server_time_offset)
-            if deal_time < self._last_deal_time:
+            # deal.time is server-as-epoch; the dedup baseline is kept in the
+            # same raw basis, so offset-measurement jitter between cycles can
+            # never make an in-order deal look older than the baseline (which
+            # previously lost fills whose conversion straddled an offset change).
+            deal_time = int(deal.time)
+            baseline = self._last_deal_time
+            if baseline is not None and deal_time < baseline:
                 continue
             if deal.type not in (0, 1):
                 continue
@@ -1105,7 +1113,7 @@ class MT5Adapter(Adapter):
             )
             if deal.ticket > self._last_deal_ticket:
                 self._last_deal_ticket = deal.ticket
-            if deal_time > self._last_deal_time:
+            if baseline is None or deal_time > baseline:
                 self._last_deal_time = deal_time
 
     def _build_fill(
@@ -1169,6 +1177,7 @@ class MT5Adapter(Adapter):
             probes = [
                 symbol.name for symbol in (mt5.symbols_get() or ())[:_MAX_OFFSET_PROBE_SYMBOLS]
             ]
+        best: tuple[float, int] | None = None
         for symbol in probes:
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
@@ -1179,27 +1188,45 @@ class MT5Adapter(Adapter):
             offset = int(time_msc / 1000) - int(time.time())
             if abs(offset) > _MAX_SERVER_TIME_OFFSET_SECONDS:
                 continue
-            self._server_time_offset = offset
-            break
+            # Prefer the freshest tick across the probes — a stale tick (a
+            # symbol that has not traded for a while) would skew the offset
+            # and shift deal timestamps away from their real execution time.
+            if best is None or time_msc > best[0]:
+                best = (time_msc, offset)
+        if best is not None:
+            self._server_time_offset = best[1]
         return self._server_time_offset
 
     def _server_deal_window(
         self,
         mt5: Any,
-        from_time: datetime,
         to_time: datetime,
         *,
+        from_time: datetime | None = None,
         candidates: tuple[str, ...] = (),
     ) -> tuple[int, int]:
         """Build a ``history_deals_get`` window in the server-as-epoch basis.
 
         Deal timestamps are stored shifted by the server offset, so the query
         window must be shifted by the same amount (plus small margins to absorb
-        second-granularity rounding).  Returns ``(from_epoch, to_epoch)`` ints.
+        second-granularity rounding).  The lower edge is anchored to the deal
+        dedup baseline (``_last_deal_time``), kept in the same raw
+        server-as-epoch basis, so the window stays correct even when the
+        measured offset jitters between cycles.  Pass ``from_time`` to
+        override the lower edge (e.g. the connect-time recovery scan).
+        Returns ``(from, to)`` epochs.
         """
         offset = self._server_time_offset_seconds(mt5, candidates=candidates)
+        if from_time is not None:
+            start = int(from_time.timestamp()) + offset
+        else:
+            if self._last_deal_time is None:
+                # Anchor the baseline to server-now on first use so the first
+                # window covers only recent deals, not the account's history.
+                self._last_deal_time = int(to_time.timestamp()) + offset
+            start = self._last_deal_time
         return (
-            int(from_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS,
+            start - _DEAL_QUERY_BACKLOG_SECONDS,
             int(to_time.timestamp()) + offset + _DEAL_QUERY_FORWARD_SECONDS,
         )
 
@@ -1393,8 +1420,8 @@ class MT5Adapter(Adapter):
         try:
             from_epoch, to_epoch = self._server_deal_window(
                 mt5,
-                _utcnow() - timedelta(seconds=_RECOVERY_DEAL_LOOKBACK_SECONDS),
                 _utcnow(),
+                from_time=_utcnow() - timedelta(seconds=_RECOVERY_DEAL_LOOKBACK_SECONDS),
             )
             deals = mt5.history_deals_get(from_epoch, to_epoch)
         except Exception as exc:

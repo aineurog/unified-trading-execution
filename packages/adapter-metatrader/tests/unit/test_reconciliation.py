@@ -509,6 +509,7 @@ class TestFetchFills:
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = (self._deal(),)
+        adapter._last_deal_time = int(_PAST.timestamp())
         last_time = adapter._last_deal_time
         last_ticket = adapter._last_deal_ticket
 
@@ -579,7 +580,7 @@ class TestFetchFills:
         assert fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
         call_args = mock_mt5_module.history_deals_get.call_args.args
         assert call_args[0] == (
-            int(adapter._last_deal_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS
+            adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS
         )
 
 
