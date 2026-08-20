@@ -812,7 +812,9 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_fetch)
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills via ``mt5.history_deals_get()``.
 
         Only trading deals (DEAL_TYPE_BUY/SELL) are fills; balance
@@ -820,14 +822,24 @@ class MT5Adapter(Adapter):
         ``client_order_id``.  Unlike the polling loop, this read does not
         advance the fill baseline — reconciliation must not disturb the
         poll loop's dedup state.
+
+        *since* is an optional lower bound (UTC) for the window.  When omitted
+        the poll baseline (``_last_deal_time``) is used, preserving the recent
+        window for direct callers.  When provided (reconciliation), the backlog
+        rewind is disabled so the returned window is symmetric with the
+        engine's own watermark-bounded local fill query.
         """
         mt5 = _get_mt5()
 
         def _fetch() -> dict[str, list[FillRecord]]:
             account = mt5.account_info()
             self._check_call_result("account_info", account)
+            from_time = since if since is not None else self._last_deal_time
+            backlog = 0 if since is not None else _DEAL_QUERY_BACKLOG_SECONDS
             deals = mt5.history_deals_get(
-                *self._server_deal_window(mt5, self._last_deal_time, _utcnow())
+                *self._server_deal_window(
+                    mt5, from_time, _utcnow(), backlog_seconds=backlog
+                )
             )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
@@ -1192,16 +1204,21 @@ class MT5Adapter(Adapter):
         to_time: datetime,
         *,
         candidates: tuple[str, ...] = (),
+        backlog_seconds: int = _DEAL_QUERY_BACKLOG_SECONDS,
     ) -> tuple[int, int]:
         """Build a ``history_deals_get`` window in the server-as-epoch basis.
 
         Deal timestamps are stored shifted by the server offset, so the query
         window must be shifted by the same amount (plus small margins to absorb
         second-granularity rounding).  Returns ``(from_epoch, to_epoch)`` ints.
+
+        *backlog_seconds* rewinds the lower bound.  Reconciliation passes an
+        explicit ``since`` and disables the backlog (0) so its window is exactly
+        symmetric with the engine's local fill query.
         """
         offset = self._server_time_offset_seconds(mt5, candidates=candidates)
         return (
-            int(from_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS,
+            int(from_time.timestamp()) + offset - backlog_seconds,
             int(to_time.timestamp()) + offset + _DEAL_QUERY_FORWARD_SECONDS,
         )
 

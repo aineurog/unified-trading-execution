@@ -53,6 +53,7 @@ class SyncMT5Engine(SyncEngine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        reconcile_interval_seconds: float | None = None,
     ) -> None:
         adapter = config if isinstance(config, MT5Adapter) else MT5Adapter(config)
         super().__init__(
@@ -62,4 +63,5 @@ class SyncMT5Engine(SyncEngine):
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            reconcile_interval_seconds=reconcile_interval_seconds,
         )

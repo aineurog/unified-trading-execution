@@ -66,6 +66,17 @@ class EngineShutdownError(UteError):
     """Called a method on an engine that has been shut down."""
 
 
+# ---- Reconciliation ----
+
+class ReconciliationError(UteError):
+    """A reconciliation pass aborted because a supported dataset fetch failed.
+
+    Raised instead of silently treating the failed dataset as empty, so a
+    transient platform error can never be mistaken for "no drift" and no
+    partial correction is applied against incomplete data.
+    """
+
+
 # ---- Catch-all ----
 
 

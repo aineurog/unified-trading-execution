@@ -17,6 +17,7 @@ from unified_trading_execution.errors import (
     PlatformConnectionError,
     PlatformError,
     RateLimitError,
+    ReconciliationError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
@@ -42,6 +43,7 @@ from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.types import (
     # Enums
     AssetClass,
+    LIVE_ORDER_STATUSES,
     # Data types
     Balance,
     FillRecord,
@@ -67,6 +69,7 @@ __all__ = [
     "AssetClass",
     "HaltClearMode",
     "HaltState",
+    "LIVE_ORDER_STATUSES",
     "OptionRight",
     "OrderSide",
     "OrderStatus",
@@ -119,6 +122,7 @@ __all__ = [
     "OrderNotFoundError",
     "PlatformError",
     "RateLimitError",
+    "ReconciliationError",
     "UnsupportedOrderTypeError",
     # Audit
     "AuditEvent",

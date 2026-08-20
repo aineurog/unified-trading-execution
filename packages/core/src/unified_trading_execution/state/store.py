@@ -20,6 +20,7 @@ from unified_trading_execution.events import (
     ReconciliationMismatch,
 )
 from unified_trading_execution.types.enums import (
+    LIVE_ORDER_STATUSES,
     AssetClass,
     OptionRight,
     OrderSide,
@@ -32,6 +33,10 @@ from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlA
 from unified_trading_execution.types.position import Balance, Position
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
+
+# Key under which the reconciliation "clean through" watermark is persisted in
+# the ``reconciliation_state`` singleton table.
+_RECONCILE_WATERMARK_KEY = "last_clean_through"
 
 
 def _slug(component: str) -> str:
@@ -124,7 +129,9 @@ class StateStore(ABC):
     @abstractmethod
     async def delete_orders_by_client_ids(self, client_order_ids: list[str]) -> None: ...
     @abstractmethod
-    async def delete_fills_by_client_ids(self, client_order_ids: list[str]) -> None: ...
+    async def delete_fills_by_client_ids(
+        self, client_order_ids: list[str], *, since: datetime | None = None
+    ) -> None: ...
 
     @abstractmethod
     async def write_audit_event(self, event: AuditEvent) -> None: ...
@@ -139,6 +146,16 @@ class StateStore(ABC):
     async def get_balance(self, currency: str) -> Balance | None: ...
     @abstractmethod
     async def get_order(self, client_order_id: str) -> OrderRecord | None: ...
+
+    async def query_open_orders(self, *, limit: int = 1000) -> list[OrderRecord]:
+        """Return orders currently live on the platform (PENDING/OPEN/PARTIALLY_FILLED).
+
+        Used by reconciliation to compare open order sets.  The default
+        implementation filters ``query_orders`` by live status; SQLite
+        overrides this with a status-filtered query.
+        """
+        orders = await self.query_orders(limit=limit)
+        return [o for o in orders if o.status in LIVE_ORDER_STATUSES]
 
     @abstractmethod
     async def query_orders(
@@ -198,6 +215,23 @@ class StateStore(ABC):
     async def delete_adapter_config(self, key: str) -> None: ...
     @abstractmethod
     async def list_adapter_config(self, prefix: str) -> dict[str, str]: ...
+
+    async def get_reconcile_watermark(self) -> datetime | None:
+        """Return the persisted reconciliation "clean through" watermark, or None.
+
+        Concrete default returns None; SQLite overrides this with the value
+        persisted in the ``reconciliation_state`` table.  Backends that do not
+        persist a watermark simply reconcile forward-only from first connect.
+        """
+        return None
+
+    async def set_reconcile_watermark(self, watermark: datetime) -> None:
+        """Persist the reconciliation "clean through" watermark.
+
+        Concrete default is a no-op; SQLite overrides this to write the value
+        into the ``reconciliation_state`` table.
+        """
+        return None
 
     @abstractmethod
     async def initialize(self) -> None: ...
@@ -401,54 +435,114 @@ class SQLiteStateStore(StateStore):
     async def upsert_order(self, order: OrderRecord) -> None:
         async with self._write_lock:
             i = _serialise_instrument(order.instrument)
-            await self.conn.execute(
-                """INSERT OR REPLACE INTO orders
-                   (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
-                    expiry, strike, option_right, multiplier, platform_symbol,
-                    order_type, side, quantity, time_in_force, price, stop_price,
-                    reduce_only, client_tag,
-                    take_profit_trigger, take_profit_limit,
-                    stop_loss_trigger, stop_loss_limit,
-                    platform_order_id, status, filled_quantity, average_fill_price,
-                    correlation_id, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    order.client_order_id,
-                    i["symbol"],
-                    i["quote_currency"],
-                    i["asset_class"],
-                    i["exchange"],
-                    i["currency"],
-                    i["expiry"],
-                    i["strike"],
-                    i["option_right"],
-                    i["multiplier"],
-                    i["platform_symbol"],
-                    order.order_type.value,
-                    order.side.value,
-                    str(order.quantity),
-                    order.time_in_force.value,
-                    str(order.price) if order.price else None,
-                    str(order.stop_price) if order.stop_price else None,
-                    1 if order.reduce_only else 0,
-                    order.client_tag,
-                    str(order.take_profit.trigger_price) if order.take_profit else None,
-                    str(order.take_profit.limit_price)
-                    if order.take_profit and order.take_profit.limit_price
-                    else None,
-                    str(order.stop_loss.trigger_price) if order.stop_loss else None,
-                    str(order.stop_loss.limit_price)
-                    if order.stop_loss and order.stop_loss.limit_price
-                    else None,
-                    order.platform_order_id,
-                    order.status.value,
-                    str(order.filled_quantity),
-                    str(order.average_fill_price) if order.average_fill_price else None,
-                    order.correlation_id,
-                    order.created_at.isoformat(),
-                    order.updated_at.isoformat(),
-                ),
-            )
+            now = datetime.now(tz=UTC).isoformat()
+            await self.conn.execute("BEGIN")
+            try:
+                # Current state: latest snapshot per client_order_id.
+                await self.conn.execute(
+                    """INSERT OR REPLACE INTO orders
+                       (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, platform_symbol,
+                        order_type, side, quantity, time_in_force, price, stop_price,
+                        reduce_only, client_tag,
+                        take_profit_trigger, take_profit_limit,
+                        stop_loss_trigger, stop_loss_limit,
+                        platform_order_id, status, filled_quantity, average_fill_price,
+                        correlation_id, created_at, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        order.client_order_id,
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        i["exchange"],
+                        i["currency"],
+                        i["expiry"],
+                        i["strike"],
+                        i["option_right"],
+                        i["multiplier"],
+                        i["platform_symbol"],
+                        order.order_type.value,
+                        order.side.value,
+                        str(order.quantity),
+                        order.time_in_force.value,
+                        str(order.price) if order.price else None,
+                        str(order.stop_price) if order.stop_price else None,
+                        1 if order.reduce_only else 0,
+                        order.client_tag,
+                        str(order.take_profit.trigger_price) if order.take_profit else None,
+                        str(order.take_profit.limit_price)
+                        if order.take_profit and order.take_profit.limit_price
+                        else None,
+                        str(order.stop_loss.trigger_price) if order.stop_loss else None,
+                        str(order.stop_loss.limit_price)
+                        if order.stop_loss and order.stop_loss.limit_price
+                        else None,
+                        order.platform_order_id,
+                        order.status.value,
+                        str(order.filled_quantity),
+                        str(order.average_fill_price) if order.average_fill_price else None,
+                        order.correlation_id,
+                        order.created_at.isoformat(),
+                        order.updated_at.isoformat(),
+                    ),
+                )
+                # Append-only lifecycle snapshot: preserves terminal transitions
+                # and orders later removed from `orders` by orphan resolution.
+                await self.conn.execute(
+                    """INSERT INTO order_history
+                       (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, platform_symbol,
+                        order_type, side, quantity, time_in_force, price, stop_price,
+                        reduce_only, client_tag,
+                        take_profit_trigger, take_profit_limit,
+                        stop_loss_trigger, stop_loss_limit,
+                        platform_order_id, status, filled_quantity, average_fill_price,
+                        correlation_id, created_at, updated_at, recorded_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        order.client_order_id,
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        i["exchange"],
+                        i["currency"],
+                        i["expiry"],
+                        i["strike"],
+                        i["option_right"],
+                        i["multiplier"],
+                        i["platform_symbol"],
+                        order.order_type.value,
+                        order.side.value,
+                        str(order.quantity),
+                        order.time_in_force.value,
+                        str(order.price) if order.price else None,
+                        str(order.stop_price) if order.stop_price else None,
+                        1 if order.reduce_only else 0,
+                        order.client_tag,
+                        str(order.take_profit.trigger_price) if order.take_profit else None,
+                        str(order.take_profit.limit_price)
+                        if order.take_profit and order.take_profit.limit_price
+                        else None,
+                        str(order.stop_loss.trigger_price) if order.stop_loss else None,
+                        str(order.stop_loss.limit_price)
+                        if order.stop_loss and order.stop_loss.limit_price
+                        else None,
+                        order.platform_order_id,
+                        order.status.value,
+                        str(order.filled_quantity),
+                        str(order.average_fill_price) if order.average_fill_price else None,
+                        order.correlation_id,
+                        order.created_at.isoformat(),
+                        order.updated_at.isoformat(),
+                        now,
+                    ),
+                )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def upsert_fill(self, fill: FillRecord) -> None:
         async with self._write_lock:
@@ -547,14 +641,27 @@ class SQLiteStateStore(StateStore):
                     (client_order_id,),
                 )
 
-    async def delete_fills_by_client_ids(self, client_order_ids: list[str]) -> None:
-        """Delete current-state fill rows by client id, holding the write lock."""
+    async def delete_fills_by_client_ids(
+        self, client_order_ids: list[str], *, since: datetime | None = None
+    ) -> None:
+        """Delete fill rows by client id, holding the write lock.
+
+        When *since* is given, only fills with ``fill_timestamp >= since`` are
+        removed, so reconciliation can correct a window of fills without
+        disturbing pre-watermark history.
+        """
         async with self._write_lock:
             for client_order_id in client_order_ids:
-                await self.conn.execute(
-                    "DELETE FROM fills WHERE client_order_id = ?",
-                    (client_order_id,),
-                )
+                if since is None:
+                    await self.conn.execute(
+                        "DELETE FROM fills WHERE client_order_id = ?",
+                        (client_order_id,),
+                    )
+                else:
+                    await self.conn.execute(
+                        "DELETE FROM fills WHERE client_order_id = ? AND fill_timestamp >= ?",
+                        (client_order_id, since.isoformat()),
+                    )
 
     # ---- Audit trail (append-only) ----
 
@@ -702,6 +809,25 @@ class SQLiteStateStore(StateStore):
             rows = await cursor.fetchall()
             return {str(row["key"]): str(row["value"]) for row in rows}
 
+    async def get_reconcile_watermark(self) -> datetime | None:
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT value FROM reconciliation_state WHERE key=?",
+                (_RECONCILE_WATERMARK_KEY,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(str(row["value"]))
+
+    async def set_reconcile_watermark(self, watermark: datetime) -> None:
+        now = datetime.now(tz=UTC).isoformat()
+        async with self._write_lock:
+            await self.conn.execute(
+                "INSERT OR REPLACE INTO reconciliation_state (key, value, updated_at) VALUES (?,?,?)",
+                (_RECONCILE_WATERMARK_KEY, watermark.isoformat(), now),
+            )
+
     # ---- Filtered queries ----
 
     async def query_orders(
@@ -725,6 +851,22 @@ class SQLiteStateStore(StateStore):
             params.append(end.isoformat())
         query += " ORDER BY created_at DESC LIMIT ?"
         params.append(limit)
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            return [self._row_to_order_record(r) for r in await cursor.fetchall()]
+
+    async def query_open_orders(self, *, limit: int = 1000) -> list[OrderRecord]:
+        """Return orders currently live (PENDING/OPEN/PARTIALLY_FILLED)."""
+        query = (
+            "SELECT * FROM orders WHERE status IN (?,?,?) "
+            "ORDER BY created_at DESC LIMIT ?"
+        )
+        params: list[Any] = [
+            OrderStatus.PENDING.value,
+            OrderStatus.OPEN.value,
+            OrderStatus.PARTIALLY_FILLED.value,
+            limit,
+        ]
         async with self._write_lock:
             cursor = await self.conn.execute(query, params)
             return [self._row_to_order_record(r) for r in await cursor.fetchall()]

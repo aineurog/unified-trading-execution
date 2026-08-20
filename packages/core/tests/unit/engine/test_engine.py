@@ -7,7 +7,7 @@ without hitting a real platform.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
@@ -21,6 +21,7 @@ from unified_trading_execution.errors import (
     InvalidSymbolError,
     OrderNotFoundError,
     RateLimitError,
+    ReconciliationError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
@@ -865,6 +866,13 @@ class TestReconcileMismatchCases:
 
     async def test_partial_fill_discrepancy_detected(self, engine, mock_adapter):
         """Case 5: local and platform fill quantities differ for the same order."""
+        # Establish a "clean through" watermark in the past so this pass
+        # compares fills newer than it.  (Forward-only bootstrap otherwise
+        # starts the watermark at "now" and skips pre-seeded fills.)
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+
         # Place an order locally
         await engine.place_order(_order(client_order_id="fill-disc"))
 
@@ -923,6 +931,167 @@ class TestReconcileMismatchCases:
         result = await engine.reconcile()
         assert result.is_clean
         assert not engine.halt_machine.is_instrument_halted(_instrument())
+
+
+class TestReconcileHaltScoping:
+    """Only position/balance drift halts; orphan and partial-fill are corrected silently."""
+
+    async def test_orphan_in_local_does_not_halt(self, engine, mock_adapter):
+        local_order = OrderRecord(
+            instrument=_instrument(),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("1"),
+            time_in_force=TimeInForce.GTC,
+            client_order_id="orphan-local",
+            price=Decimal("50000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id="pf-local-orphan",
+            status=OrderStatus.OPEN,
+            filled_quantity=Decimal("0"),
+            average_fill_price=None,
+            correlation_id="corr-local-orphan",
+            created_at=_utcnow(),
+            updated_at=_utcnow(),
+        )
+        await engine.state_store.upsert_order(local_order)
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+
+        result = await engine.reconcile()
+        assert result.orphan_orders_in_local == ["orphan-local"]
+        # Corrected without halting — orphan is an order artefact, not drift.
+        assert engine.halt_machine.active_halts() == []
+
+    async def test_partial_fill_does_not_halt(self, engine, mock_adapter):
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="fill-disc"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+        await engine.state_store.upsert_fill(
+            FillRecord(
+                client_order_id="fill-disc",
+                platform_fill_id="lf-001",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.3"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=_utcnow(),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-local",
+            )
+        )
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="fill-disc",
+                platform_fill_id="pf-001",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.7"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=_utcnow(),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-platform",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert len(result.partial_fill_discrepancies) == 1
+        assert engine.halt_machine.active_halts() == []
+
+
+class TestReconcileTriState:
+    """Unsupported datasets are skipped; other fetch failures abort the pass loudly."""
+
+    async def test_unsupported_fetch_is_skipped(self, engine, mock_adapter):
+        # A local position with an unsupported platform fetch must not be
+        # flagged as local-only (the unsupported fetch is skipped, not empty).
+        await engine.state_store.upsert_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=_utcnow(),
+            )
+        )
+        mock_adapter.set_next_error(NotImplementedError("no bulk position fetch"))
+
+        result = await engine.reconcile()
+        assert result.position_mismatches == []
+        assert not engine.halt_machine.is_instrument_halted(_instrument())
+
+    async def test_fetch_error_aborts_pass(self, engine, mock_adapter):
+        mock_adapter.set_next_error(RuntimeError("platform down"))
+        with pytest.raises(ReconciliationError):
+            await engine.reconcile()
+
+
+class TestClearHalt:
+    async def test_manual_clear(self, engine):
+        engine.halt_machine.enter_halt("instrument", _instrument(), "reason", "detail")
+        assert engine.halt_machine.is_instrument_halted(_instrument())
+
+        cleared = await engine.clear_halt("instrument", instrument=_instrument())
+        assert cleared is True
+        assert not engine.halt_machine.is_instrument_halted(_instrument())
+
+    async def test_manual_clear_non_halted_returns_false(self, engine):
+        cleared = await engine.clear_halt("instrument", instrument=_instrument())
+        assert cleared is False
+
+
+class TestPeriodicReconcile:
+    async def test_loop_task_created_when_enabled(self, mock_adapter, event_bus):
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+            get_reference_price=_ref_price,
+            reconcile_interval_seconds=0.5,
+        )
+        await eng.connect()
+        try:
+            assert eng._reconcile_loop_task is not None
+            assert not eng._reconcile_loop_task.done()
+        finally:
+            await eng.ashutdown()
+
+    async def test_no_loop_task_when_disabled(self, mock_adapter, event_bus):
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+            get_reference_price=_ref_price,
+        )
+        await eng.connect()
+        try:
+            assert eng._reconcile_loop_task is None
+        finally:
+            await eng.ashutdown()
+
+    def test_invalid_interval_raises(self, mock_adapter, event_bus):
+        with pytest.raises(ValueError):
+            Engine(adapter=mock_adapter, event_bus=event_bus, reconcile_interval_seconds=0)
 
 
 # ── timeout idempotency (Section 9.2) ───────────────────────────────
