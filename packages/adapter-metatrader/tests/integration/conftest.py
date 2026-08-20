@@ -105,7 +105,6 @@ def mt5_config(
         login=mt5_login,
         password=mt5_password,
         server=mt5_server,
-        symbol_alias_table={},
     )
 
 

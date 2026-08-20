@@ -26,6 +26,8 @@ from unified_trading_execution.events import ConnectionStateEvent
 from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.mt5.adapter import _connected_lock
 from unified_trading_execution.mt5.comments import encode_client_order_id
+from unified_trading_execution.types.enums import AssetClass
+from unified_trading_execution.types.instrument import Instrument
 
 
 def _collect_events(event_bus) -> list[ConnectionStateEvent]:
@@ -72,11 +74,10 @@ class TestConnect:
 
         assert adapter.is_connected is True
         assert adapter.account_id == "12345678"
-        assert adapter._reverse_alias == {"EURUSD.m": "EUR/USD"}
         assert adapter._poll_task is not None and not adapter._poll_task.done()
 
-        mock_mt5_module.symbol_select.assert_called_once_with("EURUSD.m", True)
-        assert adapter._selected_symbols == {"EURUSD.m"}
+        mock_mt5_module.symbol_select.assert_not_called()
+        assert adapter._selected_symbols == set()
 
         assert len(events) == 1
         event = events[0]
@@ -101,7 +102,6 @@ class TestConnect:
             password="test-password",
             server="TestBroker-Demo",
             path=r"C:\Program Files\MetaTrader 5\terminal64.exe",
-            symbol_alias_table={"EUR/USD": "EURUSD.m"},
         )
         adapter = MT5Adapter(config, event_bus=event_bus)
         await _stub_poll_loop(adapter, monkeypatch)
@@ -114,30 +114,6 @@ class TestConnect:
             password=config.password,
             server=config.server,
         )
-
-        await adapter.disconnect()
-
-    async def test_eagerly_selects_all_aliased_symbols(
-        self,
-        event_bus,
-        mock_mt5_module,
-        monkeypatch,
-    ) -> None:
-        """connect() selects every broker symbol in the alias table."""
-        config = MT5Config(
-            login=12345678,
-            password="test-password",
-            server="TestBroker-Demo",
-            symbol_alias_table={"EUR/USD": "EURUSD.m", "XAU/USD": "XAUUSD"},
-        )
-        adapter = MT5Adapter(config, event_bus=event_bus)
-        await _stub_poll_loop(adapter, monkeypatch)
-
-        await adapter.connect()
-
-        mock_mt5_module.symbol_select.assert_any_call("EURUSD.m", True)
-        mock_mt5_module.symbol_select.assert_any_call("XAUUSD", True)
-        assert adapter._selected_symbols == {"EURUSD.m", "XAUUSD"}
 
         await adapter.disconnect()
 
@@ -190,10 +166,17 @@ class TestConnect:
 
 
 class _StubStore:
-    """Minimal duck-typed StateStore: query_orders with optional failure."""
+    """Minimal duck-typed StateStore: query_orders/query_positions with optional failure."""
 
-    def __init__(self, records: tuple | list, *, error: Exception | None = None) -> None:
+    def __init__(
+        self,
+        records: tuple | list = (),
+        *,
+        positions: tuple | list = (),
+        error: Exception | None = None,
+    ) -> None:
         self._records = records
+        self._positions = positions
         self._error = error
 
     async def query_orders(self, **kwargs):
@@ -201,9 +184,15 @@ class _StubStore:
             raise self._error
         return list(self._records)
 
+    async def query_positions(self, **kwargs):
+        if self._error is not None:
+            raise self._error
+        return list(self._positions)
+
 
 class TestConnectStateStoreSeeding:
-    """connect() seeds client_order_id ↔ ticket maps from the state store."""
+    """connect() seeds client_order_id ↔ ticket and platform_symbol → Instrument
+    maps from the state store."""
 
     async def test_seeds_mappings_from_store(
         self,
@@ -227,6 +216,33 @@ class TestConnectStateStoreSeeding:
 
         assert adapter._order_id_to_ticket == {"cid-1": 5001, "cid-2": 5002}
         assert adapter._ticket_to_order_id == {5001: "cid-1", 5002: "cid-2"}
+        await adapter.disconnect()
+
+    async def test_seeds_symbol_mappings_from_store(
+        self,
+        adapter,
+        event_bus,
+        mock_mt5_module,
+        monkeypatch,
+    ) -> None:
+        """Records carrying an instrument seed platform_symbol → Instrument."""
+        await _stub_poll_loop(adapter, monkeypatch)
+        inst = Instrument(
+            symbol="EUR",
+            quote_currency="USD",
+            asset_class=AssetClass.MARGIN_FX,
+            platform_symbol="EURUSD.m",
+        )
+        adapter.attach_state_store(
+            _StubStore(
+                (SimpleNamespace(instrument=inst, client_order_id=""),),
+                positions=(SimpleNamespace(instrument=inst),),
+            )
+        )
+
+        await adapter.connect()
+
+        assert adapter._symbol_to_instrument == {"EURUSD.m": inst}
         await adapter.disconnect()
 
     async def test_seeding_tolerates_empty_client_id(
@@ -315,39 +331,6 @@ class TestConnectStateStoreSeeding:
 
         assert adapter._order_id_to_ticket == {cid: 5001}
         assert adapter._ticket_to_order_id == {5001: cid}
-        await adapter.disconnect()
-
-    async def test_eager_selection_tolerates_missing_symbol(
-        self,
-        event_bus,
-        mock_mt5_module,
-        monkeypatch,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        """A broker-missing aliased symbol must not fail the whole connect."""
-        config = MT5Config(
-            login=12345678,
-            password="test-password",
-            server="TestBroker-Demo",
-            symbol_alias_table={"EUR/USD": "EURUSD.m", "FAKE/USD": "FAKEUSD"},
-        )
-        adapter = MT5Adapter(config, event_bus=event_bus)
-        await _stub_poll_loop(adapter, monkeypatch)
-
-        def _symbol_select(symbol: str, enable: bool) -> bool:
-            return symbol != "FAKEUSD"
-
-        mock_mt5_module.symbol_select.side_effect = _symbol_select
-        mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
-
-        with caplog.at_level("WARNING", logger="unified_trading_execution.mt5.adapter"):
-            await adapter.connect()
-
-        assert adapter.is_connected is True
-        mock_mt5_module.symbol_select.assert_any_call("FAKEUSD", True)
-        assert "FAKEUSD" in adapter._failed_symbols
-        assert "FAKEUSD" in caplog.text
-
         await adapter.disconnect()
 
     async def test_initialize_failure(

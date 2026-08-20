@@ -96,7 +96,12 @@ def mt5_constants(mock_mt5_module) -> None:
 
 
 def _instrument() -> Instrument:
-    return Instrument(symbol="EUR", asset_class=AssetClass.MARGIN_FX, quote_currency="USD")
+    return Instrument(
+        symbol="EUR",
+        asset_class=AssetClass.MARGIN_FX,
+        quote_currency="USD",
+        platform_symbol="EURUSD.m",
+    )
 
 
 def _order(

@@ -8,7 +8,6 @@ Usage::
         login=12345678,
         password="hunter2",
         server="ICMarkets-Demo",
-        symbol_alias_table={"EUR/USD": "EURUSD.m"},
     ))
     await engine.connect()
     result = await engine.place_order(order)

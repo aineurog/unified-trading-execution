@@ -16,31 +16,24 @@ import os
 import pytest
 
 from unified_trading_execution.errors import InvalidSymbolError
-from unified_trading_execution.mt5 import MT5Adapter, MT5Config
+from unified_trading_execution.mt5 import MT5Adapter
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
 
-_BROKER_SYMBOLS = {
-    "EUR/USD": os.getenv("MT5_SYMBOL", "EURUSD").strip(),
-    "XAU/USD": os.getenv("MT5_SYMBOL_XAU", "XAUUSD").strip(),
-}
-_EURUSD = Instrument(symbol="EUR", quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
-_XAUUSD = Instrument(symbol="XAU", quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
-
-
-@pytest.fixture
-def mt5_config(
-    mt5_login: int,
-    mt5_password: str,
-    mt5_server: str,
-) -> MT5Config:
-    """Override the shared config with the pair aliases under test."""
-    return MT5Config(
-        login=mt5_login,
-        password=mt5_password,
-        server=mt5_server,
-        symbol_alias_table=_BROKER_SYMBOLS,
-    )
+_BROKER_SYMBOL = os.getenv("MT5_SYMBOL", "EURUSD").strip()
+_BROKER_SYMBOL_XAU = os.getenv("MT5_SYMBOL_XAU", "XAUUSD").strip()
+_EURUSD = Instrument(
+    symbol="EUR",
+    quote_currency="USD",
+    asset_class=AssetClass.MARGIN_FX,
+    platform_symbol=_BROKER_SYMBOL,
+)
+_XAUUSD = Instrument(
+    symbol="XAU",
+    quote_currency="USD",
+    asset_class=AssetClass.MARGIN_FX,
+    platform_symbol=_BROKER_SYMBOL_XAU,
+)
 
 
 async def _assert_populated(spec) -> None:
@@ -69,7 +62,12 @@ async def test_second_symbol_spec_populated(connected_adapter: MT5Adapter) -> No
 
 async def test_unknown_symbol_raises_invalid_symbol(connected_adapter: MT5Adapter) -> None:
     """A symbol the broker does not list raises InvalidSymbolError."""
-    unknown = Instrument(symbol="ZZZ", quote_currency="ZZZ", asset_class=AssetClass.MARGIN_FX)
+    unknown = Instrument(
+        symbol="ZZZ",
+        quote_currency="ZZZ",
+        asset_class=AssetClass.MARGIN_FX,
+        platform_symbol="ZZZ_NO_SUCH_SYMBOL",
+    )
     with pytest.raises(InvalidSymbolError):
         await connected_adapter.fetch_instrument_spec(unknown)
 
