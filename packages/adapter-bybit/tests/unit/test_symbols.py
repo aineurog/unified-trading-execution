@@ -67,6 +67,15 @@ class TestToBybitSymbol:
         )
         assert to_bybit_symbol(inst) == "BTCUSD"
 
+    def test_platform_symbol_returned_verbatim(self) -> None:
+        inst = Instrument(
+            symbol="BTC",
+            quote_currency="USDT",
+            asset_class=AssetClass.SPOT,
+            platform_symbol="BTCUSDT.P",
+        )
+        assert to_bybit_symbol(inst) == "BTCUSDT.P"
+
     def test_raises_on_unsupported_asset_class(self) -> None:
         inst = Instrument(
             symbol="AAPL",

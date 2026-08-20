@@ -36,7 +36,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
     TimeInForce,
 )
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 _PAST = datetime(2024, 1, 1, tzinfo=UTC)
 _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
@@ -586,30 +586,31 @@ class TestFetchFills:
 class TestResolveMt5Symbol:
     """_resolve_mt5_symbol — alias precedence, override fallback, non-pair guard."""
 
-    def _instrument(self, symbol: str = "EUR", quote: str | None = "USD") -> Instrument:
+    def _instrument(
+        self, symbol: str = "EUR", quote: str | None = "USD", platform_symbol: str | None = None
+    ) -> Instrument:
         return Instrument(
             symbol=symbol,
             quote_currency=quote,
             asset_class=AssetClass.MARGIN_FX,
+            platform_symbol=platform_symbol,
         )
 
-    def test_alias_wins_over_override(self, adapter: MT5Adapter) -> None:
-        """The alias table beats a pre-set broker_symbol_override."""
-        inst = _with_broker_override(self._instrument(), "EURUSDpro")
+    def test_alias_wins_over_platform_symbol(self, adapter: MT5Adapter) -> None:
+        """The alias table beats a pre-set platform_symbol."""
+        inst = self._instrument(platform_symbol="EURUSDpro")
 
         assert adapter._resolve_mt5_symbol(inst) == "EURUSD.m"
 
-    def test_broker_override_used_without_alias(self, adapter: MT5Adapter) -> None:
-        """Without an alias, the instrument's own override is honoured."""
-        inst = _with_broker_override(self._instrument(symbol="GBP"), "GBPUSDpro")
+    def test_platform_symbol_used_without_alias(self, adapter: MT5Adapter) -> None:
+        """Without an alias, the instrument's own platform_symbol is honoured."""
+        inst = self._instrument(symbol="GBP", platform_symbol="GBPUSDpro")
 
         assert adapter._resolve_mt5_symbol(inst) == "GBPUSDpro"
 
-    def test_non_pair_stock_uses_override(self, adapter: MT5Adapter) -> None:
-        """``str()`` raises for STOCK — the override still resolves."""
-        inst = _with_broker_override(
-            Instrument(symbol="AAPL", asset_class=AssetClass.STOCK), "AAPL.US"
-        )
+    def test_non_pair_stock_uses_platform_symbol(self, adapter: MT5Adapter) -> None:
+        """``str()`` raises for STOCK — the platform_symbol still resolves."""
+        inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK, platform_symbol="AAPL.US")
 
         assert adapter._resolve_mt5_symbol(inst) == "AAPL.US"
 

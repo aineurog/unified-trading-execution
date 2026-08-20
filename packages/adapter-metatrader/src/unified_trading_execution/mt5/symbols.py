@@ -13,9 +13,9 @@ Translation contract:
 
 **Outbound (canonical → broker):**
 
-    1. Adapter looks up ``str(instrument)`` (``"EUR/USD"``) in the alias table.
-    2. Finds ``"EURUSD.m"`` → calls ``_with_broker_override(instrument, "EURUSD.m")``.
-    3. ``to_mt5_symbol(instrument)`` returns ``"EURUSD.m"``.
+    1. Adapter resolves the broker symbol (``"EURUSD.m"``) from the alias table
+       and attaches it as ``instrument.platform_symbol``.
+    2. ``to_mt5_symbol(instrument)`` returns ``platform_symbol`` verbatim.
 
 **Inbound (broker → canonical):**
 
@@ -39,21 +39,20 @@ from unified_trading_execution.types.instrument import Instrument
 def to_mt5_symbol(instrument: Instrument) -> str:
     """Convert a canonical ``Instrument`` to an MT5 broker symbol string.
 
-    If ``instrument.broker_symbol_override`` is set (populated by the alias
-    table via ``_with_broker_override``), it is returned directly.
+    If ``instrument.platform_symbol`` is set it is returned verbatim.
     Otherwise, the base translation is applied: the symbol and quote currency
     are concatenated (e.g., ``"EUR"`` + ``"USD"`` → ``"EURUSD"``).
 
-    Raises ``ValueError`` if ``quote_currency`` is missing and no broker
-    override is set — aliasing is mandatory for such instruments.
+    Raises ``ValueError`` if ``quote_currency`` is missing and no
+    ``platform_symbol`` is set — a broker symbol is mandatory for such
+    instruments.
     """
-    override = instrument.broker_symbol_override
-    if override is not None:
-        return override
+    if instrument.platform_symbol is not None:
+        return instrument.platform_symbol
     if instrument.quote_currency is None:
         raise ValueError(
             f"Instrument {instrument.symbol!r} has no quote_currency and no "
-            "broker_symbol_override — cannot build MT5 symbol"
+            "platform_symbol — cannot build MT5 symbol"
         )
     return f"{instrument.symbol}{instrument.quote_currency}"
 

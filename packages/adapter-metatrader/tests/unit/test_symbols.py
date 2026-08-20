@@ -2,7 +2,7 @@
 
 Tests cases:
     - to_mt5_symbol: concatenates symbol + quote currency
-    - to_mt5_symbol: returns broker_symbol_override directly when set
+    - to_mt5_symbol: returns platform_symbol directly when set
     - to_mt5_symbol: handles 3-letter and non-standard currency codes
     - from_mt5_symbol: splits canonical shorthand from reverse alias table
     - from_mt5_symbol: returns None quote when shorthand has no quote
@@ -21,7 +21,7 @@ from unified_trading_execution.mt5.symbols import (
     to_mt5_symbol,
 )
 from unified_trading_execution.types.enums import AssetClass
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 
 class TestToMT5Symbol:
@@ -36,15 +36,15 @@ class TestToMT5Symbol:
         )
         assert to_mt5_symbol(instrument) == "EURUSD"
 
-    def test_uses_broker_override_when_set(self) -> None:
-        """broker_symbol_override is returned directly."""
+    def test_uses_platform_symbol_when_set(self) -> None:
+        """platform_symbol is returned verbatim."""
         instrument = Instrument(
             symbol="EUR",
             quote_currency="USD",
             asset_class=AssetClass.MARGIN_FX,
+            platform_symbol="EURUSD.m",
         )
-        overridden = _with_broker_override(instrument, "EURUSD.m")
-        assert to_mt5_symbol(overridden) == "EURUSD.m"
+        assert to_mt5_symbol(instrument) == "EURUSD.m"
 
     def test_non_standard_currencies(self) -> None:
         """3-letter and longer currency codes."""

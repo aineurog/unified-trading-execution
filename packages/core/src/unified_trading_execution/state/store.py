@@ -77,7 +77,7 @@ def _serialise_instrument(i: Instrument) -> dict[str, Any]:
         "strike": str(i.strike) if i.strike is not None else None,
         "option_right": i.option_right.value if i.option_right else None,
         "multiplier": i.multiplier,
-        "broker_symbol_override": i.broker_symbol_override,
+        "platform_symbol": i.platform_symbol,
     }
 
 
@@ -92,6 +92,7 @@ def _deserialise_instrument(d: dict[str, Any]) -> Instrument:
         strike=Decimal(d["strike"]) if d.get("strike") else None,
         option_right=OptionRight(d["option_right"]) if d.get("option_right") else None,
         multiplier=d.get("multiplier"),
+        platform_symbol=d.get("platform_symbol"),
     )
 
 
@@ -319,7 +320,7 @@ class SQLiteStateStore(StateStore):
                 await self.conn.execute(
                     """INSERT OR REPLACE INTO positions
                        (symbol, quote_currency, asset_class, exchange, currency,
-                        expiry, strike, option_right, multiplier, broker_symbol_override,
+                        expiry, strike, option_right, multiplier, platform_symbol,
                         quantity, average_entry_price, updated_at)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
@@ -332,7 +333,7 @@ class SQLiteStateStore(StateStore):
                         i["strike"],
                         i["option_right"],
                         i["multiplier"],
-                        i["broker_symbol_override"],
+                        i["platform_symbol"],
                         str(position.quantity),
                         str(position.average_entry_price),
                         now,
@@ -341,7 +342,7 @@ class SQLiteStateStore(StateStore):
                 await self.conn.execute(
                     """INSERT INTO position_history
                        (symbol, quote_currency, asset_class, exchange, currency,
-                        expiry, strike, option_right, multiplier, broker_symbol_override,
+                        expiry, strike, option_right, multiplier, platform_symbol,
                         quantity, average_entry_price, recorded_at)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
@@ -354,7 +355,7 @@ class SQLiteStateStore(StateStore):
                         i["strike"],
                         i["option_right"],
                         i["multiplier"],
-                        i["broker_symbol_override"],
+                        i["platform_symbol"],
                         str(position.quantity),
                         str(position.average_entry_price),
                         now,
@@ -403,7 +404,7 @@ class SQLiteStateStore(StateStore):
             await self.conn.execute(
                 """INSERT OR REPLACE INTO orders
                    (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
-                    expiry, strike, option_right, multiplier, broker_symbol_override,
+                    expiry, strike, option_right, multiplier, platform_symbol,
                     order_type, side, quantity, time_in_force, price, stop_price,
                     reduce_only, client_tag,
                     take_profit_trigger, take_profit_limit,
@@ -422,7 +423,7 @@ class SQLiteStateStore(StateStore):
                     i["strike"],
                     i["option_right"],
                     i["multiplier"],
-                    i["broker_symbol_override"],
+                    i["platform_symbol"],
                     order.order_type.value,
                     order.side.value,
                     str(order.quantity),
@@ -456,7 +457,7 @@ class SQLiteStateStore(StateStore):
                 """INSERT INTO fills
                    (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                     exchange, currency, expiry, strike, option_right, multiplier,
-                    broker_symbol_override, fill_quantity, fill_price, fill_timestamp,
+                    platform_symbol, fill_quantity, fill_price, fill_timestamp,
                     fee_currency, fee_amount, correlation_id)
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
@@ -471,7 +472,7 @@ class SQLiteStateStore(StateStore):
                     i["strike"],
                     i["option_right"],
                     i["multiplier"],
-                    i["broker_symbol_override"],
+                    i["platform_symbol"],
                     str(fill.fill_quantity),
                     str(fill.fill_price),
                     fill.fill_timestamp.isoformat(),
@@ -505,7 +506,7 @@ class SQLiteStateStore(StateStore):
             """INSERT INTO fills
                (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                 exchange, currency, expiry, strike, option_right, multiplier,
-                broker_symbol_override, fill_quantity, fill_price, fill_timestamp,
+                platform_symbol, fill_quantity, fill_price, fill_timestamp,
                 fee_currency, fee_amount, correlation_id)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
@@ -520,7 +521,7 @@ class SQLiteStateStore(StateStore):
                 i["strike"],
                 i["option_right"],
                 i["multiplier"],
-                i["broker_symbol_override"],
+                i["platform_symbol"],
                 str(fill.fill_quantity),
                 str(fill.fill_price),
                 fill.fill_timestamp.isoformat(),

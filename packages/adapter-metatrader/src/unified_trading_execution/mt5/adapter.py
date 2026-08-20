@@ -75,7 +75,6 @@ from unified_trading_execution.types.enums import (
 from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
-    _with_broker_override,
 )
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -1266,9 +1265,11 @@ class MT5Adapter(Adapter):
                 desc or f"mt5.symbol_info() returned None for {mt5_symbol}",
             )
         asset_class = self._asset_class_from_path(info.path)
-        instrument = _with_broker_override(
-            Instrument(symbol=symbol, quote_currency=quote, asset_class=asset_class),
-            mt5_symbol,
+        instrument = Instrument(
+            symbol=symbol,
+            quote_currency=quote,
+            asset_class=asset_class,
+            platform_symbol=mt5_symbol,
         )
         self._symbol_to_instrument[mt5_symbol] = instrument
         return instrument
@@ -1428,11 +1429,11 @@ class MT5Adapter(Adapter):
 
         The alias table is authoritative per D-8: an entry for the
         instrument's shorthand wins over any pre-set
-        ``broker_symbol_override``.  ``str()`` only produces a "BASE/QUOTE"
+        ``platform_symbol``.  ``str()`` only produces a "BASE/QUOTE"
         shorthand for pairs (forex/crypto/perp) — it raises ``ValueError``
         for stocks, CFDs, bonds, funds, and dated futures, so the alias
         lookup is guarded and those instruments resolve via
-        ``to_mt5_symbol`` (which honours ``broker_symbol_override`` and
+        ``to_mt5_symbol`` (which honours ``platform_symbol`` and
         finally falls back to ``symbol + quote_currency``).
         """
         try:
@@ -1441,7 +1442,7 @@ class MT5Adapter(Adapter):
             alias_key = None
         override = self._config.symbol_alias_table.get(alias_key) if alias_key is not None else None
         if override is not None:
-            instrument = _with_broker_override(instrument, override)
+            instrument = replace(instrument, platform_symbol=override)
         return to_mt5_symbol(instrument)
 
     def _invalidate_spec_cache(self, instrument: Instrument) -> None:

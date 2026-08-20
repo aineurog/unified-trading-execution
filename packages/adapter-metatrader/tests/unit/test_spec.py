@@ -15,14 +15,17 @@ from unified_trading_execution.errors import InvalidSymbolError
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.types.enums import AssetClass
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 
-def _instrument(symbol: str = "EUR", quote: str = "USD") -> Instrument:
+def _instrument(
+    symbol: str = "EUR", quote: str = "USD", platform_symbol: str | None = None
+) -> Instrument:
     return Instrument(
         symbol=symbol,
         quote_currency=quote,
         asset_class=AssetClass.MARGIN_FX,
+        platform_symbol=platform_symbol,
     )
 
 
@@ -179,26 +182,24 @@ class TestFetchInstrumentSpec:
 
         mock_mt5_module.symbol_info.assert_called_once_with("GBPUSD")
 
-    async def test_broker_override_used_without_alias(
+    async def test_platform_symbol_used_without_alias(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A pre-set ``broker_symbol_override`` survives when no alias matches."""
+        """A pre-set ``platform_symbol`` survives when no alias matches."""
         mock_mt5_module.symbol_info.return_value = _spec_info()
-        inst = _with_broker_override(_instrument(symbol="GBP"), "GBPUSDpro")
+        inst = _instrument(symbol="GBP", platform_symbol="GBPUSDpro")
 
         await adapter.fetch_instrument_spec(inst)
 
         mock_mt5_module.symbol_info.assert_called_once_with("GBPUSDpro")
 
-    async def test_stock_with_override_resolves_broker_symbol(
+    async def test_stock_with_platform_symbol_resolves_broker_symbol(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A non-pair instrument (stock) with an override resolves via the
-        override — ``str(instrument)`` raises for STOCK and must not be fatal."""
+        """A non-pair instrument (stock) with a platform_symbol resolves via
+        it — ``str(instrument)`` raises for STOCK and must not be fatal."""
         mock_mt5_module.symbol_info.return_value = _spec_info()
-        inst = _with_broker_override(
-            Instrument(symbol="AAPL", asset_class=AssetClass.STOCK), "AAPL.US"
-        )
+        inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK, platform_symbol="AAPL.US")
 
         await adapter.fetch_instrument_spec(inst)
 
