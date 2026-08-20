@@ -94,7 +94,7 @@ logger = logging.getLogger(__name__)
 _DEAL_QUERY_BACKLOG_SECONDS = 5
 _DEAL_QUERY_FORWARD_SECONDS = 10
 
-# Order-mapping recovery scans MT5 history back this far for ``UTE:`` comments.
+# Order-mapping recovery scans MT5 history back this far for ``U:`` comments.
 _RECOVERY_DEAL_LOOKBACK_SECONDS = 24 * 60 * 60
 
 # Offset probe: bounded symbol scan; reject impossible offsets (>±24h).
@@ -108,6 +108,7 @@ _MARKET_TICK_RETRY_DELAY_SECONDS = 0.1
 
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
+    from unified_trading_execution.state import StateStore
 
 # ---------------------------------------------------------------------------
 # Process-global connection guard
@@ -222,6 +223,11 @@ class MT5Adapter(Adapter):
         self._order_id_to_ticket: dict[str, int] = {}
         self._ticket_to_order_id: dict[int, str] = {}
 
+        # Engine-managed store (attached by core via attach_state_store) —
+        # the authoritative client_order_id → ticket record.  The adapter
+        # only reads it at connect() to seed the maps; it never writes it.
+        self._state_store: StateStore | None = None
+
         # Last known state snapshots.  Orders are keyed by MT5 ticket (raw
         # tuples), positions are NETTED per instrument (one Position per
         # instrument regardless of netting/hedging mode), and balance is the
@@ -284,6 +290,16 @@ class MT5Adapter(Adapter):
         """
         self._event_bus = event_bus
 
+    def attach_state_store(self, state_store: StateStore) -> None:
+        """Store the engine-managed ``StateStore`` for mapping recovery.
+
+        Core attaches its ``SQLiteStateStore`` before ``connect()``.  At
+        connect the adapter seeds its ``client_order_id ↔ ticket`` maps from
+        the store (authoritative, survives broker comment rewriting) and only
+        then scans MT5 comments to fill any gaps.
+        """
+        self._state_store = state_store
+
     async def connect(self) -> None:
         """Initialize the MT5 terminal connection and start the polling loop.
 
@@ -299,8 +315,9 @@ class MT5Adapter(Adapter):
         4. Build the reverse alias table.
         5. Select every aliased symbol in Market Watch (``symbol_select``)
            so quotes stream for all configured instruments.
-        6. Recover ``client_order_id → ticket`` maps from ``UTE:`` order
-           comments so pre-restart orders can still be managed.
+        6. Recover ``client_order_id → ticket`` maps from the state store
+           (authoritative) and ``U:`` order comments (cross-check), so
+           pre-restart orders can still be managed.
         7. Publish ``ConnectionStateEvent(connected=True)``.
         8. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
 
@@ -351,6 +368,7 @@ class MT5Adapter(Adapter):
             self._account_login = int(account_info.login)
             self._build_reverse_alias()
             await asyncio.to_thread(self._select_aliased_symbols, mt5)
+            await self._seed_mappings_from_state_store()
             await asyncio.to_thread(self._recover_order_mappings, mt5)
             self._connected = True
             self._publish_connection_state(True)
@@ -1099,7 +1117,7 @@ class MT5Adapter(Adapter):
         """Build a ``FillRecord`` from one MT5 deal tuple.
 
         The ``client_order_id`` is recovered from the deal's comment when it
-        carries our ``UTE:`` tag (the engine's own orders, recoverable even
+        carries our ``U:`` tag (the engine's own orders, recoverable even
         after a restart).  MT5 deals otherwise carry no client order id, so
         it falls back to the ``ticket → client_order_id`` mapping recorded
         by ``place_order``: a pending order's deal references its order
@@ -1303,15 +1321,63 @@ class MT5Adapter(Adapter):
             except UteError as exc:
                 logger.warning("Cannot select symbol %s in Market Watch: %s", broker_symbol, exc)
 
+    async def _seed_mappings_from_state_store(self) -> None:
+        """Seed ``client_order_id ↔ ticket`` maps from the engine's state store.
+
+        The engine persists an ``OrderRecord`` for every placed order at
+        ``place_order`` time (``dispatch_place_order`` → ``upsert_order``),
+        so the store is the authoritative mapping — it survives broker
+        comment rewriting and does not depend on the ``U:`` comment round
+        trip.  This runs before ``_recover_order_mappings`` so comment scans
+        never overwrite a store entry.
+
+        Best-effort by design: without an attached store, or if the query
+        fails, the maps stay empty and comment recovery is the only source.
+        Never raises into ``connect()``.
+        """
+        if self._state_store is None:
+            return
+        seeded = 0
+        try:
+            records = await self._state_store.query_orders(limit=100_000)
+        except Exception as exc:
+            logger.warning("Order-mapping recovery: state-store query failed: %s", exc)
+            return
+        for record in records:
+            cid = record.client_order_id
+            if not cid:
+                continue
+            platform_id = record.platform_order_id
+            if platform_id is None:
+                logger.warning("Order-mapping recovery: skipping order %r with no platform id", cid)
+                continue
+            try:
+                ticket = int(platform_id)
+            except ValueError:
+                logger.warning(
+                    "Order-mapping recovery: skipping order %r with non-numeric platform id %r",
+                    cid,
+                    platform_id,
+                )
+                continue
+            seeded += self._record_mapping(cid, ticket)
+        if seeded:
+            logger.info(
+                "Seeded %d client_order_id ↔ ticket mapping(s) from the state store", seeded
+            )
+
     def _recover_order_mappings(self, mt5: Any) -> None:
         """Rebuild ``client_order_id ↔ ticket`` maps from MT5 comments.
 
         Runs once at ``connect()`` so orders placed before a restart can
         still be modified/cancelled and their fills attributed.  Every open
         order and every deal in the recent history window is scanned for our
-        ``UTE:`` comment tag (see ``comments.py``).  Idempotent, and never
+        ``U:`` comment tag (see ``comments.py``).  Idempotent, and never
         fails the connection — a scan error is logged and skipped, leaving
-        the in-memory maps as they are (best-effort by design).
+        the in-memory maps as they are (best-effort by design).  Entries
+        already recorded by ``_seed_mappings_from_state_store`` are never
+        overwritten, so a rewritten comment cannot clobber the authoritative
+        store mapping.
         """
         recovered = 0
         try:
