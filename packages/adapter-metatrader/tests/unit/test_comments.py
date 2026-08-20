@@ -38,9 +38,7 @@ class TestEncodeRoundTrip:
         comments = {encode_client_order_id(str(uuid7())) for _ in range(200)}
         assert len(comments) == 200
 
-    def test_encode_refuses_comment_over_limit(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_encode_refuses_comment_over_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A generated comment that would exceed the MT5 limit is refused."""
         monkeypatch.setattr(comments, "_COMMENT_MAX_LENGTH", 10)
         assert encode_client_order_id(str(uuid7())) is None

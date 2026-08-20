@@ -308,9 +308,7 @@ class TestConnectStateStoreSeeding:
         # ticket — a broker rewrite would have changed the stored comment's
         # payload.  The store's ticket must win.
         mock_mt5_module.symbols_get.return_value = ()
-        mock_mt5_module.orders_get.return_value = (
-            SimpleNamespace(ticket=6001, comment=comment),
-        )
+        mock_mt5_module.orders_get.return_value = (SimpleNamespace(ticket=6001, comment=comment),)
         mock_mt5_module.history_deals_get.return_value = ()
 
         await adapter.connect()
