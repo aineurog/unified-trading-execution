@@ -746,8 +746,14 @@ class SQLiteStateStore(StateStore):
     async def write_halt_event(self, event: HaltEvent) -> None:
         inst = event.instrument
         async with self._write_lock:
+            i = _serialise_instrument(inst) if inst else None
             await self.conn.execute(
-                "INSERT INTO halt_events (event_id, timestamp, adapter_name, account_id, correlation_id, action, scope, symbol, asset_class, reason, detail, cleared_by) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                """INSERT INTO halt_events
+                   (event_id, timestamp, adapter_name, account_id, correlation_id,
+                    action, scope, symbol, quote_currency, asset_class, exchange,
+                    currency, expiry, strike, option_right, multiplier, platform_symbol,
+                    reason, detail, cleared_by)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     event.event_id,
                     event.timestamp.isoformat(),
@@ -756,8 +762,16 @@ class SQLiteStateStore(StateStore):
                     event.correlation_id,
                     event.action,
                     event.scope,
-                    inst.symbol if inst else None,
-                    inst.asset_class.value if inst else None,
+                    i["symbol"] if i else None,
+                    i["quote_currency"] if i else None,
+                    i["asset_class"] if i else None,
+                    i["exchange"] if i else None,
+                    i["currency"] if i else None,
+                    i["expiry"] if i else None,
+                    i["strike"] if i else None,
+                    i["option_right"] if i else None,
+                    i["multiplier"] if i else None,
+                    i["platform_symbol"] if i else None,
                     event.reason,
                     event.detail,
                     event.cleared_by,
@@ -1063,17 +1077,7 @@ class SQLiteStateStore(StateStore):
             for row in await cursor.fetchall():
                 inst = None
                 if row["symbol"] is not None and row["asset_class"] is not None:
-                    inst = Instrument(
-                        symbol=row["symbol"],
-                        quote_currency=None,
-                        asset_class=AssetClass(row["asset_class"]),
-                        exchange=None,
-                        currency=None,
-                        expiry=None,
-                        strike=None,
-                        option_right=None,
-                        multiplier=None,
-                    )
+                    inst = _deserialise_instrument(dict(row))
                 results.append(
                     HaltEvent(
                         event_id=row["event_id"],

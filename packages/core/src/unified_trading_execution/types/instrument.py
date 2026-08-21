@@ -50,8 +50,25 @@ class Instrument:
         if self.currency is not None and self.currency != self.currency.upper():
             object.__setattr__(self, "currency", self.currency.upper())
 
-        if not self.symbol:
+        # Identifier fields must be non-empty and non-blank — a whitespace-only
+        # symbol/quote/currency would otherwise round-trip through an adapter
+        # and place orders against an invalid venue symbol.
+        if not self.symbol.strip():
             raise ValueError(f"symbol must be non-empty, got {self.symbol!r}")
+        if self.quote_currency is not None and not self.quote_currency.strip():
+            raise ValueError(f"quote_currency must be non-empty, got {self.quote_currency!r}")
+        if self.currency is not None and not self.currency.strip():
+            raise ValueError(f"currency must be non-empty, got {self.currency!r}")
+
+        # Pairs need a counter currency: SPOT and MARGIN_FX are always
+        # BASE/QUOTE, and a FUTURES with expiry=None is a perpetual (also
+        # BASE/QUOTE). Dated futures carry their settlement currency in
+        # ``currency`` instead, so they are exempt.
+        is_pair = self.asset_class in (AssetClass.SPOT, AssetClass.MARGIN_FX)
+        is_perpetual = self.asset_class == AssetClass.FUTURES and self.expiry is None
+        if (is_pair or is_perpetual) and not self.quote_currency:
+            label = "perpetual FUTURES" if is_perpetual else self.asset_class.value
+            raise ValueError(f"quote_currency is required for {label}")
 
         # expiry is required for OPTION only — FUTURES with expiry=None is a perpetual.
         if self.asset_class == AssetClass.OPTION:

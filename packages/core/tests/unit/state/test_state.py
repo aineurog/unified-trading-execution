@@ -573,6 +573,10 @@ class TestSQLiteStoreAudit:
         results = await store.query_halt_events()
         assert len(results) == 1
         assert results[0].action == "entered"
+        # The full instrument identity round-trips — including quote_currency,
+        # which Instrument now requires for SPOT.
+        assert results[0].instrument == evt.instrument
+        assert results[0].instrument.quote_currency == "USDT"
 
 
 # ============================================================

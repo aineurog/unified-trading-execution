@@ -211,6 +211,122 @@ def test_symbol_must_not_be_empty():
         )
 
 
+def test_symbol_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="symbol must be non-empty"):
+        Instrument(
+            symbol="   ",
+            quote_currency="USDT",
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_quote_currency_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="quote_currency must be non-empty"):
+        Instrument(
+            symbol="BTC",
+            quote_currency="  ",
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_currency_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="currency must be non-empty"):
+        Instrument(
+            symbol="AAPL",
+            quote_currency=None,
+            asset_class=AssetClass.STOCK,
+            exchange=None,
+            currency="  ",
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+# ---- Instrument: quote_currency invariant ----
+#
+# Pairs (SPOT, MARGIN_FX) and perpetual futures (FUTURES with expiry=None)
+# require a counter currency.  Dated futures, options, and single-name
+# instruments (stock, CFD, bond, fund) carry their settlement currency in
+# ``currency`` instead and must not be forced to provide a quote_currency.
+
+
+def test_spot_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for SPOT"):
+        Instrument(
+            symbol="BTC",
+            quote_currency=None,
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_margin_fx_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for MARGIN_FX"):
+        Instrument(
+            symbol="EUR",
+            quote_currency=None,
+            asset_class=AssetClass.MARGIN_FX,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_perpetual_future_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for perpetual FUTURES"):
+        Instrument(
+            symbol="BTC",
+            quote_currency=None,
+            asset_class=AssetClass.FUTURES,
+            exchange=None,
+            currency=None,
+            expiry=None,  # perpetual
+            strike=None,
+            option_right=None,
+            multiplier=1,
+        )
+
+
+def test_dated_future_does_not_require_quote_currency():
+    # Dated futures carry their settlement currency in ``currency``, so a
+    # missing quote_currency is legitimate here.
+    inst = Instrument(
+        symbol="ES",
+        quote_currency=None,
+        asset_class=AssetClass.FUTURES,
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 12, 18),
+        strike=None,
+        option_right=None,
+        multiplier=50,
+    )
+    assert inst.currency == "USD"
+    assert inst.quote_currency is None
+
+
 # ---- Instrument: OPTION invariants ----
 
 
