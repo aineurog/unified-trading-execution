@@ -553,7 +553,25 @@ class SQLiteStateStore(StateStore):
                     exchange, currency, expiry, strike, option_right, multiplier,
                     platform_symbol, fill_quantity, fill_price, fill_timestamp,
                     fee_currency, fee_amount, correlation_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(platform_fill_id) DO UPDATE SET
+                           client_order_id = excluded.client_order_id,
+                           symbol = excluded.symbol,
+                           quote_currency = excluded.quote_currency,
+                           asset_class = excluded.asset_class,
+                           exchange = excluded.exchange,
+                           currency = excluded.currency,
+                           expiry = excluded.expiry,
+                           strike = excluded.strike,
+                           option_right = excluded.option_right,
+                           multiplier = excluded.multiplier,
+                           platform_symbol = excluded.platform_symbol,
+                           fill_quantity = excluded.fill_quantity,
+                           fill_price = excluded.fill_price,
+                           fill_timestamp = excluded.fill_timestamp,
+                           fee_currency = excluded.fee_currency,
+                           fee_amount = excluded.fee_amount,
+                           correlation_id = excluded.correlation_id""",
                 (
                     fill.client_order_id,
                     fill.platform_fill_id,
@@ -602,7 +620,25 @@ class SQLiteStateStore(StateStore):
                 exchange, currency, expiry, strike, option_right, multiplier,
                 platform_symbol, fill_quantity, fill_price, fill_timestamp,
                 fee_currency, fee_amount, correlation_id)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(platform_fill_id) DO UPDATE SET
+                       client_order_id = excluded.client_order_id,
+                       symbol = excluded.symbol,
+                       quote_currency = excluded.quote_currency,
+                       asset_class = excluded.asset_class,
+                       exchange = excluded.exchange,
+                       currency = excluded.currency,
+                       expiry = excluded.expiry,
+                       strike = excluded.strike,
+                       option_right = excluded.option_right,
+                       multiplier = excluded.multiplier,
+                       platform_symbol = excluded.platform_symbol,
+                       fill_quantity = excluded.fill_quantity,
+                       fill_price = excluded.fill_price,
+                       fill_timestamp = excluded.fill_timestamp,
+                       fee_currency = excluded.fee_currency,
+                       fee_amount = excluded.fee_amount,
+                       correlation_id = excluded.correlation_id""",
             (
                 fill.client_order_id,
                 fill.platform_fill_id,

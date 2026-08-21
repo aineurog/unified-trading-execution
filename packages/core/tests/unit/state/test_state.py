@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -306,6 +307,23 @@ class TestSQLiteStoreFills:
         results = await store.query_fills()
         assert len(results) == 1
         assert results[0].fill_quantity == Decimal("0.001")
+
+    @pytest.mark.asyncio
+    async def test_upsert_fill_updates_existing_platform_fill(self, store):
+        first = make_fill("first", qty="0.001")
+        second = replace(
+            make_fill("second", qty="0.002"),
+            platform_fill_id=first.platform_fill_id,
+        )
+
+        await store.upsert_fill(first)
+        await store.upsert_fill(second)
+
+        results = await store.query_fills()
+        assert len(results) == 1
+        assert results[0].platform_fill_id == first.platform_fill_id
+        assert results[0].client_order_id == "second"
+        assert results[0].fill_quantity == Decimal("0.002")
 
     @pytest.mark.asyncio
     async def test_query_fills_filtered_by_instrument(self, store):
