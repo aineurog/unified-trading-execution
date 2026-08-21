@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
@@ -683,6 +683,7 @@ class Engine:
                         [cid], since=context.window_start
                     )
                     for fill in context.platform_fills.get(cid, []):
+                        fill = await self._stamp_fill_correlation(fill)
                         await self._state_store.upsert_fill(fill)
                 except Exception:
                     logger.exception("Failed to correct fills for order %s", cid)
@@ -1015,9 +1016,32 @@ class Engine:
     def _on_balance_update(self, event: BalanceUpdateEvent) -> None:
         asyncio.ensure_future(self._persist_balance(event))
 
+    async def _stamp_fill_correlation(self, fill: FillRecord) -> FillRecord:
+        """Stamp a fill with the placing action's correlation_id (Section 17.14).
+
+        The adapter can recover only ``client_order_id`` from the deal comment,
+        so it cannot know the dispatch-time ``correlation_id``.  The engine
+        resolves it here from the persisted order snapshot.  Unknown tickets
+        (empty ``client_order_id``, or no local order) keep the adapter's
+        ``client_order_id`` fallback.
+        """
+        if not fill.client_order_id:
+            return fill
+        try:
+            order = await self._state_store.get_order(fill.client_order_id)
+        except Exception:
+            logger.exception(
+                "Failed to resolve correlation_id for fill %s", fill.platform_fill_id
+            )
+            return fill
+        if order is None:
+            return fill
+        return replace(fill, correlation_id=order.correlation_id)
+
     async def _persist_fill(self, event: FillEvent) -> None:
         try:
-            await self._state_store.upsert_fill(event.fill)
+            fill = await self._stamp_fill_correlation(event.fill)
+            await self._state_store.upsert_fill(fill)
         except Exception:
             logger.exception("Failed to persist fill %s", event.event_id)
 

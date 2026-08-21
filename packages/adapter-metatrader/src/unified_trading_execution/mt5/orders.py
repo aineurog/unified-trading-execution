@@ -360,6 +360,10 @@ def parse_order_record(
     volume_current = Decimal(str(order_tuple.volume_current))
     filled = volume - volume_current
 
+    # average_fill_price stays None: MT5's orders_get() exposes no
+    # volume-weighted average price, and computing one would require a
+    # history_deals_get per open order.  Reconciliation compares orders by
+    # presence only, so this only affects orphan-import completeness.
     return OrderResult(
         client_order_id=client_order_id,
         platform_order_id=str(order_tuple.ticket),

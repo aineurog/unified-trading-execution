@@ -115,7 +115,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _connected_lock = threading.Lock()
-_connected = False
 
 
 def _get_mt5() -> Any:
@@ -741,7 +740,7 @@ class MT5Adapter(Adapter):
             requests_per_interval=1,
             interval_seconds=1.0,
             remaining=1,
-            reset_at=_utcnow(),
+            reset_at=_utcnow() + timedelta(seconds=1.0),
         )
 
     # ------------------------------------------------------------------
@@ -1215,10 +1214,20 @@ class MT5Adapter(Adapter):
         *backlog_seconds* rewinds the lower bound.  Reconciliation passes an
         explicit ``since`` and disables the backlog (0) so its window is exactly
         symmetric with the engine's local fill query.
+
+        When *backlog_seconds* is 0 (reconciliation), the lower bound is rounded
+        *up* to a whole second (deal timestamps are second-granular): a
+        sub-second ``from_time`` must not open the window a second early, or MT5
+        would return the boundary-second fill that the engine's
+        ``fill_timestamp >= watermark`` query excludes.  The polling path keeps
+        the floor because its backlog rewind already absorbs the difference.
         """
         offset = self._server_time_offset_seconds(mt5, candidates=candidates)
+        from_epoch = int(from_time.timestamp())
+        if from_time.microsecond and backlog_seconds == 0:
+            from_epoch += 1
         return (
-            int(from_time.timestamp()) + offset - backlog_seconds,
+            from_epoch + offset - backlog_seconds,
             int(to_time.timestamp()) + offset + _DEAL_QUERY_FORWARD_SECONDS,
         )
 
