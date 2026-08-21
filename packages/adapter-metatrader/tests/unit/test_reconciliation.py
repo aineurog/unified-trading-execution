@@ -245,6 +245,31 @@ class TestFetchBalances:
             await adapter.fetch_balances()
 
 
+class TestFetchAccountLeverage:
+    """fetch_account_leverage — read-only account-level leverage accessor."""
+
+    async def test_returns_account_leverage(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """account_info().leverage surfaces as an int (e.g. 500 for 1:500)."""
+        mock_mt5_module.account_info.return_value = _account(leverage=500)
+
+        leverage = await adapter.fetch_account_leverage()
+
+        assert leverage == 500
+        assert isinstance(leverage, int)
+
+    async def test_account_info_none_raises_platform_error(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """``account_info()`` returning None maps to a PlatformError."""
+        mock_mt5_module.account_info.return_value = None
+        mock_mt5_module.last_error.return_value = (10011, "not initialized")
+
+        with pytest.raises(PlatformError):
+            await adapter.fetch_account_leverage()
+
+
 class TestGetRateLimits:
     """get_rate_limits — the conservative fixed estimate."""
 

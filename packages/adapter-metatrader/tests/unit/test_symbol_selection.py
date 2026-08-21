@@ -50,8 +50,23 @@ class TestEnsureSymbolSelected:
         """A symbol the broker does not provide → InvalidSymbolError + cache."""
         mock_mt5_module.symbol_select.return_value = False
         mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+        mock_mt5_module.symbols_get.return_value = None
 
-        with pytest.raises(InvalidSymbolError, match="unknown symbol"):
+        with pytest.raises(InvalidSymbolError, match="not available on this broker"):
+            adapter._ensure_symbol_selected("EURUSD.m", mock_mt5_module)
+
+        assert "EURUSD.m" in adapter._failed_symbols
+
+    def test_unreliable_error_code_still_raises_invalid_symbol(
+        self, adapter: MT5Adapter, mock_mt5_module: MagicMock
+    ) -> None:
+        """Unknown symbol is authoritative even when last_error() is a generic
+        IPC failure ("terminal call failed") rather than ERR_UNKNOWN_SYMBOL."""
+        mock_mt5_module.symbol_select.return_value = False
+        mock_mt5_module.last_error.return_value = (-10000, "terminal call failed")
+        mock_mt5_module.symbols_get.return_value = None
+
+        with pytest.raises(InvalidSymbolError, match="not available on this broker"):
             adapter._ensure_symbol_selected("EURUSD.m", mock_mt5_module)
 
         assert "EURUSD.m" in adapter._failed_symbols
@@ -62,6 +77,7 @@ class TestEnsureSymbolSelected:
         """A broker-missing symbol is not re-issued on every call."""
         mock_mt5_module.symbol_select.return_value = False
         mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+        mock_mt5_module.symbols_get.return_value = None
         with pytest.raises(InvalidSymbolError):
             adapter._ensure_symbol_selected("EURUSD.m", mock_mt5_module)
 
@@ -72,9 +88,10 @@ class TestEnsureSymbolSelected:
     def test_transient_failure_raises_without_caching(
         self, adapter: MT5Adapter, mock_mt5_module: MagicMock
     ) -> None:
-        """A transient failure raises but is not cached — a later call retries."""
+        """A symbol that exists but failed to select → PlatformError, not cached."""
         mock_mt5_module.symbol_select.return_value = False
         mock_mt5_module.last_error.return_value = (4302, "not selected")
+        mock_mt5_module.symbols_get.return_value = MagicMock()  # symbol exists
 
         with pytest.raises(PlatformError):
             adapter._ensure_symbol_selected("EURUSD.m", mock_mt5_module)

@@ -748,6 +748,7 @@ class TestPollOnce:
         # First sighting: symbol_select() flakily fails with a transient code.
         mock_mt5_module.symbol_select.side_effect = [False, True]
         mock_mt5_module.last_error.side_effect = [(4302, "not selected"), (1, "")]
+        mock_mt5_module.symbols_get.return_value = MagicMock()  # symbol exists
         mock_mt5_module.symbol_info.return_value = MagicMock(
             path="Metals\\XAUUSD", currency_base="XAU", currency_profit="USD"
         )

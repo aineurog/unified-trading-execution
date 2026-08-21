@@ -497,6 +497,11 @@ class MT5Adapter(Adapter):
             info = mt5.symbol_info(mt5_symbol)
             if info is None:
                 code, desc = mt5.last_error()
+                if not self._symbol_exists(mt5_symbol, mt5):
+                    self._failed_symbols.add(mt5_symbol)
+                    raise InvalidSymbolError(
+                        f"symbol {mt5_symbol!r} is not available on this broker"
+                    )
                 raise map_mt5_error(code, desc or f"symbol_info() failed for {mt5_symbol}")
             request = build_mt5_request(order, mt5_module=mt5)
             request["symbol"] = mt5_symbol
@@ -778,6 +783,27 @@ class MT5Adapter(Adapter):
             self._check_call_result("account_info", account)
             balance = self._build_balance(account, _utcnow())
             return {balance.currency: balance}
+
+        return await asyncio.to_thread(_fetch)
+
+    async def fetch_account_leverage(self) -> int:
+        """Return the account-level leverage from ``account_info()`` (read-only).
+
+        MT5 leverage is account-level and configured by the broker back-office;
+        there is no setter (no MQL5 or Python API).  This accessor surfaces the
+        current value as a read-only integer ratio (e.g. ``500`` for 1:500).
+
+        Deliberately not on the ``Adapter`` ABC: most venues expose leverage
+        per-instrument (Bybit's ``InstrumentSpec.max_leverage``), and MT5 has no
+        per-symbol leverage at all — so this is an MT5-specific convenience, not
+        a cross-platform contract.
+        """
+        mt5 = _get_mt5()
+
+        def _fetch() -> int:
+            account = mt5.account_info()
+            self._check_call_result("account_info", account)
+            return int(account.leverage)
 
         return await asyncio.to_thread(_fetch)
 
@@ -1381,12 +1407,35 @@ class MT5Adapter(Adapter):
         if mt5_symbol in self._selected_symbols or mt5_symbol in self._failed_symbols:
             return
         if not mt5.symbol_select(mt5_symbol, True):
+            # last_error() codes for unknown symbols are unreliable across
+            # terminal builds, so classify via the symbol catalogue directly.
             code, desc = mt5.last_error()
-            error = map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
-            if isinstance(error, InvalidSymbolError):
+            if not self._symbol_exists(mt5_symbol, mt5):
                 self._failed_symbols.add(mt5_symbol)
-            raise error
+                raise InvalidSymbolError(
+                    f"symbol {mt5_symbol!r} is not available on this broker"
+                )
+            raise map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
         self._selected_symbols.add(mt5_symbol)
+
+    def _symbol_exists(self, mt5_symbol: str, mt5: Any) -> bool:
+        """Authoritative existence test via ``symbols_get(name)``.
+
+        ``mt5.last_error()`` codes for unknown symbols are unreliable across
+        terminal builds (``ERR_UNKNOWN_SYMBOL`` vs a generic IPC "terminal
+        call failed"), so existence is checked against the symbol catalogue
+        directly rather than trusting the error code from a failed
+        ``symbol_select()`` / ``symbol_info()`` call.
+
+        Must be called from within a ``to_thread()`` block — ``symbols_get()``
+        is an MT5 IPC call.
+        """
+        try:
+            return bool(mt5.symbols_get(mt5_symbol))
+        except Exception:
+            # symbols_get() itself failed (IPC/connection) — don't classify as
+            # "not on broker"; let the caller's mapped error propagate instead.
+            return True
 
     async def _seed_symbol_mappings_from_state_store(self) -> None:
         """Seed ``platform_symbol → Instrument`` from the state store at connect.
