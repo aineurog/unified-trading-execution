@@ -69,88 +69,112 @@ class ReconciliationResult:
 def reconcile(
     *,
     local_positions: dict[Instrument, Position],
-    platform_positions: dict[Instrument, Position],
+    platform_positions: dict[Instrument, Position] | None,
     local_balances: dict[str, Balance],
-    platform_balances: dict[str, Balance],
+    platform_balances: dict[str, Balance] | None,
     local_orders: dict[str, OrderRecord],
-    platform_orders: dict[str, OrderRecord],
+    platform_orders: dict[str, OrderRecord] | None,
     local_fills: dict[str, list[FillRecord]],
-    platform_fills: dict[str, list[FillRecord]],
+    platform_fills: dict[str, list[FillRecord]] | None,
 ) -> ReconciliationResult:
     """Compare local mirror against platform state and detect all mismatches.
 
+    A platform dataset passed as ``None`` means the adapter does not support
+    that fetch (``NotImplementedError``): its comparison is skipped entirely,
+    so an unsupported dataset is never mistaken for an empty one.  The local
+    side is always a concrete snapshot.
+
     Cases handled (Section 6.3):
-      1. Position quantity mismatch
-      2. Balance mismatch
+      1. Position quantity mismatch (including presence/absence)
+      2. Balance mismatch (including presence/absence)
       3. Orphan order on platform (unknown to local)
       4. Orphan order in local (not on platform)
       5. Partial fill discrepancy
     """
 
-    # Case 1: Position quantity mismatch
+    # Case 1: Position quantity mismatch.  Absence on either side is normalised
+    # to quantity 0 so an open on one side and a close/absence on the other is
+    # detected as a quantity disagreement rather than silently skipped.
     position_mismatches: list[ReconciliationMismatch] = []
-    all_instruments = set(local_positions.keys()) | set(platform_positions.keys())
-    for inst in all_instruments:
-        local = local_positions.get(inst)
-        platform = platform_positions.get(inst)
-        if local is None or platform is None:
-            continue
-        if local.quantity != platform.quantity:
-            position_mismatches.append(
-                ReconciliationMismatch(
-                    mismatch_type="position_quantity",
-                    instrument=inst,
-                    local_value=str(local.quantity),
-                    platform_value=str(platform.quantity),
+    if platform_positions is not None:
+        all_instruments = set(local_positions.keys()) | set(platform_positions.keys())
+        for inst in all_instruments:
+            local = local_positions.get(inst)
+            platform = platform_positions.get(inst)
+            local_qty = local.quantity if local is not None else Decimal("0")
+            platform_qty = platform.quantity if platform is not None else Decimal("0")
+            if local_qty != platform_qty:
+                position_mismatches.append(
+                    ReconciliationMismatch(
+                        mismatch_type="position_quantity",
+                        instrument=inst,
+                        local_value="absent" if local is None else str(local_qty),
+                        platform_value="absent" if platform is None else str(platform_qty),
+                    )
                 )
-            )
 
-    # Case 2: Balance mismatch
+    # Case 2: Balance mismatch.  Absence on either side is normalised to zero.
     balance_mismatches: list[ReconciliationMismatch] = []
-    all_currencies = set(local_balances.keys()) | set(platform_balances.keys())
-    for cur in all_currencies:
-        local_bal = local_balances.get(cur)
-        platform_bal = platform_balances.get(cur)
-        if local_bal is None or platform_bal is None:
-            continue
-        if local_bal.free != platform_bal.free or local_bal.total != platform_bal.total:
-            balance_mismatches.append(
-                ReconciliationMismatch(
-                    mismatch_type="balance",
-                    instrument=None,
-                    local_value=f"free={local_bal.free}, total={local_bal.total}",
-                    platform_value=f"free={platform_bal.free}, total={platform_bal.total}",
+    if platform_balances is not None:
+        all_currencies = set(local_balances.keys()) | set(platform_balances.keys())
+        for cur in all_currencies:
+            local_bal = local_balances.get(cur)
+            platform_bal = platform_balances.get(cur)
+            local_free = local_bal.free if local_bal is not None else Decimal("0")
+            local_total = local_bal.total if local_bal is not None else Decimal("0")
+            platform_free = platform_bal.free if platform_bal is not None else Decimal("0")
+            platform_total = platform_bal.total if platform_bal is not None else Decimal("0")
+            if local_free != platform_free or local_total != platform_total:
+                balance_mismatches.append(
+                    ReconciliationMismatch(
+                        mismatch_type="balance",
+                        instrument=None,
+                        local_value=(
+                            "absent"
+                            if local_bal is None
+                            else f"free={local_free}, total={local_total}"
+                        ),
+                        platform_value=(
+                            "absent"
+                            if platform_bal is None
+                            else f"free={platform_free}, total={platform_total}"
+                        ),
+                    )
                 )
-            )
 
-    # Case 3: Orphan order on platform (unknown to local mirror)
-    orphan_on_platform = [
-        order for cid, order in platform_orders.items() if cid not in local_orders
-    ]
+    # Case 3: Orphan order on platform (unknown to local open orders).
+    orphan_on_platform: list[OrderRecord] = []
+    orphan_in_local: list[str] = []
+    if platform_orders is not None:
+        orphan_on_platform = [
+            order for cid, order in platform_orders.items() if cid not in local_orders
+        ]
+        # Case 4: Orphan order in local (not on platform).  ``local_orders`` is
+        # already scoped to live orders by the caller, so terminal orders are
+        # never flagged as orphans.
+        orphan_in_local = [cid for cid in local_orders if cid not in platform_orders]
 
-    # Case 4: Orphan order in local mirror (not on platform)
-    orphan_in_local = [cid for cid in local_orders if cid not in platform_orders]
-
-    # Case 5: Partial fill discrepancy
+    # Case 5: Partial fill discrepancy.
     partial_fill_discrepancies: list[ReconciliationMismatch] = []
-    for cid in set(local_fills.keys()) | set(platform_fills.keys()):
-        local_total = sum(
-            (f.fill_quantity for f in local_fills.get(cid, [])),
-            start=Decimal("0"),
-        )
-        platform_total = sum(
-            (f.fill_quantity for f in platform_fills.get(cid, [])),
-            start=Decimal("0"),
-        )
-        if local_total != platform_total:
-            partial_fill_discrepancies.append(
-                ReconciliationMismatch(
-                    mismatch_type="partial_fill",
-                    instrument=None,  # order-id scoped, not instrument scoped
-                    local_value=str(local_total),
-                    platform_value=str(platform_total),
-                )
+    if platform_fills is not None:
+        for cid in set(local_fills.keys()) | set(platform_fills.keys()):
+            local_total = sum(
+                (f.fill_quantity for f in local_fills.get(cid, [])),
+                start=Decimal("0"),
             )
+            platform_total = sum(
+                (f.fill_quantity for f in platform_fills.get(cid, [])),
+                start=Decimal("0"),
+            )
+            if local_total != platform_total:
+                partial_fill_discrepancies.append(
+                    ReconciliationMismatch(
+                        mismatch_type="partial_fill",
+                        instrument=None,  # order-id scoped, not instrument scoped
+                        local_value=str(local_total),
+                        platform_value=str(platform_total),
+                    )
+                )
 
     return ReconciliationResult(
         position_mismatches=position_mismatches,

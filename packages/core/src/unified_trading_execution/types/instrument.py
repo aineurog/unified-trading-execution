@@ -14,13 +14,15 @@ class Instrument:
     """Structured instrument identifier — designed against the most demanding platform (IBKR).
 
     Frozen and hashable — usable as a dict key and cache lookup key.
-    Equality and hashing consider all fields.
+    Equality and hashing consider all fields except ``platform_symbol``
+    (venue-specific spelling, not identity).
 
     The shorthand str() form (BASE/QUOTE) is available only for crypto spot/perp
     pairs and forex pairs. All other instruments raise ValueError on str().
 
-    ``broker_symbol_override`` is NOT a constructor parameter — it is set exclusively
-    by the MT5 adapter (v2) via the ``_with_broker_override`` factory.
+    ``platform_symbol`` is the optional venue-specific symbol string (e.g. MT5's
+    ``"EURUSD.m"``).  When set, adapters use it verbatim instead of deriving a
+    symbol from ``symbol``/``quote_currency``.
     """
 
     symbol: str
@@ -32,15 +34,10 @@ class Instrument:
     strike: Decimal | None = None
     option_right: OptionRight | None = None
     multiplier: int | None = None
-    _broker_symbol_override: str | None = field(default=None, init=False, repr=False)
-
-    @property
-    def broker_symbol_override(self) -> str | None:
-        """Adapter-only passthrough for broker-specific symbol translation (MT5 alias table).
-
-        Never set by user code. Populated exclusively via ``_with_broker_override``.
-        """
-        return self._broker_symbol_override
+    # Venue-specific symbol string (e.g. MT5's "EURUSD.m").  Deliberately NOT
+    # normalised to uppercase (venue symbols are case-sensitive) and NOT part
+    # of equality/hash — spelling on one venue, not the instrument's identity.
+    platform_symbol: str | None = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         # Normalize identifier fields to uppercase. Digits (e.g. symbol "4" in
@@ -53,8 +50,25 @@ class Instrument:
         if self.currency is not None and self.currency != self.currency.upper():
             object.__setattr__(self, "currency", self.currency.upper())
 
-        if not self.symbol:
+        # Identifier fields must be non-empty and non-blank — a whitespace-only
+        # symbol/quote/currency would otherwise round-trip through an adapter
+        # and place orders against an invalid venue symbol.
+        if not self.symbol.strip():
             raise ValueError(f"symbol must be non-empty, got {self.symbol!r}")
+        if self.quote_currency is not None and not self.quote_currency.strip():
+            raise ValueError(f"quote_currency must be non-empty, got {self.quote_currency!r}")
+        if self.currency is not None and not self.currency.strip():
+            raise ValueError(f"currency must be non-empty, got {self.currency!r}")
+
+        # Pairs need a counter currency: SPOT and MARGIN_FX are always
+        # BASE/QUOTE, and a FUTURES with expiry=None is a perpetual (also
+        # BASE/QUOTE). Dated futures carry their settlement currency in
+        # ``currency`` instead, so they are exempt.
+        is_pair = self.asset_class in (AssetClass.SPOT, AssetClass.MARGIN_FX)
+        is_perpetual = self.asset_class == AssetClass.FUTURES and self.expiry is None
+        if (is_pair or is_perpetual) and not self.quote_currency:
+            label = "perpetual FUTURES" if is_perpetual else self.asset_class.value
+            raise ValueError(f"quote_currency is required for {label}")
 
         # expiry is required for OPTION only — FUTURES with expiry=None is a perpetual.
         if self.asset_class == AssetClass.OPTION:
@@ -82,28 +96,6 @@ class Instrument:
             f"Instrument {self.symbol!r} with asset_class={self.asset_class} "
             f"cannot be represented as a shorthand string. Use explicit field access."
         )
-
-
-def _with_broker_override(instrument: Instrument, override: str) -> Instrument:
-    """Create a copy with ``broker_symbol_override`` set. For adapter use only.
-
-    This is the only way to set ``broker_symbol_override``. It is not exposed
-    on the public ``Instrument`` constructor. Imported by adapter packages;
-    core never calls this function.
-    """
-    new = Instrument(
-        symbol=instrument.symbol,
-        quote_currency=instrument.quote_currency,
-        asset_class=instrument.asset_class,
-        exchange=instrument.exchange,
-        currency=instrument.currency,
-        expiry=instrument.expiry,
-        strike=instrument.strike,
-        option_right=instrument.option_right,
-        multiplier=instrument.multiplier,
-    )
-    object.__setattr__(new, "_broker_symbol_override", override)
-    return new
 
 
 @dataclass(frozen=True, slots=True)

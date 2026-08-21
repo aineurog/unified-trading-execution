@@ -458,11 +458,15 @@ class MockAdapter(Adapter):
             if rec.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
         }
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
         if (err := self._consume_error()) is not None:
             raise err
         result: dict[str, list[FillRecord]] = {}
         for fill in self._fills:
+            if since is not None and fill.fill_timestamp < since:
+                continue
             result.setdefault(fill.client_order_id, []).append(fill)
         return result
 

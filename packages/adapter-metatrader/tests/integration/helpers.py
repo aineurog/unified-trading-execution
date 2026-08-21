@@ -107,7 +107,7 @@ def position_for_symbol(
     """Find a netted position by base symbol/asset class.
 
     Polling keys positions by the resolved ``Instrument`` (which carries a
-    broker_symbol_override), so plain dict lookup by a caller-built instrument
+    ``platform_symbol``), so plain dict lookup by a caller-built instrument
     fails — compare the identity fields instead.
     """
     for key, position in positions.items():
@@ -133,7 +133,7 @@ async def cleanup_adapter(adapter: MT5Adapter) -> None:
         positions = await adapter.fetch_positions()
         legs: list[tuple[Instrument, Any]] = []
         for instrument in positions:
-            broker_symbol = instrument.broker_symbol_override
+            broker_symbol = instrument.platform_symbol
             if not broker_symbol:
                 continue
             raw = await asyncio.to_thread(mt5.positions_get, symbol=broker_symbol)

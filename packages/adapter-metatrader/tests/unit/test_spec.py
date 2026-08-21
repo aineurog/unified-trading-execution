@@ -15,14 +15,17 @@ from unified_trading_execution.errors import InvalidSymbolError
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.types.enums import AssetClass
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 
-def _instrument(symbol: str = "EUR", quote: str = "USD") -> Instrument:
+def _instrument(
+    symbol: str = "EUR", quote: str = "USD", platform_symbol: str | None = "EURUSD.m"
+) -> Instrument:
     return Instrument(
         symbol=symbol,
         quote_currency=quote,
         asset_class=AssetClass.MARGIN_FX,
+        platform_symbol=platform_symbol,
     )
 
 
@@ -125,7 +128,6 @@ class TestFetchInstrumentSpec:
             login=12345678,
             password="test-password",
             server="TestBroker-Demo",
-            symbol_alias_table={"EUR/USD": "EURUSD.m"},
             instrument_spec_cache_ttl=None,
         )
         adapter = MT5Adapter(config, event_bus=event_bus)
@@ -159,55 +161,33 @@ class TestFetchInstrumentSpec:
         with pytest.raises(InvalidSymbolError, match="not tradable"):
             await adapter.fetch_instrument_spec(_instrument())
 
-    async def test_alias_override_uses_broker_symbol(
+    async def test_platform_symbol_used_verbatim(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """The alias table decides the broker symbol for outbound queries."""
+        """The instrument's ``platform_symbol`` is the broker symbol verbatim."""
         mock_mt5_module.symbol_info.return_value = _spec_info()
-
-        await adapter.fetch_instrument_spec(_instrument())
-
-        mock_mt5_module.symbol_info.assert_called_once_with("EURUSD.m")
-
-    async def test_no_alias_falls_back_to_concatenation(
-        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
-    ) -> None:
-        """Without an alias entry the symbol+quote concatenation is used."""
-        mock_mt5_module.symbol_info.return_value = _spec_info()
-
-        await adapter.fetch_instrument_spec(_instrument(symbol="GBP"))
-
-        mock_mt5_module.symbol_info.assert_called_once_with("GBPUSD")
-
-    async def test_broker_override_used_without_alias(
-        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
-    ) -> None:
-        """A pre-set ``broker_symbol_override`` survives when no alias matches."""
-        mock_mt5_module.symbol_info.return_value = _spec_info()
-        inst = _with_broker_override(_instrument(symbol="GBP"), "GBPUSDpro")
+        inst = _instrument(symbol="GBP", platform_symbol="GBPUSDpro")
 
         await adapter.fetch_instrument_spec(inst)
 
         mock_mt5_module.symbol_info.assert_called_once_with("GBPUSDpro")
 
-    async def test_stock_with_override_resolves_broker_symbol(
+    async def test_stock_with_platform_symbol_resolves_broker_symbol(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """A non-pair instrument (stock) with an override resolves via the
-        override — ``str(instrument)`` raises for STOCK and must not be fatal."""
+        """A non-pair instrument (stock) with a platform_symbol resolves via
+        it — ``str(instrument)`` raises for STOCK and must not be fatal."""
         mock_mt5_module.symbol_info.return_value = _spec_info()
-        inst = _with_broker_override(
-            Instrument(symbol="AAPL", asset_class=AssetClass.STOCK), "AAPL.US"
-        )
+        inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK, platform_symbol="AAPL.US")
 
         await adapter.fetch_instrument_spec(inst)
 
         mock_mt5_module.symbol_info.assert_called_once_with("AAPL.US")
 
-    async def test_missing_quote_and_alias_raises_value_error(
+    async def test_missing_platform_symbol_raises_value_error(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """No quote currency and no alias means no usable MT5 symbol."""
+        """No platform_symbol means no usable MT5 symbol."""
         inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK)
 
         with pytest.raises(ValueError):

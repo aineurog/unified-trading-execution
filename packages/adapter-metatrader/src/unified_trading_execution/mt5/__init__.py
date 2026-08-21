@@ -4,7 +4,7 @@ Exports:
     MT5Engine       — all-in-one async engine (recommended entry point).
     SyncMT5Engine   — all-in-one blocking engine.
     MT5Adapter      — the concrete adapter class (advanced usage).
-    MT5Config       — configuration dataclass (credentials, symbol aliasing).
+    MT5Config       — configuration dataclass (credentials, terminal path).
 """
 
 from __future__ import annotations

@@ -67,7 +67,6 @@ def mt5_config() -> MT5Config:
         login=12345678,
         password="test-password",
         server="TestBroker-Demo",
-        symbol_alias_table={"EUR/USD": "EURUSD.m"},
     )
 
 

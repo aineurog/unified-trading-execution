@@ -30,12 +30,16 @@ _SUPPORTED_ASSET_CLASSES: frozenset[AssetClass] = frozenset(
 def to_bybit_symbol(instrument: Instrument) -> str:
     """Convert a canonical ``Instrument`` to a Bybit symbol string.
 
-    For spot and perpetual futures the symbol is simply
-    ``{symbol}{quote_currency}``, e.g. ``BTC`` + ``USDT`` = ``BTCUSDT``.
+    If ``instrument.platform_symbol`` is set it is returned verbatim (the
+    venue's exact spelling).  Otherwise, for spot and perpetual futures the
+    symbol is simply ``{symbol}{quote_currency}``, e.g. ``BTC`` + ``USDT`` =
+    ``BTCUSDT``.
 
     Raises ``InvalidSymbolError`` if the instrument's asset class is not
     supported or if ``quote_currency`` is missing.
     """
+    if instrument.platform_symbol is not None:
+        return instrument.platform_symbol
     if instrument.asset_class not in _SUPPORTED_ASSET_CLASSES:
         raise InvalidSymbolError(f"Asset class {instrument.asset_class} is not supported by Bybit")
     if instrument.quote_currency is None:

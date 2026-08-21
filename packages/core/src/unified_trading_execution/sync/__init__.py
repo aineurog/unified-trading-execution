@@ -75,6 +75,7 @@ class SyncEngine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        reconcile_interval_seconds: float | None = None,
     ) -> None:
         self._async_engine = Engine(
             adapter=adapter,
@@ -83,6 +84,7 @@ class SyncEngine:
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            reconcile_interval_seconds=reconcile_interval_seconds,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
@@ -180,6 +182,10 @@ class SyncEngine:
     def reconcile(self) -> ReconciliationResult:
         """Run a full reconciliation pass (blocking)."""
         return self._run(self._async_engine.reconcile())
+
+    def clear_halt(self, scope: str, instrument: Instrument | None = None) -> bool:
+        """Manually clear a halt for the given scope (blocking)."""
+        return self._run(self._async_engine.clear_halt(scope, instrument=instrument))
 
     # ---- State mirror access ----
 

@@ -50,7 +50,12 @@ from .helpers import (
 )
 
 _BROKER_SYMBOL = os.getenv("MT5_SYMBOL", "EURUSD").strip()
-_INSTRUMENT = Instrument(symbol="EUR", quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
+_INSTRUMENT = Instrument(
+    symbol="EUR",
+    quote_currency="USD",
+    asset_class=AssetClass.MARGIN_FX,
+    platform_symbol=_BROKER_SYMBOL,
+)
 _ORDER_TYPES = (OrderType.MARKET, OrderType.LIMIT, OrderType.STOP, OrderType.STOP_LIMIT)
 _TEvent = TypeVar("_TEvent", bound=Event)
 
@@ -61,16 +66,11 @@ def mt5_config(
     mt5_password: str,
     mt5_server: str,
 ) -> MT5Config:
-    """Override the shared config: alias EUR/USD to the live broker symbol.
-
-    The polling loop resolves deal/position symbols only through the reverse
-    alias table, so the round trip needs ``EUR/USD → <broker symbol>``.
-    """
+    """Shared config — the broker symbol is carried by ``_INSTRUMENT.platform_symbol``."""
     return MT5Config(
         login=mt5_login,
         password=mt5_password,
         server=mt5_server,
-        symbol_alias_table={"EUR/USD": _BROKER_SYMBOL},
     )
 
 

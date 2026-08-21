@@ -14,6 +14,7 @@ Usage::
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from decimal import Decimal
 from typing import Literal
 
@@ -49,6 +50,7 @@ class BybitEngine(Engine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        reconcile_interval_seconds: float | None = None,
     ) -> None:
         adapter = config if isinstance(config, BybitAdapter) else BybitAdapter(config)
         super().__init__(
@@ -58,6 +60,7 @@ class BybitEngine(Engine):
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            reconcile_interval_seconds=reconcile_interval_seconds,
         )
 
     # ── leverage intent ───────────────────────────────────────────────
@@ -147,8 +150,10 @@ class BybitEngine(Engine):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         return await self._adapter.fetch_open_orders()
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
-        return await self._adapter.fetch_fills()
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
+        return await self._adapter.fetch_fills(since=since)
 
     async def reconcile_user_intent(self) -> None:
         await self._adapter.reconcile_user_intent()

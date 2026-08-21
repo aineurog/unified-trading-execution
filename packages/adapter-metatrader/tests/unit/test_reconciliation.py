@@ -12,7 +12,7 @@ Tests cases:
     - fetch_open_orders: unknown type/state raises PlatformError
     - fetch_fills: groups trading deals by client_order_id, excludes non-trading
     - fetch_fills: never advances the poll baseline
-    - _resolve_mt5_symbol: alias wins, override fallback, non-pair guard
+    - _resolve_mt5_symbol: platform_symbol mandatory, returned verbatim
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
     TimeInForce,
 )
-from unified_trading_execution.types.instrument import Instrument, _with_broker_override
+from unified_trading_execution.types.instrument import Instrument
 
 _PAST = datetime(2024, 1, 1, tzinfo=UTC)
 _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
@@ -126,13 +126,9 @@ def _account(**overrides: object) -> MagicMock:
 
 def _set_eurusd_symbol_info(mock_mt5_module: MagicMock) -> None:
     """Configure ``symbol_info()`` to resolve ``EURUSD.m`` as a forex pair."""
-    mock_mt5_module.symbol_info.return_value = MagicMock(path="Forex\\EURUSD")
-
-
-def _prepared(adapter: MT5Adapter) -> MT5Adapter:
-    """Wire the reverse alias table so inbound symbols resolve."""
-    adapter._build_reverse_alias()
-    return adapter
+    mock_mt5_module.symbol_info.return_value = MagicMock(
+        path="Forex\\EURUSD", currency_base="EUR", currency_profit="USD"
+    )
 
 
 class TestFetchPositions:
@@ -142,7 +138,6 @@ class TestFetchPositions:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """BUY and SELL legs on one symbol collapse into a signed Position."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -176,11 +171,10 @@ class TestFetchPositions:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """A symbol with no path mapping is skipped, not fatal."""
-        _prepared(adapter)
 
         def fake_symbol_info(symbol: str) -> MagicMock:
             if symbol == "EURUSD.m":
-                return MagicMock(path="Forex\\EURUSD")
+                return MagicMock(path="Forex\\EURUSD", currency_base="EUR", currency_profit="USD")
             return MagicMock()
 
         mock_mt5_module.symbol_info.side_effect = fake_symbol_info
@@ -251,6 +245,31 @@ class TestFetchBalances:
             await adapter.fetch_balances()
 
 
+class TestFetchAccountLeverage:
+    """fetch_account_leverage — read-only account-level leverage accessor."""
+
+    async def test_returns_account_leverage(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """account_info().leverage surfaces as an int (e.g. 500 for 1:500)."""
+        mock_mt5_module.account_info.return_value = _account(leverage=500)
+
+        leverage = await adapter.fetch_account_leverage()
+
+        assert leverage == 500
+        assert isinstance(leverage, int)
+
+    async def test_account_info_none_raises_platform_error(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """``account_info()`` returning None maps to a PlatformError."""
+        mock_mt5_module.account_info.return_value = None
+        mock_mt5_module.last_error.return_value = (10011, "not initialized")
+
+        with pytest.raises(PlatformError):
+            await adapter.fetch_account_leverage()
+
+
 class TestGetRateLimits:
     """get_rate_limits — the conservative fixed estimate."""
 
@@ -271,7 +290,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """A pending LIMIT BUY maps to a full OrderRecord."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.orders_get.return_value = (_order(),)
@@ -297,7 +315,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """STOP keeps its trigger in ``stop_price`` (price_open)."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(type=5),)  # SELL_STOP
 
@@ -312,7 +329,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """STOP_LIMIT keeps trigger in stop_price and limit in price."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (
             _order(type=6, price_open=1.1500, price_stoplimit=1.1600),
@@ -328,7 +344,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """An order placed outside the engine keys by platform id."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(),)
 
@@ -342,7 +357,6 @@ class TestFetchOpenOrders:
     ) -> None:
         """A U:-tagged order keys by its decoded client_order_id even with an
         empty ticket map (fresh process after a restart)."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         cid = str(uuid7())
         comment = encode_client_order_id(cid)
@@ -358,7 +372,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """A non-U: comment falls back to the ticket-map / platform key."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(comment="manual trade"),)
 
@@ -370,11 +383,10 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """An order for an unknown symbol is skipped with a warning."""
-        _prepared(adapter)
 
         def fake_symbol_info(symbol: str) -> MagicMock:
             if symbol == "EURUSD.m":
-                return MagicMock(path="Forex\\EURUSD")
+                return MagicMock(path="Forex\\EURUSD", currency_base="EUR", currency_profit="USD")
             return MagicMock()
 
         mock_mt5_module.symbol_info.side_effect = fake_symbol_info
@@ -391,7 +403,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """An unrecognized MT5 order type is a PlatformError."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(type=99),)
 
@@ -402,7 +413,6 @@ class TestFetchOpenOrders:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """An unrecognized MT5 order state is a PlatformError."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (_order(state=99),)
 
@@ -414,7 +424,6 @@ class TestFetchOpenOrders:
     ) -> None:
         """STARTED and REQUEST_* states (0, 7-9) are transient but valid in
         orders_get() — they must map to OPEN, never abort the fetch."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.orders_get.return_value = (
             _order(ticket=1001, state=0),  # ORDER_STATE_STARTED
@@ -462,7 +471,6 @@ class TestFetchFills:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """BUY/SELL deals map to FillRecords keyed by client_order_id."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
@@ -487,7 +495,6 @@ class TestFetchFills:
     ) -> None:
         """A U:-tagged deal groups under its decoded client_order_id even
         with an empty ticket map (fresh process after a restart)."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         cid = str(uuid7())
         comment = encode_client_order_id(cid)
@@ -504,11 +511,11 @@ class TestFetchFills:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """Reconciliation must not disturb the poll loop's dedup state."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = (self._deal(),)
+        adapter._last_deal_time = int(_PAST.timestamp())
         last_time = adapter._last_deal_time
         last_ticket = adapter._last_deal_ticket
 
@@ -521,8 +528,8 @@ class TestFetchFills:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """Deals for unresolvable symbols are skipped, not fatal."""
-        _prepared(adapter)
-        _set_eurusd_symbol_info(mock_mt5_module)
+        # An unrecognized market path makes BADSYM.m unresolvable.
+        mock_mt5_module.symbol_info.return_value = MagicMock()
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = (self._deal(symbol="BADSYM.m"),)
@@ -536,7 +543,6 @@ class TestFetchFills:
     ) -> None:
         """A zero/negative-volume or -price deal must not violate FillRecord's
         fill_quantity/fill_price > 0 invariant — skip it like the poll loop."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         adapter._ticket_to_order_id = {1001: "client-abc"}
         mock_mt5_module.account_info.return_value = _account()
@@ -565,7 +571,6 @@ class TestFetchFills:
     ) -> None:
         """fetch_fills shifts its query into the server-as-epoch basis and
         reports server-as-epoch deals with real-UTC timestamps."""
-        _prepared(adapter)
         _set_eurusd_symbol_info(mock_mt5_module)
         offset = 10800
         adapter._server_time_offset = offset
@@ -579,42 +584,45 @@ class TestFetchFills:
         assert fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
         call_args = mock_mt5_module.history_deals_get.call_args.args
         assert call_args[0] == (
-            int(adapter._last_deal_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS
+            adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS
         )
 
 
 class TestResolveMt5Symbol:
-    """_resolve_mt5_symbol — alias precedence, override fallback, non-pair guard."""
+    """_resolve_mt5_symbol — platform_symbol is mandatory and returned verbatim."""
 
-    def _instrument(self, symbol: str = "EUR", quote: str | None = "USD") -> Instrument:
+    def _instrument(
+        self, symbol: str = "EUR", quote: str | None = "USD", platform_symbol: str | None = None
+    ) -> Instrument:
         return Instrument(
             symbol=symbol,
             quote_currency=quote,
             asset_class=AssetClass.MARGIN_FX,
+            platform_symbol=platform_symbol,
         )
 
-    def test_alias_wins_over_override(self, adapter: MT5Adapter) -> None:
-        """The alias table beats a pre-set broker_symbol_override."""
-        inst = _with_broker_override(self._instrument(), "EURUSDpro")
+    def test_platform_symbol_returned_verbatim(self, adapter: MT5Adapter) -> None:
+        """The instrument's platform_symbol is the MT5 symbol."""
+        inst = self._instrument(platform_symbol="EURUSDpro")
 
-        assert adapter._resolve_mt5_symbol(inst) == "EURUSD.m"
+        assert adapter._resolve_mt5_symbol(inst) == "EURUSDpro"
 
-    def test_broker_override_used_without_alias(self, adapter: MT5Adapter) -> None:
-        """Without an alias, the instrument's own override is honoured."""
-        inst = _with_broker_override(self._instrument(symbol="GBP"), "GBPUSDpro")
+    def test_platform_symbol_recorded_for_inbound(self, adapter: MT5Adapter) -> None:
+        """Resolving an outbound symbol registers it for inbound reconstruction."""
+        inst = self._instrument(symbol="GBP", platform_symbol="GBPUSDpro")
 
-        assert adapter._resolve_mt5_symbol(inst) == "GBPUSDpro"
+        adapter._resolve_mt5_symbol(inst)
 
-    def test_non_pair_stock_uses_override(self, adapter: MT5Adapter) -> None:
-        """``str()`` raises for STOCK — the override still resolves."""
-        inst = _with_broker_override(
-            Instrument(symbol="AAPL", asset_class=AssetClass.STOCK), "AAPL.US"
-        )
+        assert adapter._symbol_to_instrument["GBPUSDpro"] == inst
+
+    def test_non_pair_stock_uses_platform_symbol(self, adapter: MT5Adapter) -> None:
+        """A STOCK instrument with a platform_symbol resolves via it."""
+        inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK, platform_symbol="AAPL.US")
 
         assert adapter._resolve_mt5_symbol(inst) == "AAPL.US"
 
-    def test_non_pair_without_override_raises(self, adapter: MT5Adapter) -> None:
-        """No quote and no override means no usable MT5 symbol."""
+    def test_non_pair_without_platform_symbol_raises(self, adapter: MT5Adapter) -> None:
+        """No platform_symbol means no usable MT5 symbol."""
         inst = Instrument(symbol="AAPL", asset_class=AssetClass.STOCK)
 
         with pytest.raises(ValueError):

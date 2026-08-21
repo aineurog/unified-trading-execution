@@ -1,6 +1,7 @@
 """Public type re-exports."""
 
 from unified_trading_execution.types.enums import (
+    LIVE_ORDER_STATUSES,
     AssetClass,
     HaltClearMode,
     HaltState,
@@ -29,6 +30,7 @@ __all__ = [
     "AssetClass",
     "HaltClearMode",
     "HaltState",
+    "LIVE_ORDER_STATUSES",
     "OptionRight",
     "OrderSide",
     "OrderStatus",

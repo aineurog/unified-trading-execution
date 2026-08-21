@@ -14,7 +14,6 @@ from unified_trading_execution.types.enums import AssetClass, OptionRight
 from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
-    _with_broker_override,
 )
 
 # ---- Helper ----
@@ -118,44 +117,46 @@ def test_stock_constructs_with_minimal_fields():
     assert inst.currency == "USD"
 
 
-# ---- Instrument: broker_symbol_override is not a constructor param ----
+# ---- Instrument: platform_symbol (venue-specific spelling, not identity) ----
 
 
-def test_broker_symbol_override_defaults_to_none():
+def test_platform_symbol_defaults_to_none():
     inst = make_spot()
-    assert inst.broker_symbol_override is None
+    assert inst.platform_symbol is None
 
 
-def test_broker_symbol_override_not_accepted_by_constructor():
-    with pytest.raises(TypeError):
-        Instrument(
-            symbol="BTC",
-            quote_currency="USDT",
-            asset_class=AssetClass.SPOT,
-            exchange=None,
-            currency=None,
-            expiry=None,
-            strike=None,
-            option_right=None,
-            multiplier=None,
-            broker_symbol_override="BTCUSDT.P",
-        )
+def test_platform_symbol_is_accepted_by_constructor_and_case_preserved():
+    inst = Instrument(
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        platform_symbol="btcusdt.p",
+    )
+    assert inst.platform_symbol == "btcusdt.p"  # NOT uppercased
 
 
-def test_with_broker_override_creates_copy_with_override_set():
-    inst = make_spot()
-    copy = _with_broker_override(inst, "BTCUSDT.P")
-    assert copy.broker_symbol_override == "BTCUSDT.P"
-    assert inst.broker_symbol_override is None  # original unchanged
+def test_platform_symbol_excluded_from_equality():
+    a = make_spot(symbol="BTC")
+    b = Instrument(
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        platform_symbol="BTCUSDT.P",
+    )
+    assert a == b
+    assert hash(a) == hash(b)
 
 
-def test_with_broker_override_preserves_all_other_fields():
-    inst = make_spot(symbol="ETH", quote="USDC")
-    copy = _with_broker_override(inst, "ETHUSDC.M")
-    assert copy.symbol == "ETH"
-    assert copy.quote_currency == "USDC"
-    assert copy.asset_class == AssetClass.SPOT
-    assert copy.multiplier is None
+def test_platform_symbol_excluded_from_dict_identity():
+    a = make_spot(symbol="BTC")
+    b = Instrument(
+        symbol="BTC",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+        platform_symbol="BTCUSDT.P",
+    )
+    d = {a: "value"}
+    assert d[b] == "value"
 
 
 # ---- Instrument: symbol invariant ----
@@ -208,6 +209,122 @@ def test_symbol_must_not_be_empty():
             option_right=None,
             multiplier=None,
         )
+
+
+def test_symbol_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="symbol must be non-empty"):
+        Instrument(
+            symbol="   ",
+            quote_currency="USDT",
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_quote_currency_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="quote_currency must be non-empty"):
+        Instrument(
+            symbol="BTC",
+            quote_currency="  ",
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_currency_must_not_be_whitespace_only():
+    with pytest.raises(ValueError, match="currency must be non-empty"):
+        Instrument(
+            symbol="AAPL",
+            quote_currency=None,
+            asset_class=AssetClass.STOCK,
+            exchange=None,
+            currency="  ",
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+# ---- Instrument: quote_currency invariant ----
+#
+# Pairs (SPOT, MARGIN_FX) and perpetual futures (FUTURES with expiry=None)
+# require a counter currency.  Dated futures, options, and single-name
+# instruments (stock, CFD, bond, fund) carry their settlement currency in
+# ``currency`` instead and must not be forced to provide a quote_currency.
+
+
+def test_spot_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for SPOT"):
+        Instrument(
+            symbol="BTC",
+            quote_currency=None,
+            asset_class=AssetClass.SPOT,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_margin_fx_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for MARGIN_FX"):
+        Instrument(
+            symbol="EUR",
+            quote_currency=None,
+            asset_class=AssetClass.MARGIN_FX,
+            exchange=None,
+            currency=None,
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+
+
+def test_perpetual_future_requires_quote_currency():
+    with pytest.raises(ValueError, match="quote_currency is required for perpetual FUTURES"):
+        Instrument(
+            symbol="BTC",
+            quote_currency=None,
+            asset_class=AssetClass.FUTURES,
+            exchange=None,
+            currency=None,
+            expiry=None,  # perpetual
+            strike=None,
+            option_right=None,
+            multiplier=1,
+        )
+
+
+def test_dated_future_does_not_require_quote_currency():
+    # Dated futures carry their settlement currency in ``currency``, so a
+    # missing quote_currency is legitimate here.
+    inst = Instrument(
+        symbol="ES",
+        quote_currency=None,
+        asset_class=AssetClass.FUTURES,
+        exchange="CME",
+        currency="USD",
+        expiry=date(2026, 12, 18),
+        strike=None,
+        option_right=None,
+        multiplier=50,
+    )
+    assert inst.currency == "USD"
+    assert inst.quote_currency is None
 
 
 # ---- Instrument: OPTION invariants ----

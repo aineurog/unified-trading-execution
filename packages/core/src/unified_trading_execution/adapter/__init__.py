@@ -204,10 +204,18 @@ class Adapter(ABC):
         """
         raise NotImplementedError(f"{self.platform_name} does not support bulk order fetch")
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills from the platform, keyed by client_order_id.
 
         Optional: raises NotImplementedError by default.
+
+        *since* is an optional lower bound (UTC) for the fill window, used by
+        reconciliation to fetch only fills newer than the persisted "clean
+        through" watermark.  When omitted, the adapter returns its own recent
+        window.  Adapters that ignore *since* should still accept the keyword
+        so core can call them uniformly.
         """
         raise NotImplementedError(f"{self.platform_name} does not support bulk fill fetch")
 

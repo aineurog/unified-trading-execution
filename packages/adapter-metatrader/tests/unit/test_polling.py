@@ -41,7 +41,8 @@ from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import AssetClass
 
 # Fixed timestamps for deterministic deal/position diffs — deal times are
-# second-granular and _last_deal_time is advanced to the newest deal seen.
+# second-granular and _last_deal_time (a raw server-as-epoch int) is advanced
+# to the newest deal seen.
 _PAST = datetime(2024, 1, 1, tzinfo=UTC)
 _DEAL_TIME = int(datetime(2024, 1, 2, 12, 0, 0, tzinfo=UTC).timestamp())
 
@@ -98,7 +99,7 @@ def _account(**overrides: object) -> MagicMock:
 
 
 def _eurusd_symbol_info() -> MagicMock:
-    return MagicMock(path="Forex\\EURUSD")
+    return MagicMock(path="Forex\\EURUSD", currency_base="EUR", currency_profit="USD")
 
 
 class TestPollOnce:
@@ -108,7 +109,6 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
         """All MT5 calls happen inside a single asyncio.to_thread block."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = (
             Mt5Order(
                 ticket=1001,
@@ -148,7 +148,7 @@ class TestPollOnce:
             ),
         )
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         with patch("asyncio.to_thread", wraps=asyncio.to_thread) as mock_to_thread:
             await adapter._poll_once()
@@ -168,12 +168,11 @@ class TestPollOnce:
         engine's dispatch, never by the polling loop — so a new order updates
         ``_last_orders`` and nothing else.
         """
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         captured: list[Event] = []
         event_bus.subscribe(Event, captured.append)
@@ -201,11 +200,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """Order disappeared from open orders + new fill → FillEvent."""
-        adapter._build_reverse_alias()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         adapter._ticket_to_order_id = {1001: "client-1"}
 
         # Baseline: one open pending order.
@@ -259,7 +257,6 @@ class TestPollOnce:
         """A market order's fill (``deal.order == 0``) is attributed via the
         deal ticket — ``place_order`` records the deal ticket, not an order
         ticket, for market executions."""
-        adapter._build_reverse_alias()
         adapter._ticket_to_order_id = {3001: "client-1"}  # market order → deal ticket
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         deal = Mt5Deal(
@@ -287,7 +284,6 @@ class TestPollOnce:
     ) -> None:
         """A deal carrying the engine's U: tag attributes the fill by comment
         even when the ticket maps are empty (fresh process after a restart)."""
-        adapter._build_reverse_alias()
         cid = str(uuid7())
         comment = encode_client_order_id(cid)
         assert comment is not None
@@ -317,11 +313,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """Position quantity/price changed → PositionUpdateEvent."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
 
         positions: list[PositionUpdateEvent] = []
@@ -362,11 +357,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """Balance changed → BalanceUpdateEvent."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         balances: list[BalanceUpdateEvent] = []
         event_bus.subscribe(BalanceUpdateEvent, balances.append)
@@ -398,11 +392,10 @@ class TestPollOnce:
         Balance invariant.  ``_process_balance`` must derive one field from
         the others so the invariant holds exactly.
         """
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         mock_mt5_module.account_info.return_value = MagicMock(
             currency="USD",
@@ -423,11 +416,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """Identical state → no events published."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -454,11 +446,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """Two legs (buy + sell on same instrument) are netted to one Position."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -501,7 +492,6 @@ class TestPollOnce:
         Time-only diffing would drop the second (its time is not strictly
         greater than the first); monotonic ticket dedup catches both.
         """
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
@@ -533,7 +523,7 @@ class TestPollOnce:
                 position_id=2001,
             ),
         )
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
 
         fills: list[FillEvent] = []
@@ -547,7 +537,6 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """The same deal re-fetched next cycle is not published twice."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
@@ -567,7 +556,7 @@ class TestPollOnce:
                 position_id=2001,
             ),
         )
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         fills: list[FillEvent] = []
         event_bus.subscribe(FillEvent, fills.append)
@@ -581,9 +570,8 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """A deal stored server-as-epoch (real time + server offset) is
-        published with a real-UTC ``fill_timestamp`` and advances
-        ``_last_deal_time`` to real UTC — never the shifted stamp."""
-        adapter._build_reverse_alias()
+        published with a real-UTC ``fill_timestamp`` and advances the dedup
+        baseline ``_last_deal_time`` in the raw server-as-epoch basis."""
         offset = 10800  # e.g. a UTC+3 broker
         adapter._server_time_offset = offset
         server_stamp = _DEAL_TIME + offset  # how the terminal stores it
@@ -606,7 +594,7 @@ class TestPollOnce:
             ),
         )
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         fills: list[FillEvent] = []
         event_bus.subscribe(FillEvent, fills.append)
@@ -614,14 +602,13 @@ class TestPollOnce:
 
         assert len(fills) == 1
         assert fills[0].fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
-        assert adapter._last_deal_time == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+        assert adapter._last_deal_time == _DEAL_TIME + offset
 
     async def test_history_window_shifted_by_server_offset(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """``history_deals_get`` is queried in the server-as-epoch basis: the
         window is shifted by the server offset and padded by the margins."""
-        adapter._build_reverse_alias()
         offset = 7200
         adapter._server_time_offset = offset
         mock_mt5_module.orders_get.return_value = ()
@@ -629,12 +616,12 @@ class TestPollOnce:
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp()) + offset
 
         await adapter._poll_once()
 
         call_args = mock_mt5_module.history_deals_get.call_args.args
-        assert call_args[0] == (int(_PAST.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS)
+        assert call_args[0] == (adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS)
         expected_to = int(time.time()) + offset + _DEAL_QUERY_FORWARD_SECONDS
         assert expected_to - 1 <= call_args[1] <= expected_to + 1
 
@@ -646,13 +633,12 @@ class TestPollOnce:
         Previously a single end-of-snapshot check saw only the final call's
         status and an ``orders_get()`` failure could slip through as "no data".
         """
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = None
         mock_mt5_module.positions_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
         mock_mt5_module.last_error.return_value = (10011, "processing error")
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         with pytest.raises(PlatformError):
             await adapter._poll_once()
@@ -661,11 +647,10 @@ class TestPollOnce:
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
         """A publish failure mid-cycle leaves the baseline advanced — no re-report."""
-        adapter._build_reverse_alias()
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
         mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -695,16 +680,15 @@ class TestPollOnce:
         caplog: pytest.LogCaptureFixture,
     ) -> None:
         """One unresolvable symbol doesn't silence events for the rest."""
-        adapter._reverse_alias = {"EURUSD.m": "EUR/USD", "CRYPTOX.m": "CRYPTO/USD"}
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
-        adapter._last_deal_time = _PAST
+        adapter._last_deal_time = int(_PAST.timestamp())
 
         def _symbol_info(symbol: str) -> MagicMock:
             if symbol == "CRYPTOX.m":
                 return MagicMock(path="Other\\CryptoX")
-            return MagicMock(path="Forex\\EURUSD")
+            return MagicMock(path="Forex\\EURUSD", currency_base="EUR", currency_profit="USD")
 
         mock_mt5_module.symbol_info.side_effect = _symbol_info
         mock_mt5_module.positions_get.return_value = (
@@ -751,7 +735,6 @@ class TestPollOnce:
         ``UteError`` subclasses retry next cycle, so one flaky IPC call doesn't
         skip the symbol for the rest of the session.
         """
-        adapter._reverse_alias = {"GOLD.m": "XAU/USD"}
         position = Mt5Position(
             ticket=2001,
             time=_DEAL_TIME,
@@ -765,7 +748,10 @@ class TestPollOnce:
         # First sighting: symbol_select() flakily fails with a transient code.
         mock_mt5_module.symbol_select.side_effect = [False, True]
         mock_mt5_module.last_error.side_effect = [(4302, "not selected"), (1, "")]
-        mock_mt5_module.symbol_info.return_value = MagicMock(path="Metals\\XAUUSD")
+        mock_mt5_module.symbols_get.return_value = MagicMock()  # symbol exists
+        mock_mt5_module.symbol_info.return_value = MagicMock(
+            path="Metals\\XAUUSD", currency_base="XAU", currency_profit="USD"
+        )
 
         with caplog.at_level(logging.WARNING, logger="unified_trading_execution.mt5.adapter"):
             resolved = adapter._resolve_poll_instruments(mock_mt5_module, (position,), ())

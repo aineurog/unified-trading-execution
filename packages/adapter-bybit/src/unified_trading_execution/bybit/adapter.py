@@ -2259,7 +2259,9 @@ class BybitAdapter(Adapter):
 
         return result
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills, grouped by client order id.
 
         Only ``Trade`` executions are returned — the WebSocket ``execution``
@@ -2267,6 +2269,11 @@ class BybitAdapter(Adapter):
         filtering here keeps REST and WS views identical.  Executions without
         an ``orderLinkId`` cannot be attributed in core and are skipped with
         a log.
+
+        *since* is an optional lower bound (aware UTC).  Bybit's executions
+        endpoint has no server-side ``since`` filter, so fills older than
+        *since* are dropped client-side to give reconciliation a symmetric
+        watermark-bounded window.
         """
         result: dict[str, list[FillRecord]] = {}
         for category in _ORDER_CATEGORIES:
@@ -2284,6 +2291,8 @@ class BybitAdapter(Adapter):
                     )
                 except Exception:
                     logger.exception("Skipping malformed Bybit execution entry: %s", entry)
+                    continue
+                if since is not None and fill.fill_timestamp < since:
                     continue
                 result.setdefault(client_order_id, []).append(fill)
         return result

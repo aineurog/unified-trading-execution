@@ -9,6 +9,7 @@ Tests cover:
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -67,6 +68,15 @@ class TestToBybitSymbol:
         )
         assert to_bybit_symbol(inst) == "BTCUSD"
 
+    def test_platform_symbol_returned_verbatim(self) -> None:
+        inst = Instrument(
+            symbol="BTC",
+            quote_currency="USDT",
+            asset_class=AssetClass.SPOT,
+            platform_symbol="BTCUSDT.P",
+        )
+        assert to_bybit_symbol(inst) == "BTCUSDT.P"
+
     def test_raises_on_unsupported_asset_class(self) -> None:
         inst = Instrument(
             symbol="AAPL",
@@ -83,16 +93,20 @@ class TestToBybitSymbol:
             to_bybit_symbol(inst)
 
     def test_raises_on_missing_quote_currency(self) -> None:
+        # SPOT and perpetual futures now require quote_currency at Instrument
+        # construction, so the only supported asset-class shape that can reach
+        # to_bybit_symbol without a quote is a dated future (settlement currency
+        # carried in ``currency``).  The adapter still rejects it explicitly.
         inst = Instrument(
-            symbol="BTC",
+            symbol="ES",
             quote_currency=None,
-            asset_class=AssetClass.SPOT,
-            exchange=None,
-            currency=None,
-            expiry=None,
+            asset_class=AssetClass.FUTURES,
+            exchange="CME",
+            currency="USD",
+            expiry=date(2026, 12, 18),
             strike=None,
             option_right=None,
-            multiplier=None,
+            multiplier=50,
         )
         with pytest.raises(InvalidSymbolError, match="no quote_currency"):
             to_bybit_symbol(inst)

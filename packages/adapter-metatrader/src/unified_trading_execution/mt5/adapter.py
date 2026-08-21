@@ -26,6 +26,7 @@ import asyncio
 import logging
 import threading
 import time
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -65,7 +66,7 @@ from unified_trading_execution.mt5.orders import (
     parse_mt5_result,
     parse_order_record,
 )
-from unified_trading_execution.mt5.symbols import from_mt5_symbol, to_mt5_symbol
+from unified_trading_execution.mt5.symbols import to_mt5_symbol
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -75,7 +76,6 @@ from unified_trading_execution.types.enums import (
 from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
-    _with_broker_override,
 )
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -115,7 +115,6 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _connected_lock = threading.Lock()
-_connected = False
 
 
 def _get_mt5() -> Any:
@@ -183,6 +182,7 @@ def _decimal_places(value: Decimal) -> int:
 _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "FOREX": AssetClass.MARGIN_FX,
     "METALS": AssetClass.MARGIN_FX,  # spot metals (XAUUSD) trade as quoted pairs on margin
+    "COMMODITIES": AssetClass.MARGIN_FX,  # spot metals grouped under Commodities on some brokers
     "INDICES": AssetClass.CFD,  # index CFDs
     "STOCKS": AssetClass.STOCK,
     "CRYPTOCURRENCIES": AssetClass.SPOT,
@@ -191,6 +191,12 @@ _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "BONDS": AssetClass.BOND,
     "FUNDS": AssetClass.FUND,
 }
+
+# Asset classes whose broker symbol is a BASE/QUOTE pair — ``symbol_info()``
+# gives a meaningful ``currency_base`` (the base) and ``currency_profit`` (the
+# quote).  Everything else is a single-name symbol (stock, index CFD, future,
+# bond, fund) whose "base" is the name itself.
+_PAIR_ASSET_CLASSES: frozenset[AssetClass] = frozenset({AssetClass.MARGIN_FX, AssetClass.SPOT})
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +241,11 @@ class MT5Adapter(Adapter):
         self._last_orders: dict[int, object] = {}
         self._last_positions: dict[Instrument, Position] = {}
         self._last_balance: Balance | None = None
-        self._last_deal_time: datetime = datetime.now(tz=UTC)
+        # Deal dedup baseline in the server-as-epoch basis (raw deal.time).
+        # Anchored lazily on the first window build after the server offset is
+        # measured, then advanced to the newest deal seen.  Keeping it in the
+        # raw basis makes dedup immune to offset-measurement jitter.
+        self._last_deal_time: int | None = None
         self._last_deal_ticket: int = 0
 
         # Server-as-epoch minus real-UTC epoch (seconds); measured from a live
@@ -243,7 +253,9 @@ class MT5Adapter(Adapter):
         self._server_time_offset: int = 0
 
         # Broker symbol → canonical Instrument cache for inbound reconstruction.
-        # Populated lazily on first sighting via symbol_info().path.
+        # Seeded at connect from the state store, extended on every outbound
+        # order, and completed lazily via symbol_info() metadata for symbols
+        # the engine has never traded (e.g. manual terminal positions).
         self._symbol_to_instrument: dict[str, Instrument] = {}
         self._failed_symbols: set[str] = set()
 
@@ -253,9 +265,6 @@ class MT5Adapter(Adapter):
 
         # Instrument spec cache: Instrument → (InstrumentSpec, fetched_at)
         self._spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
-
-        # Reverse alias table built from config's forward table.
-        self._reverse_alias: dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Identification
@@ -312,14 +321,12 @@ class MT5Adapter(Adapter):
            passed as keyword arguments (omitting ``path`` auto-detects the
            terminal).
         3. ``mt5.account_info()`` — resolve the actual account login.
-        4. Build the reverse alias table.
-        5. Select every aliased symbol in Market Watch (``symbol_select``)
-           so quotes stream for all configured instruments.
-        6. Recover ``client_order_id → ticket`` maps from the state store
-           (authoritative) and ``U:`` order comments (cross-check), so
+        4. Seed ``platform_symbol → Instrument`` and ``client_order_id → ticket``
+           maps from the state store (authoritative), then cross-check
+           ``client_order_id ↔ ticket`` against ``U:`` order comments, so
            pre-restart orders can still be managed.
-        7. Publish ``ConnectionStateEvent(connected=True)``.
-        8. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
+        5. Publish ``ConnectionStateEvent(connected=True)``.
+        6. Start ``_poll_task = asyncio.create_task(self._poll_loop())``.
 
         The guard is held for the lifetime of the connection and released by
         ``disconnect()``.  On any failure the guard is released and a
@@ -366,8 +373,7 @@ class MT5Adapter(Adapter):
                 )
 
             self._account_login = int(account_info.login)
-            self._build_reverse_alias()
-            await asyncio.to_thread(self._select_aliased_symbols, mt5)
+            await self._seed_symbol_mappings_from_state_store()
             await self._seed_mappings_from_state_store()
             await asyncio.to_thread(self._recover_order_mappings, mt5)
             self._connected = True
@@ -491,6 +497,11 @@ class MT5Adapter(Adapter):
             info = mt5.symbol_info(mt5_symbol)
             if info is None:
                 code, desc = mt5.last_error()
+                if not self._symbol_exists(mt5_symbol, mt5):
+                    self._failed_symbols.add(mt5_symbol)
+                    raise InvalidSymbolError(
+                        f"symbol {mt5_symbol!r} is not available on this broker"
+                    )
                 raise map_mt5_error(code, desc or f"symbol_info() failed for {mt5_symbol}")
             request = build_mt5_request(order, mt5_module=mt5)
             request["symbol"] = mt5_symbol
@@ -739,7 +750,7 @@ class MT5Adapter(Adapter):
             requests_per_interval=1,
             interval_seconds=1.0,
             remaining=1,
-            reset_at=_utcnow(),
+            reset_at=_utcnow() + timedelta(seconds=1.0),
         )
 
     # ------------------------------------------------------------------
@@ -772,6 +783,27 @@ class MT5Adapter(Adapter):
             self._check_call_result("account_info", account)
             balance = self._build_balance(account, _utcnow())
             return {balance.currency: balance}
+
+        return await asyncio.to_thread(_fetch)
+
+    async def fetch_account_leverage(self) -> int:
+        """Return the account-level leverage from ``account_info()`` (read-only).
+
+        MT5 leverage is account-level and configured by the broker back-office;
+        there is no setter (no MQL5 or Python API).  This accessor surfaces the
+        current value as a read-only integer ratio (e.g. ``500`` for 1:500).
+
+        Deliberately not on the ``Adapter`` ABC: most venues expose leverage
+        per-instrument (Bybit's ``InstrumentSpec.max_leverage``), and MT5 has no
+        per-symbol leverage at all — so this is an MT5-specific convenience, not
+        a cross-platform contract.
+        """
+        mt5 = _get_mt5()
+
+        def _fetch() -> int:
+            account = mt5.account_info()
+            self._check_call_result("account_info", account)
+            return int(account.leverage)
 
         return await asyncio.to_thread(_fetch)
 
@@ -810,7 +842,9 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_fetch)
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills via ``mt5.history_deals_get()``.
 
         Only trading deals (DEAL_TYPE_BUY/SELL) are fills; balance
@@ -818,14 +852,23 @@ class MT5Adapter(Adapter):
         ``client_order_id``.  Unlike the polling loop, this read does not
         advance the fill baseline — reconciliation must not disturb the
         poll loop's dedup state.
+
+        *since* is an optional lower bound (UTC) for the window.  When omitted
+        the poll baseline (``_last_deal_time``) is used, preserving the recent
+        window for direct callers.  When provided (reconciliation), the backlog
+        rewind is disabled so the returned window is symmetric with the
+        engine's own watermark-bounded local fill query.
         """
         mt5 = _get_mt5()
 
         def _fetch() -> dict[str, list[FillRecord]]:
             account = mt5.account_info()
             self._check_call_result("account_info", account)
+            backlog = 0 if since is not None else _DEAL_QUERY_BACKLOG_SECONDS
             deals = mt5.history_deals_get(
-                *self._server_deal_window(mt5, self._last_deal_time, _utcnow())
+                *self._server_deal_window(
+                    mt5, _utcnow(), from_time=since, backlog_seconds=backlog
+                )
             )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
@@ -898,9 +941,7 @@ class MT5Adapter(Adapter):
             # Probe the server-time offset from symbols that are actively
             # trading this cycle (positions/orders).
             probes = tuple({o.symbol for o in orders or ()} | {p.symbol for p in positions or ()})
-            deals = mt5.history_deals_get(
-                *self._server_deal_window(mt5, self._last_deal_time, now, candidates=probes)
-            )
+            deals = mt5.history_deals_get(*self._server_deal_window(mt5, now, candidates=probes))
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, positions, deals)
             return orders, positions, account, deals, instruments, now
@@ -1069,16 +1110,23 @@ class MT5Adapter(Adapter):
         This both catches same-second deals that time alone would miss and
         prevents re-reporting already-published fills.
 
+        The time baseline (``_last_deal_time``) is kept in the raw
+        server-as-epoch basis — never the offset-converted value — so a
+        jittering offset measurement between cycles cannot reorder deals
+        relative to the baseline.
+
         The ticket/time baseline is committed immediately after each
         successful publish, so an exception mid-loop re-tries only the
         unpublished deals — no duplicates for the ones already reported.
         """
         for deal in deals or ():
-            # deal.time is server-as-epoch (shifted by the server offset);
-            # normalize back to real UTC so the baseline and FillEvent
-            # timestamps stay in the same basis as _utcnow().
-            deal_time = from_mt5_epoch(deal.time, self._server_time_offset)
-            if deal_time < self._last_deal_time:
+            # deal.time is server-as-epoch; the dedup baseline is kept in the
+            # same raw basis, so offset-measurement jitter between cycles can
+            # never make an in-order deal look older than the baseline (which
+            # previously lost fills whose conversion straddled an offset change).
+            deal_time = int(deal.time)
+            baseline = self._last_deal_time
+            if baseline is not None and deal_time < baseline:
                 continue
             if deal.type not in (0, 1):
                 continue
@@ -1105,7 +1153,7 @@ class MT5Adapter(Adapter):
             )
             if deal.ticket > self._last_deal_ticket:
                 self._last_deal_ticket = deal.ticket
-            if deal_time > self._last_deal_time:
+            if baseline is None or deal_time > baseline:
                 self._last_deal_time = deal_time
 
     def _build_fill(
@@ -1169,6 +1217,7 @@ class MT5Adapter(Adapter):
             probes = [
                 symbol.name for symbol in (mt5.symbols_get() or ())[:_MAX_OFFSET_PROBE_SYMBOLS]
             ]
+        best: tuple[float, int] | None = None
         for symbol in probes:
             tick = mt5.symbol_info_tick(symbol)
             if tick is None:
@@ -1179,27 +1228,57 @@ class MT5Adapter(Adapter):
             offset = int(time_msc / 1000) - int(time.time())
             if abs(offset) > _MAX_SERVER_TIME_OFFSET_SECONDS:
                 continue
-            self._server_time_offset = offset
-            break
+            # Prefer the freshest tick across the probes — a stale tick (a
+            # symbol that has not traded for a while) would skew the offset
+            # and shift deal timestamps away from their real execution time.
+            if best is None or time_msc > best[0]:
+                best = (time_msc, offset)
+        if best is not None:
+            self._server_time_offset = best[1]
         return self._server_time_offset
 
     def _server_deal_window(
         self,
         mt5: Any,
-        from_time: datetime,
         to_time: datetime,
         *,
+        from_time: datetime | None = None,
         candidates: tuple[str, ...] = (),
+        backlog_seconds: int = _DEAL_QUERY_BACKLOG_SECONDS,
     ) -> tuple[int, int]:
         """Build a ``history_deals_get`` window in the server-as-epoch basis.
 
         Deal timestamps are stored shifted by the server offset, so the query
         window must be shifted by the same amount (plus small margins to absorb
-        second-granularity rounding).  Returns ``(from_epoch, to_epoch)`` ints.
+        second-granularity rounding).  The lower edge is anchored to the deal
+        dedup baseline (``_last_deal_time``), kept in the same raw
+        server-as-epoch basis, so the window stays correct even when the
+        measured offset jitters between cycles.  Pass ``from_time`` to
+        override the lower edge (the connect-time recovery scan, or
+        reconciliation's explicit ``since``).
+
+        *backlog_seconds* rewinds the lower bound.  Reconciliation passes an
+        explicit ``since`` and disables the backlog (0) so its window is exactly
+        symmetric with the engine's local fill query; in that case a sub-second
+        ``from_time`` is rounded *up* to a whole second (deal timestamps are
+        second-granular) so MT5 does not return the boundary-second fill that
+        the engine's ``fill_timestamp >= watermark`` query excludes.  The
+        polling path keeps the floor because its backlog rewind already absorbs
+        the difference.
         """
         offset = self._server_time_offset_seconds(mt5, candidates=candidates)
+        if from_time is not None:
+            start = int(from_time.timestamp()) + offset
+            if from_time.microsecond and backlog_seconds == 0:
+                start += 1
+        else:
+            if self._last_deal_time is None:
+                # Anchor the baseline to server-now on first use so the first
+                # window covers only recent deals, not the account's history.
+                self._last_deal_time = int(to_time.timestamp()) + offset
+            start = self._last_deal_time
         return (
-            int(from_time.timestamp()) + offset - _DEAL_QUERY_BACKLOG_SECONDS,
+            start - backlog_seconds,
             int(to_time.timestamp()) + offset + _DEAL_QUERY_FORWARD_SECONDS,
         )
 
@@ -1248,15 +1327,22 @@ class MT5Adapter(Adapter):
     def _resolve_instrument(self, mt5_symbol: str, mt5: Any) -> Instrument:
         """Build the canonical ``Instrument`` for an MT5 symbol.
 
-        Combines ``from_mt5_symbol()`` (symbol/quote from the reverse alias
-        table) with ``symbol_info().path`` (asset class).  Must only be
-        called from within a ``to_thread()`` block — ``symbol_info()`` is an
-        MT5 IPC call.
+        Resolution order:
+
+        1. ``_symbol_to_instrument`` — seeded from the state store at connect
+           and extended on every outbound order, so anything the engine has
+           traded resolves exactly (full field round-trip).
+        2. ``symbol_info()`` broker metadata — ``currency_base`` /
+           ``currency_profit`` give the base/quote (or settlement currency
+           for non-pair symbols) and ``path`` gives the asset class.  This
+           covers symbols the engine has never traded (e.g. manual positions).
+
+        Must only be called from within a ``to_thread()`` block —
+        ``symbol_info()`` is an MT5 IPC call.
         """
         cached = self._symbol_to_instrument.get(mt5_symbol)
         if cached is not None:
             return cached
-        symbol, quote = from_mt5_symbol(mt5_symbol, self._reverse_alias)
         self._ensure_symbol_selected(mt5_symbol, mt5)
         info = mt5.symbol_info(mt5_symbol)
         if info is None:
@@ -1266,10 +1352,32 @@ class MT5Adapter(Adapter):
                 desc or f"mt5.symbol_info() returned None for {mt5_symbol}",
             )
         asset_class = self._asset_class_from_path(info.path)
-        instrument = _with_broker_override(
-            Instrument(symbol=symbol, quote_currency=quote, asset_class=asset_class),
-            mt5_symbol,
-        )
+        base = info.currency_base or None
+        profit = info.currency_profit or None
+        if asset_class in _PAIR_ASSET_CLASSES:
+            # Base/quote pair (forex, metals, crypto spot) — symbol is the base,
+            # quote_currency is the profit/settlement currency.
+            if not base:
+                raise ValueError(
+                    f"MT5 symbol {mt5_symbol!r} has no currency_base — "
+                    "cannot reconstruct a pair Instrument"
+                )
+            instrument = Instrument(
+                symbol=base,
+                quote_currency=profit,
+                asset_class=asset_class,
+                platform_symbol=mt5_symbol,
+            )
+        else:
+            # Single-name symbol (stock, CFD index, future, bond, fund) — the
+            # broker symbol is the name; the profit currency is its currency.
+            instrument = Instrument(
+                symbol=base or mt5_symbol,
+                quote_currency=None,
+                currency=profit,
+                asset_class=asset_class,
+                platform_symbol=mt5_symbol,
+            )
         self._symbol_to_instrument[mt5_symbol] = instrument
         return instrument
 
@@ -1299,27 +1407,90 @@ class MT5Adapter(Adapter):
         if mt5_symbol in self._selected_symbols or mt5_symbol in self._failed_symbols:
             return
         if not mt5.symbol_select(mt5_symbol, True):
+            # last_error() codes for unknown symbols are unreliable across
+            # terminal builds, so classify via the symbol catalogue directly.
             code, desc = mt5.last_error()
-            error = map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
-            if isinstance(error, InvalidSymbolError):
+            if not self._symbol_exists(mt5_symbol, mt5):
                 self._failed_symbols.add(mt5_symbol)
-            raise error
+                raise InvalidSymbolError(
+                    f"symbol {mt5_symbol!r} is not available on this broker"
+                )
+            raise map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
         self._selected_symbols.add(mt5_symbol)
 
-    def _select_aliased_symbols(self, mt5: Any) -> None:
-        """Eagerly select every aliased symbol in Market Watch at connect.
+    def _symbol_exists(self, mt5_symbol: str, mt5: Any) -> bool:
+        """Authoritative existence test via ``symbols_get(name)``.
 
-        Guarantees the poll loop's very first cycle sees live quotes and that
-        orders for aliased instruments never hit the "not selected" terminal
-        error.  A symbol the broker does not provide is logged and recorded in
-        ``_failed_symbols`` — it must not fail the whole connection; the lazy
-        ``_ensure_symbol_selected()`` path will surface real errors on use.
+        ``mt5.last_error()`` codes for unknown symbols are unreliable across
+        terminal builds (``ERR_UNKNOWN_SYMBOL`` vs a generic IPC "terminal
+        call failed"), so existence is checked against the symbol catalogue
+        directly rather than trusting the error code from a failed
+        ``symbol_select()`` / ``symbol_info()`` call.
+
+        Must be called from within a ``to_thread()`` block — ``symbols_get()``
+        is an MT5 IPC call.
         """
-        for broker_symbol in self._config.symbol_alias_table.values():
-            try:
-                self._ensure_symbol_selected(broker_symbol, mt5)
-            except UteError as exc:
-                logger.warning("Cannot select symbol %s in Market Watch: %s", broker_symbol, exc)
+        try:
+            return bool(mt5.symbols_get(mt5_symbol))
+        except Exception:
+            # symbols_get() itself failed (IPC/connection) — don't classify as
+            # "not on broker"; let the caller's mapped error propagate instead.
+            return True
+
+    async def _seed_symbol_mappings_from_state_store(self) -> None:
+        """Seed ``platform_symbol → Instrument`` from the state store at connect.
+
+        The engine persists an ``OrderRecord``/``Position`` (each carrying the
+        instrument's ``platform_symbol``) for everything it trades, so the
+        store is the authoritative inbound-resolution map: it gives an exact
+        full-field round-trip for symbols the engine has previously traded,
+        independent of broker metadata semantics or comment rewriting.
+
+        Best-effort by design: without an attached store, or if a query fails,
+        the map simply stays empty and ``_resolve_instrument`` falls back to
+        ``symbol_info()`` metadata.  Never raises into ``connect()``.
+        """
+        if self._state_store is None:
+            return
+        seeded = 0
+        orders: Sequence[OrderRecord]
+        try:
+            orders = await self._state_store.query_orders(limit=100_000)
+        except Exception as exc:
+            logger.warning("Symbol-mapping recovery: orders query failed: %s", exc)
+            orders = ()
+        for record in orders:
+            instrument = getattr(record, "instrument", None)
+            if instrument is not None:
+                seeded += self._record_symbol_mapping(instrument)
+
+        positions: Sequence[Position]
+        try:
+            positions = await self._state_store.query_positions(limit=100_000)
+        except Exception as exc:
+            logger.warning("Symbol-mapping recovery: positions query failed: %s", exc)
+            positions = ()
+        for position in positions:
+            instrument = getattr(position, "instrument", None)
+            if instrument is not None:
+                seeded += self._record_symbol_mapping(instrument)
+
+        if seeded:
+            logger.info(
+                "Seeded %d platform_symbol → Instrument mapping(s) from the state store", seeded
+            )
+
+    def _record_symbol_mapping(self, instrument: Instrument) -> int:
+        """Record a ``platform_symbol → Instrument`` mapping if unknown.
+
+        Returns 1 when a new mapping was added, otherwise 0.  Instruments
+        without a ``platform_symbol`` are skipped — there is nothing to key on.
+        """
+        broker_symbol = instrument.platform_symbol
+        if broker_symbol is None or broker_symbol in self._symbol_to_instrument:
+            return 0
+        self._symbol_to_instrument[broker_symbol] = instrument
+        return 1
 
     async def _seed_mappings_from_state_store(self) -> None:
         """Seed ``client_order_id ↔ ticket`` maps from the engine's state store.
@@ -1393,8 +1564,8 @@ class MT5Adapter(Adapter):
         try:
             from_epoch, to_epoch = self._server_deal_window(
                 mt5,
-                _utcnow() - timedelta(seconds=_RECOVERY_DEAL_LOOKBACK_SECONDS),
                 _utcnow(),
+                from_time=_utcnow() - timedelta(seconds=_RECOVERY_DEAL_LOOKBACK_SECONDS),
             )
             deals = mt5.history_deals_get(from_epoch, to_epoch)
         except Exception as exc:
@@ -1424,33 +1595,19 @@ class MT5Adapter(Adapter):
         return 1
 
     def _resolve_mt5_symbol(self, instrument: Instrument) -> str:
-        """Apply the alias table and return the MT5 broker symbol string.
+        """Return the MT5 broker symbol for *instrument*, registering it.
 
-        The alias table is authoritative per D-8: an entry for the
-        instrument's shorthand wins over any pre-set
-        ``broker_symbol_override``.  ``str()`` only produces a "BASE/QUOTE"
-        shorthand for pairs (forex/crypto/perp) — it raises ``ValueError``
-        for stocks, CFDs, bonds, funds, and dated futures, so the alias
-        lookup is guarded and those instruments resolve via
-        ``to_mt5_symbol`` (which honours ``broker_symbol_override`` and
-        finally falls back to ``symbol + quote_currency``).
+        ``platform_symbol`` is mandatory for MT5 — there is no symbol
+        derivation from ``symbol``/``quote_currency`` (broker suffixes are
+        not standardized).  The mapping is recorded so the inbound polling
+        path reconstructs the exact same canonical ``Instrument``.
         """
-        try:
-            alias_key = str(instrument)
-        except ValueError:
-            alias_key = None
-        override = self._config.symbol_alias_table.get(alias_key) if alias_key is not None else None
-        if override is not None:
-            instrument = _with_broker_override(instrument, override)
+        self._record_symbol_mapping(instrument)
         return to_mt5_symbol(instrument)
 
     def _invalidate_spec_cache(self, instrument: Instrument) -> None:
         """Remove a cached ``InstrumentSpec``, forcing a re-fetch on next access."""
         self._spec_cache.pop(instrument, None)
-
-    def _build_reverse_alias(self) -> None:
-        """Build the reverse alias table from ``MT5Config.symbol_alias_table``."""
-        self._reverse_alias = {v: k for k, v in self._config.symbol_alias_table.items()}
 
     def _publish_position(self, position: Position) -> None:
         self._publish(
@@ -1471,8 +1628,8 @@ class MT5Adapter(Adapter):
         ``"Metals\\XAUUSD"``, ``"Indices\\US500"``, ``"Stocks\\AAPL"``).  This is
         the authoritative source for asset class — never guessed from the symbol
         string.  Used by the inbound reconstruction path: ``symbol_info()`` gives
-        the path, ``from_mt5_symbol()`` gives the ``(symbol, quote)`` pair, and this
-        function completes the ``Instrument``.
+        the path, ``currency_base``/``currency_profit`` give the base/quote
+        (or settlement currency), and this function completes the ``Instrument``.
 
         The exact mapping is broker-dependent; raise ``ValueError`` for an
         unrecognized path rather than defaulting to a wrong asset class.

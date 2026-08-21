@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
@@ -31,7 +32,7 @@ from unified_trading_execution.dispatch import (
     dispatch_modify_order,
     dispatch_place_order,
 )
-from unified_trading_execution.errors import EngineShutdownError
+from unified_trading_execution.errors import EngineShutdownError, ReconciliationError
 from unified_trading_execution.events import (
     AuditEvent,
     BalanceUpdateEvent,
@@ -75,6 +76,40 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _fill_discrepant_order_ids(
+    local_fills: dict[str, list[FillRecord]],
+    platform_fills: dict[str, list[FillRecord]],
+) -> list[str]:
+    """Return the client_order_ids whose summed fill quantity differs between
+    the local mirror and the platform (the partial-fill discrepancy set)."""
+    ids: list[str] = []
+    for cid in set(local_fills.keys()) | set(platform_fills.keys()):
+        local_total = sum(
+            (f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0")
+        )
+        platform_total = sum(
+            (f.fill_quantity for f in platform_fills.get(cid, [])), start=Decimal("0")
+        )
+        if local_total != platform_total:
+            ids.append(cid)
+    return ids
+
+
+@dataclass(frozen=True, slots=True)
+class _ReconcileContext:
+    """Platform and local snapshots carried from the gather phase into the
+    apply phase so resolution never re-fetches per mismatch."""
+
+    window_start: datetime
+    local_positions: dict[Instrument, Position]
+    local_balances: dict[str, Balance]
+    local_fills: dict[str, list[FillRecord]]
+    platform_positions: dict[Instrument, Position] | None
+    platform_balances: dict[str, Balance] | None
+    platform_orders: dict[str, OrderRecord] | None
+    platform_fills: dict[str, list[FillRecord]] | None
+
+
 class Engine:
     """Async-native trading engine — the main entry point.
 
@@ -112,6 +147,7 @@ class Engine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        reconcile_interval_seconds: float | None = None,
     ) -> None:
         self._adapter = adapter
         # Section 6.2: storage location is optional with a sensible default —
@@ -144,6 +180,18 @@ class Engine:
         self._last_connected: bool | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
 
+        # Periodic reconciliation (optional, opt-in).  None means disabled.
+        if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
+            raise ValueError(
+                "reconcile_interval_seconds must be > 0 or None, "
+                f"got {reconcile_interval_seconds}"
+            )
+        self._reconcile_interval_seconds = reconcile_interval_seconds
+        self._reconcile_loop_task: asyncio.Task[None] | None = None
+        # Serialises manual / reconnect / periodic reconciles so they never
+        # run concurrently and never mutate the mirror at the same time.
+        self._reconcile_lock = asyncio.Lock()
+
         # Wire up state-mirror subscriptions
         self._event_bus.subscribe(FillEvent, self._on_fill)
         self._event_bus.subscribe(PositionUpdateEvent, self._on_position_update)
@@ -166,6 +214,10 @@ class Engine:
 
         # Fetch initial rate limits
         await self._refresh_rate_limits()
+
+        # Start the optional periodic reconciliation loop, if enabled.
+        if self._reconcile_interval_seconds is not None:
+            self._reconcile_loop_task = asyncio.ensure_future(self._reconcile_loop())
 
     def _on_connection_state(self, event: ConnectionStateEvent) -> None:
         """Trigger an automatic reconcile when the connection re-establishes.
@@ -194,6 +246,27 @@ class Engine:
         except Exception:
             logger.exception("Automatic reconciliation after reconnect failed")
 
+    async def _reconcile_loop(self) -> None:
+        """Periodic reconciliation loop (only runs when the user opted in).
+
+        Runs until shutdown.  Each pass is best-effort: a failed pass (e.g. a
+        transient platform error) is logged and retried on the next tick.  The
+        loop skips while the adapter is disconnected, since the reconnect path
+        already triggers a reconcile on re-establishment.
+        """
+        interval = self._reconcile_interval_seconds
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+            if self._shutdown or not self._adapter.is_connected:
+                continue
+            try:
+                await self.reconcile()
+            except Exception:
+                logger.warning("Periodic reconciliation failed", exc_info=True)
+
     async def disconnect(self) -> None:
         """Disconnect the adapter gracefully."""
         await self._adapter.disconnect()
@@ -216,6 +289,8 @@ class Engine:
         # Step 3 — cancel any pending reconnect reconciliation before closing
         if self._reconcile_task is not None and not self._reconcile_task.done():
             self._reconcile_task.cancel()
+        if self._reconcile_loop_task is not None and not self._reconcile_loop_task.done():
+            self._reconcile_loop_task.cancel()
         # Step 4 — close state store
         await self._state_store.close()
 
@@ -356,31 +431,51 @@ class Engine:
         1. Gather local state from the state store
         2. Gather platform state from the adapter (if supported)
         3. Detect mismatches via the pure reconcile() function
-        4. Apply resolution per case (Section 6.3)
-        5. Publish ReconciliationCompleteEvent and persist audit record
-        6. Enter or clear halts based on result
+        4. Apply resolution per case (Section 6.3) using carried snapshots
+        5. Advance the "clean through" watermark only on a clean pass
+        6. Publish ReconciliationCompleteEvent and persist audit record
+        7. Enter or clear halts based on result
+
+        A supported dataset that fails to fetch aborts the whole pass with
+        ``ReconciliationError`` (fail loud) before any mutation, so a transient
+        platform error is never mistaken for "no drift".  An unsupported dataset
+        (``NotImplementedError``) is skipped entirely.
         """
         self._check_not_shutdown()
+        async with self._reconcile_lock:
+            return await self._reconcile_locked()
 
+    async def _reconcile_locked(self) -> ReconciliationResult:
         import time
 
         t0 = time.monotonic()
 
+        # Watermark ("clean through"): gates the fill window.  Forward-only
+        # bootstrap — on the first pass there is no persisted watermark, so we
+        # treat "now" as the clean point and compare only fills newer than it.
+        # Positions/balances/open-orders are always full current snapshots.
+        watermark = await self._state_store.get_reconcile_watermark()
+        if watermark is None:
+            watermark = _utcnow()
+        window_start = watermark
+
         # -- 1. Gather local state --
         local_positions = await self._gather_local_positions()
         local_balances = await self._gather_local_balances()
-        local_orders_list = await self._state_store.query_orders(limit=100_000)
+        local_orders_list = await self._state_store.query_open_orders(limit=100_000)
         local_orders = {o.client_order_id: o for o in local_orders_list}
-        local_fills_list = await self._state_store.query_fills(limit=100_000)
+        local_fills_list = await self._state_store.query_fills(
+            limit=100_000, start=window_start
+        )
         local_fills: dict[str, list[FillRecord]] = {}
         for f in local_fills_list:
             local_fills.setdefault(f.client_order_id, []).append(f)
 
-        # -- 2. Gather platform state --
+        # -- 2. Gather platform state (tri-state; may raise ReconciliationError) --
         platform_positions = await self._fetch_platform_positions()
         platform_balances = await self._fetch_platform_balances()
         platform_orders = await self._fetch_platform_orders()
-        platform_fills = await self._fetch_platform_fills()
+        platform_fills = await self._fetch_platform_fills(since=window_start)
 
         # -- 3. Detect mismatches --
         result = reconcile(
@@ -396,10 +491,24 @@ class Engine:
 
         duration_ms = (time.monotonic() - t0) * 1000
 
-        # -- 4. Apply resolution per case (Section 6.3) --
-        await self._apply_reconciliation_result(result)
+        # -- 4. Apply resolution using the already-fetched snapshots --
+        context = _ReconcileContext(
+            window_start=window_start,
+            local_positions=local_positions,
+            local_balances=local_balances,
+            local_fills=local_fills,
+            platform_positions=platform_positions,
+            platform_balances=platform_balances,
+            platform_orders=platform_orders,
+            platform_fills=platform_fills,
+        )
+        await self._apply_reconciliation_result(result, context)
 
-        # -- 5. Publish + audit --
+        # -- 5. Advance watermark only on a clean pass --
+        if result.is_clean:
+            await self._state_store.set_reconcile_watermark(_utcnow())
+
+        # -- 6. Publish + audit --
         corr_id = _new_id()
         timestamp = _utcnow()
 
@@ -426,10 +535,10 @@ class Engine:
             )
         )
 
-        # -- 6. Halt management --
+        # -- 7. Halt management --
         await self._manage_halt_state(result, corr_id, timestamp)
 
-        # -- 7. Adapter-owned user intent reconciliation --
+        # -- 8. Adapter-owned user intent reconciliation --
         # Adapters that manage adapter-owned intent (e.g. Bybit leverage /
         # margin mode) detect and correct drift here.
         await self._adapter.reconcile_user_intent()
@@ -454,105 +563,130 @@ class Engine:
                 result[bal.currency] = bal
         return result
 
-    async def _fetch_platform_positions(self) -> dict[Instrument, Position]:
+    async def _fetch_platform_positions(self) -> dict[Instrument, Position] | None:
+        """Fetch platform positions (tri-state).
+
+        ``NotImplementedError`` → unsupported (None, skip comparison).
+        Any other error → fail loud (abort the whole pass, no mutation).
+        """
         try:
             return await self._adapter.fetch_positions()
         except NotImplementedError:
-            return {}
-        except Exception:
-            logger.exception("Failed to fetch platform positions")
-            return {}
+            return None
+        except Exception as exc:
+            raise ReconciliationError(f"Failed to fetch platform positions: {exc}") from exc
 
-    async def _fetch_platform_balances(self) -> dict[str, Balance]:
+    async def _fetch_platform_balances(self) -> dict[str, Balance] | None:
+        """Fetch platform balances (tri-state)."""
         try:
             return await self._adapter.fetch_balances()
         except NotImplementedError:
-            return {}
-        except Exception:
-            logger.exception("Failed to fetch platform balances")
-            return {}
+            return None
+        except Exception as exc:
+            raise ReconciliationError(f"Failed to fetch platform balances: {exc}") from exc
 
-    async def _fetch_platform_orders(self) -> dict[str, OrderRecord]:
+    async def _fetch_platform_orders(self) -> dict[str, OrderRecord] | None:
+        """Fetch platform open orders (tri-state)."""
         try:
             return await self._adapter.fetch_open_orders()
         except NotImplementedError:
-            return {}
-        except Exception:
-            logger.exception("Failed to fetch platform orders")
-            return {}
+            return None
+        except Exception as exc:
+            raise ReconciliationError(f"Failed to fetch platform open orders: {exc}") from exc
 
-    async def _fetch_platform_fills(self) -> dict[str, list[FillRecord]]:
+    async def _fetch_platform_fills(
+        self, *, since: datetime | None
+    ) -> dict[str, list[FillRecord]] | None:
+        """Fetch platform fills since *since* (tri-state)."""
         try:
-            return await self._adapter.fetch_fills()
+            return await self._adapter.fetch_fills(since=since)
         except NotImplementedError:
-            return {}
-        except Exception:
-            logger.exception("Failed to fetch platform fills")
-            return {}
+            return None
+        except Exception as exc:
+            raise ReconciliationError(f"Failed to fetch platform fills: {exc}") from exc
 
-    async def _apply_reconciliation_result(self, result: ReconciliationResult) -> None:
-        """Apply resolution per mismatch case (Section 6.3).
+    async def _apply_reconciliation_result(
+        self, result: ReconciliationResult, context: _ReconcileContext
+    ) -> None:
+        """Apply resolution per mismatch case (Section 6.3) using carried snapshots.
 
-        - Position mismatch  → overwrite local with platform truth
-        - Balance mismatch   → overwrite local with platform truth
-        - Orphan on platform → import into local state store
-        - Orphan in local    → remove from local state store (not persisted
-                               in v1 — we cannot delete rows from the audit
-                               trail; the order is marked accordingly)
-        - Partial fill diff  → overwrite local fills with platform fills
+        Resolution never re-fetches platform state — it uses the snapshots
+        gathered at the start of the pass.  Position/balance drift triggers a
+        full sync of that dataset (platform truth imported, local-only entries
+        zeroed).  Orphan and partial-fill corrections are surgical.
         """
-        # Position mismatches: platform is authoritative
-        for mm in result.position_mismatches:
-            # Re-fetch platform position and overwrite local
+        # Position mismatches: platform is authoritative.  A full sync also
+        # resolves presence/absence (local-only → zeroed flat).
+        if result.position_mismatches and context.platform_positions is not None:
             try:
-                platform_positions = await self._adapter.fetch_positions()
-                if mm.instrument and mm.instrument in platform_positions:
-                    await self._state_store.upsert_position(platform_positions[mm.instrument])
+                for pos in context.platform_positions.values():
+                    await self._state_store.upsert_position(pos)
+                for inst in context.local_positions:
+                    if inst not in context.platform_positions:
+                        await self._state_store.upsert_position(
+                            Position(
+                                instrument=inst,
+                                quantity=Decimal("0"),
+                                average_entry_price=Decimal("0"),
+                                updated_at=_utcnow(),
+                            )
+                        )
             except Exception:
-                logger.exception("Failed to overwrite position for %s", mm.instrument)
+                logger.exception("Failed to sync positions to platform truth")
 
-        # Balance mismatches: platform is authoritative
-        for mm in result.balance_mismatches:
+        # Balance mismatches: platform is authoritative.  Local-only currencies
+        # are zeroed.
+        if result.balance_mismatches and context.platform_balances is not None:
             try:
-                platform_balances = await self._adapter.fetch_balances()
-                for bal in platform_balances.values():
+                for bal in context.platform_balances.values():
                     await self._state_store.upsert_balance(bal)
+                for cur in context.local_balances:
+                    if cur not in context.platform_balances:
+                        await self._state_store.upsert_balance(
+                            Balance(
+                                currency=cur,
+                                free=Decimal("0"),
+                                used=Decimal("0"),
+                                total=Decimal("0"),
+                                updated_at=_utcnow(),
+                            )
+                        )
             except Exception:
-                logger.exception("Failed to overwrite balances")
+                logger.exception("Failed to sync balances to platform truth")
 
-        # Orphan on platform: import into local
+        # Orphan on platform: import into local.
         for order in result.orphan_orders_on_platform:
             try:
                 await self._state_store.upsert_order(order)
             except Exception:
                 logger.exception("Failed to import orphan order %s", order.client_order_id)
 
-        # Orphan in local: remove from local mirror (Section 6.3, case 4).
-        # The audit trail is preserved — only current-state orders table is
-        # cleaned up. The order record in audit_events remains immutable.
-        for client_order_id in result.orphan_orders_in_local:
+        # Orphan in local: remove from the open mirror.  The append-only
+        # order_history snapshot preserves the lifecycle record.
+        if result.orphan_orders_in_local:
             try:
-                await self._state_store.delete_orders_by_client_ids([client_order_id])
-                logger.info(
-                    "Removed orphan order %s from local mirror",
-                    client_order_id,
+                await self._state_store.delete_orders_by_client_ids(
+                    result.orphan_orders_in_local
                 )
             except Exception:
-                logger.exception(
-                    "Failed to remove orphan order %s from local mirror",
-                    client_order_id,
-                )
+                logger.exception("Failed to remove orphan orders from local mirror")
+            else:
+                for client_order_id in result.orphan_orders_in_local:
+                    logger.info("Removed orphan order %s from local mirror", client_order_id)
 
-        # Partial fill discrepancies: overwrite local fills with platform
-        if result.partial_fill_discrepancies:
-            try:
-                platform_fills = await self._adapter.fetch_fills()
-                await self._state_store.delete_fills_by_client_ids(list(platform_fills))
-                all_fills = [fill for fills in platform_fills.values() for fill in fills]
-                for fill in all_fills:
-                    await self._state_store.upsert_fill(fill)
-            except Exception:
-                logger.exception("Failed to overwrite fills")
+        # Partial fill: surgical correction per discrepant order, bounded to the
+        # watermark window so pre-watermark fills are never disturbed.
+        if result.partial_fill_discrepancies and context.platform_fills is not None:
+            for cid in _fill_discrepant_order_ids(context.local_fills, context.platform_fills):
+                try:
+                    await self._state_store.delete_fills_by_client_ids(
+                        [cid], since=context.window_start
+                    )
+                    for fill in context.platform_fills.get(cid, []):
+                        fill = await self._stamp_fill_correlation(fill)
+                        await self._state_store.upsert_fill(fill)
+                except Exception:
+                    logger.exception("Failed to correct fills for order %s", cid)
 
     async def _manage_halt_state(
         self,
@@ -602,45 +736,126 @@ class Engine:
         if not self._halt_machine.config.auto_halt_enabled:
             return
 
-        for mismatch in result.all_mismatches:
-            scope: Literal["instrument", "account"] = (
-                "instrument" if mismatch.instrument else "account"
-            )
-            inst = mismatch.instrument
-            if self._halt_machine.enter_halt(
-                scope=scope,
-                instrument=inst,
+        # Only position and balance disagreements halt.  Orphan orders and
+        # partial-fill discrepancies are corrected without halting — they are
+        # order-level artefacts, not evidence of account-state drift.
+        for mismatch in result.position_mismatches:
+            if mismatch.instrument is None:
+                continue  # defensive: position mismatches always carry an instrument
+            await self._enter_halt(
+                scope="instrument",
+                instrument=mismatch.instrument,
                 reason=mismatch.mismatch_type,
                 detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-            ):
-                self._event_bus.publish(
-                    HaltEnteredEvent(
-                        event_id=_new_id(),
-                        timestamp=timestamp,
-                        adapter_name=self._adapter.platform_name,
-                        account_id=self._adapter.account_id,
-                        correlation_id=corr_id,
-                        scope=scope,
-                        instrument=inst,
-                        reason=mismatch.mismatch_type,
-                        detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                    )
+                corr_id=corr_id,
+                timestamp=timestamp,
+            )
+        for mismatch in result.balance_mismatches:
+            await self._enter_halt(
+                scope="account",
+                instrument=None,
+                reason=mismatch.mismatch_type,
+                detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
+                corr_id=corr_id,
+                timestamp=timestamp,
+            )
+
+    async def _enter_halt(
+        self,
+        *,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+        corr_id: str,
+        timestamp: datetime,
+    ) -> None:
+        """Enter a halt and publish/persist the corresponding events."""
+        if not self._halt_machine.enter_halt(
+            scope=scope, instrument=instrument, reason=reason, detail=detail
+        ):
+            return
+        self._event_bus.publish(
+            HaltEnteredEvent(
+                event_id=_new_id(),
+                timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                scope=scope,
+                instrument=instrument,
+                reason=reason,
+                detail=detail,
+            )
+        )
+        await self._state_store.write_halt_event(
+            HaltEvent(
+                event_id=_new_id(),
+                timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                action="entered",
+                scope=scope,
+                instrument=instrument,
+                reason=reason,
+                detail=detail,
+                cleared_by=None,
+            )
+        )
+
+    # ── Manual halt clearing ───────────────────────────────────────
+
+    async def clear_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None = None,
+    ) -> bool:
+        """Manually clear a halt for the given scope (Section 6.4).
+
+        Works regardless of ``HaltClearMode``: it authorises the clear through
+        both state-machine gates (``manual_clear`` for MANUAL mode and
+        ``reconciliation_is_clean`` for AUTOMATIC mode) so an explicit user
+        request always clears.  Returns True if a halt was actually cleared.
+        """
+        self._check_not_shutdown()
+        cleared = self._halt_machine.try_clear_halt(
+            scope,
+            instrument=instrument,
+            reconciliation_is_clean=True,
+            manual_clear=True,
+        )
+        if cleared:
+            corr_id = _new_id()
+            timestamp = _utcnow()
+            self._event_bus.publish(
+                HaltClearedEvent(
+                    event_id=_new_id(),
+                    timestamp=timestamp,
+                    adapter_name=self._adapter.platform_name,
+                    account_id=self._adapter.account_id,
+                    correlation_id=corr_id,
+                    scope=scope,
+                    instrument=instrument,
+                    cleared_by="manual",
                 )
-                await self._state_store.write_halt_event(
-                    HaltEvent(
-                        event_id=_new_id(),
-                        timestamp=timestamp,
-                        adapter_name=self._adapter.platform_name,
-                        account_id=self._adapter.account_id,
-                        correlation_id=corr_id,
-                        action="entered",
-                        scope=scope,
-                        instrument=inst,
-                        reason=mismatch.mismatch_type,
-                        detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                        cleared_by=None,
-                    )
+            )
+            await self._state_store.write_halt_event(
+                HaltEvent(
+                    event_id=_new_id(),
+                    timestamp=timestamp,
+                    adapter_name=self._adapter.platform_name,
+                    account_id=self._adapter.account_id,
+                    correlation_id=corr_id,
+                    action="cleared",
+                    scope=scope,
+                    instrument=instrument,
+                    reason="manual_clear",
+                    detail="",
+                    cleared_by="manual",
                 )
+            )
+        return cleared
 
     # ── State mirror access ────────────────────────────────────────
 
@@ -801,9 +1016,32 @@ class Engine:
     def _on_balance_update(self, event: BalanceUpdateEvent) -> None:
         asyncio.ensure_future(self._persist_balance(event))
 
+    async def _stamp_fill_correlation(self, fill: FillRecord) -> FillRecord:
+        """Stamp a fill with the placing action's correlation_id (Section 17.14).
+
+        The adapter can recover only ``client_order_id`` from the deal comment,
+        so it cannot know the dispatch-time ``correlation_id``.  The engine
+        resolves it here from the persisted order snapshot.  Unknown tickets
+        (empty ``client_order_id``, or no local order) keep the adapter's
+        ``client_order_id`` fallback.
+        """
+        if not fill.client_order_id:
+            return fill
+        try:
+            order = await self._state_store.get_order(fill.client_order_id)
+        except Exception:
+            logger.exception(
+                "Failed to resolve correlation_id for fill %s", fill.platform_fill_id
+            )
+            return fill
+        if order is None:
+            return fill
+        return replace(fill, correlation_id=order.correlation_id)
+
     async def _persist_fill(self, event: FillEvent) -> None:
         try:
-            await self._state_store.upsert_fill(event.fill)
+            fill = await self._stamp_fill_correlation(event.fill)
+            await self._state_store.upsert_fill(fill)
         except Exception:
             logger.exception("Failed to persist fill %s", event.event_id)
 

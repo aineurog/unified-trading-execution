@@ -35,6 +35,18 @@ class OrderStatus(StrEnum):
     EXPIRED = "EXPIRED"
 
 
+# Statuses that represent an order still working/live on the platform.  Used
+# to scope reconciliation orphan detection to open orders only, so terminal
+# orders (FILLED/CANCELLED/REJECTED/EXPIRED) are never mistaken for orphans.
+LIVE_ORDER_STATUSES: frozenset[OrderStatus] = frozenset(
+    {
+        OrderStatus.PENDING,
+        OrderStatus.OPEN,
+        OrderStatus.PARTIALLY_FILLED,
+    }
+)
+
+
 class AssetClass(StrEnum):
     SPOT = "SPOT"
     MARGIN_FX = "MARGIN_FX"

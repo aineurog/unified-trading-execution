@@ -44,7 +44,12 @@ from unified_trading_execution.types.order import OrderModification
 from .helpers import build_unified_order, cleanup_adapter, spec_price, spec_qty
 
 _BROKER_SYMBOL = os.getenv("MT5_SYMBOL", "EURUSD").strip()
-_INSTRUMENT = Instrument(symbol="EUR", quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
+_INSTRUMENT = Instrument(
+    symbol="EUR",
+    quote_currency="USD",
+    asset_class=AssetClass.MARGIN_FX,
+    platform_symbol=_BROKER_SYMBOL,
+)
 
 
 @pytest.fixture
@@ -53,13 +58,11 @@ def mt5_config(
     mt5_password: str,
     mt5_server: str,
 ) -> MT5Config:
-    """Alias EUR/USD to the live broker symbol (reverse alias is needed by
-    the polling/recovery paths that resolve deal/position symbols)."""
+    """Shared config — the broker symbol is carried by ``_INSTRUMENT.platform_symbol``."""
     return MT5Config(
         login=mt5_login,
         password=mt5_password,
         server=mt5_server,
-        symbol_alias_table={"EUR/USD": _BROKER_SYMBOL},
     )
 
 

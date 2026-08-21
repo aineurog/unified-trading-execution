@@ -31,7 +31,12 @@ from .helpers import (
 )
 
 _BROKER_SYMBOL = os.getenv("MT5_SYMBOL", "EURUSD").strip()
-_INSTRUMENT = Instrument(symbol="EUR", quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
+_INSTRUMENT = Instrument(
+    symbol="EUR",
+    quote_currency="USD",
+    asset_class=AssetClass.MARGIN_FX,
+    platform_symbol=_BROKER_SYMBOL,
+)
 
 
 @pytest.fixture
@@ -44,7 +49,6 @@ def mt5_config(
         login=mt5_login,
         password=mt5_password,
         server=mt5_server,
-        symbol_alias_table={"EUR/USD": _BROKER_SYMBOL},
     )
 
 

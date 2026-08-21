@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime
+from dataclasses import replace
 from decimal import Decimal
 
 import pytest
@@ -308,6 +309,23 @@ class TestSQLiteStoreFills:
         assert results[0].fill_quantity == Decimal("0.001")
 
     @pytest.mark.asyncio
+    async def test_upsert_fill_updates_existing_platform_fill(self, store):
+        first = make_fill("first", qty="0.001")
+        second = replace(
+            make_fill("second", qty="0.002"),
+            platform_fill_id=first.platform_fill_id,
+        )
+
+        await store.upsert_fill(first)
+        await store.upsert_fill(second)
+
+        results = await store.query_fills()
+        assert len(results) == 1
+        assert results[0].platform_fill_id == first.platform_fill_id
+        assert results[0].client_order_id == "second"
+        assert results[0].fill_quantity == Decimal("0.002")
+
+    @pytest.mark.asyncio
     async def test_query_fills_filtered_by_instrument(self, store):
         await store.upsert_fill(make_fill("abc"))
         await store.upsert_fill(make_fill("def"))
@@ -328,6 +346,146 @@ class TestSQLiteStoreFills:
         await store.upsert_fills_batch(fills)
         results = await store.query_fills()
         assert len(results) == 2
+
+
+# ============================================================
+# SQLiteStateStore — order_history (append-only lifecycle)
+# ============================================================
+
+
+class TestSQLiteStoreOrderHistory:
+    @pytest.mark.asyncio
+    async def test_upsert_appends_history_snapshot(self, store):
+        await store.upsert_order(make_order(status=OrderStatus.OPEN))
+        await store.upsert_order(make_order(status=OrderStatus.FILLED))
+        cursor = await store.conn.execute(
+            "SELECT COUNT(*) AS n FROM order_history WHERE client_order_id='abc'"
+        )
+        row = await cursor.fetchone()
+        assert row["n"] == 2
+
+    @pytest.mark.asyncio
+    async def test_orders_keeps_latest_snapshot(self, store):
+        await store.upsert_order(make_order(status=OrderStatus.OPEN))
+        await store.upsert_order(make_order(status=OrderStatus.FILLED))
+        got = await store.get_order("abc")
+        assert got is not None
+        assert got.status == OrderStatus.FILLED
+
+    @pytest.mark.asyncio
+    async def test_orphan_removal_preserves_history(self, store):
+        """Deleting an orphan from `orders` must not destroy its lifecycle log."""
+        await store.upsert_order(make_order(status=OrderStatus.OPEN))
+        await store.delete_orders_by_client_ids(["abc"])
+        assert await store.get_order("abc") is None
+        cursor = await store.conn.execute(
+            "SELECT COUNT(*) AS n FROM order_history WHERE client_order_id='abc'"
+        )
+        row = await cursor.fetchone()
+        assert row["n"] == 1
+
+
+# ============================================================
+# SQLiteStateStore — query_open_orders (live statuses only)
+# ============================================================
+
+
+class TestSQLiteStoreOpenOrders:
+    @pytest.mark.asyncio
+    async def test_only_live_statuses_returned(self, store):
+        for status in (
+            OrderStatus.PENDING,
+            OrderStatus.OPEN,
+            OrderStatus.PARTIALLY_FILLED,
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        ):
+            await store.upsert_order(make_order(client_order_id=f"cid-{status.value}", status=status))
+        open_orders = await store.query_open_orders()
+        cids = {o.client_order_id for o in open_orders}
+        assert cids == {"cid-PENDING", "cid-OPEN", "cid-PARTIALLY_FILLED"}
+
+    @pytest.mark.asyncio
+    async def test_terminal_orders_not_returned(self, store):
+        await store.upsert_order(make_order(client_order_id="closed", status=OrderStatus.FILLED))
+        assert await store.query_open_orders() == []
+
+
+# ============================================================
+# SQLiteStateStore — reconciliation watermark
+# ============================================================
+
+
+class TestReconcileWatermark:
+    @pytest.mark.asyncio
+    async def test_default_is_none(self, store):
+        assert await store.get_reconcile_watermark() is None
+
+    @pytest.mark.asyncio
+    async def test_roundtrip(self, store):
+        wm = datetime(2026, 7, 27, 8, 0, 0, tzinfo=UTC)
+        await store.set_reconcile_watermark(wm)
+        got = await store.get_reconcile_watermark()
+        assert got == wm
+        assert got.tzinfo is not None  # stored timezone-aware
+
+    @pytest.mark.asyncio
+    async def test_overwrites(self, store):
+        await store.set_reconcile_watermark(datetime(2026, 1, 1, tzinfo=UTC))
+        later = datetime(2026, 7, 28, tzinfo=UTC)
+        await store.set_reconcile_watermark(later)
+        assert await store.get_reconcile_watermark() == later
+
+
+# ============================================================
+# SQLiteStateStore — delete_fills_by_client_ids (window-bounded)
+# ============================================================
+
+
+class TestDeleteFillsSince:
+    @pytest.mark.asyncio
+    async def test_delete_without_since_removes_all(self, store):
+        await store.upsert_fill(make_fill("abc", qty="0.1"))
+        await store.delete_fills_by_client_ids(["abc"])
+        assert await store.query_fills() == []
+
+    @pytest.mark.asyncio
+    async def test_delete_with_since_preserves_older_fills(self, store):
+        # Distinct timestamps so the window filter can tell them apart.
+        from datetime import timedelta
+
+        old = FillRecord(
+            client_order_id="abc",
+            platform_fill_id="fill-old",
+            instrument=make_inst(),
+            fill_quantity=Decimal("0.1"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW - timedelta(hours=1),
+            fee_currency="USDT",
+            fee_amount=Decimal("0.05"),
+            correlation_id="corr-old",
+        )
+        new = FillRecord(
+            client_order_id="abc",
+            platform_fill_id="fill-new",
+            instrument=make_inst(),
+            fill_quantity=Decimal("0.2"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW,
+            fee_currency="USDT",
+            fee_amount=Decimal("0.05"),
+            correlation_id="corr-new",
+        )
+        await store.upsert_fill(old)
+        await store.upsert_fill(new)
+
+        await store.delete_fills_by_client_ids(["abc"], since=NOW - timedelta(minutes=30))
+
+        remaining = await store.query_fills()
+        assert len(remaining) == 1
+        assert remaining[0].platform_fill_id == "fill-old"
 
 
 # ============================================================
@@ -415,6 +573,10 @@ class TestSQLiteStoreAudit:
         results = await store.query_halt_events()
         assert len(results) == 1
         assert results[0].action == "entered"
+        # The full instrument identity round-trips — including quote_currency,
+        # which Instrument now requires for SPOT.
+        assert results[0].instrument == evt.instrument
+        assert results[0].instrument.quote_currency == "USDT"
 
 
 # ============================================================
@@ -572,6 +734,66 @@ class TestReconciliation:
         assert not result.is_clean
         # position mismatch + balance mismatch + orphan on platform
         assert len(result.all_mismatches) >= 3
+
+    def test_position_absence_is_quantity_zero(self):
+        """A local position with no platform counterpart is a quantity drift.
+
+        Presence/absence is normalised to quantity 0 on the absent side so an
+        open-on-one-side / flat-on-the-other is detected (not skipped).
+        """
+        inst = make_inst()
+        local = {inst: make_position(qty="0.5")}
+        result = reconcile(
+            local_positions=local,
+            platform_positions={},  # platform has no open position
+            local_balances={},
+            platform_balances={},
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
+        )
+        assert len(result.position_mismatches) == 1
+        assert result.position_mismatches[0].platform_value == "absent"
+
+    def test_balance_absence_is_zero(self):
+        """A local balance with no platform counterpart is a balance drift."""
+        local = {"USDT": make_balance(free="9000")}
+        result = reconcile(
+            local_positions={},
+            platform_positions={},
+            local_balances=local,
+            platform_balances={},
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
+        )
+        assert len(result.balance_mismatches) == 1
+        assert result.balance_mismatches[0].platform_value == "absent"
+
+    def test_none_platform_dataset_is_skipped(self):
+        """A ``None`` platform dataset (unsupported fetch) is skipped entirely.
+
+        It must never be mistaken for an empty platform, which would falsely
+        flag every local entry as local-only.
+        """
+        inst = make_inst()
+        local_positions = {inst: make_position(qty="0.5")}
+        local_balances = {"USDT": make_balance(free="9000")}
+        result = reconcile(
+            local_positions=local_positions,
+            platform_positions=None,  # unsupported
+            local_balances=local_balances,
+            platform_balances=None,  # unsupported
+            local_orders={},
+            platform_orders=None,
+            local_fills={},
+            platform_fills=None,
+        )
+        assert result.position_mismatches == []
+        assert result.balance_mismatches == []
+        assert result.is_clean
 
 
 # ============================================================

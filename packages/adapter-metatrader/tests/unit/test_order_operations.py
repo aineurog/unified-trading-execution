@@ -96,7 +96,12 @@ def mt5_constants(mock_mt5_module) -> None:
 
 
 def _instrument() -> Instrument:
-    return Instrument(symbol="EUR", asset_class=AssetClass.MARGIN_FX, quote_currency="USD")
+    return Instrument(
+        symbol="EUR",
+        asset_class=AssetClass.MARGIN_FX,
+        quote_currency="USD",
+        platform_symbol="EURUSD.m",
+    )
 
 
 def _order(
@@ -317,9 +322,10 @@ class TestPlaceOrder:
     async def test_symbol_info_none_raises(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """symbol_info() returning None maps to an error."""
+        """symbol_info() returning None for an existing symbol maps to an error."""
         mock_mt5_module.symbol_info.return_value = None
         mock_mt5_module.last_error.return_value = (10011, "unknown symbol")
+        mock_mt5_module.symbols_get.return_value = MagicMock()  # symbol exists
 
         with pytest.raises(PlatformError):
             await adapter.place_order(_order())
@@ -359,8 +365,9 @@ class TestPlaceOrder:
         """A symbol the broker does not provide raises InvalidSymbolError."""
         mock_mt5_module.symbol_select.return_value = False
         mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+        mock_mt5_module.symbols_get.return_value = None
 
-        with pytest.raises(InvalidSymbolError, match="unknown symbol"):
+        with pytest.raises(InvalidSymbolError, match="not available on this broker"):
             await adapter.place_order(_order())
 
         mock_mt5_module.order_send.assert_not_called()
