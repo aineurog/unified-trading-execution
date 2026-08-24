@@ -61,6 +61,7 @@ module = [
     "uuid_extensions",
     "pybit.*",
     "MetaTrader5",
+    "ib_async.*",
 ]
 ignore_missing_imports = true
 
@@ -103,4 +104,5 @@ modules = [
     "unified_trading_execution.bybit",
     "unified_trading_execution.ctrader",
     "unified_trading_execution.mt5",
+    "unified_trading_execution.ibkr",
 ]
