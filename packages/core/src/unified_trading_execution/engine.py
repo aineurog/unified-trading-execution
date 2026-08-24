@@ -22,7 +22,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from uuid_extensions import uuid7
 
@@ -966,6 +966,25 @@ class Engine:
     @property
     def risk_config(self) -> RiskConfig:
         return self._risk_config
+
+    # ── Adapter method auto-proxy ─────────────────────────────────
+
+    def __getattr__(self, name: str) -> Any:
+        """Proxy unknown attribute lookups to the underlying adapter.
+
+        Adapter-specific methods (``fetch_account_leverage``, ``set_leverage``,
+        ``fetch_positions``, ...) are not on the ``Adapter`` ABC — they vary by
+        platform.  This returns the adapter's coroutine directly (the caller
+        awaits it), mirroring how ``SyncEngine`` proxies through its background
+        loop.  Core never imports adapter code — resolution is dynamic.
+        """
+        adapter = self.__dict__.get("_adapter")
+        if adapter is None:
+            raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
+        method = getattr(adapter, name, None)
+        if callable(method):
+            return method
+        raise AttributeError(f"{type(self).__name__!r} object has no attribute {name!r}")
 
     # ── Internal: instrument spec caching ──────────────────────────
 

@@ -233,6 +233,33 @@ class TestEngineConstruction:
         assert isinstance(engine.state_store, StateStore)
 
 
+# ── adapter method auto-proxy via __getattr__ ─────────────────────────
+
+
+class TestAdapterAutoProxy:
+    """Async Engine proxies unknown attributes to the adapter coroutine."""
+
+    async def test_proxies_adapter_coroutine(self, mock_adapter, event_bus):
+        """Adapter-specific methods are returned as coroutines (caller awaits)."""
+        eng = Engine(adapter=mock_adapter, event_bus=event_bus)
+
+        async def _fake() -> dict:
+            return {"BTC": "fake"}
+
+        mock_adapter.fetch_account_leverage = _fake  # type: ignore[attr-defined]
+
+        method = eng.fetch_account_leverage
+        assert asyncio.iscoroutinefunction(method)
+        assert await method() == {"BTC": "fake"}
+
+    async def test_unknown_attribute_raises(self, mock_adapter, event_bus):
+        """An attribute absent from both Engine and adapter raises AttributeError."""
+        eng = Engine(adapter=mock_adapter, event_bus=event_bus)
+
+        with pytest.raises(AttributeError, match="Engine"):
+            eng.nonexistent_method()
+
+
 # ── place_order ──────────────────────────────────────────────────────
 
 
