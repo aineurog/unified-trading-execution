@@ -69,7 +69,7 @@ jobs:
         run: pip install pytest pytest-asyncio
 
       - name: Unit tests
-        run: pytest packages/ --ignore=packages/*/tests/integration -v
+        run: pytest packages/ --ignore-glob=packages/*/tests/integration -v
 
   integration-tests:
     needs: unit-tests
