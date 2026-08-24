@@ -583,9 +583,7 @@ class TestFetchFills:
         fill = fills["client-abc"][0]
         assert fill.fill_timestamp == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
         call_args = mock_mt5_module.history_deals_get.call_args.args
-        assert call_args[0] == (
-            adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS
-        )
+        assert call_args[0] == (adapter._last_deal_time - _DEAL_QUERY_BACKLOG_SECONDS)
 
 
 class TestResolveMt5Symbol:

@@ -907,10 +907,7 @@ class SQLiteStateStore(StateStore):
 
     async def query_open_orders(self, *, limit: int = 1000) -> list[OrderRecord]:
         """Return orders currently live (PENDING/OPEN/PARTIALLY_FILLED)."""
-        query = (
-            "SELECT * FROM orders WHERE status IN (?,?,?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
+        query = "SELECT * FROM orders WHERE status IN (?,?,?) ORDER BY created_at DESC LIMIT ?"
         params: list[Any] = [
             OrderStatus.PENDING.value,
             OrderStatus.OPEN.value,

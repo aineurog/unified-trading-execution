@@ -18,7 +18,7 @@ import threading
 from collections.abc import Callable, Coroutine
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 
 from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.engine import Engine
@@ -183,7 +183,9 @@ class SyncEngine:
         """Run a full reconciliation pass (blocking)."""
         return self._run(self._async_engine.reconcile())
 
-    def clear_halt(self, scope: str, instrument: Instrument | None = None) -> bool:
+    def clear_halt(
+        self, scope: Literal["instrument", "account"], instrument: Instrument | None = None
+    ) -> bool:
         """Manually clear a halt for the given scope (blocking)."""
         return self._run(self._async_engine.clear_halt(scope, instrument=instrument))
 

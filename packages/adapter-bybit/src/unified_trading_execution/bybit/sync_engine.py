@@ -154,9 +154,7 @@ class SyncBybitEngine(SyncEngine):
     def fetch_open_orders(self) -> dict[str, OrderRecord]:
         return self._run(self._adapter.fetch_open_orders())
 
-    def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         return self._run(self._adapter.fetch_fills(since=since))
 
     def reconcile_user_intent(self) -> None:

@@ -46,21 +46,14 @@ class TestAssetClassClassifier:
     def test_metal_base_currency_wins_over_path(self, adapter: MT5Adapter) -> None:
         """A metal under a 'Commodities' folder is MARGIN_FX (not CFD)."""
         assert (
-            adapter._asset_class_from_path(
-                "Commodities\\XAGUSD", currency_base="XAG", calc_mode=0
-            )
+            adapter._asset_class_from_path("Commodities\\XAGUSD", currency_base="XAG", calc_mode=0)
             == AssetClass.MARGIN_FX
         )
 
     def test_path_thesaurus_scans_all_segments(self, adapter: MT5Adapter) -> None:
         """An account-group root ('PRO') cannot hide the meaningful segment."""
-        assert (
-            adapter._asset_class_from_path("PRO\\Noble\\GOLD.pro") == AssetClass.MARGIN_FX
-        )
-        assert (
-            adapter._asset_class_from_path("PRO\\Indices\\Major", calc_mode=4)
-            == AssetClass.CFD
-        )
+        assert adapter._asset_class_from_path("PRO\\Noble\\GOLD.pro") == AssetClass.MARGIN_FX
+        assert adapter._asset_class_from_path("PRO\\Indices\\Major", calc_mode=4) == AssetClass.CFD
         assert (
             adapter._asset_class_from_path("Equities_CFD\\US\\AAPL_CFD.US", calc_mode=2)
             == AssetClass.STOCK
@@ -85,9 +78,7 @@ class TestAssetClassClassifier:
             asset_class_path_map={"PreciousMetals": AssetClass.MARGIN_FX},
         )
         adapter = MT5Adapter(config)
-        assert (
-            adapter._asset_class_from_path("PreciousMetals\\XAU") == AssetClass.MARGIN_FX
-        )
+        assert adapter._asset_class_from_path("PreciousMetals\\XAU") == AssetClass.MARGIN_FX
 
 
 class TestSplitSymbolName:
@@ -111,9 +102,7 @@ class TestBuildInstrumentFromSymbolInfo:
     """Reconstruction of the canonical Instrument from a symbol_info() row."""
 
     def test_decomposable_forex(self, adapter: MT5Adapter) -> None:
-        info = _symbol_info(
-            "EURUSD", base="EUR", profit="USD", path="Forex\\EURUSD", calc_mode=0
-        )
+        info = _symbol_info("EURUSD", base="EUR", profit="USD", path="Forex\\EURUSD", calc_mode=0)
         inst = adapter._build_instrument_from_symbol_info("EURUSD.m", info)
         assert inst.symbol == "EUR"
         assert inst.quote_currency == "USD"
@@ -130,9 +119,7 @@ class TestBuildInstrumentFromSymbolInfo:
         assert inst.asset_class == AssetClass.MARGIN_FX
 
     def test_non_decomposable_crypto(self, adapter: MT5Adapter) -> None:
-        info = _symbol_info(
-            "SOLUSD", base="USD", profit="USD", path="Crypto\\SOLUSD", calc_mode=2
-        )
+        info = _symbol_info("SOLUSD", base="USD", profit="USD", path="Crypto\\SOLUSD", calc_mode=2)
         inst = adapter._build_instrument_from_symbol_info("SOLUSD", info)
         assert inst.symbol == "SOL"
         assert inst.quote_currency == "USD"
@@ -185,9 +172,7 @@ class TestResolveInstrument:
         assert inst.quote_currency == "USD"
         assert inst.asset_class == AssetClass.SPOT
 
-    async def test_caches_result(
-        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
-    ) -> None:
+    async def test_caches_result(self, mock_mt5_module: MagicMock, adapter: MT5Adapter) -> None:
         mock_mt5_module.symbol_info.return_value = _symbol_info(
             "EURUSD", base="EUR", profit="USD", path="Forex\\EURUSD", calc_mode=0
         )

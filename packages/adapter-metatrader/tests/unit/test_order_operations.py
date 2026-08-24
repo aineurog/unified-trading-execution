@@ -431,9 +431,7 @@ class TestPlaceOrder:
             platform_symbol="SOLUSD",
         )
 
-        with caplog.at_level(
-            logging.WARNING, logger="unified_trading_execution.mt5.adapter"
-        ):
+        with caplog.at_level(logging.WARNING, logger="unified_trading_execution.mt5.adapter"):
             await adapter.place_order(order)
 
         assert order.instrument.symbol == "SOL"

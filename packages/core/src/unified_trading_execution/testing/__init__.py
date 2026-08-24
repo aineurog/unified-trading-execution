@@ -458,9 +458,7 @@ class MockAdapter(Adapter):
             if rec.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
         }
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         if (err := self._consume_error()) is not None:
             raise err
         result: dict[str, list[FillRecord]] = {}

@@ -402,7 +402,9 @@ class TestSQLiteStoreOpenOrders:
             OrderStatus.REJECTED,
             OrderStatus.EXPIRED,
         ):
-            await store.upsert_order(make_order(client_order_id=f"cid-{status.value}", status=status))
+            await store.upsert_order(
+                make_order(client_order_id=f"cid-{status.value}", status=status)
+            )
         open_orders = await store.query_open_orders()
         cids = {o.client_order_id for o in open_orders}
         assert cids == {"cid-PENDING", "cid-OPEN", "cid-PARTIALLY_FILLED"}

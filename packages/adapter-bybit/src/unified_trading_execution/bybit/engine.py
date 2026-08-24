@@ -150,9 +150,7 @@ class BybitEngine(Engine):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         return await self._adapter.fetch_open_orders()
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         return await self._adapter.fetch_fills(since=since)
 
     async def reconcile_user_intent(self) -> None:

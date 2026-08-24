@@ -84,9 +84,7 @@ def _fill_discrepant_order_ids(
     the local mirror and the platform (the partial-fill discrepancy set)."""
     ids: list[str] = []
     for cid in set(local_fills.keys()) | set(platform_fills.keys()):
-        local_total = sum(
-            (f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0")
-        )
+        local_total = sum((f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0"))
         platform_total = sum(
             (f.fill_quantity for f in platform_fills.get(cid, [])), start=Decimal("0")
         )
@@ -183,8 +181,7 @@ class Engine:
         # Periodic reconciliation (optional, opt-in).  None means disabled.
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
             raise ValueError(
-                "reconcile_interval_seconds must be > 0 or None, "
-                f"got {reconcile_interval_seconds}"
+                f"reconcile_interval_seconds must be > 0 or None, got {reconcile_interval_seconds}"
             )
         self._reconcile_interval_seconds = reconcile_interval_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
@@ -255,12 +252,16 @@ class Engine:
         already triggers a reconcile on re-establishment.
         """
         interval = self._reconcile_interval_seconds
-        while not self._shutdown:
+        if interval is None:
+            return
+        while True:
+            if self._shutdown:
+                break
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
-            if self._shutdown or not self._adapter.is_connected:
+            if not self._adapter.is_connected:
                 continue
             try:
                 await self.reconcile()
@@ -464,9 +465,7 @@ class Engine:
         local_balances = await self._gather_local_balances()
         local_orders_list = await self._state_store.query_open_orders(limit=100_000)
         local_orders = {o.client_order_id: o for o in local_orders_list}
-        local_fills_list = await self._state_store.query_fills(
-            limit=100_000, start=window_start
-        )
+        local_fills_list = await self._state_store.query_fills(limit=100_000, start=window_start)
         local_fills: dict[str, list[FillRecord]] = {}
         for f in local_fills_list:
             local_fills.setdefault(f.client_order_id, []).append(f)
@@ -665,9 +664,7 @@ class Engine:
         # order_history snapshot preserves the lifecycle record.
         if result.orphan_orders_in_local:
             try:
-                await self._state_store.delete_orders_by_client_ids(
-                    result.orphan_orders_in_local
-                )
+                await self._state_store.delete_orders_by_client_ids(result.orphan_orders_in_local)
             except Exception:
                 logger.exception("Failed to remove orphan orders from local mirror")
             else:
@@ -1049,9 +1046,7 @@ class Engine:
         try:
             order = await self._state_store.get_order(fill.client_order_id)
         except Exception:
-            logger.exception(
-                "Failed to resolve correlation_id for fill %s", fill.platform_fill_id
-            )
+            logger.exception("Failed to resolve correlation_id for fill %s", fill.platform_fill_id)
             return fill
         if order is None:
             return fill

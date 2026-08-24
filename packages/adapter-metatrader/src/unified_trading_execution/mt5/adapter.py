@@ -193,9 +193,9 @@ _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "FX": AssetClass.MARGIN_FX,
     "CURRENCIES": AssetClass.MARGIN_FX,
     "METALS": AssetClass.MARGIN_FX,
-    "NOBLE": AssetClass.MARGIN_FX,       # precious metals (Oanda's market folder)
+    "NOBLE": AssetClass.MARGIN_FX,  # precious metals (Oanda's market folder)
     "PRECIOUS": AssetClass.MARGIN_FX,
-    "COMMODITIES": AssetClass.CFD,       # soft commodities (sugar, oil, coffee)
+    "COMMODITIES": AssetClass.CFD,  # soft commodities (sugar, oil, coffee)
     "ENERGY": AssetClass.CFD,
     "INDICES": AssetClass.CFD,
     "INDEX": AssetClass.CFD,
@@ -217,17 +217,17 @@ _PATH_ASSET_CLASS: dict[str, AssetClass] = {
 # different modes across brokers), so it is only a last-resort fallback when
 # neither the metal-base check nor the path thesaurus resolves.
 _CALC_MODE_ASSET_CLASS: dict[int, AssetClass] = {
-    0: AssetClass.MARGIN_FX,    # SYMBOL_CALC_MODE_FOREX
-    1: AssetClass.FUTURES,      # SYMBOL_CALC_MODE_FUTURES
-    2: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFD
-    3: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDINDEX
-    4: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDLEVERAGE
-    32: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS
-    33: AssetClass.FUTURES,     # SYMBOL_CALC_MODE_EXCH_FUTURES
-    64: AssetClass.MARGIN_FX,   # SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
-    66: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS
-    67: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX
-    68: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS_MOEX
+    0: AssetClass.MARGIN_FX,  # SYMBOL_CALC_MODE_FOREX
+    1: AssetClass.FUTURES,  # SYMBOL_CALC_MODE_FUTURES
+    2: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFD
+    3: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFDINDEX
+    4: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFDLEVERAGE
+    32: AssetClass.STOCK,  # SYMBOL_CALC_MODE_EXCH_STOCKS
+    33: AssetClass.FUTURES,  # SYMBOL_CALC_MODE_EXCH_FUTURES
+    64: AssetClass.MARGIN_FX,  # SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
+    66: AssetClass.BOND,  # SYMBOL_CALC_MODE_EXCH_BONDS
+    67: AssetClass.STOCK,  # SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX
+    68: AssetClass.BOND,  # SYMBOL_CALC_MODE_EXCH_BONDS_MOEX
 }
 
 # Base currencies that are precious metals.  Broker-independent — ``currency_base``
@@ -979,9 +979,7 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_fetch)
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         """Fetch recent fills via ``mt5.history_deals_get()``.
 
         Only trading deals (DEAL_TYPE_BUY/SELL) are fills; balance
@@ -1003,9 +1001,7 @@ class MT5Adapter(Adapter):
             self._check_call_result("account_info", account)
             backlog = 0 if since is not None else _DEAL_QUERY_BACKLOG_SECONDS
             deals = mt5.history_deals_get(
-                *self._server_deal_window(
-                    mt5, _utcnow(), from_time=since, backlog_seconds=backlog
-                )
+                *self._server_deal_window(mt5, _utcnow(), from_time=since, backlog_seconds=backlog)
             )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
@@ -1524,9 +1520,7 @@ class MT5Adapter(Adapter):
             code, desc = mt5.last_error()
             if not self._symbol_exists(mt5_symbol, mt5):
                 self._failed_symbols.add(mt5_symbol)
-                raise InvalidSymbolError(
-                    f"symbol {mt5_symbol!r} is not available on this broker"
-                )
+                raise InvalidSymbolError(f"symbol {mt5_symbol!r} is not available on this broker")
             raise map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
         self._selected_symbols.add(mt5_symbol)
 

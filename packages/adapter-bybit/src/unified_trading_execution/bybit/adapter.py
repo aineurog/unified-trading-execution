@@ -2259,9 +2259,7 @@ class BybitAdapter(Adapter):
 
         return result
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         """Fetch recent fills, grouped by client order id.
 
         Only ``Trade`` executions are returned — the WebSocket ``execution``
