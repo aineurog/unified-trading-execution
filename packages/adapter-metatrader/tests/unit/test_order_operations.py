@@ -24,6 +24,7 @@ Tests cases:
 
 from __future__ import annotations
 
+import logging
 from collections import namedtuple
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -396,6 +397,50 @@ class TestPlaceOrder:
             await adapter.place_order(
                 _order(stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010")))
             )
+
+    async def test_corrects_wrong_instrument_from_symbol_info(
+        self,
+        mock_mt5_module: MagicMock,
+        adapter: MT5Adapter,
+        mt5_constants,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A wrong symbol/quote/asset_class is corrected to the broker's values.
+
+        The caller supplies only ``platform_symbol`` (mandatory) with wrong
+        ``symbol``/``quote_currency``/``asset_class``; the adapter derives the
+        canonical identity from ``symbol_info()``, corrects the order's
+        instrument in place (so the dispatch layer persists the true values),
+        and logs a warning rather than silently overwriting.
+        """
+        info = MagicMock()
+        info.name = "SOLUSD"
+        info.currency_base = "USD"
+        info.currency_profit = "USD"
+        info.path = "Crypto\\SOLUSD"
+        info.trade_calc_mode = 2
+        info.filling_mode = 0b100  # ORDER_FILLING_RETURN
+        mock_mt5_module.symbol_info.return_value = info
+        _send_success(mock_mt5_module)
+
+        order = _order(OrderType.LIMIT, OrderSide.BUY)
+        order.instrument = Instrument(
+            symbol="WRONG",
+            quote_currency="WRONG",
+            asset_class=AssetClass.STOCK,
+            platform_symbol="SOLUSD",
+        )
+
+        with caplog.at_level(
+            logging.WARNING, logger="unified_trading_execution.mt5.adapter"
+        ):
+            await adapter.place_order(order)
+
+        assert order.instrument.symbol == "SOL"
+        assert order.instrument.quote_currency == "USD"
+        assert order.instrument.asset_class == AssetClass.SPOT
+        assert adapter._symbol_to_instrument["SOLUSD"] == order.instrument
+        assert "Correcting Instrument" in caplog.text
 
 
 class TestModifyOrder:

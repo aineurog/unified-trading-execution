@@ -94,6 +94,10 @@ class MT5Engine(Engine):
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         return await self._adapter.fetch_instrument_spec(instrument)
 
+    async def resolve_instrument(self, platform_symbol: str) -> Instrument:
+        """Discover the canonical ``Instrument`` for an MT5 ``platform_symbol``."""
+        return await self._adapter.resolve_instrument(platform_symbol)
+
     async def get_rate_limits(self) -> RateLimits:
         return await self._adapter.get_rate_limits()
 

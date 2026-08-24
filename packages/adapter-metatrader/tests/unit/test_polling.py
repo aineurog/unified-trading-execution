@@ -768,16 +768,16 @@ class TestPollOnce:
 
 
 class TestAssetClassFromPath:
-    """Asset-class derivation from symbol_info().path."""
+    """Asset-class derivation from symbol_info().path (layered classifier)."""
 
-    def test_first_segment_wins_over_substring(self, adapter: MT5Adapter) -> None:
-        """'Stocks\\CryptoMining' is STOCK — substring 'CRYPTO' must not match."""
+    def test_thesaurus_segment_matches_exactly(self, adapter: MT5Adapter) -> None:
+        """A known segment maps to its asset class — 'CRYPTOMINING' is not 'CRYPTO'."""
         assert adapter._asset_class_from_path("Stocks\\CryptoMining\\CRPT") == AssetClass.STOCK
         assert adapter._asset_class_from_path("Forex\\EURUSD") == AssetClass.MARGIN_FX
         assert adapter._asset_class_from_path("Metals\\XAUUSD") == AssetClass.MARGIN_FX
 
-    def test_unrecognized_first_segment_raises(self, adapter: MT5Adapter) -> None:
-        """Unknown first segment raises — never a silent default."""
+    def test_unrecognized_path_raises(self, adapter: MT5Adapter) -> None:
+        """No layer resolves → ValueError, never a silent default."""
         with pytest.raises(ValueError):
             adapter._asset_class_from_path("Strange\\EURUSD")
 

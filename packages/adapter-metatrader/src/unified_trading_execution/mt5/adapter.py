@@ -176,27 +176,103 @@ def _decimal_places(value: Decimal) -> int:
     return max(0, -exponent)
 
 
-# MT5 symbol market-path segment → canonical AssetClass.  The mapping is
-# broker-dependent (the segment names come from the broker's own market tree);
-# an unrecognized path is an error, never a silent default.
+# MT5 symbol market-path segment → canonical AssetClass.  This is a *thesaurus*
+# of the standard market-tree folder names, matched case-insensitively against
+# ANY segment of ``symbol_info().path`` (not just the first), so a broker's
+# account-group root (e.g. Oanda's ``"PRO\\Noble\\GOLD.pro"``) cannot hide the
+# meaningful segment.  It is the primary signal; ``trade_calc_mode`` is only a
+# fallback because the same asset can report different calc modes per broker
+# (a metal is 0 on one broker and 4 on another).  Extendable per-broker via
+# ``MT5Config.asset_class_path_map``.
+#
+# Soft commodities map to CFD: precious metals are caught earlier by the
+# broker-independent ``_METAL_BASE_CURRENCIES`` check, so a "Commodities"
+# folder that holds silver (XAG) resolves as metal before reaching this table.
 _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "FOREX": AssetClass.MARGIN_FX,
-    "METALS": AssetClass.MARGIN_FX,  # spot metals (XAUUSD) trade as quoted pairs on margin
-    "COMMODITIES": AssetClass.MARGIN_FX,  # spot metals grouped under Commodities on some brokers
-    "INDICES": AssetClass.CFD,  # index CFDs
+    "FX": AssetClass.MARGIN_FX,
+    "CURRENCIES": AssetClass.MARGIN_FX,
+    "METALS": AssetClass.MARGIN_FX,
+    "NOBLE": AssetClass.MARGIN_FX,       # precious metals (Oanda's market folder)
+    "PRECIOUS": AssetClass.MARGIN_FX,
+    "COMMODITIES": AssetClass.CFD,       # soft commodities (sugar, oil, coffee)
+    "ENERGY": AssetClass.CFD,
+    "INDICES": AssetClass.CFD,
+    "INDEX": AssetClass.CFD,
     "STOCKS": AssetClass.STOCK,
+    "STOCK": AssetClass.STOCK,
+    "EQUITIES": AssetClass.STOCK,
+    "EQUITIES_CFD": AssetClass.STOCK,
+    "SHARES": AssetClass.STOCK,
     "CRYPTOCURRENCIES": AssetClass.SPOT,
     "CRYPTO": AssetClass.SPOT,
     "FUTURES": AssetClass.FUTURES,
     "BONDS": AssetClass.BOND,
     "FUNDS": AssetClass.FUND,
+    "ETF": AssetClass.FUND,
 }
 
-# Asset classes whose broker symbol is a BASE/QUOTE pair — ``symbol_info()``
-# gives a meaningful ``currency_base`` (the base) and ``currency_profit`` (the
-# quote).  Everything else is a single-name symbol (stock, index CFD, future,
-# bond, fund) whose "base" is the name itself.
-_PAIR_ASSET_CLASSES: frozenset[AssetClass] = frozenset({AssetClass.MARGIN_FX, AssetClass.SPOT})
+# MT5 ``ENUM_SYMBOL_CALC_MODE`` → canonical AssetClass.  Broker-independent in
+# *type* but not in *value* for a given asset (metals and indices report
+# different modes across brokers), so it is only a last-resort fallback when
+# neither the metal-base check nor the path thesaurus resolves.
+_CALC_MODE_ASSET_CLASS: dict[int, AssetClass] = {
+    0: AssetClass.MARGIN_FX,    # SYMBOL_CALC_MODE_FOREX
+    1: AssetClass.FUTURES,      # SYMBOL_CALC_MODE_FUTURES
+    2: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFD
+    3: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDINDEX
+    4: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDLEVERAGE
+    32: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS
+    33: AssetClass.FUTURES,     # SYMBOL_CALC_MODE_EXCH_FUTURES
+    64: AssetClass.MARGIN_FX,   # SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
+    66: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS
+    67: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX
+    68: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS_MOEX
+}
+
+# Base currencies that are precious metals.  Broker-independent — ``currency_base``
+# is MT5's own field.  Disambiguates a metal (XAUUSD/XAGUSD) that a broker groups
+# under a "Commodities" folder from a soft commodity (SUGAR).
+_METAL_BASE_CURRENCIES: frozenset[str] = frozenset({"XAU", "XAG", "XPT", "XPD"})
+
+# Broker symbol suffixes to strip before splitting a name into base/quote
+# (matched case-insensitively, longest-most-specific, applied repeatedly so
+# ``AAPL_CFD.US`` → ``AAPL``).  Pure name cleanup — never an asset-class guess.
+_BROKER_SYMBOL_SUFFIXES: tuple[str, ...] = (
+    ".PRO",
+    ".US",
+    ".UK",
+    ".DE",
+    "_CFD",
+    "-CASH",
+    "+",
+)
+
+# Quote-currency suffixes to split a crypto/forex name (``SOLUSD`` → ``SOL``/``USD``).
+# Ordered longest-first so ``USDT`` is matched before ``USD``.
+_QUOTE_CURRENCY_SUFFIXES: tuple[str, ...] = (
+    "USDT",
+    "USDC",
+    "USD",
+    "EUR",
+    "GBP",
+    "JPY",
+    "CHF",
+    "AUD",
+    "NZD",
+    "CAD",
+    "TRY",
+    "ZAR",
+)
+
+
+def _path_segments(path: str) -> list[str]:
+    """Split a broker market path into uppercased segments, empty dropped.
+
+    Handles both ``\\`` and ``/`` separators so the classifier is agnostic to
+    how the broker writes its market tree.
+    """
+    return [seg.upper() for seg in path.replace("/", "\\").split("\\") if seg]
 
 
 # ---------------------------------------------------------------------------
@@ -217,6 +293,17 @@ class MT5Adapter(Adapter):
         self._config = config
         self._event_bus = event_bus
         self._connected = False
+
+        # Merge the broker-specific path thesaurus from config over the built-in
+        # defaults, keyed case-insensitively (segments are uppercased on lookup).
+        self._path_asset_class = dict(_PATH_ASSET_CLASS)
+        if config.asset_class_path_map:
+            self._path_asset_class.update(
+                {
+                    str(segment).upper(): asset_class
+                    for segment, asset_class in config.asset_class_path_map.items()
+                }
+            )
 
         # Actual account login, resolved from terminal after connect().
         self._account_login: int | None = None
@@ -503,6 +590,40 @@ class MT5Adapter(Adapter):
                         f"symbol {mt5_symbol!r} is not available on this broker"
                     )
                 raise map_mt5_error(code, desc or f"symbol_info() failed for {mt5_symbol}")
+
+            # Correct a caller-supplied Instrument against the broker's own
+            # symbol_info() so the DB stores the true identity.  platform_symbol
+            # is mandatory and was used to resolve mt5_symbol; symbol /
+            # quote_currency / asset_class are optional and are derived here,
+            # then tested against the user's values — wrong ones are corrected
+            # with a logged warning (never silently) and cached so the inbound
+            # polling path reconstructs the same corrected instrument.
+            try:
+                canonical = self._build_instrument_from_symbol_info(mt5_symbol, info)
+                if not self._identity_matches(order.instrument, canonical):
+                    logger.warning(
+                        "Correcting Instrument %r for platform_symbol %r: "
+                        "broker reports symbol=%r quote_currency=%r asset_class=%r",
+                        order.instrument,
+                        mt5_symbol,
+                        canonical.symbol,
+                        canonical.quote_currency,
+                        canonical.asset_class,
+                    )
+                    order.instrument = replace(
+                        order.instrument,
+                        symbol=canonical.symbol,
+                        quote_currency=canonical.quote_currency,
+                        asset_class=canonical.asset_class,
+                    )
+                    self._symbol_to_instrument[mt5_symbol] = order.instrument
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping instrument correction for %r — %s",
+                    mt5_symbol,
+                    exc,
+                )
+
             request = build_mt5_request(order, mt5_module=mt5)
             request["symbol"] = mt5_symbol
             comment = encode_client_order_id(client_order_id)
@@ -806,6 +927,22 @@ class MT5Adapter(Adapter):
             return int(account.leverage)
 
         return await asyncio.to_thread(_fetch)
+
+    async def resolve_instrument(self, platform_symbol: str) -> Instrument:
+        """Build the canonical ``Instrument`` for an MT5 ``platform_symbol``.
+
+        Fetches ``symbol_info()`` from the broker and reconstructs the
+        canonical identity — a convenience for callers that want to discover
+        (or verify) an instrument's ``symbol``/``quote_currency``/
+        ``asset_class`` without placing an order.  Results are cached in the
+        same ``_symbol_to_instrument`` map used by the polling path.
+        """
+        mt5 = _get_mt5()
+
+        def _resolve() -> Instrument:
+            return self._resolve_instrument(platform_symbol, mt5)
+
+        return await asyncio.to_thread(_resolve)
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch all open orders via ``mt5.orders_get()``.
@@ -1333,9 +1470,10 @@ class MT5Adapter(Adapter):
            and extended on every outbound order, so anything the engine has
            traded resolves exactly (full field round-trip).
         2. ``symbol_info()`` broker metadata — ``currency_base`` /
-           ``currency_profit`` give the base/quote (or settlement currency
-           for non-pair symbols) and ``path`` gives the asset class.  This
-           covers symbols the engine has never traded (e.g. manual positions).
+           ``currency_profit`` give the base/quote, ``path`` and
+           ``trade_calc_mode`` give the asset class, and the name gives the
+           symbol for non-decomposable instruments.  This covers symbols the
+           engine has never traded (e.g. manual terminal positions).
 
         Must only be called from within a ``to_thread()`` block —
         ``symbol_info()`` is an MT5 IPC call.
@@ -1351,33 +1489,7 @@ class MT5Adapter(Adapter):
                 code,
                 desc or f"mt5.symbol_info() returned None for {mt5_symbol}",
             )
-        asset_class = self._asset_class_from_path(info.path)
-        base = info.currency_base or None
-        profit = info.currency_profit or None
-        if asset_class in _PAIR_ASSET_CLASSES:
-            # Base/quote pair (forex, metals, crypto spot) — symbol is the base,
-            # quote_currency is the profit/settlement currency.
-            if not base:
-                raise ValueError(
-                    f"MT5 symbol {mt5_symbol!r} has no currency_base — "
-                    "cannot reconstruct a pair Instrument"
-                )
-            instrument = Instrument(
-                symbol=base,
-                quote_currency=profit,
-                asset_class=asset_class,
-                platform_symbol=mt5_symbol,
-            )
-        else:
-            # Single-name symbol (stock, CFD index, future, bond, fund) — the
-            # broker symbol is the name; the profit currency is its currency.
-            instrument = Instrument(
-                symbol=base or mt5_symbol,
-                quote_currency=None,
-                currency=profit,
-                asset_class=asset_class,
-                platform_symbol=mt5_symbol,
-            )
+        instrument = self._build_instrument_from_symbol_info(mt5_symbol, info)
         self._symbol_to_instrument[mt5_symbol] = instrument
         return instrument
 
@@ -1621,29 +1733,155 @@ class MT5Adapter(Adapter):
             )
         )
 
-    def _asset_class_from_path(self, path: str) -> AssetClass:
-        """Derive the canonical ``AssetClass`` from an MT5 symbol's market path.
+    def _asset_class_from_path(
+        self,
+        path: str,
+        *,
+        currency_base: str | None = None,
+        calc_mode: int | None = None,
+    ) -> AssetClass:
+        """Derive the canonical ``AssetClass`` for an MT5 symbol.
 
-        ``symbol_info().path`` is the broker's market tree (e.g. ``"Forex\\EURUSD"``,
-        ``"Metals\\XAUUSD"``, ``"Indices\\US500"``, ``"Stocks\\AAPL"``).  This is
-        the authoritative source for asset class — never guessed from the symbol
-        string.  Used by the inbound reconstruction path: ``symbol_info()`` gives
-        the path, ``currency_base``/``currency_profit`` give the base/quote
-        (or settlement currency), and this function completes the ``Instrument``.
+        Layered, broker-agnostic classification — no broker names are
+        hardcoded; a new broker's market folder is accommodated either by an
+        existing thesaurus entry or, failing that, the config escape hatch
+        ``MT5Config.asset_class_path_map``:
 
-        The exact mapping is broker-dependent; raise ``ValueError`` for an
-        unrecognized path rather than defaulting to a wrong asset class.
+        1. Precious-metal base currency (``XAU``/``XAG``/``XPT``/``XPD``) —
+           a broker-independent field, so a metal grouped under
+           "Commodities" still resolves to MARGIN_FX before any path is
+           consulted.
+        2. Any ``symbol_info().path`` segment matched against the thesaurus
+           (built-in + config overrides).  Scanning ALL segments — not just
+           the first — means an account-group root such as Oanda's ``PRO``
+           cannot hide the meaningful ``Noble``/``Indices``/``Equities_CFD``
+           segment beneath it.
+        3. ``trade_calc_mode`` fallback (MT5's ``ENUM_SYMBOL_CALC_MODE``),
+           used only when neither of the above resolves.
+
+        Raises ``ValueError`` for a symbol none of the three layers
+        recognise — never guesses, so a wrong asset class cannot silently
+        corrupt the DB.
         """
-        # Match on the first path component only — substring containment
-        # could misclassify e.g. "Stocks\\CryptoMining" as SPOT.
-        segment = path.upper().split("\\")[0].split("/")[0]
-        asset_class = _PATH_ASSET_CLASS.get(segment)
-        if asset_class is None:
-            raise ValueError(
-                f"Unrecognized MT5 symbol path {path!r} — cannot derive asset class. "
-                "Add a mapping to _PATH_ASSET_CLASS."
+        base = (currency_base or "").upper()
+        if base in _METAL_BASE_CURRENCIES:
+            return AssetClass.MARGIN_FX
+
+        for segment in _path_segments(path):
+            asset_class = self._path_asset_class.get(segment)
+            if asset_class is not None:
+                return asset_class
+
+        if calc_mode is not None:
+            asset_class = _CALC_MODE_ASSET_CLASS.get(calc_mode)
+            if asset_class is not None:
+                return asset_class
+
+        raise ValueError(
+            f"Unrecognized MT5 symbol path {path!r} "
+            f"(currency_base={base!r}, calc_mode={calc_mode!r}) — cannot derive "
+            "asset class. Add a mapping to MT5Config.asset_class_path_map."
+        )
+
+    @staticmethod
+    def _split_symbol_name(name: str) -> tuple[str, str | None]:
+        """Split a broker symbol name into ``(symbol, quote_currency|None)``.
+
+        Strips broker suffixes first (``AAPL_CFD.US`` → ``AAPL``), then, if
+        the remaining name ends with a known quote currency
+        (``SOLUSD`` → ``SOL``/``USD``), splits it off.  Returns
+        ``(name, None)`` when no quote suffix matches.  Pure string logic —
+        never an asset-class guess.
+        """
+        cleaned = name.upper()
+        changed = True
+        while changed:
+            changed = False
+            for suffix in _BROKER_SYMBOL_SUFFIXES:
+                if cleaned.endswith(suffix) and len(cleaned) > len(suffix):
+                    cleaned = cleaned[: -len(suffix)]
+                    changed = True
+                    break
+        for quote in _QUOTE_CURRENCY_SUFFIXES:
+            if cleaned.endswith(quote) and len(cleaned) > len(quote):
+                return cleaned[: -len(quote)], quote
+        return cleaned, None
+
+    def _build_instrument_from_symbol_info(self, mt5_symbol: str, info: Any) -> Instrument:
+        """Build the canonical ``Instrument`` from a ``symbol_info()`` row.
+
+        Reconstructs ``symbol``/``quote_currency``/``asset_class`` (and the
+        settlement ``currency`` for single-name instruments) from broker
+        metadata:
+
+        * ``currency_base``/``currency_profit``: when they differ the pair is
+          decomposable and carried verbatim (generic, zero config).
+        * ``path``/``trade_calc_mode``: feed ``_asset_class_from_path``.
+        * ``name``: for non-decomposable symbols (base == profit, e.g. crypto
+          ``SOLUSD``, metal ``GOLD.pro``, stock ``AAPL``) the tradable's
+          identity lives only in the name, so it is split into symbol (+quote).
+
+        Must be called from within a ``to_thread()`` block — the caller has
+        already fetched ``info`` via ``symbol_info()``.
+        """
+        base = (info.currency_base or "").upper()
+        profit = (info.currency_profit or "").upper()
+        asset_class = self._asset_class_from_path(
+            info.path,
+            currency_base=base or None,
+            calc_mode=info.trade_calc_mode,
+        )
+        name = getattr(info, "name", None) or mt5_symbol
+        is_pair = asset_class in (AssetClass.SPOT, AssetClass.MARGIN_FX)
+
+        if base and profit and base != profit:
+            # Decomposable — base/quote carried verbatim in the broker fields.
+            if is_pair:
+                return Instrument(
+                    symbol=base,
+                    quote_currency=profit,
+                    asset_class=asset_class,
+                    platform_symbol=mt5_symbol,
+                )
+            return Instrument(
+                symbol=base,
+                quote_currency=None,
+                currency=profit,
+                asset_class=asset_class,
+                platform_symbol=mt5_symbol,
             )
-        return asset_class
+
+        # Non-decomposable (base == profit, or fields missing) — the
+        # tradable's identity lives only in the name.
+        symbol, quote = self._split_symbol_name(name)
+        if is_pair:
+            return Instrument(
+                symbol=symbol,
+                quote_currency=quote or profit or None,
+                asset_class=asset_class,
+                platform_symbol=mt5_symbol,
+            )
+        return Instrument(
+            symbol=symbol,
+            quote_currency=None,
+            currency=profit or None,
+            asset_class=asset_class,
+            platform_symbol=mt5_symbol,
+        )
+
+    @staticmethod
+    def _identity_matches(current: Instrument, canonical: Instrument) -> bool:
+        """Whether *current* already carries the broker-derived identity.
+
+        Only the fields MT5 can derive from ``symbol_info()`` are tested —
+        ``symbol``, ``quote_currency``, ``asset_class`` — since those are the
+        optional fields the adapter corrects on behalf of the caller.
+        """
+        return (
+            current.symbol == canonical.symbol
+            and current.quote_currency == canonical.quote_currency
+            and current.asset_class == canonical.asset_class
+        )
 
     def _check_call_result(self, call_name: str, result: Any) -> None:
         """Raise the mapped MT5 error if *result* is ``None``.

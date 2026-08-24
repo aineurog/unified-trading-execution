@@ -6,7 +6,10 @@ It is supplied by the user at construction time and never hardcoded by the adapt
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
+
+from unified_trading_execution.types.enums import AssetClass
 
 DEFAULT_POLL_INTERVAL_SECONDS: float = 0.5
 DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS: float = 86400.0
@@ -35,6 +38,12 @@ class MT5Config:
     path: str | None = None
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     instrument_spec_cache_ttl: float | None = DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS
+    # Broker-specific market-tree vocabulary.  Keys are ``symbol_info().path``
+    # segments (matched case-insensitively), values the canonical AssetClass.
+    # Extends and overrides the adapter's built-in thesaurus — the escape
+    # hatch for a broker whose market folders are named differently (e.g. a
+    # broker that groups metals under "PreciousMetals" instead of "Metals").
+    asset_class_path_map: Mapping[str, AssetClass] | None = None
 
     def __post_init__(self) -> None:
         if self.poll_interval_seconds <= 0:
