@@ -292,6 +292,15 @@ class TestSyncShutdown:
                 # The state store was closed during an in-flight order — this
                 # is a normal outcome of concurrent teardown, not a bug.
                 results.append(("db_closed", i))
+            except ValueError as exc:
+                # aiosqlite raises ValueError("no active connection") when the
+                # connection is torn down mid-flight — the same teardown race
+                # as sqlite3.ProgrammingError above, surfaced via a different
+                # exception type.
+                if "no active connection" in str(exc):
+                    results.append(("db_closed", i))
+                else:
+                    results.append(("error", exc))
             except Exception as exc:
                 results.append(("error", exc))
 
