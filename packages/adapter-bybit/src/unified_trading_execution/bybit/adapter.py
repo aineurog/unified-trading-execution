@@ -2143,15 +2143,15 @@ class BybitAdapter(Adapter):
             if not cursor:
                 break
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
-        """Fetch all Bybit positions across every applicable category, keyed by Instrument.
+    async def fetch_positions(self) -> list[Position]:
+        """Fetch all open Bybit positions across every applicable category.
 
-        Returns rows for both open and flat (size-0) positions — the same
-        ``Position`` shape the WebSocket position stream emits — so the REST
-        snapshot and the live mirror stay strictly comparable.  An entry that
-        cannot be translated (unknown/de-listed symbol) is skipped with a
-        logged error rather than aborting the whole snapshot, consistent with
-        the WebSocket handlers.
+        Returns one ``Position`` per leg; a hedged account yields two legs per
+        symbol (``positionIdx`` 1 and 2).  Flat (size-0) entries — which the
+        WebSocket stream emits on close — are skipped, so this returns only
+        live legs for reconciliation.  An entry that cannot be translated
+        (unknown/de-listed symbol) is skipped with a logged error rather than
+        aborting the whole snapshot.
 
         Category coverage:
         - ``linear``: queried twice — once scoped to ``settleCoin=USDT``
@@ -2166,7 +2166,7 @@ class BybitAdapter(Adapter):
           (no entry price, no liquidation price, no PnL tracking).  Spot
           balances are reconciled via ``fetch_balances`` instead.
         """
-        result: dict[Instrument, Position] = {}
+        result: list[Position] = []
 
         # linear — must be split by settleCoin to cover both USDT and USDC perps.
         for settle_coin in ("USDT", "USDC"):
@@ -2179,7 +2179,8 @@ class BybitAdapter(Adapter):
                 except Exception:
                     logger.exception("Skipping malformed Bybit linear position entry: %s", entry)
                     continue
-                result[position.instrument] = position
+                if position.quantity != 0:
+                    result.append(position)
 
         # inverse — category alone is sufficient; no settleCoin required.
         async for entry in self._paged_results(self._session.get_positions, "inverse"):
@@ -2189,7 +2190,8 @@ class BybitAdapter(Adapter):
             except Exception:
                 logger.exception("Skipping malformed Bybit inverse position entry: %s", entry)
                 continue
-            result[position.instrument] = position
+            if position.quantity != 0:
+                result.append(position)
 
         return result
 

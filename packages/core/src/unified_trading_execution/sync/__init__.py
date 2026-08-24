@@ -191,9 +191,13 @@ class SyncEngine:
 
     # ---- State mirror access ----
 
-    def get_position(self, instrument: Instrument) -> Position | None:
-        """Read mirrored position (blocking)."""
-        return self._run(self._async_engine.get_position(instrument))
+    def get_positions(self, instrument: Instrument) -> list[Position]:
+        """Read mirrored position legs (blocking)."""
+        return self._run(self._async_engine.get_positions(instrument))
+
+    def get_net_position(self, instrument: Instrument) -> Position | None:
+        """Read the netted (derived) position for an instrument (blocking)."""
+        return self._run(self._async_engine.get_net_position(instrument))
 
     def get_balance(self, currency: str) -> Balance | None:
         """Read mirrored balance (blocking)."""
@@ -219,6 +223,7 @@ class SyncEngine:
     def get_fill_history(
         self,
         instrument: Instrument | None = None,
+        position_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> list[FillRecord]:
@@ -226,21 +231,7 @@ class SyncEngine:
         return self._run(
             self._async_engine.get_fill_history(
                 instrument=instrument,
-                start=start,
-                end=end,
-            )
-        )
-
-    def get_position_history(
-        self,
-        instrument: Instrument | None = None,
-        start: datetime | None = None,
-        end: datetime | None = None,
-    ) -> list[Position]:
-        """Query position history (blocking)."""
-        return self._run(
-            self._async_engine.get_position_history(
-                instrument=instrument,
+                position_id=position_id,
                 start=start,
                 end=end,
             )

@@ -68,8 +68,8 @@ class ReconciliationResult:
 
 def reconcile(
     *,
-    local_positions: dict[Instrument, Position],
-    platform_positions: dict[Instrument, Position] | None,
+    local_positions: list[Position],
+    platform_positions: list[Position] | None,
     local_balances: dict[str, Balance],
     platform_balances: dict[str, Balance] | None,
     local_orders: dict[str, OrderRecord],
@@ -92,24 +92,33 @@ def reconcile(
       5. Partial fill discrepancy
     """
 
-    # Case 1: Position quantity mismatch.  Absence on either side is normalised
-    # to quantity 0 so an open on one side and a close/absence on the other is
-    # detected as a quantity disagreement rather than silently skipped.
+    # Case 1: Position quantity mismatch, compared per leg.  Absence on either
+    # side is normalised to quantity 0 so an open on one side and a close/
+    # absence on the other is detected as a quantity disagreement rather than
+    # silently skipped.  Legs are keyed by (instrument, position_id) so hedged
+    # legs of the same instrument are compared independently.
     position_mismatches: list[ReconciliationMismatch] = []
     if platform_positions is not None:
-        all_instruments = set(local_positions.keys()) | set(platform_positions.keys())
-        for inst in all_instruments:
-            local = local_positions.get(inst)
-            platform = platform_positions.get(inst)
+        local_by_leg = {(p.instrument, p.position_id): p for p in local_positions}
+        platform_by_leg = {(p.instrument, p.position_id): p for p in platform_positions}
+        for leg in set(local_by_leg) | set(platform_by_leg):
+            local = local_by_leg.get(leg)
+            platform = platform_by_leg.get(leg)
             local_qty = local.quantity if local is not None else Decimal("0")
             platform_qty = platform.quantity if platform is not None else Decimal("0")
             if local_qty != platform_qty:
                 position_mismatches.append(
                     ReconciliationMismatch(
                         mismatch_type="position_quantity",
-                        instrument=inst,
-                        local_value="absent" if local is None else str(local_qty),
-                        platform_value="absent" if platform is None else str(platform_qty),
+                        instrument=leg[0],
+                        local_value=(
+                            "absent" if local is None else f"{local_qty} [leg {local.position_id}]"
+                        ),
+                        platform_value=(
+                            "absent"
+                            if platform is None
+                            else f"{platform_qty} [leg {platform.position_id}]"
+                        ),
                     )
                 )
 

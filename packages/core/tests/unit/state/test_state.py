@@ -44,12 +44,13 @@ def make_inst(symbol="BTC"):
     )
 
 
-def make_position(symbol="BTC", qty="0.5"):
+def make_position(symbol="BTC", qty="0.5", position_id="1"):
     return Position(
         instrument=make_inst(symbol),
         quantity=Decimal(qty),
         average_entry_price=Decimal("50000"),
         updated_at=NOW,
+        position_id=position_id,
     )
 
 
@@ -87,7 +88,7 @@ def make_order(client_order_id="abc", status=OrderStatus.OPEN):
     )
 
 
-def make_fill(client_order_id="abc", qty="0.001", price="50000"):
+def make_fill(client_order_id="abc", qty="0.001", price="50000", position_id=None):
     return FillRecord(
         client_order_id=client_order_id,
         platform_fill_id=f"fill-{client_order_id}",
@@ -98,6 +99,7 @@ def make_fill(client_order_id="abc", qty="0.001", price="50000"):
         fee_currency="USDT",
         fee_amount=Decimal("0.05"),
         correlation_id="corr-1",
+        position_id=position_id,
     )
 
 
@@ -150,8 +152,7 @@ class TestDefaultStateStorePath:
         from unified_trading_execution.state.store import default_state_store_path
 
         path = default_state_store_path("bybit", "acct123")
-        project = tmp_path.name
-        assert os.path.join(f"./{project}_data", "bybit_acct123.db") == path
+        assert path == os.path.join(".", "unified_trading_execution_data", "bybit_acct123.db")
 
     def test_slugs_unsafe_identifiers(self, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
@@ -181,14 +182,15 @@ class TestSQLiteStorePositions:
     async def test_upsert_and_get_position(self, store):
         pos = make_position()
         await store.upsert_position(pos)
-        got = await store.get_position(pos.instrument)
-        assert got is not None
-        assert got.quantity == Decimal("0.5")
+        legs = await store.get_positions(pos.instrument)
+        assert len(legs) == 1
+        assert legs[0].quantity == Decimal("0.5")
+        assert legs[0].position_id == "1"
 
     @pytest.mark.asyncio
     async def test_get_position_nonexistent(self, store):
-        got = await store.get_position(make_inst("ETH"))
-        assert got is None
+        assert await store.get_positions(make_inst("ETH")) == []
+        assert await store.get_net_position(make_inst("ETH")) is None
 
     @pytest.mark.asyncio
     async def test_upsert_position_overwrites(self, store):
@@ -196,25 +198,30 @@ class TestSQLiteStorePositions:
         await store.upsert_position(pos1)
         pos2 = make_position(qty="1.0")
         await store.upsert_position(pos2)
-        got = await store.get_position(pos2.instrument)
-        assert got.quantity == Decimal("1.0")
+        legs = await store.get_positions(pos2.instrument)
+        assert len(legs) == 1
+        assert legs[0].quantity == Decimal("1.0")
 
     @pytest.mark.asyncio
-    async def test_position_history_recorded(self, store):
-        await store.upsert_position(make_position(qty="0.5"))
-        await store.upsert_position(make_position(qty="1.0"))
-        history = await store.query_positions(instrument=make_inst())
-        assert len(history) == 2
-        assert history[0].quantity == Decimal("1.0")  # most recent first
+    async def test_query_positions_returns_open_legs(self, store):
+        await store.upsert_position(make_position(qty="0.5", position_id="1"))
+        await store.upsert_position(make_position(qty="0.3", position_id="2"))
+        legs = await store.query_positions(instrument=make_inst())
+        assert len(legs) == 2
 
     @pytest.mark.asyncio
-    async def test_query_positions_filtered_by_time(self, store):
-        await store.upsert_position(make_position(qty="0.5"))
-        history = await store.query_positions(
-            instrument=make_inst(),
-            start=datetime(2025, 1, 1, tzinfo=UTC),
-        )
-        assert len(history) == 1
+    async def test_get_net_position_nets_legs(self, store):
+        await store.upsert_position(make_position(qty="0.5", position_id="1"))
+        await store.upsert_position(make_position(qty="0.3", position_id="2"))
+        net = await store.get_net_position(make_inst())
+        assert net is not None
+        assert net.quantity == Decimal("0.8")
+
+    @pytest.mark.asyncio
+    async def test_delete_position_removes_leg(self, store):
+        await store.upsert_position(make_position(qty="0.5", position_id="7"))
+        await store.delete_position(make_inst(), "7")
+        assert await store.get_positions(make_inst()) == []
 
 
 # ============================================================
@@ -342,10 +349,16 @@ class TestSQLiteStoreFills:
 
     @pytest.mark.asyncio
     async def test_batched_fills_insert(self, store):
-        fills = [make_fill("abc"), make_fill("def")]
+        fills = [
+            make_fill("abc", position_id="1"),
+            make_fill("def", position_id="2"),
+        ]
         await store.upsert_fills_batch(fills)
         results = await store.query_fills()
         assert len(results) == 2
+        # position_id must survive the batched (unlocked) write path too.
+        by_id = {r.position_id: r for r in results}
+        assert set(by_id) == {"1", "2"}
 
 
 # ============================================================
@@ -621,9 +634,8 @@ class TestReconciliation:
     """Each mismatch case from Section 6.3 has its own distinct test."""
 
     def test_case1_position_quantity_mismatch(self):
-        inst = make_inst()
-        local = {inst: make_position(qty="0.5")}
-        platform = {inst: make_position(qty="1.0")}
+        local = [make_position(qty="0.5", position_id="1")]
+        platform = [make_position(qty="1.0", position_id="1")]
         result = reconcile(
             local_positions=local,
             platform_positions=platform,
@@ -636,15 +648,15 @@ class TestReconciliation:
         )
         assert len(result.position_mismatches) == 1
         assert result.position_mismatches[0].mismatch_type == "position_quantity"
-        assert result.position_mismatches[0].local_value == "0.5"
-        assert result.position_mismatches[0].platform_value == "1.0"
+        assert result.position_mismatches[0].local_value == "0.5 [leg 1]"
+        assert result.position_mismatches[0].platform_value == "1.0 [leg 1]"
 
     def test_case2_balance_mismatch(self):
         local = {"USDT": make_balance(free="9000")}
         platform = {"USDT": make_balance(free="8000")}
         result = reconcile(
-            local_positions={},
-            platform_positions={},
+            local_positions=[],
+            platform_positions=[],
             local_balances=local,
             platform_balances=platform,
             local_orders={},
@@ -658,8 +670,8 @@ class TestReconciliation:
     def test_case3_orphan_order_on_platform(self):
         platform_orders = {"abc": make_order("abc")}
         result = reconcile(
-            local_positions={},
-            platform_positions={},
+            local_positions=[],
+            platform_positions=[],
             local_balances={},
             platform_balances={},
             local_orders={},
@@ -673,8 +685,8 @@ class TestReconciliation:
     def test_case4_orphan_order_in_local(self):
         local_orders = {"abc": make_order("abc")}
         result = reconcile(
-            local_positions={},
-            platform_positions={},
+            local_positions=[],
+            platform_positions=[],
             local_balances={},
             platform_balances={},
             local_orders=local_orders,
@@ -689,8 +701,8 @@ class TestReconciliation:
         local_fills = {"abc": [make_fill("abc", qty="0.001")]}
         platform_fills = {"abc": [make_fill("abc", qty="0.002")]}
         result = reconcile(
-            local_positions={},
-            platform_positions={},
+            local_positions=[],
+            platform_positions=[],
             local_balances={},
             platform_balances={},
             local_orders={},
@@ -702,8 +714,7 @@ class TestReconciliation:
         assert result.partial_fill_discrepancies[0].mismatch_type == "partial_fill"
 
     def test_clean_reconciliation(self):
-        inst = make_inst()
-        pos = {inst: make_position()}
+        pos = [make_position()]
         bal = {"USDT": make_balance()}
         orders = {"abc": make_order()}
         fills = {"abc": [make_fill("abc")]}
@@ -722,10 +733,9 @@ class TestReconciliation:
 
     def test_all_mismatches_combined(self):
         """When multiple mismatches occur, all_mismatches returns them all."""
-        inst = make_inst()
         result = reconcile(
-            local_positions={inst: make_position(qty="0.5")},
-            platform_positions={inst: make_position(qty="1.0")},
+            local_positions=[make_position(qty="0.5", position_id="1")],
+            platform_positions=[make_position(qty="1.0", position_id="1")],
             local_balances={"USDT": make_balance(free="9000")},
             platform_balances={"USDT": make_balance(free="8000")},
             local_orders={},
@@ -743,11 +753,10 @@ class TestReconciliation:
         Presence/absence is normalised to quantity 0 on the absent side so an
         open-on-one-side / flat-on-the-other is detected (not skipped).
         """
-        inst = make_inst()
-        local = {inst: make_position(qty="0.5")}
+        local = [make_position(qty="0.5", position_id="1")]
         result = reconcile(
             local_positions=local,
-            platform_positions={},  # platform has no open position
+            platform_positions=[],  # platform has no open position
             local_balances={},
             platform_balances={},
             local_orders={},
@@ -762,8 +771,8 @@ class TestReconciliation:
         """A local balance with no platform counterpart is a balance drift."""
         local = {"USDT": make_balance(free="9000")}
         result = reconcile(
-            local_positions={},
-            platform_positions={},
+            local_positions=[],
+            platform_positions=[],
             local_balances=local,
             platform_balances={},
             local_orders={},
@@ -780,8 +789,7 @@ class TestReconciliation:
         It must never be mistaken for an empty platform, which would falsely
         flag every local entry as local-only.
         """
-        inst = make_inst()
-        local_positions = {inst: make_position(qty="0.5")}
+        local_positions = [make_position(qty="0.5", position_id="1")]
         local_balances = {"USDT": make_balance(free="9000")}
         result = reconcile(
             local_positions=local_positions,

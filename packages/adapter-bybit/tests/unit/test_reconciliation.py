@@ -98,7 +98,7 @@ def _execution(**overrides: Any) -> dict[str, Any]:
 
 
 class TestFetchPositions:
-    async def test_long_short_flat_keyed_by_instrument(
+    async def test_long_short_flat_skips_flat(
         self,
         adapter: BybitAdapter,
         mock_pybit_http: Any,
@@ -114,13 +114,13 @@ class TestFetchPositions:
 
         result = await adapter.fetch_positions()
 
-        assert len(result) == 3
-        btc = result[adapter._instruments[("linear", "BTCUSDT")]]
-        eth = result[adapter._instruments[("linear", "ETHUSDT")]]
-        sol = result[adapter._instruments[("linear", "SOLUSDT")]]
-        assert btc.quantity == Decimal("1.5")
-        assert eth.quantity == Decimal("-2")
-        assert sol.quantity == Decimal("0")
+        # Flat (size-0) entry is skipped; returns one leg per live position.
+        assert len(result) == 2
+        by_symbol = {p.instrument.symbol: p for p in result}
+        assert by_symbol["BTC"].quantity == Decimal("1.5")
+        assert by_symbol["BTC"].position_id == "0"
+        assert by_symbol["ETH"].quantity == Decimal("-2")
+        assert by_symbol["ETH"].position_id == "0"
 
     async def test_paginates_across_cursor(
         self,

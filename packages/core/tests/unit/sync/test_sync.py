@@ -190,7 +190,7 @@ class TestConcurrentSyncCalls:
             assert r.status == OrderStatus.OPEN
 
     def test_concurrent_mixed_reads_and_writes(self, sync_engine):
-        """Concurrent reads (get_order, get_position) and writes
+        """Concurrent reads (get_order, get_positions) and writes
         (place_order) from mixed threads must not interfere.
         """
         # Pre-place some orders that the read threads will query
@@ -317,7 +317,7 @@ class TestSyncShutdown:
 
 
 class TestSyncHistoryAccessors:
-    """Verify all six history accessors are available through SyncEngine
+    """Verify all five history accessors are available through SyncEngine
     and properly delegate to the async engine."""
 
     def test_sync_order_history(self, sync_engine):
@@ -330,9 +330,9 @@ class TestSyncHistoryAccessors:
         results = sync_engine.get_fill_history()
         assert isinstance(results, list)
 
-    def test_sync_position_history(self, sync_engine):
-        results = sync_engine.get_position_history()
-        assert isinstance(results, list)
+    def test_sync_position_accessors(self, sync_engine):
+        assert isinstance(sync_engine.get_positions(_instrument()), list)
+        assert sync_engine.get_net_position(_instrument()) is None
 
     def test_sync_balance_history(self, sync_engine):
         results = sync_engine.get_balance_history()

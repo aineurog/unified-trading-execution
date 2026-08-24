@@ -136,6 +136,8 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
 
     ``quantity`` follows the core convention: positive = long (``Buy``),
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
+    ``position_id`` is the Bybit ``positionIdx`` (0 = one-way, 1/2 = hedge
+    side), scoped to the instrument.
     """
     side = entry.get("side")
     size = _decimal(entry.get("size"), "size")
@@ -151,6 +153,7 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
         quantity=quantity,
         average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
+        position_id=str(entry.get("positionIdx", 0)),
     )
 
 

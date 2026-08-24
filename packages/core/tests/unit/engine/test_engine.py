@@ -598,12 +598,14 @@ class TestStateMirrorSubscriptions:
             quantity=Decimal("1.5"),
             average_entry_price=Decimal("50000"),
             updated_at=_utcnow(),
+            position_id="1",
         )
         mock_adapter.inject_position_update(pos)
         await asyncio.sleep(0.01)
-        stored = await engine.get_position(_instrument())
-        assert stored is not None
-        assert stored.quantity == Decimal("1.5")
+        stored = await engine.get_positions(_instrument())
+        assert len(stored) == 1
+        assert stored[0].quantity == Decimal("1.5")
+        assert stored[0].position_id == "1"
 
     async def test_balance_update_persisted(self, engine, mock_adapter):
         bal = Balance(
@@ -744,6 +746,7 @@ class TestReconcileMismatchCases:
             quantity=Decimal("1"),
             average_entry_price=Decimal("50000"),
             updated_at=_utcnow(),
+            position_id="1",
         )
         await engine.state_store.upsert_position(local_pos)
 
@@ -753,6 +756,7 @@ class TestReconcileMismatchCases:
             quantity=Decimal("2"),
             average_entry_price=Decimal("50000"),
             updated_at=_utcnow(),
+            position_id="1",
         )
         mock_adapter.seed_position(platform_pos)
 
@@ -763,9 +767,9 @@ class TestReconcileMismatchCases:
         assert result.position_mismatches[0].instrument == _instrument()
 
         # Resolution: local should be overwritten with platform truth
-        stored = await engine.get_position(_instrument())
-        assert stored is not None
-        assert stored.quantity == Decimal("2")
+        stored = await engine.get_positions(_instrument())
+        assert len(stored) == 1
+        assert stored[0].quantity == Decimal("2")
 
         # Halt should be entered for the instrument
         assert engine.halt_machine.is_instrument_halted(_instrument())
@@ -1057,6 +1061,7 @@ class TestReconcileTriState:
                 quantity=Decimal("1"),
                 average_entry_price=Decimal("50000"),
                 updated_at=_utcnow(),
+                position_id="1",
             )
         )
         mock_adapter.set_next_error(NotImplementedError("no bulk position fetch"))

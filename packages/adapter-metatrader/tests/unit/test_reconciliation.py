@@ -3,7 +3,7 @@
 Tests run against the mocked ``MetaTrader5`` module — no real terminal IPC.
 
 Tests cases:
-    - fetch_positions: nets hedging legs per instrument, skips unknown symbols
+    - fetch_positions: one Position per terminal leg, skips unknown symbols
     - fetch_positions: ``positions_get()`` failure raises PlatformError
     - fetch_balances: free is derived as total - used (invariant preserved)
     - get_rate_limits: returns the conservative fixed estimate
@@ -132,12 +132,12 @@ def _set_eurusd_symbol_info(mock_mt5_module: MagicMock) -> None:
 
 
 class TestFetchPositions:
-    """fetch_positions — netting, symbol resolution, failure paths."""
+    """fetch_positions — per-leg mapping, symbol resolution, failure paths."""
 
-    async def test_nets_hedging_legs_per_instrument(
+    async def test_returns_one_leg_per_terminal_position(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        """BUY and SELL legs on one symbol collapse into a signed Position."""
+        """BUY and SELL legs on one symbol stay distinct (one Position per leg)."""
         _set_eurusd_symbol_info(mock_mt5_module)
         mock_mt5_module.positions_get.return_value = (
             Mt5Position(
@@ -162,10 +162,12 @@ class TestFetchPositions:
 
         positions = await adapter.fetch_positions()
 
-        assert len(positions) == 1
-        position = positions[next(iter(positions))]
-        assert position.quantity == Decimal("0.1")
-        assert position.average_entry_price == Decimal("1.1")
+        assert len(positions) == 2
+        by_id = {p.position_id: p for p in positions}
+        assert by_id["2001"].quantity == Decimal("0.2")
+        assert by_id["2001"].average_entry_price == Decimal("1.1")
+        assert by_id["2002"].quantity == Decimal("-0.1")
+        assert by_id["2002"].average_entry_price == Decimal("1.1")
 
     async def test_unresolvable_symbol_skipped(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter

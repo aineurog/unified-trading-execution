@@ -182,8 +182,12 @@ class Adapter(ABC):
 
     # ---- Reconciliation data (optional — not required for basic operation) ----
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
-        """Fetch all open positions from the platform, keyed by Instrument.
+    async def fetch_positions(self) -> list[Position]:
+        """Fetch all open positions from the platform as a list of legs.
+
+        One ``Position`` per terminal position leg: a hedged account yields
+        multiple entries for the same instrument (each with its own
+        ``position_id``), and a netted account yields a single entry.
 
         Optional: raises NotImplementedError by default. Adapters that
         implement this method enable full reconciliation.
