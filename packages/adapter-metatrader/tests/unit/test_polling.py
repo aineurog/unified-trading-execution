@@ -442,10 +442,10 @@ class TestPollOnce:
 
         assert captured == []
 
-    async def test_hedging_legs_netted(
+    async def test_hedging_legs_published_per_leg(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
-        """Two legs (buy + sell on same instrument) are netted to one Position."""
+        """Two legs (buy + sell on same instrument) are published independently."""
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.account_info.return_value = _account()
         mock_mt5_module.history_deals_get.return_value = ()
@@ -476,13 +476,12 @@ class TestPollOnce:
         event_bus.subscribe(PositionUpdateEvent, positions.append)
         await adapter._poll_once()
 
-        assert len(positions) == 1
-        netted = positions[0].position
-        assert netted.quantity == Decimal("0.2")
-        expected_avg = (
-            Decimal("0.5") * Decimal("1.1") + Decimal("0.3") * Decimal("1.105")
-        ) / Decimal("0.8")
-        assert netted.average_entry_price == expected_avg
+        assert len(positions) == 2
+        by_id = {e.position.position_id: e.position for e in positions}
+        assert by_id["2001"].quantity == Decimal("0.5")
+        assert by_id["2001"].average_entry_price == Decimal("1.1")
+        assert by_id["2002"].quantity == Decimal("-0.3")
+        assert by_id["2002"].average_entry_price == Decimal("1.105")
 
     async def test_same_second_deals_both_published(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus

@@ -24,7 +24,7 @@ from unified_trading_execution.types.enums import (
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
-from unified_trading_execution.types.position import Balance, Position
+from unified_trading_execution.types.position import Balance
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -82,6 +82,7 @@ def _fill(
     platform_fill_id: str = "f-001",
     instrument: Instrument | None = None,
     fill_timestamp: datetime | None = None,
+    position_id: str | None = None,
 ) -> FillRecord:
     return FillRecord(
         client_order_id=client_order_id,
@@ -93,6 +94,7 @@ def _fill(
         fee_currency="USDT",
         fee_amount=1,
         correlation_id="corr-1",
+        position_id=position_id,
     )
 
 
@@ -211,53 +213,24 @@ class TestQueryFillHistory:
         assert results[0].client_order_id == "late"
 
 
-# ── position history filterability ───────────────────────────────────
+# ── fill history position-leg filterability ──────────────────────────
 
 
-class TestQueryPositionHistory:
-    async def test_instrument_filter(self, store):
-        btc = _instrument("BTCUSDT")
-        eth = _instrument("ETHUSDT")
-        await store.upsert_position(
-            Position(
-                instrument=btc,
-                quantity=1,
-                average_entry_price=50000,
-                updated_at=_utcnow(),
-            )
-        )
-        await store.upsert_position(
-            Position(
-                instrument=eth,
-                quantity=2,
-                average_entry_price=3000,
-                updated_at=_utcnow(),
-            )
-        )
+class TestQueryFillHistoryByPosition:
+    async def test_position_id_filter(self, store):
+        await store.upsert_fill(_fill(platform_fill_id="pf1", position_id="1"))
+        await store.upsert_fill(_fill(platform_fill_id="pf2", position_id="2"))
 
-        results = await history.query_position_history(store, instrument=btc)
+        results = await history.query_fill_history(store, position_id="1")
         assert len(results) == 1
-        assert results[0].instrument.symbol == "BTCUSDT"
+        assert results[0].position_id == "1"
 
-    async def test_no_filters_returns_all(self, store):
-        await store.upsert_position(
-            Position(
-                instrument=_instrument("BTCUSDT"),
-                quantity=1,
-                average_entry_price=50000,
-                updated_at=_utcnow(),
-            )
-        )
-        await store.upsert_position(
-            Position(
-                instrument=_instrument("ETHUSDT"),
-                quantity=2,
-                average_entry_price=3000,
-                updated_at=_utcnow(),
-            )
-        )
-        results = await history.query_position_history(store)
-        assert len(results) >= 2
+    async def test_no_position_id_returns_all(self, store):
+        await store.upsert_fill(_fill(platform_fill_id="pf1", position_id="1"))
+        await store.upsert_fill(_fill(platform_fill_id="pf2", position_id="2"))
+
+        results = await history.query_fill_history(store)
+        assert len(results) == 2
 
 
 # ── balance history filterability ────────────────────────────────────

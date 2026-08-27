@@ -52,18 +52,17 @@ def _slug(component: str) -> str:
 def default_state_store_path(platform_name: str, account_id: str) -> str:
     """Resolve the default ``StateStore`` location per Section 6.2.
 
-    Returns ``./<project>_data/<platform>_<account>.db`` relative to the process
-    working directory, where ``<project>`` is the name of the current working
-    directory itself (predictable and human-inspectable, never hidden or
-    written to a system location).  ``<platform>`` and ``<account>`` are
-    slugified so the resulting filename is always filesystem-safe.
+    Returns ``./unified_trading_execution_data/<platform>_<account>.db``
+    relative to the process working directory — deterministic regardless of
+    the working directory's name (predictable and human-inspectable, never
+    hidden or written to a system location).  ``<platform>`` and ``<account>``
+    are slugified so the resulting filename is always filesystem-safe.
 
-    Example with ``platform_name="bybit"``, ``account_id="acct123"`` and a CWD
-    named ``ute``: ``./ute_data/bybit_acct123.db``.
+    Example with ``platform_name="bybit"``, ``account_id="acct123"``:
+    ``./unified_trading_execution_data/bybit_acct123.db``.
     """
-    project = Path.cwd().name
     filename = f"{_slug(platform_name)}_{_slug(account_id)}.db"
-    return os.path.join(f"./{project}_data", filename)
+    return os.path.join("./unified_trading_execution_data", filename)
 
 
 # ============================================================
@@ -116,6 +115,8 @@ class StateStore(ABC):
     @abstractmethod
     async def upsert_position(self, position: Position) -> None: ...
     @abstractmethod
+    async def delete_position(self, instrument: Instrument, position_id: str) -> None: ...
+    @abstractmethod
     async def upsert_balance(self, balance: Balance) -> None: ...
     @abstractmethod
     async def upsert_order(self, order: OrderRecord) -> None: ...
@@ -141,7 +142,9 @@ class StateStore(ABC):
     async def write_halt_event(self, event: HaltEvent) -> None: ...
 
     @abstractmethod
-    async def get_position(self, instrument: Instrument) -> Position | None: ...
+    async def get_positions(self, instrument: Instrument) -> list[Position]: ...
+    @abstractmethod
+    async def get_net_position(self, instrument: Instrument) -> Position | None: ...
     @abstractmethod
     async def get_balance(self, currency: str) -> Balance | None: ...
     @abstractmethod
@@ -171,6 +174,7 @@ class StateStore(ABC):
         self,
         *,
         instrument: Instrument | None = None,
+        position_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 1000,
@@ -180,8 +184,6 @@ class StateStore(ABC):
         self,
         *,
         instrument: Instrument | None = None,
-        start: datetime | None = None,
-        end: datetime | None = None,
         limit: int = 1000,
     ) -> list[Position]: ...
     @abstractmethod
@@ -346,6 +348,8 @@ class SQLiteStateStore(StateStore):
     # ---- Upserts ----
 
     async def upsert_position(self, position: Position) -> None:
+        if position.position_id is None:
+            raise ValueError("position_id is required to persist a position")
         async with self._write_lock:
             i = _serialise_instrument(position.instrument)
             now = position.updated_at.isoformat()
@@ -355,8 +359,8 @@ class SQLiteStateStore(StateStore):
                     """INSERT OR REPLACE INTO positions
                        (symbol, quote_currency, asset_class, exchange, currency,
                         expiry, strike, option_right, multiplier, platform_symbol,
-                        quantity, average_entry_price, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        position_id, quantity, average_entry_price, updated_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         i["symbol"],
                         i["quote_currency"],
@@ -368,28 +372,7 @@ class SQLiteStateStore(StateStore):
                         i["option_right"],
                         i["multiplier"],
                         i["platform_symbol"],
-                        str(position.quantity),
-                        str(position.average_entry_price),
-                        now,
-                    ),
-                )
-                await self.conn.execute(
-                    """INSERT INTO position_history
-                       (symbol, quote_currency, asset_class, exchange, currency,
-                        expiry, strike, option_right, multiplier, platform_symbol,
-                        quantity, average_entry_price, recorded_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        i["symbol"],
-                        i["quote_currency"],
-                        i["asset_class"],
-                        i["exchange"],
-                        i["currency"],
-                        i["expiry"],
-                        i["strike"],
-                        i["option_right"],
-                        i["multiplier"],
-                        i["platform_symbol"],
+                        position.position_id,
                         str(position.quantity),
                         str(position.average_entry_price),
                         now,
@@ -400,6 +383,14 @@ class SQLiteStateStore(StateStore):
                 raise
             else:
                 await self.conn.commit()
+
+    async def delete_position(self, instrument: Instrument, position_id: str) -> None:
+        async with self._write_lock:
+            i = _serialise_instrument(instrument)
+            await self.conn.execute(
+                "DELETE FROM positions WHERE symbol=? AND asset_class=? AND position_id=?",
+                (i["symbol"], i["asset_class"], position_id),
+            )
 
     async def upsert_balance(self, balance: Balance) -> None:
         async with self._write_lock:
@@ -552,8 +543,8 @@ class SQLiteStateStore(StateStore):
                    (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                     exchange, currency, expiry, strike, option_right, multiplier,
                     platform_symbol, fill_quantity, fill_price, fill_timestamp,
-                    fee_currency, fee_amount, correlation_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    fee_currency, fee_amount, correlation_id, position_id)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(platform_fill_id) DO UPDATE SET
                            client_order_id = excluded.client_order_id,
                            symbol = excluded.symbol,
@@ -571,7 +562,8 @@ class SQLiteStateStore(StateStore):
                            fill_timestamp = excluded.fill_timestamp,
                            fee_currency = excluded.fee_currency,
                            fee_amount = excluded.fee_amount,
-                           correlation_id = excluded.correlation_id""",
+                           correlation_id = excluded.correlation_id,
+                           position_id = excluded.position_id""",
                 (
                     fill.client_order_id,
                     fill.platform_fill_id,
@@ -591,6 +583,7 @@ class SQLiteStateStore(StateStore):
                     fill.fee_currency,
                     str(fill.fee_amount) if fill.fee_amount else None,
                     fill.correlation_id,
+                    fill.position_id,
                 ),
             )
 
@@ -619,8 +612,8 @@ class SQLiteStateStore(StateStore):
                (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                 exchange, currency, expiry, strike, option_right, multiplier,
                 platform_symbol, fill_quantity, fill_price, fill_timestamp,
-                fee_currency, fee_amount, correlation_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                fee_currency, fee_amount, correlation_id, position_id)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(platform_fill_id) DO UPDATE SET
                        client_order_id = excluded.client_order_id,
                        symbol = excluded.symbol,
@@ -638,7 +631,8 @@ class SQLiteStateStore(StateStore):
                        fill_timestamp = excluded.fill_timestamp,
                        fee_currency = excluded.fee_currency,
                        fee_amount = excluded.fee_amount,
-                       correlation_id = excluded.correlation_id""",
+                       correlation_id = excluded.correlation_id,
+                       position_id = excluded.position_id""",
             (
                 fill.client_order_id,
                 fill.platform_fill_id,
@@ -658,6 +652,7 @@ class SQLiteStateStore(StateStore):
                 fill.fee_currency,
                 str(fill.fee_amount) if fill.fee_amount else None,
                 fill.correlation_id,
+                fill.position_id,
             ),
         )
 
@@ -780,22 +775,40 @@ class SQLiteStateStore(StateStore):
 
     # ---- Single-record reads ----
 
-    async def get_position(self, instrument: Instrument) -> Position | None:
+    async def get_positions(self, instrument: Instrument) -> list[Position]:
         async with self._write_lock:
             i = _serialise_instrument(instrument)
             cursor = await self.conn.execute(
-                "SELECT quantity, average_entry_price, updated_at FROM positions WHERE symbol=? AND asset_class=?",
+                "SELECT quantity, average_entry_price, updated_at, position_id "
+                "FROM positions WHERE symbol=? AND asset_class=?",
                 (i["symbol"], i["asset_class"]),
             )
-            row = await cursor.fetchone()
-            if row is None:
-                return None
-            return Position(
-                instrument=instrument,
-                quantity=Decimal(row["quantity"]),
-                average_entry_price=Decimal(row["average_entry_price"]),
-                updated_at=datetime.fromisoformat(row["updated_at"]),
-            )
+            return [
+                Position(
+                    instrument=instrument,
+                    quantity=Decimal(row["quantity"]),
+                    average_entry_price=Decimal(row["average_entry_price"]),
+                    updated_at=datetime.fromisoformat(row["updated_at"]),
+                    position_id=row["position_id"],
+                )
+                for row in await cursor.fetchall()
+            ]
+
+    async def get_net_position(self, instrument: Instrument) -> Position | None:
+        legs = await self.get_positions(instrument)
+        net_quantity = sum((leg.quantity for leg in legs), start=Decimal("0"))
+        if net_quantity == 0:
+            return None
+        weighted = sum(
+            (leg.quantity * leg.average_entry_price for leg in legs),
+            start=Decimal("0"),
+        )
+        return Position(
+            instrument=instrument,
+            quantity=net_quantity,
+            average_entry_price=weighted / net_quantity,
+            updated_at=max(leg.updated_at for leg in legs),
+        )
 
     async def get_balance(self, currency: str) -> Balance | None:
         async with self._write_lock:
@@ -907,10 +920,7 @@ class SQLiteStateStore(StateStore):
 
     async def query_open_orders(self, *, limit: int = 1000) -> list[OrderRecord]:
         """Return orders currently live (PENDING/OPEN/PARTIALLY_FILLED)."""
-        query = (
-            "SELECT * FROM orders WHERE status IN (?,?,?) "
-            "ORDER BY created_at DESC LIMIT ?"
-        )
+        query = "SELECT * FROM orders WHERE status IN (?,?,?) ORDER BY created_at DESC LIMIT ?"
         params: list[Any] = [
             OrderStatus.PENDING.value,
             OrderStatus.OPEN.value,
@@ -925,6 +935,7 @@ class SQLiteStateStore(StateStore):
         self,
         *,
         instrument: Instrument | None = None,
+        position_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
         limit: int = 1000,
@@ -934,6 +945,9 @@ class SQLiteStateStore(StateStore):
         if instrument is not None:
             query += " AND symbol=? AND asset_class=?"
             params.extend([instrument.symbol, instrument.asset_class.value])
+        if position_id is not None:
+            query += " AND position_id=?"
+            params.append(position_id)
         if start is not None:
             query += " AND fill_timestamp >= ?"
             params.append(start.isoformat())
@@ -950,22 +964,14 @@ class SQLiteStateStore(StateStore):
         self,
         *,
         instrument: Instrument | None = None,
-        start: datetime | None = None,
-        end: datetime | None = None,
         limit: int = 1000,
     ) -> list[Position]:
-        query = "SELECT * FROM position_history WHERE 1=1"
+        query = "SELECT * FROM positions WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
             query += " AND symbol=? AND asset_class=?"
             params.extend([instrument.symbol, instrument.asset_class.value])
-        if start is not None:
-            query += " AND recorded_at >= ?"
-            params.append(start.isoformat())
-        if end is not None:
-            query += " AND recorded_at <= ?"
-            params.append(end.isoformat())
-        query += " ORDER BY recorded_at DESC, id DESC LIMIT ?"
+        query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         async with self._write_lock:
             cursor = await self.conn.execute(query, params)
@@ -977,7 +983,8 @@ class SQLiteStateStore(StateStore):
                         instrument=inst,
                         quantity=Decimal(row["quantity"]),
                         average_entry_price=Decimal(row["average_entry_price"]),
-                        updated_at=datetime.fromisoformat(row["recorded_at"]),
+                        updated_at=datetime.fromisoformat(row["updated_at"]),
+                        position_id=row["position_id"],
                     )
                 )
             return results
@@ -1182,4 +1189,5 @@ class SQLiteStateStore(StateStore):
             fee_currency=row["fee_currency"],
             fee_amount=Decimal(row["fee_amount"]) if row["fee_amount"] else None,
             correlation_id=row["correlation_id"],
+            position_id=row["position_id"],
         )

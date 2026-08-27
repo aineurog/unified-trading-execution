@@ -84,9 +84,7 @@ def _fill_discrepant_order_ids(
     the local mirror and the platform (the partial-fill discrepancy set)."""
     ids: list[str] = []
     for cid in set(local_fills.keys()) | set(platform_fills.keys()):
-        local_total = sum(
-            (f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0")
-        )
+        local_total = sum((f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0"))
         platform_total = sum(
             (f.fill_quantity for f in platform_fills.get(cid, [])), start=Decimal("0")
         )
@@ -101,10 +99,10 @@ class _ReconcileContext:
     apply phase so resolution never re-fetches per mismatch."""
 
     window_start: datetime
-    local_positions: dict[Instrument, Position]
+    local_positions: list[Position]
     local_balances: dict[str, Balance]
     local_fills: dict[str, list[FillRecord]]
-    platform_positions: dict[Instrument, Position] | None
+    platform_positions: list[Position] | None
     platform_balances: dict[str, Balance] | None
     platform_orders: dict[str, OrderRecord] | None
     platform_fills: dict[str, list[FillRecord]] | None
@@ -152,8 +150,8 @@ class Engine:
         self._adapter = adapter
         # Section 6.2: storage location is optional with a sensible default —
         # when the user supplies no store, one is created at the auto-derived
-        # ``./<project>_data/<platform>_<account>.db`` location.  Never hidden,
-        # never hardcoded; readable via ``engine.state_store.path``.
+        # ``./unified_trading_execution_data/<platform>_<account>.db`` location.
+        # Never hidden, never hardcoded; readable via ``engine.state_store.path``.
         self._state_store = state_store or SQLiteStateStore(
             default_state_store_path(
                 adapter.platform_name,
@@ -183,8 +181,7 @@ class Engine:
         # Periodic reconciliation (optional, opt-in).  None means disabled.
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
             raise ValueError(
-                "reconcile_interval_seconds must be > 0 or None, "
-                f"got {reconcile_interval_seconds}"
+                f"reconcile_interval_seconds must be > 0 or None, got {reconcile_interval_seconds}"
             )
         self._reconcile_interval_seconds = reconcile_interval_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
@@ -255,12 +252,16 @@ class Engine:
         already triggers a reconcile on re-establishment.
         """
         interval = self._reconcile_interval_seconds
-        while not self._shutdown:
+        if interval is None:
+            return
+        while True:
+            if self._shutdown:
+                break
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 break
-            if self._shutdown or not self._adapter.is_connected:
+            if not self._adapter.is_connected:
                 continue
             try:
                 await self.reconcile()
@@ -464,9 +465,7 @@ class Engine:
         local_balances = await self._gather_local_balances()
         local_orders_list = await self._state_store.query_open_orders(limit=100_000)
         local_orders = {o.client_order_id: o for o in local_orders_list}
-        local_fills_list = await self._state_store.query_fills(
-            limit=100_000, start=window_start
-        )
+        local_fills_list = await self._state_store.query_fills(limit=100_000, start=window_start)
         local_fills: dict[str, list[FillRecord]] = {}
         for f in local_fills_list:
             local_fills.setdefault(f.client_order_id, []).append(f)
@@ -545,14 +544,9 @@ class Engine:
 
         return result
 
-    async def _gather_local_positions(self) -> dict[Instrument, Position]:
-        """Discover all positions by scanning position history."""
-        history = await self._state_store.query_positions(limit=100_000)
-        result: dict[Instrument, Position] = {}
-        for pos in history:
-            if pos.instrument not in result:
-                result[pos.instrument] = pos
-        return result
+    async def _gather_local_positions(self) -> list[Position]:
+        """Return all open position legs from the live state mirror."""
+        return await self._state_store.query_positions(limit=100_000)
 
     async def _gather_local_balances(self) -> dict[str, Balance]:
         """Discover all balances by scanning balance history."""
@@ -563,7 +557,7 @@ class Engine:
                 result[bal.currency] = bal
         return result
 
-    async def _fetch_platform_positions(self) -> dict[Instrument, Position] | None:
+    async def _fetch_platform_positions(self) -> list[Position] | None:
         """Fetch platform positions (tri-state).
 
         ``NotImplementedError`` → unsupported (None, skip comparison).
@@ -615,22 +609,19 @@ class Engine:
         full sync of that dataset (platform truth imported, local-only entries
         zeroed).  Orphan and partial-fill corrections are surgical.
         """
-        # Position mismatches: platform is authoritative.  A full sync also
-        # resolves presence/absence (local-only → zeroed flat).
+        # Position mismatches: platform is authoritative.  Platform legs are
+        # upserted and local-only legs are deleted (closed, not zeroed).
         if result.position_mismatches and context.platform_positions is not None:
             try:
-                for pos in context.platform_positions.values():
+                platform_keys = {(p.instrument, p.position_id) for p in context.platform_positions}
+                for pos in context.platform_positions:
                     await self._state_store.upsert_position(pos)
-                for inst in context.local_positions:
-                    if inst not in context.platform_positions:
-                        await self._state_store.upsert_position(
-                            Position(
-                                instrument=inst,
-                                quantity=Decimal("0"),
-                                average_entry_price=Decimal("0"),
-                                updated_at=_utcnow(),
+                for local in context.local_positions:
+                    if (local.instrument, local.position_id) not in platform_keys:
+                        if local.position_id is not None:
+                            await self._state_store.delete_position(
+                                local.instrument, local.position_id
                             )
-                        )
             except Exception:
                 logger.exception("Failed to sync positions to platform truth")
 
@@ -665,9 +656,7 @@ class Engine:
         # order_history snapshot preserves the lifecycle record.
         if result.orphan_orders_in_local:
             try:
-                await self._state_store.delete_orders_by_client_ids(
-                    result.orphan_orders_in_local
-                )
+                await self._state_store.delete_orders_by_client_ids(result.orphan_orders_in_local)
             except Exception:
                 logger.exception("Failed to remove orphan orders from local mirror")
             else:
@@ -859,8 +848,11 @@ class Engine:
 
     # ── State mirror access ────────────────────────────────────────
 
-    async def get_position(self, instrument: Instrument) -> Position | None:
-        return await self._state_store.get_position(instrument)
+    async def get_positions(self, instrument: Instrument) -> list[Position]:
+        return await self._state_store.get_positions(instrument)
+
+    async def get_net_position(self, instrument: Instrument) -> Position | None:
+        return await self._state_store.get_net_position(instrument)
 
     async def get_balance(self, currency: str) -> Balance | None:
         return await self._state_store.get_balance(currency)
@@ -882,23 +874,13 @@ class Engine:
     async def get_fill_history(
         self,
         instrument: Instrument | None = None,
+        position_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
     ) -> list[FillRecord]:
         return await self._state_store.query_fills(
             instrument=instrument,
-            start=start,
-            end=end,
-        )
-
-    async def get_position_history(
-        self,
-        instrument: Instrument | None = None,
-        start: datetime | None = None,
-        end: datetime | None = None,
-    ) -> list[Position]:
-        return await self._state_store.query_positions(
-            instrument=instrument,
+            position_id=position_id,
             start=start,
             end=end,
         )
@@ -1049,9 +1031,7 @@ class Engine:
         try:
             order = await self._state_store.get_order(fill.client_order_id)
         except Exception:
-            logger.exception(
-                "Failed to resolve correlation_id for fill %s", fill.platform_fill_id
-            )
+            logger.exception("Failed to resolve correlation_id for fill %s", fill.platform_fill_id)
             return fill
         if order is None:
             return fill
@@ -1066,7 +1046,13 @@ class Engine:
 
     async def _persist_position(self, event: PositionUpdateEvent) -> None:
         try:
-            await self._state_store.upsert_position(event.position)
+            position = event.position
+            # A zero-quantity update carrying a position_id is a close signal
+            # for that leg — delete it rather than store a synthetic flat row.
+            if position.quantity == 0 and position.position_id is not None:
+                await self._state_store.delete_position(position.instrument, position.position_id)
+            else:
+                await self._state_store.upsert_position(position)
         except Exception:
             logger.exception("Failed to persist position %s", event.event_id)
 

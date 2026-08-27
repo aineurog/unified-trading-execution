@@ -20,10 +20,11 @@ CREATE TABLE IF NOT EXISTS positions (
     option_right        TEXT,
     multiplier          INTEGER,
     platform_symbol TEXT,
+    position_id         TEXT NOT NULL,
     quantity            TEXT NOT NULL,
     average_entry_price TEXT NOT NULL,
     updated_at          TEXT NOT NULL,
-    PRIMARY KEY (symbol, asset_class)
+    PRIMARY KEY (symbol, asset_class, position_id)
 );
 
 CREATE TABLE IF NOT EXISTS balances (
@@ -71,23 +72,6 @@ CREATE TABLE IF NOT EXISTS orders (
 -- History (snapshot on every upsert)
 -- ============================================================
 
-CREATE TABLE IF NOT EXISTS position_history (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    symbol              TEXT NOT NULL,
-    quote_currency      TEXT,
-    asset_class         TEXT NOT NULL,
-    exchange            TEXT,
-    currency            TEXT,
-    expiry              TEXT,
-    strike              TEXT,
-    option_right        TEXT,
-    multiplier          INTEGER,
-    platform_symbol TEXT,
-    quantity            TEXT NOT NULL,
-    average_entry_price TEXT NOT NULL,
-    recorded_at         TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS balance_history (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     currency    TEXT NOT NULL,
@@ -119,7 +103,8 @@ CREATE TABLE IF NOT EXISTS fills (
     fill_timestamp      TEXT NOT NULL,
     fee_currency        TEXT,
     fee_amount          TEXT,
-    correlation_id      TEXT NOT NULL
+    correlation_id      TEXT NOT NULL,
+    position_id         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS audit_events (
@@ -175,13 +160,10 @@ CREATE INDEX IF NOT EXISTS idx_orders_symbol ON orders(symbol);
 CREATE INDEX IF NOT EXISTS idx_fills_fill_timestamp ON fills(fill_timestamp);
 CREATE INDEX IF NOT EXISTS idx_fills_symbol ON fills(symbol);
 CREATE INDEX IF NOT EXISTS idx_fills_client_order_id ON fills(client_order_id);
-CREATE INDEX IF NOT EXISTS idx_position_history_recorded_at ON position_history(recorded_at);
-CREATE INDEX IF NOT EXISTS idx_position_history_symbol ON position_history(symbol);
 CREATE INDEX IF NOT EXISTS idx_balance_history_recorded_at ON balance_history(recorded_at);
 CREATE INDEX IF NOT EXISTS idx_balance_history_currency ON balance_history(currency);
 CREATE INDEX IF NOT EXISTS idx_orders_asset_class ON orders(asset_class);
 CREATE INDEX IF NOT EXISTS idx_fills_asset_class ON fills(asset_class);
-CREATE INDEX IF NOT EXISTS idx_position_history_asset_class ON position_history(asset_class);
 CREATE INDEX IF NOT EXISTS idx_audit_events_timestamp ON audit_events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_audit_events_event_type ON audit_events(event_type);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_events_timestamp ON reconciliation_events(timestamp);

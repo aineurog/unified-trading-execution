@@ -42,30 +42,15 @@ async def query_fill_history(
     store: StateStore,
     *,
     instrument: Instrument | None = None,
+    position_id: str | None = None,
     start: datetime | None = None,
     end: datetime | None = None,
     limit: int = 1000,
 ) -> list[FillRecord]:
-    """Return fill records filtered by instrument and/or time range."""
+    """Return fill records filtered by instrument, position, and/or time range."""
     return await store.query_fills(
         instrument=instrument,
-        start=start,
-        end=end,
-        limit=limit,
-    )
-
-
-async def query_position_history(
-    store: StateStore,
-    *,
-    instrument: Instrument | None = None,
-    start: datetime | None = None,
-    end: datetime | None = None,
-    limit: int = 1000,
-) -> list[Position]:
-    """Return position snapshots filtered by instrument and/or time range."""
-    return await store.query_positions(
-        instrument=instrument,
+        position_id=position_id,
         start=start,
         end=end,
         limit=limit,
@@ -140,6 +125,5 @@ __all__ = [
     "query_fill_history",
     "query_halt_events",
     "query_order_history",
-    "query_position_history",
     "query_reconciliation_events",
 ]

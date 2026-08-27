@@ -193,9 +193,9 @@ _PATH_ASSET_CLASS: dict[str, AssetClass] = {
     "FX": AssetClass.MARGIN_FX,
     "CURRENCIES": AssetClass.MARGIN_FX,
     "METALS": AssetClass.MARGIN_FX,
-    "NOBLE": AssetClass.MARGIN_FX,       # precious metals (Oanda's market folder)
+    "NOBLE": AssetClass.MARGIN_FX,  # precious metals (Oanda's market folder)
     "PRECIOUS": AssetClass.MARGIN_FX,
-    "COMMODITIES": AssetClass.CFD,       # soft commodities (sugar, oil, coffee)
+    "COMMODITIES": AssetClass.CFD,  # soft commodities (sugar, oil, coffee)
     "ENERGY": AssetClass.CFD,
     "INDICES": AssetClass.CFD,
     "INDEX": AssetClass.CFD,
@@ -217,17 +217,17 @@ _PATH_ASSET_CLASS: dict[str, AssetClass] = {
 # different modes across brokers), so it is only a last-resort fallback when
 # neither the metal-base check nor the path thesaurus resolves.
 _CALC_MODE_ASSET_CLASS: dict[int, AssetClass] = {
-    0: AssetClass.MARGIN_FX,    # SYMBOL_CALC_MODE_FOREX
-    1: AssetClass.FUTURES,      # SYMBOL_CALC_MODE_FUTURES
-    2: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFD
-    3: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDINDEX
-    4: AssetClass.CFD,          # SYMBOL_CALC_MODE_CFDLEVERAGE
-    32: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS
-    33: AssetClass.FUTURES,     # SYMBOL_CALC_MODE_EXCH_FUTURES
-    64: AssetClass.MARGIN_FX,   # SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
-    66: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS
-    67: AssetClass.STOCK,       # SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX
-    68: AssetClass.BOND,        # SYMBOL_CALC_MODE_EXCH_BONDS_MOEX
+    0: AssetClass.MARGIN_FX,  # SYMBOL_CALC_MODE_FOREX
+    1: AssetClass.FUTURES,  # SYMBOL_CALC_MODE_FUTURES
+    2: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFD
+    3: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFDINDEX
+    4: AssetClass.CFD,  # SYMBOL_CALC_MODE_CFDLEVERAGE
+    32: AssetClass.STOCK,  # SYMBOL_CALC_MODE_EXCH_STOCKS
+    33: AssetClass.FUTURES,  # SYMBOL_CALC_MODE_EXCH_FUTURES
+    64: AssetClass.MARGIN_FX,  # SYMBOL_CALC_MODE_FOREX_NO_LEVERAGE
+    66: AssetClass.BOND,  # SYMBOL_CALC_MODE_EXCH_BONDS
+    67: AssetClass.STOCK,  # SYMBOL_CALC_MODE_EXCH_STOCKS_MOEX
+    68: AssetClass.BOND,  # SYMBOL_CALC_MODE_EXCH_BONDS_MOEX
 }
 
 # Base currencies that are precious metals.  Broker-independent — ``currency_base``
@@ -326,7 +326,7 @@ class MT5Adapter(Adapter):
         # instrument regardless of netting/hedging mode), and balance is the
         # single-currency account balance.
         self._last_orders: dict[int, object] = {}
-        self._last_positions: dict[Instrument, Position] = {}
+        self._last_positions: dict[tuple[Instrument, str], Position] = {}
         self._last_balance: Balance | None = None
         # Deal dedup baseline in the server-as-epoch basis (raw deal.time).
         # Anchored lazily on the first window build after the server offset is
@@ -878,20 +878,20 @@ class MT5Adapter(Adapter):
     # Reconciliation data (optional ABC methods)
     # ------------------------------------------------------------------
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
+    async def fetch_positions(self) -> list[Position]:
         """Fetch all open positions via ``mt5.positions_get()``.
 
-        In hedging mode, individual legs are netted per instrument before
-        returning — core sees one ``Position`` per instrument regardless
-        of the account's netting/hedging mode.
+        Returns one ``Position`` per terminal leg — a hedging account yields
+        multiple legs per instrument, each carrying its MT5 ticket as
+        ``position_id``.
         """
         mt5 = _get_mt5()
 
-        def _fetch() -> dict[Instrument, Position]:
+        def _fetch() -> list[Position]:
             positions = mt5.positions_get()
             self._check_call_result("positions_get", positions)
             instruments = self._resolve_poll_instruments(mt5, positions, ())
-            return self._net_positions(positions, instruments, _utcnow())
+            return list(self._position_legs(positions, instruments, _utcnow()).values())
 
         return await asyncio.to_thread(_fetch)
 
@@ -979,9 +979,7 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_fetch)
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         """Fetch recent fills via ``mt5.history_deals_get()``.
 
         Only trading deals (DEAL_TYPE_BUY/SELL) are fills; balance
@@ -1003,9 +1001,7 @@ class MT5Adapter(Adapter):
             self._check_call_result("account_info", account)
             backlog = 0 if since is not None else _DEAL_QUERY_BACKLOG_SECONDS
             deals = mt5.history_deals_get(
-                *self._server_deal_window(
-                    mt5, _utcnow(), from_time=since, backlog_seconds=backlog
-                )
+                *self._server_deal_window(mt5, _utcnow(), from_time=since, backlog_seconds=backlog)
             )
             self._check_call_result("history_deals_get", deals)
             instruments = self._resolve_poll_instruments(mt5, (), deals)
@@ -1110,21 +1106,21 @@ class MT5Adapter(Adapter):
         instruments: dict[str, Instrument],
         now: datetime,
     ) -> None:
-        """Net position legs per instrument and publish changes.
+        """Publish per-leg position changes.
 
-        Hedging-mode accounts return one position tuple per leg; they are
-        netted into a single ``Position`` per instrument before the diff.
-        A position that disappears from ``positions_get()`` is published as
-        a flat (quantity 0) position so the mirror learns of the close.
+        One ``Position`` is tracked per terminal leg, keyed by
+        ``(instrument, ticket)``.  A leg that disappears from
+        ``positions_get()`` is published as a zero-quantity close signal
+        carrying its ticket so the mirror deletes the leg.
         """
-        netted = self._net_positions(positions, instruments, now)
+        current = self._position_legs(positions, instruments, now)
         previous_positions = self._last_positions
         # Commit the baseline from the fetched snapshot *before* publishing —
         # a mid-cycle publish failure must not leave a stale baseline that
         # makes the next cycle re-report the same state.
-        self._last_positions = netted
-        for instrument, position in netted.items():
-            previous = previous_positions.get(instrument)
+        self._last_positions = current
+        for key, position in current.items():
+            previous = previous_positions.get(key)
             # Diff on quantity/price only — updated_at is snapshot metadata
             # and must not make an unchanged position look "changed".
             if (
@@ -1133,54 +1129,43 @@ class MT5Adapter(Adapter):
                 or previous.average_entry_price != position.average_entry_price
             ):
                 self._publish_position(position)
-        for instrument in previous_positions:
-            if instrument not in netted:
-                previous = previous_positions[instrument]
+        for key, previous in previous_positions.items():
+            if key not in current:
+                instrument, position_id = key
                 closed = Position(
                     instrument=instrument,
                     quantity=Decimal("0"),
                     average_entry_price=previous.average_entry_price,
                     updated_at=now,
+                    position_id=position_id,
                 )
                 self._publish_position(closed)
 
-    def _net_positions(
+    def _position_legs(
         self,
         positions: Any,
         instruments: dict[str, Instrument],
         now: datetime,
-    ) -> dict[Instrument, Position]:
-        """Net raw ``positions_get()`` legs into one ``Position`` per instrument.
+    ) -> dict[tuple[Instrument, str], Position]:
+        """Map raw ``positions_get()`` legs to one ``Position`` per leg.
 
-        Signed quantity follows the core convention: BUY leg = +volume,
-        SELL leg = -volume.  The average entry price is the volume-weighted
-        average across the legs.
+        Keyed by ``(instrument, ticket)`` so hedged legs of the same
+        instrument stay distinct.  Signed quantity follows the core
+        convention: BUY leg (type 0) = +volume, SELL leg (type 1) = -volume.
         """
-        legs_by_symbol: dict[str, list[Any]] = {}
-        for position in positions or ():
-            legs_by_symbol.setdefault(position.symbol, []).append(position)
-
-        result: dict[Instrument, Position] = {}
-        for symbol, legs in legs_by_symbol.items():
-            instrument = instruments.get(symbol)
+        result: dict[tuple[Instrument, str], Position] = {}
+        for leg in positions or ():
+            instrument = instruments.get(leg.symbol)
             if instrument is None:
                 continue
-            net_quantity = Decimal("0")
-            weighted_price = Decimal("0")
-            total_volume = Decimal("0")
-            for leg in legs:
-                volume = Decimal(str(leg.volume))
-                # POSITION_TYPE_BUY = 0, POSITION_TYPE_SELL = 1.
-                quantity = volume if leg.type == 0 else -volume
-                net_quantity += quantity
-                total_volume += volume
-                weighted_price += volume * Decimal(str(leg.price_open))
-            average = weighted_price / total_volume if total_volume else Decimal("0")
-            result[instrument] = Position(
+            volume = Decimal(str(leg.volume))
+            quantity = volume if leg.type == 0 else -volume
+            result[(instrument, str(leg.ticket))] = Position(
                 instrument=instrument,
-                quantity=net_quantity,
-                average_entry_price=average,
+                quantity=quantity,
+                average_entry_price=Decimal(str(leg.price_open)),
                 updated_at=now,
+                position_id=str(leg.ticket),
             )
         return result
 
@@ -1524,9 +1509,7 @@ class MT5Adapter(Adapter):
             code, desc = mt5.last_error()
             if not self._symbol_exists(mt5_symbol, mt5):
                 self._failed_symbols.add(mt5_symbol)
-                raise InvalidSymbolError(
-                    f"symbol {mt5_symbol!r} is not available on this broker"
-                )
+                raise InvalidSymbolError(f"symbol {mt5_symbol!r} is not available on this broker")
             raise map_mt5_error(code, desc or f"symbol_select() failed for {mt5_symbol}")
         self._selected_symbols.add(mt5_symbol)
 

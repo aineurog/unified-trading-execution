@@ -95,7 +95,7 @@ class MockAdapter(Adapter):
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
 
         # Seeded platform state for reconciliation
-        self._positions: dict[Instrument, Position] = {}
+        self._positions: list[Position] = []
         self._balances: dict[str, Balance] = {}
         self._fills: list[FillRecord] = []
 
@@ -439,10 +439,10 @@ class MockAdapter(Adapter):
 
     # ---- Reconciliation data (optional Adapter ABC methods) ----
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
+    async def fetch_positions(self) -> list[Position]:
         if (err := self._consume_error()) is not None:
             raise err
-        return dict(self._positions)
+        return list(self._positions)
 
     async def fetch_balances(self) -> dict[str, Balance]:
         if (err := self._consume_error()) is not None:
@@ -458,9 +458,7 @@ class MockAdapter(Adapter):
             if rec.status in (OrderStatus.OPEN, OrderStatus.PARTIALLY_FILLED)
         }
 
-    async def fetch_fills(
-        self, *, since: datetime | None = None
-    ) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
         if (err := self._consume_error()) is not None:
             raise err
         result: dict[str, list[FillRecord]] = {}
@@ -473,8 +471,8 @@ class MockAdapter(Adapter):
     # -- Seeding helpers for reconciliation tests --
 
     def seed_position(self, position: Position) -> None:
-        """Pre-seed a position for fetch_positions()."""
-        self._positions[position.instrument] = position
+        """Pre-seed a position leg for fetch_positions()."""
+        self._positions.append(position)
 
     def seed_balance(self, balance: Balance) -> None:
         """Pre-seed a balance for fetch_balances()."""

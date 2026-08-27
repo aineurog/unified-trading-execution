@@ -190,7 +190,7 @@ class TestConcurrentSyncCalls:
             assert r.status == OrderStatus.OPEN
 
     def test_concurrent_mixed_reads_and_writes(self, sync_engine):
-        """Concurrent reads (get_order, get_position) and writes
+        """Concurrent reads (get_order, get_positions) and writes
         (place_order) from mixed threads must not interfere.
         """
         # Pre-place some orders that the read threads will query
@@ -292,6 +292,15 @@ class TestSyncShutdown:
                 # The state store was closed during an in-flight order — this
                 # is a normal outcome of concurrent teardown, not a bug.
                 results.append(("db_closed", i))
+            except ValueError as exc:
+                # aiosqlite raises ValueError("no active connection") when the
+                # connection is torn down mid-flight — the same teardown race
+                # as sqlite3.ProgrammingError above, surfaced via a different
+                # exception type.
+                if "no active connection" in str(exc):
+                    results.append(("db_closed", i))
+                else:
+                    results.append(("error", exc))
             except Exception as exc:
                 results.append(("error", exc))
 
@@ -317,7 +326,7 @@ class TestSyncShutdown:
 
 
 class TestSyncHistoryAccessors:
-    """Verify all six history accessors are available through SyncEngine
+    """Verify all five history accessors are available through SyncEngine
     and properly delegate to the async engine."""
 
     def test_sync_order_history(self, sync_engine):
@@ -330,9 +339,9 @@ class TestSyncHistoryAccessors:
         results = sync_engine.get_fill_history()
         assert isinstance(results, list)
 
-    def test_sync_position_history(self, sync_engine):
-        results = sync_engine.get_position_history()
-        assert isinstance(results, list)
+    def test_sync_position_accessors(self, sync_engine):
+        assert isinstance(sync_engine.get_positions(_instrument()), list)
+        assert sync_engine.get_net_position(_instrument()) is None
 
     def test_sync_balance_history(self, sync_engine):
         results = sync_engine.get_balance_history()

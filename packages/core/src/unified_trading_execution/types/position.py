@@ -11,12 +11,18 @@ from unified_trading_execution.types.instrument import Instrument
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """Current position in a single instrument. Positive = long, negative = short."""
+    """A single position leg. Positive quantity = long, negative = short.
+
+    ``position_id`` is the platform-assigned identifier for this specific leg
+    (MT5 ticket, Bybit positionIdx, cTrader positionId), unique within the
+    instrument.  ``None`` for a derived/synthetic position.
+    """
 
     instrument: Instrument
     quantity: Decimal
     average_entry_price: Decimal
     updated_at: datetime  # UTC, timezone-aware
+    position_id: str | None = None  # platform leg id, unique within the instrument
 
     def __post_init__(self) -> None:
         if self.updated_at.tzinfo is None:
