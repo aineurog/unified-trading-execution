@@ -29,6 +29,21 @@ def mock_ib_async_module():
         mock_ib.disconnect = MagicMock()
         mock_ib.isConnected.return_value = True
         mock_ib.reqContractDetailsAsync = AsyncMock(return_value=[])
+        mock_ib.managedAccounts = MagicMock(return_value=["DU_TEST"])
+
+        # eventkit Events support += / -= (the adapter wires/unwires these)
+        for _evt_name in (
+            "connectedEvent",
+            "disconnectedEvent",
+            "positionEvent",
+            "accountValueEvent",
+            "execDetailsEvent",
+        ):
+            evt = MagicMock()
+            # eventkit's __iadd__/__isub__ return the event itself
+            evt.__iadd__ = MagicMock(return_value=evt)
+            evt.__isub__ = MagicMock(return_value=evt)
+            setattr(mock_ib, _evt_name, evt)
 
         mock_ib_class.return_value = mock_ib
         yield mock_ib

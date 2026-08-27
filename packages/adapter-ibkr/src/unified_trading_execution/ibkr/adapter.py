@@ -13,11 +13,19 @@ This module contains no business logic, no retry policy, no risk decisions.
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+import contextlib
+import logging
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from ib_async import IB, Trade
+from uuid_extensions import uuid7
+
 from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.errors import PlatformConnectionError
 from unified_trading_execution.events import (
+    ConnectionStateEvent,
     Event,
     EventBus,
 )
@@ -34,10 +42,19 @@ from unified_trading_execution.types.order import (
 from unified_trading_execution.types.position import Balance, Position
 
 if TYPE_CHECKING:
-    from ib_async import IB, Trade
-
     from unified_trading_execution.ibkr.config import IBKRConfig
     from unified_trading_execution.state import StateStore
+
+
+logger = logging.getLogger(__name__)
+
+
+def _new_id() -> str:
+    return str(uuid7())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +85,12 @@ class IBKRAdapter(Adapter):
 
         # Wired by the engine via attach_* hooks (see Engine.__init__).
         self._state_store: StateStore | None = None
+
+        # Serialize overlapping connect() calls — prevents duplicate IB instances.
+        self._connect_lock = asyncio.Lock()
+
+        # Whether the adapter considers itself connected (mirrors IB.isConnected).
+        self._connected = False
 
     # ------------------------------------------------------------------
     # Engine wiring (attach_* hooks — override the ABC no-op defaults)
@@ -135,22 +158,180 @@ class IBKRAdapter(Adapter):
         - Hooks up all push event callbacks (``positionEvent``, etc.).
         - Calls ``connectAsync(host, port, clientId)``.
         - Resolves the managed account ID.
-        - Requests initial market data / account updates if needed.
+        - Publishes ``ConnectionStateEvent(connected=True)``.
 
         Raises ``PlatformConnectionError`` if connection fails or times out.
+        Idempotent — a second call while already connected is a no-op.
+        Overlapping concurrent calls are serialized so only one IB instance
+        is ever created (mirrors MT5's process-global guard spirit).
         """
-        raise NotImplementedError
+        # Fast path: already connected — idempotent no-op.
+        if self._connected and self._ib is not None and self._ib.isConnected():
+            return
+
+        async with self._connect_lock:
+            # Re-check inside the lock — another waiter may have connected while
+            # we were queued.
+            if self._connected and self._ib is not None and self._ib.isConnected():
+                return
+
+            # If a half-torn-down IB still lingers, clean it before re-creating.
+            if self._ib is not None:
+                with contextlib.suppress(Exception):
+                    self._unwire_events(self._ib)
+                with contextlib.suppress(Exception):
+                    self._ib.disconnect()
+                self._ib = None
+                self._managed_account = None
+                self._connected = False
+
+            ib = IB()
+            self._wire_events(ib)
+            self._ib = ib
+
+            try:
+                await ib.connectAsync(
+                    host=self._config.host,
+                    port=self._config.port,
+                    clientId=self._config.client_id,
+                    timeout=self._config.timeout_seconds,
+                    readonly=self._config.readonly,
+                    account=self._config.account or "",
+                )
+            except TimeoutError as exc:
+                await self._cleanup_after_failed_connect(ib)
+                raise PlatformConnectionError(
+                    f"IBKR connection to {self._config.host}:{self._config.port} timed out"
+                ) from exc
+            except Exception as exc:
+                # ib_async already called disconnect() internally on failure
+                # (connectAsync's except BaseException: self.disconnect()), but
+                # we still need to unwire and clear our own state.
+                await self._cleanup_after_failed_connect(ib)
+                if isinstance(exc, PlatformConnectionError):
+                    raise
+                raise PlatformConnectionError(
+                    f"failed to connect to IBKR at {self._config.host}:{self._config.port}: {exc}"
+                ) from exc
+
+            # Resolve managed account — config wins, else sole account, else first.
+            try:
+                accounts: list[str] = ib.managedAccounts()
+            except Exception:
+                accounts = []
+            if self._config.account:
+                self._managed_account = self._config.account
+            elif accounts:
+                self._managed_account = accounts[0]
+            else:
+                self._managed_account = "UNKNOWN"
+
+            self._connected = True
+            self._publish_connection_state(True)
+
+    async def _cleanup_after_failed_connect(self, ib: IB) -> None:
+        """Unwire events and clear state after a failed connectAsync."""
+        with contextlib.suppress(Exception):
+            self._unwire_events(ib)
+        with contextlib.suppress(Exception):
+            ib.disconnect()
+        if self._ib is ib:
+            self._ib = None
+        self._managed_account = None
+        self._connected = False
+
+    def _wire_events(self, ib: IB) -> None:
+        """Subscribe adapter callbacks to ib_async push events (eventkit +=)."""
+        ib.connectedEvent += self._on_connected
+        ib.disconnectedEvent += self._on_disconnected
+        # Push streams — keep wired even though handlers are still stubs;
+        # they become live without a reconnect when implemented.
+        ib.positionEvent += self._on_position_update
+        ib.accountValueEvent += self._on_account_value
+        ib.execDetailsEvent += self._on_exec_details
+
+    def _unwire_events(self, ib: IB) -> None:
+        """Unsubscribe adapter callbacks (eventkit -=) — best-effort, never raises."""
+        for event_name, handler in (
+            ("connectedEvent", self._on_connected),
+            ("disconnectedEvent", self._on_disconnected),
+            ("positionEvent", self._on_position_update),
+            ("accountValueEvent", self._on_account_value),
+            ("execDetailsEvent", self._on_exec_details),
+        ):
+            try:
+                event = getattr(ib, event_name, None)
+                if event is not None:
+                    event -= handler
+            except Exception:
+                pass
+
+    def _publish_connection_state(self, connected: bool) -> None:
+        self._publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                connected=connected,
+            )
+        )
 
     async def disconnect(self) -> None:
         """Disconnect from TWS/Gateway and cleanup callbacks.
 
-        Publishes ``ConnectionStateEvent(connected=False)``.
+        Publishes ``ConnectionStateEvent(connected=False)`` once.
+        Idempotent — safe to call when already disconnected; a second call
+        is a no-op and does not publish a duplicate event.
         """
-        raise NotImplementedError
+        # Idempotent fast path — no IB or already torn down.
+        if self._ib is None and not self._connected:
+            return
+        # If we have an IB but it already reports disconnected and we have
+        # already flipped _connected, treat as already disconnected.
+        if self._ib is not None and not self._connected:
+            # Still need to ensure IB instance is cleared.
+            with contextlib.suppress(Exception):
+                self._unwire_events(self._ib)
+            with contextlib.suppress(Exception):
+                self._ib.disconnect()
+            self._ib = None
+            return
+
+        ib = self._ib
+        # Flip flag first so concurrent is_connected checks see disconnecting.
+        self._connected = False
+
+        if ib is not None:
+            with contextlib.suppress(Exception):
+                self._unwire_events(ib)
+            try:
+                ib.disconnect()
+            except Exception:
+                logger.exception("IB.disconnect() raised during adapter disconnect")
+            finally:
+                if self._ib is ib:
+                    self._ib = None
+
+        self._managed_account = None
+        # Only publish if we actually transitioned from connected — caller
+        # already returned above for the double-disconnect case.
+        try:
+            self._publish_connection_state(False)
+        except RuntimeError:
+            # No event_bus wired — still consider disconnect successful;
+            # Engine-constructed adapters always have a bus wired.
+            logger.warning("disconnect: event_bus not wired, skipping ConnectionStateEvent")
 
     @property
     def is_connected(self) -> bool:
-        return self._ib is not None and self._ib.isConnected()
+        if self._connected and self._ib is not None:
+            try:
+                return bool(self._ib.isConnected())
+            except Exception:
+                return False
+        return False
 
     # ------------------------------------------------------------------
     # Order operations
@@ -292,34 +473,61 @@ class IBKRAdapter(Adapter):
     # Event Callbacks (adapter-internal push handlers)
     # ------------------------------------------------------------------
 
-    def _on_connected(self) -> None:
-        """Callback fired by ib_async when connection is established."""
-        raise NotImplementedError
+    def _on_connected(self, *args: Any) -> None:
+        """Callback fired by ib_async when connection is established.
 
-    def _on_disconnected(self) -> None:
-        """Callback fired by ib_async when connection is lost."""
-        raise NotImplementedError
+        ib_async emits connectedEvent with no args; the adapter's own
+        connect() already publishes ConnectionStateEvent(True), so an
+        unsolicited reconnect (e.g. Gateway bounce) is the only case that
+        reaches here without a prior publish.  Guard with _connected.
+        """
+        if self._connected:
+            return
+        self._connected = True
+        with contextlib.suppress(RuntimeError):
+            self._publish_connection_state(True)
+
+    def _on_disconnected(self, *args: Any) -> None:
+        """Callback fired by ib_async when connection is lost.
+
+        Handles unsolicited drops (Gateway/TWS closed). Explicit
+        disconnect() already unwired this handler, so this only fires for
+        external drops — publish once and clear state.
+        """
+        if not self._connected and self._ib is None:
+            return
+        was_connected = self._connected
+        self._connected = False
+        self._managed_account = None
+        if was_connected:
+            with contextlib.suppress(RuntimeError):
+                self._publish_connection_state(False)
 
     def _on_position_update(self, position: Any) -> None:
         """Callback fired by ib_async on position changes.
 
         Translates to ``PositionUpdateEvent`` and publishes to EventBus.
+        Not yet implemented — stubbed to keep event wiring live without
+        a reconnect.
         """
-        raise NotImplementedError
+        # TODO: translate to PositionUpdateEvent (needs from_ibkr_contract)
+        return
 
     def _on_account_value(self, value: Any) -> None:
         """Callback fired by ib_async on account value changes.
 
         Translates to ``BalanceUpdateEvent`` and publishes to EventBus.
+        Not yet implemented — stubbed to keep event wiring live.
         """
-        raise NotImplementedError
+        return
 
     def _on_exec_details(self, trade: Trade, fill: Any, execution: Any) -> None:
         """Callback fired by ib_async when an order is filled.
 
         Translates to ``FillEvent`` and publishes to EventBus.
+        Not yet implemented — stubbed to keep event wiring live.
         """
-        raise NotImplementedError
+        return
 
     # ------------------------------------------------------------------
     # Internal helpers
