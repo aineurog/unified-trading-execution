@@ -88,12 +88,14 @@ class TestCheckIBKRResult:
 
     def test_none_result_raises(self) -> None:
         """None result triggers failure check and raises PlatformError."""
-        with pytest.raises(PlatformError, match="reqContractDetails failed: returned None."):
+        with pytest.raises(PlatformError, match=r"reqContractDetails failed: returned None\."):
             check_ibkr_result(None, "reqContractDetails")
 
     def test_empty_list_result_raises(self) -> None:
         """Empty list result triggers failure check and raises PlatformError."""
-        with pytest.raises(PlatformError, match="reqContractDetails failed: returned empty list."):
+        with pytest.raises(
+            PlatformError, match=r"reqContractDetails failed: returned empty list\."
+        ):
             check_ibkr_result([], "reqContractDetails")
 
     def test_exception_result_raises(self) -> None:

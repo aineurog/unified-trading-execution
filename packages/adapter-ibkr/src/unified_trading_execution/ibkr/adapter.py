@@ -224,7 +224,9 @@ class IBKRAdapter(Adapter):
             elif accounts:
                 self._managed_account = accounts[0]
             else:
-                self._managed_account = "UNKNOWN"
+                # Leave None — account_id falls back to config.account, then to
+                # the deterministic "ibkr-account" placeholder (see account_id).
+                self._managed_account = None
 
             self._connected = True
             self._publish_connection_state(True)

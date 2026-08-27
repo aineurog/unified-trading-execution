@@ -115,8 +115,6 @@ class TestToIBKRContract:
     def test_uses_config_defaults(self) -> None:
         """Missing exchange or currency fall back to IBKRConfig defaults."""
         bare_stock = Instrument(symbol="MSFT", asset_class=AssetClass.STOCK)
-        config = type(ibkr_config := None)  # placeholder to satisfy linters
-        del config, ibkr_config
 
         from unified_trading_execution.ibkr.config import IBKRConfig
 
