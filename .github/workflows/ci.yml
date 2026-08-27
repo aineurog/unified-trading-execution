@@ -27,6 +27,7 @@ jobs:
           pip install -e packages/adapter-bybit
           pip install -e packages/adapter-ctrader
           pip install -e packages/adapter-metatrader
+          pip install -e packages/adapter-ibkr
 
       - name: Install dev dependencies
         run: pip install ruff mypy pytest pytest-asyncio
@@ -43,6 +44,7 @@ jobs:
           mypy --strict packages/adapter-bybit/src/
           mypy --strict packages/adapter-ctrader/src/
           mypy --strict packages/adapter-metatrader/src/
+          mypy --strict packages/adapter-ibkr/src/
 
   unit-tests:
     needs: lint-and-typecheck
@@ -64,6 +66,7 @@ jobs:
           pip install -e packages/adapter-bybit
           pip install -e packages/adapter-ctrader
           pip install -e packages/adapter-metatrader
+          pip install -e packages/adapter-ibkr
 
       - name: Install dev dependencies
         run: pip install pytest pytest-asyncio

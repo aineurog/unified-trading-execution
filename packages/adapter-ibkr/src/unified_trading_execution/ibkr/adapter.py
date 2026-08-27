@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.events import (
+    Event,
     EventBus,
 )
 from unified_trading_execution.types.enums import OrderType
@@ -27,6 +28,7 @@ from unified_trading_execution.types.order import (
     OrderModification,
     OrderRecord,
     OrderResult,
+    TpSlAttachment,
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
@@ -35,6 +37,7 @@ if TYPE_CHECKING:
     from ib_async import IB, Trade
 
     from unified_trading_execution.ibkr.config import IBKRConfig
+    from unified_trading_execution.state import StateStore
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +66,41 @@ class IBKRAdapter(Adapter):
         # Instrument spec cache: Instrument → (InstrumentSpec, fetched_at)
         self._spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
 
+        # Wired by the engine via attach_* hooks (see Engine.__init__).
+        self._state_store: StateStore | None = None
+
+    # ------------------------------------------------------------------
+    # Engine wiring (attach_* hooks — override the ABC no-op defaults)
+    # ------------------------------------------------------------------
+
+    def attach_event_bus(self, event_bus: EventBus) -> None:
+        """Store the engine's shared event bus so push callbacks can publish.
+
+        The engine owns the single ``EventBus`` and hands it to the adapter
+        via this hook (see ``Engine.__init__``).  Overriding the ABC default
+        so ``IBKREngine``-constructed adapters publish correctly even when no
+        bus was passed to ``IBKRAdapter.__init__``.
+        """
+        self._event_bus = event_bus
+
+    def attach_state_store(self, state_store: StateStore) -> None:
+        """Store the engine-managed ``StateStore`` for any future mapping recovery.
+
+        Core attaches its ``SQLiteStateStore`` before ``connect()``.  IBKR is
+        push-driven and does not currently persist adapter-owned intent, but the
+        store is retained for symmetry with the other adapters (e.g. future
+        ``client_order_id ↔ orderRef`` recovery after a restart).
+        """
+        self._state_store = state_store
+
+    def _publish(self, event: Event) -> None:
+        """Publish onto the engine's bus, requiring it was wired first."""
+        if self._event_bus is None:
+            raise RuntimeError(
+                "event_bus not wired — construct via IBKREngine or call attach_event_bus() first"
+            )
+        self._event_bus.publish(event)
+
     # ------------------------------------------------------------------
     # Identification
     # ------------------------------------------------------------------
@@ -76,11 +114,15 @@ class IBKRAdapter(Adapter):
         """Return the resolved account ID (e.g., 'DU123456').
 
         After ``connect()`` succeeds, this is the actual managed account.
-        Before connect, falls back to the config account (if any).
+        Before connect, falls back to the config account (if any).  When
+        neither is set, a stable ``"ibkr-account"`` placeholder keeps the
+        default state-store path (``./unified_trading_execution_data/ibkr_ibkr-account.db``)
+        deterministic across restarts — set ``IBKRConfig.account`` to get a
+        per-account store file.
         """
         if self._managed_account is not None:
             return self._managed_account
-        return self._config.account or "UNKNOWN"
+        return self._config.account or "ibkr-account"
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -193,13 +235,37 @@ class IBKRAdapter(Adapter):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
+    # Position TP/SL modification (optional ABC method)
+    # ------------------------------------------------------------------
+
+    async def modify_position_tpsl(
+        self,
+        position_id: str,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Modify TP/SL on an existing open position.
+
+        IBKR models TP/SL as bracket child orders linked to a parent order via
+        ``parentId``.  ``position_id`` is the platform position reference
+        (the contract ``conId``), obtained from ``PositionUpdateEvent`` or the
+        state store — not ``UnifiedOrder.position_id``.
+
+        TODO(ibkr): implement via ``ib.placeOrder`` on the bracket children.
+        At least one of *take_profit* / *stop_loss* must be provided.
+        """
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
     # Reconciliation data (optional ABC methods)
     # ------------------------------------------------------------------
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
-        """Fetch all open positions from ``self._ib.positions()``.
+    async def fetch_positions(self) -> list[Position]:
+        """Fetch all open positions from ``self._ib.positions()`` as legs.
 
-        Resolves IBKR contracts back to canonical ``Instrument`` objects.
+        One ``Position`` per terminal position leg, with ``position_id`` set
+        to the contract's ``conId`` (``str(contract.conId)``).  Resolves each
+        ``ib_async`` contract back to a canonical ``Instrument``.
         """
         raise NotImplementedError
 
@@ -215,7 +281,11 @@ class IBKRAdapter(Adapter):
         raise NotImplementedError
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
-        """Fetch today's fills from ``self._ib.fills()`` or ``reqExecutionsAsync()``."""
+        """Fetch recent fills from ``self._ib.fills()`` or ``reqExecutionsAsync()``.
+
+        *since* is an optional UTC lower bound for the fill window (used by
+        reconciliation's watermark-bounded query).
+        """
         raise NotImplementedError
 
     # ------------------------------------------------------------------

@@ -18,6 +18,7 @@ Usage::
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import datetime
 from decimal import Decimal
 
 from unified_trading_execution.adapter import RateLimits
@@ -70,7 +71,7 @@ class IBKREngine(Engine):
     async def get_rate_limits(self) -> RateLimits:
         return await self._adapter.get_rate_limits()
 
-    async def fetch_positions(self) -> dict[Instrument, Position]:
+    async def fetch_positions(self) -> list[Position]:
         return await self._adapter.fetch_positions()
 
     async def fetch_balances(self) -> dict[str, Balance]:
@@ -79,5 +80,5 @@ class IBKREngine(Engine):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         return await self._adapter.fetch_open_orders()
 
-    async def fetch_fills(self) -> dict[str, list[FillRecord]]:
-        return await self._adapter.fetch_fills()
+    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
+        return await self._adapter.fetch_fills(since=since)

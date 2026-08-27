@@ -49,14 +49,10 @@ class IBKRConfig:
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0:
-            raise ValueError(
-                f"timeout_seconds must be > 0, got {self.timeout_seconds}"
-            )
+            raise ValueError(f"timeout_seconds must be > 0, got {self.timeout_seconds}")
 
         if self.client_id < 0:
-            raise ValueError(
-                f"client_id must be a non-negative integer, got {self.client_id}"
-            )
+            raise ValueError(f"client_id must be a non-negative integer, got {self.client_id}")
 
         if not self.default_exchange:
             raise ValueError("default_exchange must be a non-empty string")
@@ -66,6 +62,4 @@ class IBKRConfig:
 
         ttl = self.instrument_spec_cache_ttl
         if ttl is not None and ttl <= 0:
-            raise ValueError(
-                f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}"
-            )
+            raise ValueError(f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}")

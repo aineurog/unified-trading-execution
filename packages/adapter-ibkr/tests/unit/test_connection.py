@@ -20,7 +20,7 @@ class TestIBKRConnectionLifecycle:
         self,
         adapter: IBKRAdapter,
         mock_ib_async_module: object,
-        ) -> None:
+    ) -> None:
         """Successful connection initializes client, connects, and emits connected event."""
         ...
 
@@ -28,7 +28,7 @@ class TestIBKRConnectionLifecycle:
         self,
         adapter: IBKRAdapter,
         mock_ib_async_module: object,
-        ) -> None:
+    ) -> None:
         """Disconnect shuts down connection and emits disconnected event."""
         ...
 
@@ -36,7 +36,7 @@ class TestIBKRConnectionLifecycle:
         self,
         adapter: IBKRAdapter,
         mock_ib_async_module: object,
-        ) -> None:
+    ) -> None:
         """Connecting an already connected adapter is a safe no-op or raises."""
         ...
 
@@ -47,9 +47,9 @@ class TestIBKRConnectionLifecycle:
         ...
 
     async def test_disconnect_idempotence(
-            self,
-            adapter: IBKRAdapter,
-            mock_ib_async_module: object,
-        ) -> None:
-            """Calling disconnect multiple times does not raise errors."""
-            ...
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: object,
+    ) -> None:
+        """Calling disconnect multiple times does not raise errors."""
+        ...
