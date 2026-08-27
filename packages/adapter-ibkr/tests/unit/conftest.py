@@ -23,7 +23,7 @@ def mock_ib_async_module():
     Returns the mock IB instance so individual tests can configure return values
     on ``mock_ib.placeOrder``, ``mock_ib.reqContractDetailsAsync``, etc.
     """
-    with patch("unified_trading_execution.ibkr.adapter.IB") as mock_ib_class:
+    with patch("unified_trading_execution.ibkr.adapter.IB", create=True) as mock_ib_class:
         mock_ib = MagicMock()
         mock_ib.connectAsync = AsyncMock(return_value=None)
         mock_ib.disconnect = MagicMock()

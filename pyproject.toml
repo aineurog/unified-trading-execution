@@ -68,7 +68,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["packages"]
-addopts = ["-v", "--tb=short"]
+addopts = ["-v", "--tb=short", "--import-mode=importlib"]
 
 [tool.importlinter]
 root_package = "unified_trading_execution"
