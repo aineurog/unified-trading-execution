@@ -37,7 +37,7 @@ This is a uv workspace monorepo. See the [requirements document](unified-trading
 ## Testing
 
 - Unit tests run against the public mock adapter — no real network calls.
-- Integration tests (in each adapter's `tests/integration/`) require sandbox/testnet credentials.
+- Integration tests (in each adapter's `tests/<adapter>_integration/`) require sandbox/testnet credentials.
 - See `.env.example` for the required environment variables.
 
 ## Questions

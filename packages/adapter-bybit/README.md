@@ -90,7 +90,7 @@ pytest packages/adapter-bybit/tests/unit/
 # Integration tests (requires testnet credentials):
 export BYBIT_TESTNET_API_KEY=your-key
 export BYBIT_TESTNET_API_SECRET=your-secret
-pytest packages/adapter-bybit/tests/integration/
+pytest packages/adapter-bybit/tests/bybit_integration/
 
 # Skip integration tests automatically when credentials are missing:
 pytest packages/adapter-bybit/tests/
