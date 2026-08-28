@@ -17,18 +17,30 @@ import asyncio
 import contextlib
 import logging
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from ib_async import IB, Trade
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.errors import PlatformConnectionError
+from unified_trading_execution.errors import (
+    InvalidSymbolError,
+    OrderNotFoundError,
+    PlatformConnectionError,
+    PlatformError,
+)
 from unified_trading_execution.events import (
     ConnectionStateEvent,
     Event,
     EventBus,
 )
+from unified_trading_execution.ibkr.orders import (
+    apply_ibkr_modification,
+    build_ibkr_orders,
+    parse_ibkr_trade,
+)
+from unified_trading_execution.ibkr.symbols import to_ibkr_contract
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -336,47 +348,111 @@ class IBKRAdapter(Adapter):
         return False
 
     # ------------------------------------------------------------------
-    # Order operations
+    # Order operations — pure translation via ibkr.orders + ibkr.symbols,
+    # thin I/O via ib_async.IB. No business logic here.
     # ------------------------------------------------------------------
+
+    def _require_ib(self) -> IB:
+        """Return the live ``IB`` or raise if not connected."""
+        if self._ib is None or not self.is_connected:
+            raise PlatformConnectionError("IBKR adapter is not connected — call connect() first")
+        return self._ib
+
+    def _find_trade(self, client_order_id: str) -> Trade | None:
+        """Find any Trade (open or done) by ``orderRef``."""
+        ib = self._ib
+        if ib is None:
+            return None
+        for trade in ib.trades():
+            if trade.order.orderRef == client_order_id:
+                return trade
+        return None
+
+    def _find_open_trade(self, client_order_id: str) -> Trade | None:
+        """Find an open Trade by ``orderRef`` (only live orders)."""
+        ib = self._ib
+        if ib is None:
+            return None
+        for trade in ib.openTrades():
+            if trade.order.orderRef == client_order_id:
+                return trade
+        # Fallback: trades() may contain a PendingSubmit not yet in openTrades()
+        return self._find_trade(client_order_id)
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
         """Translate and submit a fully-validated order to IBKR.
 
-        - Converts ``Instrument`` to ``Contract``.
+        - Converts ``Instrument`` to ``Contract`` via ``to_ibkr_contract``.
         - Converts ``UnifiedOrder`` to one or more ``Order`` objects
-          (handling bracket orders for TP/SL).
-        - Assigns the UUID7 ``client_order_id`` to ``orderRef``.
-        - Calls ``self._ib.placeOrder()``.
-        - Returns immediately with a PENDING/SUBMITTED result.
-
-        Note: Actual fills arrive asynchronously via ``_on_exec_details``.
+          (handling bracket orders for TP/SL) via ``build_ibkr_orders``.
+        - Calls ``IB.placeOrder(contract, order)`` for each leg; bracket
+          children are linked via ``parentId`` after the parent's ``orderId``
+          is assigned.
+        - Returns the parent ``OrderResult`` immediately (PENDING/OPEN);
+          fills arrive via ``_on_exec_details``.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        if self._config.readonly:
+            raise PlatformError("adapter is in readonly mode — order placement blocked")
+
+        contract = to_ibkr_contract(order.instrument, self._config)
+        orders = build_ibkr_orders(order)
+
+        # Single order — fast path
+        if len(orders) == 1:
+            trade = ib.placeOrder(contract, orders[0])
+            return parse_ibkr_trade(trade)
+
+        # Bracket: parent first, then children linked to parent's orderId
+        parent_trade = ib.placeOrder(contract, orders[0])
+        parent_id = parent_trade.order.orderId
+        for child in orders[1:]:
+            child.parentId = parent_id
+            ib.placeOrder(contract, child)
+        return parse_ibkr_trade(parent_trade)
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
         """Modify an existing open order.
 
-        Looks up the open trade via ``client_order_id`` (matching ``orderRef``).
-        Mutates the quantity, price, or stop price.
-        Calls ``self._ib.placeOrder()`` with the modified order.
+        Looks up the open trade via ``client_order_id`` (matching ``orderRef``),
+        mutates price/stop/quantity in place, and re-submits via ``placeOrder``.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        trade = self._find_open_trade(modification.client_order_id)
+        if trade is None:
+            raise OrderNotFoundError(
+                f"no open order for client_order_id {modification.client_order_id!r}"
+            )
+        apply_ibkr_modification(modification, trade.order)
+        updated = ib.placeOrder(trade.contract, trade.order)
+        return parse_ibkr_trade(updated)
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel an existing order by ``client_order_id``.
 
-        Finds the active order by ``orderRef`` and calls ``self._ib.cancelOrder()``.
+        Finds the active order by ``orderRef`` and calls ``IB.cancelOrder``.
         Raises ``OrderNotFoundError`` if the order is not active or unknown.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        trade = self._find_open_trade(client_order_id)
+        if trade is None:
+            raise OrderNotFoundError(f"no open order for client_order_id {client_order_id!r}")
+        result = ib.cancelOrder(trade.order)
+        # cancelOrder mutates the trade in place; fall back to original trade
+        target = result if result is not None else trade
+        return parse_ibkr_trade(target)
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by ``client_order_id``.
 
-        Scans ``self._ib.openTrades()`` for a matching ``orderRef``.
-        Returns ``None`` if not found.
+        Scans all trades for a matching ``orderRef``. Returns ``None`` if not found.
         """
-        raise NotImplementedError
+        if self._ib is None:
+            return None
+        trade = self._find_trade(client_order_id)
+        if trade is None:
+            return None
+        return parse_ibkr_trade(trade)
 
     # ------------------------------------------------------------------
     # Instrument metadata
@@ -385,10 +461,80 @@ class IBKRAdapter(Adapter):
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         """Fetch trading rules from IBKR via ``reqContractDetailsAsync()``.
 
-        Extracts min tick size, price magnifier, and valid order sizes.
-        Cached with TTL per ``IBKRConfig.instrument_spec_cache_ttl``.
+        Extracts ``minTick`` → ``tick_size``, ``sizeIncrement`` → ``lot_size``,
+        ``minSize`` → ``min_qty``. Cached with TTL per
+        ``IBKRConfig.instrument_spec_cache_ttl`` (``None`` = infinite).
+
+        Raises ``InvalidSymbolError`` if the contract is unknown on this
+        gateway, ``PlatformConnectionError`` if the gateway is unreachable.
         """
-        raise NotImplementedError
+        # Fast path: cached and still fresh
+        cached = self._spec_cache.get(instrument)
+        if cached is not None:
+            spec, fetched_at = cached
+            ttl = self._config.instrument_spec_cache_ttl
+            if ttl is None or (_utcnow() - fetched_at).total_seconds() < ttl:
+                return spec
+            self._spec_cache.pop(instrument, None)
+
+        ib = self._require_ib()
+        contract = to_ibkr_contract(instrument, self._config)
+
+        try:
+            details_list = await ib.reqContractDetailsAsync(contract)
+        except Exception as exc:
+            # Connection-level failures (socket closed, timeout) bubble as
+            # PlatformConnectionError so Engine can retry; contract-level
+            # failures are InvalidSymbol — empty list handled below.
+            raise PlatformConnectionError(
+                f"failed to fetch contract details for {instrument.symbol!r}: {exc}"
+            ) from exc
+
+        if not details_list:
+            raise InvalidSymbolError(
+                f"IBKR symbol {instrument.symbol!r} is not available: no contract details"
+            )
+
+        details = details_list[0]
+
+        # IBKR guarantees minTick for tradable contracts; fall back to 0.01
+        # only for malformed test fixtures (never on a live gateway).
+        raw_tick = getattr(details, "minTick", 0) or 0
+        tick_size = Decimal(str(raw_tick)) if raw_tick else Decimal("0.01")
+        if tick_size <= 0:
+            tick_size = Decimal("0.01")
+
+        raw_increment = getattr(details, "sizeIncrement", 0) or 0
+        lot_size = Decimal(str(raw_increment)) if raw_increment else Decimal("1")
+        if lot_size <= 0:
+            lot_size = Decimal("1")
+
+        raw_min = getattr(details, "minSize", 0) or 0
+        min_qty = Decimal(str(raw_min)) if raw_min else lot_size
+        if min_qty <= 0:
+            min_qty = lot_size
+
+        # IBKR has no explicit max size in ContractDetails — use a safe large cap
+        max_qty = Decimal("1000000000")
+        min_notional = Decimal("0")
+
+        # Precision derived from the Decimal exponent, not float formatting
+        def _places(value: Decimal) -> int:
+            normalized = value.normalize()
+            exp = normalized.as_tuple().exponent
+            return max(0, -int(exp)) if isinstance(exp, int) else 0
+
+        spec = InstrumentSpec(
+            tick_size=tick_size,
+            lot_size=lot_size,
+            min_qty=min_qty,
+            max_qty=max_qty,
+            min_notional=min_notional,
+            price_precision=_places(tick_size),
+            qty_precision=_places(lot_size),
+        )
+        self._spec_cache[instrument] = (spec, _utcnow())
+        return spec
 
     # ------------------------------------------------------------------
     # Capability reporting
@@ -478,12 +624,16 @@ class IBKRAdapter(Adapter):
     def _on_connected(self, *args: Any) -> None:
         """Callback fired by ib_async when connection is established.
 
-        ib_async emits connectedEvent with no args; the adapter's own
-        connect() already publishes ConnectionStateEvent(True), so an
-        unsolicited reconnect (e.g. Gateway bounce) is the only case that
-        reaches here without a prior publish.  Guard with _connected.
+        ib_async emits connectedEvent from inside connectAsync while
+        adapter.connect() holds _connect_lock. That emission would race
+        connect()'s own publish and create a duplicate True. Suppress
+        while the lock is held — connect() publishes exactly once itself.
+        Unsolicited reconnects (Gateway bounce) happen outside the lock
+        and are published here.
         """
         if self._connected:
+            return
+        if self._connect_lock.locked():
             return
         self._connected = True
         with contextlib.suppress(RuntimeError):
