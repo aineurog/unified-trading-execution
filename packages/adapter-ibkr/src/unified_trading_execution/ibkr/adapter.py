@@ -38,6 +38,8 @@ from unified_trading_execution.events import (
 from unified_trading_execution.ibkr.orders import (
     apply_ibkr_modification,
     build_ibkr_orders,
+    is_final_order_status,
+    map_ibkr_status,
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import to_ibkr_contract
@@ -376,8 +378,15 @@ class IBKRAdapter(Adapter):
         for trade in ib.openTrades():
             if trade.order.orderRef == client_order_id:
                 return trade
-        # Fallback: trades() may contain a PendingSubmit not yet in openTrades()
-        return self._find_trade(client_order_id)
+        # Fallback: trades() may contain a PendingSubmit not yet in openTrades(),
+        # but must still be live — a terminal order (filled/cancelled/rejected/
+        # expired) must never be returned for modification or cancellation.
+        fallback = self._find_trade(client_order_id)
+        if fallback is None:
+            return None
+        if is_final_order_status(map_ibkr_status(fallback.orderStatus.status)):
+            return None
+        return fallback
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
         """Translate and submit a fully-validated order to IBKR.
@@ -445,10 +454,11 @@ class IBKRAdapter(Adapter):
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query order status by ``client_order_id``.
 
-        Scans all trades for a matching ``orderRef``. Returns ``None`` if not found.
+        Scans all trades for a matching ``orderRef``. Returns ``None`` if not
+        found. Raises ``PlatformConnectionError`` if not connected (consistent
+        with the other order operations).
         """
-        if self._ib is None:
-            return None
+        self._require_ib()
         trade = self._find_trade(client_order_id)
         if trade is None:
             return None

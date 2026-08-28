@@ -4,7 +4,7 @@ Covers each branch of adapter.py order ops:
   - place_order: single, bracket (TP/SL), readonly, not-connected, bubbling
   - modify_order: success, not-found, unsupported TP/SL, not-connected
   - cancel_order: success, not-found, not-connected
-  - get_order_by_client_id: found, not-found, not-connected (via _ib is None)
+  - get_order_by_client_id: found, not-found, not-connected (raises)
 """
 
 from __future__ import annotations
@@ -271,6 +271,21 @@ class TestModifyOrder:
                 OrderModification(client_order_id="nope", price=Decimal("1"))
             )
 
+    async def test_modify_terminal_trade_not_found(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        # Already-filled order: absent from openTrades() but still in trades().
+        # _find_open_trade's fallback must reject it as terminal.
+        filled = _trade(order_ref="cid-done", order_id=99, status="Filled", filled=10, total_qty=10)
+        mock_ib.openTrades.return_value = []  # type: ignore[attr-defined]
+        mock_ib.trades.return_value = [filled]  # type: ignore[attr-defined]
+        with pytest.raises(OrderNotFoundError):
+            await adapter.modify_order(
+                OrderModification(client_order_id="cid-done", price=Decimal("1"))
+            )
+
     async def test_modify_rejects_tpsl(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
     ) -> None:
@@ -355,9 +370,11 @@ class TestGetOrderByClientId:
         mock_ib.trades.return_value = []  # type: ignore[attr-defined]
         assert await adapter.get_order_by_client_id("nope") is None
 
-    async def test_get_without_ib_returns_none(self, adapter: IBKRAdapter) -> None:
-        # never connected -> _ib is None
-        assert await adapter.get_order_by_client_id("any") is None
+    async def test_get_without_ib_raises(self, adapter: IBKRAdapter) -> None:
+        # never connected -> _ib is None; get_order_by_client_id must raise,
+        # consistent with the other order operations.
+        with pytest.raises(PlatformConnectionError):
+            await adapter.get_order_by_client_id("any")
 
     async def test_get_finds_filled_trade(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
