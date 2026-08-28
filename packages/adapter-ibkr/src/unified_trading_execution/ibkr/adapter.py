@@ -42,8 +42,8 @@ from unified_trading_execution.ibkr.orders import (
     map_ibkr_status,
     parse_ibkr_trade,
 )
-from unified_trading_execution.ibkr.symbols import to_ibkr_contract
-from unified_trading_execution.types.enums import OrderType
+from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
+from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -228,6 +228,16 @@ class IBKRAdapter(Adapter):
                     f"failed to connect to IBKR at {self._config.host}:{self._config.port}: {exc}"
                 ) from exc
 
+            # Enforce TWS/Gateway Time Zone = UTC for Engine UTC purity.
+            # TWS sends Execution.time naive in its display zone; Engine watermark
+            # `since` is UTC. If TWS is not UTC, `since` filtering is hours off
+            # and `reconcile` misses fills. Block early with a clear message.
+            try:
+                self._assert_tws_utc(ib)
+            except PlatformConnectionError:
+                await self._cleanup_after_failed_connect(ib)
+                raise
+
             # Resolve managed account — config wins, else sole account, else first.
             try:
                 accounts: list[str] = ib.managedAccounts()
@@ -354,10 +364,36 @@ class IBKRAdapter(Adapter):
     # thin I/O via ib_async.IB. No business logic here.
     # ------------------------------------------------------------------
 
+    def _assert_tws_utc(self, ib: IB) -> None:
+        """Reject a known non-UTC TWS/Gateway timezone.
+
+        Engine is UTC-only (watermark `since` is UTC). TWS sends
+        Execution.time naive in its display zone. ``ib_async`` does not expose
+        the Gateway GUI timezone reliably: an empty ``TimezoneTWS`` means
+        unknown, not necessarily non-UTC.
+        """
+        tws_tz = str(getattr(ib, "TimezoneTWS", "") or "").strip()
+        if not tws_tz:
+            logger.warning(
+                "IBKR TWS/Gateway timezone is unknown (ib_async TimezoneTWS is empty); "
+                "verify the Gateway/TWS GUI timezone is UTC before using fill watermarks"
+            )
+            return
+        if tws_tz.upper() not in ("UTC", "ETC/UTC", "GMT") and "UTC" not in tws_tz.upper():  # noqa: E501
+            raise PlatformConnectionError(
+                f"TWS/Gateway Time Zone is {tws_tz!r} — "
+                "set TWS/Gateway → Configure → Settings → General → Time Zone = UTC "
+                "and reconnect. Engine is UTC-only; non-UTC TWS makes fetch_fills(since) "
+                "filter fills incorrectly by hours."
+            )
+
     def _require_ib(self) -> IB:
         """Return the live ``IB`` or raise if not connected."""
         if self._ib is None or not self.is_connected:
             raise PlatformConnectionError("IBKR adapter is not connected — call connect() first")
+        # Enforce UTC on every operation, not just connect — user could change
+        # TWS setting mid-session without reconnecting.
+        self._assert_tws_utc(self._ib)
         return self._ib
 
     def _find_trade(self, client_order_id: str) -> Trade | None:
@@ -571,7 +607,13 @@ class IBKRAdapter(Adapter):
         IBKR generally allows up to 50 requests per second. ``ib_async``
         handles pacing internally. We return a conservative static estimate.
         """
-        raise NotImplementedError
+        now = _utcnow()
+        return RateLimits(
+            requests_per_interval=50,
+            interval_seconds=1.0,
+            remaining=50,
+            reset_at=now,
+        )
 
     # ------------------------------------------------------------------
     # Position TP/SL modification (optional ABC method)
@@ -596,36 +638,358 @@ class IBKRAdapter(Adapter):
         raise NotImplementedError
 
     # ------------------------------------------------------------------
-    # Reconciliation data (optional ABC methods)
+    # Reconciliation data — proper ib_async usage, covering all cases
     # ------------------------------------------------------------------
 
     async def fetch_positions(self) -> list[Position]:
-        """Fetch all open positions from ``self._ib.positions()`` as legs.
+        """Fetch all open positions as legs (one Position per IBKR Position).
 
-        One ``Position`` per terminal position leg, with ``position_id`` set
-        to the contract's ``conId`` (``str(contract.conId)``).  Resolves each
-        ``ib_async`` contract back to a canonical ``Instrument``.
+        Uses ``IB.positions()`` (all accounts, or ``self._managed_account``
+        when set). Skips zero-quantity and unmappable contracts with a
+        warning, never aborting the whole snapshot. ``position_id`` is
+        ``str(contract.conId)`` when available.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        now = _utcnow()
+        account = self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
+        try:
+            raw_positions = ib.positions(account=account) if account else ib.positions()
+        except Exception as exc:
+            raise PlatformConnectionError(f"failed to fetch IBKR positions: {exc}") from exc
+
+        result: list[Position] = []
+        for pos in raw_positions:
+            qty = Decimal(str(pos.position))
+            if qty == 0:
+                continue
+            try:
+                instrument = from_ibkr_contract(pos.contract)
+            except Exception as exc:
+                logger.warning(
+                    "Skipping IBKR position with unmappable contract %r: %s", pos.contract, exc
+                )
+                continue
+            avg_price = Decimal(str(pos.avgCost)) if pos.avgCost else Decimal("0")
+            # IBKR avgCost is per-share cost; for FX it's the price. Use as entry price.
+            position_id = str(pos.contract.conId) if getattr(pos.contract, "conId", 0) else None
+            try:
+                result.append(
+                    Position(
+                        instrument=instrument,
+                        quantity=qty,
+                        average_entry_price=avg_price,
+                        updated_at=now,
+                        position_id=position_id,
+                    )
+                )
+            except Exception as exc:
+                logger.warning("Skipping invalid Position for %s: %s", instrument, exc)
+        return result
 
     async def fetch_balances(self) -> dict[str, Balance]:
-        """Fetch account balances from ``self._ib.accountValues()``.
+        """Fetch account balances from ``IB.accountValues()``.
 
-        Extracts TotalCashValue and NetLiquidation by currency.
+        Groups ``AccountValue`` by currency and uses ``TotalCashValue`` as
+        ``free`` and ``NetLiquidation`` as ``total`` (``used = total - free``).
+        Falls back to ``CashBalance``/``AvailableFunds`` when the primary tags
+        are absent. Skips currencies with no usable value.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        now = _utcnow()
+        account = self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
+        try:
+            values = ib.accountValues(account=account) if account else ib.accountValues()
+        except Exception as exc:
+            raise PlatformConnectionError(f"failed to fetch IBKR account values: {exc}") from exc
+
+        per_ccy: dict[str, dict[str, Decimal]] = {}
+        for av in values:
+            ccy = (getattr(av, "currency", "") or "").strip() or "USD"
+            tag = getattr(av, "tag", "")
+            raw = getattr(av, "value", "")
+            if not tag or raw in (None, ""):
+                continue
+            try:
+                dec = Decimal(str(raw))
+            except Exception:
+                continue
+            bucket = per_ccy.setdefault(ccy, {})
+            # Keep last value for tag (IBKR sends one per account/currency/tag)
+            bucket[tag] = dec
+
+        result: dict[str, Balance] = {}
+        for ccy, tags in per_ccy.items():
+            # Prefer NetLiquidation as total, else TotalCashValue, else CashBalance
+            total = tags.get("NetLiquidation")
+            if total is None:
+                total = tags.get("TotalCashValue")
+            if total is None:
+                total = tags.get("CashBalance")
+            if total is None:
+                continue
+            free = tags.get("AvailableFunds")
+            if free is None:
+                free = tags.get("TotalCashValue")
+            if free is None:
+                free = tags.get("CashBalance", total)
+            # Clamp free to total
+            if free > total:
+                free = total
+            used = total - free
+            try:
+                result[ccy] = Balance(
+                    currency=ccy, free=free, used=used, total=total, updated_at=now
+                )
+            except Exception as exc:
+                logger.warning("Skipping balance for %s: %s", ccy, exc)
+        return result
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
-        """Fetch all open orders from ``self._ib.openTrades()``."""
-        raise NotImplementedError
+        """Fetch all open orders from ``IB.openTrades()``.
+
+        Translates each ``Trade`` to an ``OrderRecord`` via ``from_ibkr_contract``
+        + order-field mapping. Skips unmappable contracts with a warning.
+        Keyed by ``client_order_id`` (``orderRef``) falling back to
+        ``platform_order_id`` so orphans remain reconcilable.
+        """
+        ib = self._require_ib()
+        now = _utcnow()
+        try:
+            trades = ib.openTrades()
+        except Exception as exc:
+            raise PlatformConnectionError(f"failed to fetch IBKR open orders: {exc}") from exc
+
+        result: dict[str, OrderRecord] = {}
+        for trade in trades:
+            order = getattr(trade, "order", None)
+            status = getattr(trade, "orderStatus", None)
+            contract = getattr(trade, "contract", None)
+            if order is None or status is None or contract is None:
+                continue
+            try:
+                instrument = from_ibkr_contract(contract)
+            except Exception as exc:
+                logger.warning("Skipping open order with unmappable contract %r: %s", contract, exc)
+                continue
+
+            # Map IBKR wire fields to unified enums
+            action = getattr(order, "action", "")
+            side = OrderSide.BUY if str(action).upper() == "BUY" else OrderSide.SELL
+
+            otype = str(getattr(order, "orderType", "")).upper()
+            if otype == "MKT":
+                order_type = OrderType.MARKET
+            elif otype == "LMT":
+                order_type = OrderType.LIMIT
+            elif otype == "STP":
+                order_type = OrderType.STOP
+            elif otype in ("STP LMT", "STP_LMT"):
+                order_type = OrderType.STOP_LIMIT
+            else:
+                # Unknown order type — skip rather than guess
+                logger.warning("Skipping order with unknown orderType %r", otype)
+                continue
+
+            tif_raw = str(getattr(order, "tif", "")).upper()
+            tif_map = {
+                "GTC": TimeInForce.GTC,
+                "DAY": TimeInForce.DAY,
+                "IOC": TimeInForce.IOC,
+                "FOK": TimeInForce.FOK,
+                "GTD": TimeInForce.GTD,
+            }
+            time_in_force = tif_map.get(tif_raw, TimeInForce.GTC)
+
+            # Prices: UNSET_DOUBLE sentinel means not set
+            def _as_decimal(val: object) -> Decimal | None:
+                try:
+                    if val is None:
+                        return None
+                    # ib_async uses float('inf') or UNSET_DOUBLE for unset
+                    f = float(str(val))
+                    if f in (float("inf"), float("-inf")) or abs(f) > 1e12:
+                        return None
+                    # UNSET_DOUBLE is ~1.797...e308, treat as unset
+                    if f == 0 and str(val) == "1.7976931348623157e+308":
+                        return None
+                    return Decimal(str(val))
+                except Exception:
+                    return None
+
+            price = _as_decimal(getattr(order, "lmtPrice", None))
+            # lmtPrice 0 or UNSET means no limit
+            if price is not None and price == 0:
+                price = None
+            stop_price = _as_decimal(getattr(order, "auxPrice", None))
+            if stop_price is not None and stop_price == 0:
+                stop_price = None
+
+            # Quantity
+            try:
+                qty = Decimal(str(getattr(order, "totalQuantity", 0) or 0))
+            except Exception:
+                qty = Decimal("0")
+            if qty == 0:
+                continue
+
+            client_order_id = str(getattr(order, "orderRef", "") or "")
+            perm_id = getattr(order, "permId", 0) or 0
+            order_id = getattr(order, "orderId", 0) or 0
+            platform_order_id = str(perm_id or order_id) if (perm_id or order_id) else None
+
+            # Status
+            ib_status = str(getattr(status, "status", "") or "")
+            try:
+                # Reuse orders mapping helper if available
+                from unified_trading_execution.ibkr.orders import map_ibkr_status
+
+                unified_status = map_ibkr_status(ib_status)
+            except Exception:
+                unified_status = OrderStatus.OPEN
+
+            filled_qty = Decimal(str(getattr(status, "filled", 0) or 0))
+            avg_price_raw = getattr(status, "avgFillPrice", 0) or 0
+            try:
+                avg_fill = Decimal(str(avg_price_raw)) if avg_price_raw else None
+            except Exception:
+                avg_fill = None
+
+            # Timestamps from Trade log — ib_async already UTC
+            created_at = now
+            updated_at = now
+            log = getattr(trade, "log", None)
+            if log:
+                try:
+                    first = log[0].time
+                    last = log[-1].time
+                    if first is not None:
+                        created_at = first if first.tzinfo else first.replace(tzinfo=UTC)
+                    if last is not None:
+                        updated_at = last if last.tzinfo else last.replace(tzinfo=UTC)
+                except Exception:
+                    pass
+
+            # GTD expiry not available on wire — keep None
+            try:
+                record = OrderRecord(
+                    instrument=instrument,
+                    order_type=order_type,
+                    side=side,
+                    quantity=qty,
+                    time_in_force=time_in_force,
+                    client_order_id=client_order_id or platform_order_id or str(order_id),
+                    price=price,
+                    stop_price=stop_price,
+                    reduce_only=False,
+                    client_tag=None,
+                    take_profit=None,
+                    stop_loss=None,
+                    platform_order_id=platform_order_id,
+                    status=unified_status,
+                    filled_quantity=filled_qty,
+                    average_fill_price=avg_fill,
+                    correlation_id=client_order_id,
+                    created_at=created_at,
+                    updated_at=updated_at,
+                )
+            except Exception as exc:
+                logger.warning("Skipping invalid OrderRecord for %r: %s", client_order_id, exc)
+                continue
+
+            key = record.client_order_id or record.platform_order_id or str(order_id)
+            result[key] = record
+        return result
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
-        """Fetch recent fills from ``self._ib.fills()`` or ``reqExecutionsAsync()``.
+        """Fetch fills from ``IB.fills()`` grouped by ``client_order_id``.
 
-        *since* is an optional UTC lower bound for the fill window (used by
-        reconciliation's watermark-bounded query).
+        Uses the session's ``Fill`` cache (``Execution`` + ``CommissionReport``).
+        Filters with ``since`` on ``Execution.time`` when provided. Skips
+        fills with unmappable contracts or zero quantity/price.
         """
-        raise NotImplementedError
+        ib = self._require_ib()
+        try:
+            fills = ib.fills()
+        except Exception as exc:
+            raise PlatformConnectionError(f"failed to fetch IBKR fills: {exc}") from exc
+
+        grouped: dict[str, list[FillRecord]] = {}
+        for fill in fills:
+            execution = getattr(fill, "execution", None)
+            contract = getattr(fill, "contract", None)
+            commission = getattr(fill, "commissionReport", None)
+            if execution is None or contract is None:
+                continue
+            exec_time = getattr(execution, "time", None)
+            if exec_time is None:
+                continue
+            if exec_time.tzinfo is None:
+                exec_time = exec_time.replace(tzinfo=UTC)
+            if since is not None and exec_time < since:
+                continue
+            try:
+                instrument = from_ibkr_contract(contract)
+            except Exception as exc:
+                logger.warning("Skipping fill with unmappable contract %r: %s", contract, exc)
+                continue
+            shares = getattr(execution, "shares", 0) or 0
+            price = getattr(execution, "price", 0) or 0
+            try:
+                qty = Decimal(str(shares))
+                fill_price = Decimal(str(price))
+            except Exception:
+                continue
+            if qty <= 0 or fill_price <= 0:
+                continue
+            client_order_id = str(getattr(execution, "orderRef", "") or "")
+            # Fallback to permId if orderRef empty (manual TWS orders)
+            if not client_order_id:
+                perm = getattr(execution, "permId", 0) or 0
+                client_order_id = str(perm) if perm else ""
+            if not client_order_id:
+                # No attribution — skip (Engine needs client_order_id to reconcile)
+                logger.warning(
+                    "Skipping fill without orderRef/execId %r", getattr(execution, "execId", "")
+                )
+                continue
+            exec_id = str(getattr(execution, "execId", "") or "")
+            if not exec_id:
+                exec_id = f"{client_order_id}-{exec_time.isoformat()}"
+            fee_amount: Decimal | None = None
+            fee_currency: str | None = None
+            if commission is not None:
+                try:
+                    fee_amount = Decimal(str(getattr(commission, "commission", 0) or 0))
+                    fee_currency = str(getattr(commission, "currency", "") or "") or None
+                    if fee_amount == 0:
+                        fee_amount = None
+                        fee_currency = None
+                except Exception:
+                    fee_amount = None
+                    fee_currency = None
+            # position_id not applicable to IBKR fills — keep None
+            try:
+                record = FillRecord(
+                    client_order_id=client_order_id,
+                    platform_fill_id=exec_id,
+                    instrument=instrument,
+                    fill_quantity=qty,
+                    fill_price=fill_price,
+                    fill_timestamp=exec_time,
+                    fee_currency=fee_currency,
+                    fee_amount=fee_amount,
+                    correlation_id=client_order_id,
+                    position_id=None,
+                )
+            except Exception as exc:
+                logger.warning("Skipping invalid FillRecord for %r: %s", client_order_id, exc)
+                continue
+            grouped.setdefault(client_order_id, []).append(record)
+
+        # Sort each client's fills by timestamp for deterministic reconciliation
+        for lst in grouped.values():
+            lst.sort(key=lambda r: r.fill_timestamp)
+        return grouped
 
     # ------------------------------------------------------------------
     # Event Callbacks (adapter-internal push handlers)
