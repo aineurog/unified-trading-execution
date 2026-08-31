@@ -388,3 +388,387 @@ class TestGetOrderByClientId:
         result = await adapter.get_order_by_client_id("cid-filled")
         assert result is not None
         assert result.status is OrderStatus.FILLED
+
+
+# ---------------------------------------------------------------------------
+# modify_position_tpsl
+# ---------------------------------------------------------------------------
+
+
+class TestModifyPositionTpsl:
+    def _pos(self, con_id: int = 111, qty: float = 10, avg_cost: float = 100) -> object:
+        from ib_async import Contract
+        from ib_async.objects import Position as IBPos
+
+        c = Contract()
+        c.conId = con_id
+        c.symbol = "AAPL"
+        c.secType = "STK"
+        c.exchange = "NASDAQ"
+        c.currency = "USD"
+        return IBPos(account="DU_TEST", contract=c, position=qty, avgCost=avg_cost)
+
+    def _fx_pos(self, con_id: int = 222, qty: float = 1000) -> object:
+        from ib_async import Contract
+        from ib_async.objects import Position as IBPos
+
+        c = Contract()
+        c.conId = con_id
+        c.symbol = "EUR"
+        c.secType = "CASH"
+        c.exchange = "IDEALPRO"
+        c.currency = "USD"
+        return IBPos(account="DU_TEST", contract=c, position=qty, avgCost=1.08)
+
+    async def test_tpsl_places_oca_pair_stock(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        captured: list[tuple[Contract, Order]] = []
+
+        def _place(c: Contract, o: Order) -> Trade:
+            captured.append((c, o))
+            o.permId = 1
+            o.orderId = 100 + len(captured)
+            return _trade(order_ref=o.orderRef, order_id=o.orderId, perm_id=1)
+
+        mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
+
+        await adapter.modify_position_tpsl(
+            "111",
+            take_profit=TpSlAttachment(Decimal("150")),
+            stop_loss=TpSlAttachment(Decimal("90")),
+        )
+
+        assert len(captured) == 2
+        (c1, tp), (c2, sl) = captured
+        assert c1.exchange == "SMART"  # NASDAQ direct replaced
+        assert c2.exchange == "SMART"
+        assert tp.orderType == "LMT" and tp.action == "SELL"
+        assert sl.orderType == "STP" and sl.action == "SELL"
+        assert tp.ocaGroup == sl.ocaGroup == "pos-tpsl-111"
+        assert tp.transmit is False and sl.transmit is True
+        assert tp.orderRef.startswith("111-tp-") and sl.orderRef.startswith("111-sl-")
+
+    async def test_fx_uses_idealpro(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._fx_pos(con_id=222, qty=1000)]  # type: ignore[attr-defined]
+        captured: list[tuple[Contract, Order]] = []
+
+        def _place(c: Contract, o: Order) -> Trade:
+            captured.append((c, o))
+            return _trade(order_ref=o.orderRef, order_id=1, perm_id=1)
+
+        mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
+
+        await adapter.modify_position_tpsl("222", take_profit=TpSlAttachment(Decimal("1.20")))
+
+        assert captured[0][0].exchange == "IDEALPRO"
+        assert captured[0][1].orderType == "LMT"
+
+    async def test_only_tp_or_sl(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=5)]  # type: ignore[attr-defined]
+        mock_ib.placeOrder.side_effect = lambda c, o: _trade(
+            order_ref=o.orderRef, order_id=1, perm_id=1
+        )  # type: ignore[attr-defined]
+        await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("10")))
+        assert mock_ib.placeOrder.call_count == 1  # type: ignore[attr-defined]
+        mock_ib.placeOrder.reset_mock()  # type: ignore[attr-defined]
+        await adapter.modify_position_tpsl(
+            "111", stop_loss=TpSlAttachment(Decimal("9"), limit_price=Decimal("8.9"))
+        )
+        assert mock_ib.placeOrder.call_count == 1  # type: ignore[attr-defined]
+        # STP LMT
+        assert mock_ib.placeOrder.call_args[0][1].orderType == "STP LMT"  # type: ignore[attr-defined]
+
+    async def test_short_position_uses_buy(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=-10)]  # type: ignore[attr-defined]
+        captured: list[Order] = []
+
+        def _place(c: Contract, o: Order) -> Trade:
+            captured.append(o)
+            return _trade(order_ref=o.orderRef, order_id=1, perm_id=1)
+
+        mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
+        await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("90")))
+        assert captured[0].action == "BUY"
+
+    async def test_no_position_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = []  # type: ignore[attr-defined]
+        with pytest.raises(OrderNotFoundError):
+            await adapter.modify_position_tpsl("999", take_profit=TpSlAttachment(Decimal("1")))
+
+    async def test_flat_position_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=0)]  # type: ignore[attr-defined]
+        with pytest.raises(OrderNotFoundError, match="flat"):
+            await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("1")))
+
+    async def test_no_tp_sl_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        with pytest.raises(ValueError, match="at least one"):
+            await adapter.modify_position_tpsl("111")
+
+    async def test_tp_limit_price_rejected(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        with pytest.raises(ValueError, match="limit_price"):
+            await adapter.modify_position_tpsl(
+                "111", take_profit=TpSlAttachment(Decimal("1"), limit_price=Decimal("2"))
+            )
+
+    async def test_not_connected(self, adapter: IBKRAdapter) -> None:
+        with pytest.raises(PlatformConnectionError):
+            await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("1")))
+
+
+# ---------------------------------------------------------------------------
+# Push EventBus — _on_* handlers
+# ---------------------------------------------------------------------------
+
+
+class TestPushEvents:
+    def test_position_update_publishes(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import PositionUpdateEvent
+
+        captured: list[PositionUpdateEvent] = []
+        adapter._event_bus.subscribe(PositionUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.conId = 123
+        from ib_async.objects import Position as IBPos
+
+        pos = IBPos(account="DU_TEST", contract=contract, position=5, avgCost=150)
+        adapter._on_position_update(pos)
+
+        assert len(captured) == 1
+        assert captured[0].position.instrument.symbol == "AAPL"
+        assert captured[0].position.quantity == Decimal("5")
+        assert captured[0].position.position_id == "123"
+
+    def test_position_update_skips_unmappable(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import PositionUpdateEvent
+
+        captured: list[PositionUpdateEvent] = []
+        adapter._event_bus.subscribe(PositionUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        bad = Contract()
+        bad.symbol = ""
+        bad.secType = "BOND"
+        from ib_async.objects import Position as IBPos
+
+        pos = IBPos(account="DU_TEST", contract=bad, position=1, avgCost=100)
+        adapter._on_position_update(pos)
+        assert len(captured) == 0
+
+    def test_account_value_publishes(self, adapter: IBKRAdapter) -> None:
+        from ib_async.objects import AccountValue
+
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        av = AccountValue(
+            account="DU_TEST", tag="TotalCashValue", value="10000", currency="USD", modelCode=""
+        )
+        adapter._on_account_value(av)
+
+        assert len(captured) == 1
+        assert captured[0].balance.currency == "USD"
+        assert captured[0].balance.total == Decimal("10000")
+
+    def test_account_value_skips_irrelevant_tag(self, adapter: IBKRAdapter) -> None:
+        from ib_async.objects import AccountValue
+
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        av = AccountValue(
+            account="DU_TEST", tag="UnrealizedPnL", value="100", currency="USD", modelCode=""
+        )
+        adapter._on_account_value(av)
+        assert len(captured) == 0
+
+    def test_exec_details_publishes_fill(self, adapter: IBKRAdapter) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.conId = 1
+        trade = _trade(order_ref="cid-fill", order_id=1, perm_id=1)
+        execution = Execution(
+            execId="exec-1",
+            time=datetime.now(UTC),
+            acctNumber="DU_TEST",
+            exchange="SMART",
+            side="BOT",
+            shares=10,
+            price=100,
+            permId=1,
+            clientId=1,
+            orderId=1,
+            orderRef="cid-fill",
+        )
+        commission = CommissionReport(
+            execId="exec-1",
+            commission=1.0,
+            currency="USD",
+            realizedPNL=0,
+            yield_=0,
+            yieldRedemptionDate=0,
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=commission,
+            time=datetime.now(UTC),
+        )
+
+        adapter._on_exec_details(trade, fill, execution)
+
+        assert len(captured) == 1
+        assert captured[0].fill.client_order_id == "cid-fill"
+        assert captured[0].fill.fill_quantity == Decimal("10")
+        assert captured[0].fill.fill_price == Decimal("100")
+
+    def test_exec_details_skips_zero_qty(self, adapter: IBKRAdapter) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        trade = _trade(order_ref="cid-zero", order_id=1, perm_id=1)
+        execution = Execution(
+            execId="e1", time=datetime.now(UTC), orderRef="cid-zero", shares=0, price=100, permId=1
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=CommissionReport(
+                execId="e1",
+                commission=0,
+                currency="USD",
+                realizedPNL=0,
+                yield_=0,
+                yieldRedemptionDate=0,
+            ),
+            time=datetime.now(UTC),
+        )
+        adapter._on_exec_details(trade, fill, execution)
+        assert len(captured) == 0
+
+    def test_exec_details_skips_no_order_ref(self, adapter: IBKRAdapter) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        trade = Trade(
+            contract=contract,
+            order=Order(
+                orderId=1, permId=0, orderRef="", action="BUY", totalQuantity=1, orderType="LMT"
+            ),
+            orderStatus=IBOrderStatus(
+                orderId=1, status="Submitted", filled=0, remaining=1, avgFillPrice=0, permId=0
+            ),
+        )
+        execution = Execution(
+            execId="e1", time=datetime.now(UTC), orderRef="", permId=0, shares=1, price=100
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=CommissionReport(
+                execId="e1",
+                commission=0,
+                currency="USD",
+                realizedPNL=0,
+                yield_=0,
+                yieldRedemptionDate=0,
+            ),
+            time=datetime.now(UTC),
+        )
+        adapter._on_exec_details(trade, fill, execution)
+        assert len(captured) == 0
+
+
+# ---------------------------------------------------------------------------
+# TWS UTC enforcement
+# ---------------------------------------------------------------------------
+
+
+class TestTwsUtcEnforcement:
+    async def test_connect_blocks_non_utc(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        mock_ib = mock_ib_async_module
+        mock_ib.TimezoneTWS = "US/Eastern"
+        with pytest.raises(PlatformConnectionError, match=r"Time Zone.*UTC"):
+            await adapter.connect()
+
+    async def test_require_ib_blocks_non_utc_mid_session(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        # must not block fetch; only next connect() should.
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.TimezoneTWS = "US/Eastern"
+        positions = await adapter.fetch_positions()
+        assert isinstance(positions, list)
