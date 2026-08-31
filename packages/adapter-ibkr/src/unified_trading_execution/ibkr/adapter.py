@@ -15,12 +15,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from ib_async import IB, Trade
+from ib_async import IB, Order, Trade
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
@@ -31,9 +32,12 @@ from unified_trading_execution.errors import (
     PlatformError,
 )
 from unified_trading_execution.events import (
+    BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
     EventBus,
+    FillEvent,
+    PositionUpdateEvent,
 )
 from unified_trading_execution.ibkr.orders import (
     apply_ibkr_modification,
@@ -624,15 +628,78 @@ class IBKRAdapter(Adapter):
     ) -> None:
         """Modify TP/SL on an existing open position.
 
-        IBKR models TP/SL as bracket child orders linked to a parent order via
-        ``parentId``.  ``position_id`` is the platform position reference
-        (the contract ``conId``), obtained from ``PositionUpdateEvent`` or the
-        state store — not ``UnifiedOrder.position_id``.
-
-        TODO(ibkr): implement via ``ib.placeOrder`` on the bracket children.
-        At least one of *take_profit* / *stop_loss* must be provided.
+        Places OCA-linked opposite-side orders for the position's contract.
+        ``position_id`` is ``str(contract.conId)`` from ``Position``.
+        At least one of ``take_profit``/``stop_loss`` must be provided.
+        Uses the same ``LMT``/``STP``/``STP LMT`` mapping as brackets.
         """
-        raise NotImplementedError
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss must be provided")
+        if take_profit is not None and take_profit.limit_price is not None:
+            raise ValueError(
+                "take_profit.limit_price is not supported — profit-taker is LMT at trigger"
+            )
+        ib = self._require_ib()
+        # Find the position leg by conId
+        target = None
+        for pos in ib.positions():
+            cid = str(getattr(pos.contract, "conId", "") or "")
+            if cid == position_id:
+                target = pos
+                break
+        if target is None:
+            raise OrderNotFoundError(f"no position for conId {position_id!r}")
+        qty = Decimal(str(target.position))
+        if qty == 0:
+            raise OrderNotFoundError(f"position {position_id!r} is flat")
+        # Opposite side closes the position
+        is_long = qty > 0
+        action = "SELL" if is_long else "BUY"
+        abs_qty = float(abs(qty))
+        # Use SMART for STK/OPT/FUT to avoid 10311 direct NASDAQ block;
+        # FX (CASH) must stay IDEALPRO — SMART has no EUR/USD book (Error 200).
+        order_contract = copy.copy(target.contract)
+        if getattr(target.contract, "secType", "").upper() == "CASH":
+            order_contract.exchange = "IDEALPRO"
+        else:
+            order_contract.exchange = self._config.default_exchange or "SMART"
+        orders: list[Order] = []
+        # Use GTC for protective orders (IBKR default for held orders)
+        tif_kwargs: dict[str, object] = {"tif": "GTC"}
+        if take_profit is not None:
+            tp = Order(
+                action=action,
+                totalQuantity=abs_qty,
+                orderType="LMT",
+                lmtPrice=take_profit.trigger_price,
+                orderRef=f"{position_id}-tp-{str(uuid7()).replace('-', '')[:6]}",
+                **tif_kwargs,  # type: ignore[arg-type]
+            )
+            orders.append(tp)
+        if stop_loss is not None:
+            sl_type = "STP LMT" if stop_loss.limit_price is not None else "STP"
+            sl_kwargs: dict[str, object] = {
+                "action": action,
+                "totalQuantity": abs_qty,
+                "orderType": sl_type,
+                "auxPrice": stop_loss.trigger_price,
+                "orderRef": f"{position_id}-sl-{str(uuid7()).replace('-', '')[:6]}",
+                **tif_kwargs,
+            }
+            if stop_loss.limit_price is not None:
+                sl_kwargs["lmtPrice"] = stop_loss.limit_price
+            sl = Order(**sl_kwargs)  # type: ignore[arg-type]
+            orders.append(sl)
+        if len(orders) == 2:
+            oca = f"pos-tpsl-{position_id}"
+            for o in orders:
+                o.ocaGroup = oca
+        # Transmit atomically: only last transmits
+        for o in orders[:-1]:
+            o.transmit = False
+        orders[-1].transmit = True
+        for o in orders:
+            ib.placeOrder(order_contract, o)
 
     # ------------------------------------------------------------------
     # Reconciliation data — proper ib_async usage, covering all cases
@@ -1033,30 +1100,136 @@ class IBKRAdapter(Adapter):
                 self._publish_connection_state(False)
 
     def _on_position_update(self, position: Any) -> None:
-        """Callback fired by ib_async on position changes.
-
-        Translates to ``PositionUpdateEvent`` and publishes to EventBus.
-        Not yet implemented — stubbed to keep event wiring live without
-        a reconnect.
-        """
-        # TODO: translate to PositionUpdateEvent (needs from_ibkr_contract)
-        return
+        """Translate a live ``IB`` position to ``PositionUpdateEvent``."""
+        try:
+            contract = getattr(position, "contract", None)
+            if contract is None:
+                return
+            instrument = from_ibkr_contract(contract)
+            qty = Decimal(str(getattr(position, "position", 0) or 0))
+            avg_cost = Decimal(str(getattr(position, "avgCost", 0) or 0))
+            pos_id = str(contract.conId) if getattr(contract, "conId", 0) else None
+            pos = Position(
+                instrument=instrument,
+                quantity=qty,
+                average_entry_price=avg_cost,
+                updated_at=_utcnow(),
+                position_id=pos_id,
+            )
+            self._publish(
+                PositionUpdateEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    position=pos,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping positionEvent for %r: %s", position, exc)
 
     def _on_account_value(self, value: Any) -> None:
-        """Callback fired by ib_async on account value changes.
+        """Translate a live ``AccountValue`` to ``BalanceUpdateEvent``."""
+        try:
+            tag = str(getattr(value, "tag", "") or "")
+            if tag not in ("TotalCashValue", "NetLiquidation", "CashBalance", "AvailableFunds"):
+                return
+            ccy = str(getattr(value, "currency", "") or "").strip() or "USD"
+            raw = getattr(value, "value", "")
+            if raw in (None, ""):
+                return
+            dec = Decimal(str(raw))
+            # Push is per-tag; for live mirror use tag value as total with free=total
+            # fetch_balances() does the full per-currency aggregation for reconcile
+            bal = Balance(
+                currency=ccy, free=dec, used=Decimal("0"), total=dec, updated_at=_utcnow()
+            )
+            self._publish(
+                BalanceUpdateEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    balance=bal,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping accountValueEvent for %r: %s", value, exc)
 
-        Translates to ``BalanceUpdateEvent`` and publishes to EventBus.
-        Not yet implemented — stubbed to keep event wiring live.
+    def _on_exec_details(self, trade: Trade, fill: Any) -> None:
+        """Translate a live execution to ``FillEvent``.
+
+        ``ib_async`` emits ``execDetailsEvent(trade, fill)`` — the execution
+        details live on ``fill.execution``, not as a third callback argument.
         """
-        return
-
-    def _on_exec_details(self, trade: Trade, fill: Any, execution: Any) -> None:
-        """Callback fired by ib_async when an order is filled.
-
-        Translates to ``FillEvent`` and publishes to EventBus.
-        Not yet implemented — stubbed to keep event wiring live.
-        """
-        return
+        try:
+            execution = getattr(fill, "execution", None)
+            contract = getattr(fill, "contract", None) or getattr(trade, "contract", None)
+            if execution is None or contract is None:
+                return
+            instrument = from_ibkr_contract(contract)
+            exec_price = Decimal(str(getattr(execution, "price", 0) or 0))
+            shares = Decimal(str(getattr(execution, "shares", 0) or 0))
+            if shares <= 0 or exec_price <= 0:
+                return
+            client_order_id = str(
+                getattr(execution, "orderRef", "") or getattr(trade.order, "orderRef", "") or ""
+            )
+            if not client_order_id:
+                perm = getattr(execution, "permId", 0) or getattr(trade.order, "permId", 0) or 0
+                client_order_id = str(perm) if perm else ""
+            if not client_order_id:
+                return
+            exec_id = str(getattr(execution, "execId", "") or "")
+            if not exec_id:
+                exec_id = f"{client_order_id}-{_new_id()[:8]}"
+            exec_time_raw = (
+                getattr(execution, "time", None) or getattr(fill, "time", None) or _utcnow()
+            )
+            exec_time = (
+                exec_time_raw
+                if getattr(exec_time_raw, "tzinfo", None)
+                else exec_time_raw.replace(tzinfo=UTC)
+            )
+            commission = getattr(fill, "commissionReport", None)
+            fee_amount: Decimal | None = None
+            fee_currency: str | None = None
+            if commission is not None:
+                try:
+                    fee_amount = Decimal(str(getattr(commission, "commission", 0) or 0))
+                    fee_currency = str(getattr(commission, "currency", "") or "") or None
+                    if fee_amount == 0:
+                        fee_amount = None
+                        fee_currency = None
+                except Exception:
+                    fee_amount = None
+                    fee_currency = None
+            fill_record = FillRecord(
+                client_order_id=client_order_id,
+                platform_fill_id=exec_id,
+                instrument=instrument,
+                fill_quantity=shares,
+                fill_price=exec_price,
+                fill_timestamp=exec_time,
+                fee_currency=fee_currency,
+                fee_amount=fee_amount,
+                correlation_id=client_order_id,
+                position_id=None,
+            )
+            self._publish(
+                FillEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=client_order_id,
+                    fill=fill_record,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping execDetailsEvent for %r: %s", fill, exc)
 
     # ------------------------------------------------------------------
     # Internal helpers

@@ -93,10 +93,15 @@ def to_ibkr_contract(
     local = _local_symbol_kwarg(instrument)
 
     if instrument.asset_class is AssetClass.MARGIN_FX:
+        # FX must route via IDEALPRO — SMART has no EUR/USD book (Error 200).
+        if instrument.exchange and instrument.exchange.upper() != "SMART":
+            fx_exchange = instrument.exchange
+        else:
+            fx_exchange = "IDEALPRO"
         return Forex(
             symbol=instrument.symbol,
             currency=_require_quote(instrument),
-            **_exchange_kwarg(exchange),
+            **_exchange_kwarg(fx_exchange),
             **local,
         )
 
