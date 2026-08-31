@@ -30,6 +30,7 @@ def mock_ib_async_module():
         mock_ib.isConnected.return_value = True
         mock_ib.reqContractDetailsAsync = AsyncMock(return_value=[])
         mock_ib.managedAccounts = MagicMock(return_value=["DU_TEST"])
+        mock_ib.TimezoneTWS = "UTC"
 
         # eventkit Events support += / -= (the adapter wires/unwires these)
         for _evt_name in (

@@ -114,6 +114,24 @@ class TestIBKRConnectionLifecycle:
         # Only one underlying connectAsync despite two concurrent callers
         assert mock_ib.connectAsync.call_count == 1  # type: ignore[attr-defined]
 
+    async def test_connect_rejects_non_utc_timezone(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: object,
+        event_bus: object,
+    ) -> None:
+        """A known non-UTC TWS/Gateway timezone blocks connect with a clear error."""
+        from unified_trading_execution.events import EventBus
+
+        assert isinstance(event_bus, EventBus)
+        mock_ib = mock_ib_async_module  # type: ignore[assignment]
+        mock_ib.TimezoneTWS = "America/New_York"  # type: ignore[attr-defined]
+
+        with pytest.raises(PlatformConnectionError, match="Time Zone"):
+            await adapter.connect()
+        assert adapter.is_connected is False
+        assert adapter._ib is None
+
     async def test_connect_failure_raises_platform_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: object, event_bus: object
     ) -> None:
