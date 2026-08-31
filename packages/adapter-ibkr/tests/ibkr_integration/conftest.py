@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import AsyncIterator
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -43,9 +44,15 @@ def _load_env_files() -> None:
             line = raw_line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            # Strip inline comments (e.g. IBKR_PORT=7497 # comment) — not inside quotes
+            if "#" in line:
+                # Only split at # that is not inside quotes — simple: split and keep before #
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
             key, _, value = line.partition("=")
             key = key.strip()
-            value = value.strip().strip('"').strip("'")
+            value = value.strip().strip('"').strip("'").split("#", 1)[0].strip()
             os.environ.setdefault(key, value)
 
 
@@ -61,12 +68,7 @@ def _require_env(name: str) -> str:
 
 # Check if ib_async package is importable — skip all integration
 # tests if the library is not installed in the environment.
-try:
-    import ib_async  # noqa: F401
-
-    _IBKR_AVAILABLE = True
-except ImportError:
-    _IBKR_AVAILABLE = False
+_IBKR_AVAILABLE = find_spec("ib_async") is not None
 
 
 @pytest.fixture(scope="session")
