@@ -13,8 +13,6 @@ Coverage:
   - get_rate_limits
 """
 
-# ruff: noqa: F841
-
 from __future__ import annotations
 
 import asyncio
@@ -192,7 +190,7 @@ async def test_market_fill_and_fetch(connected_adapter: IBKRAdapter) -> None:
         time_in_force=TimeInForce.GTC,
         client_order_id=cid,
     )
-    placed = await adapter.place_order(order)
+    await adapter.place_order(order)
     # MARKET may be PENDING briefly then FILLED
     await asyncio.sleep(2.5)
     cur = await adapter.get_order_by_client_id(cid)

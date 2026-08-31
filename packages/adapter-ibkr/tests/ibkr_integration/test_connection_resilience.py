@@ -1,10 +1,6 @@
 """Connection resilience — disconnect/reconnect and is_connected."""
 
-# ruff: noqa: F401
-
 from __future__ import annotations
-
-import pytest
 
 from unified_trading_execution.events import ConnectionStateEvent
 from unified_trading_execution.ibkr import IBKRAdapter

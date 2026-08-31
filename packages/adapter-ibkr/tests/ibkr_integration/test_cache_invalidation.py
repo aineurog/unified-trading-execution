@@ -1,7 +1,5 @@
 """Spec cache — hit, TTL, and invalidation."""
 
-# ruff: noqa: E501
-
 from __future__ import annotations
 
 import asyncio
@@ -29,7 +27,13 @@ async def test_spec_cache_hit(connected_adapter: IBKRAdapter) -> None:
 async def test_ttl_expiry(ibkr_config: IBKRConfig) -> None:
     from unified_trading_execution.events import EventBus
 
-    cfg = IBKRConfig(host=ibkr_config.host, port=ibkr_config.port, client_id=ibkr_config.client_id + 1, account=ibkr_config.account, instrument_spec_cache_ttl=1.0)
+    cfg = IBKRConfig(
+        host=ibkr_config.host,
+        port=ibkr_config.port,
+        client_id=ibkr_config.client_id + 1,
+        account=ibkr_config.account,
+        instrument_spec_cache_ttl=1.0,
+    )
     adapter = IBKRAdapter(cfg, event_bus=EventBus())
     await adapter.connect()
     try:

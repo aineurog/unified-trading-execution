@@ -15,6 +15,7 @@ from __future__ import annotations
 import contextlib
 import os
 from collections.abc import AsyncIterator
+from importlib.util import find_spec
 from pathlib import Path
 
 import pytest
@@ -67,12 +68,7 @@ def _require_env(name: str) -> str:
 
 # Check if ib_async package is importable — skip all integration
 # tests if the library is not installed in the environment.
-try:
-    import ib_async  # noqa: F401
-
-    _IBKR_AVAILABLE = True
-except ImportError:
-    _IBKR_AVAILABLE = False
+_IBKR_AVAILABLE = find_spec("ib_async") is not None
 
 
 @pytest.fixture(scope="session")

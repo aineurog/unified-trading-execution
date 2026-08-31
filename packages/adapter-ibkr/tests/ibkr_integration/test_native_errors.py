@@ -1,7 +1,5 @@
 """Live native-error checks — InvalidSymbol, OrderNotFound."""
 
-# ruff: noqa: E501, SIM105
-
 from __future__ import annotations
 
 import contextlib
@@ -22,12 +20,26 @@ def _stock(symbol: str = "AAPL") -> Instrument:
 
 async def test_invalid_symbol_rejected(connected_adapter: IBKRAdapter) -> None:
     fake = Instrument(symbol="FAKE123XYZ", asset_class=AssetClass.STOCK, currency="USD")
-    order = UnifiedOrder(instrument=fake, order_type=OrderType.LIMIT, side=OrderSide.BUY, quantity=Decimal("1"), time_in_force=TimeInForce.GTC, client_order_id="invalid-sym", price=Decimal("10"))
-    try:
+    order = UnifiedOrder(
+        instrument=fake,
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("1"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="invalid-sym",
+        price=Decimal("10"),
+    )
+    with contextlib.suppress(UteError):
         await connected_adapter.place_order(order)
-    except UteError:
-        pass
-    valid = UnifiedOrder(instrument=_stock(), order_type=OrderType.LIMIT, side=OrderSide.BUY, quantity=Decimal("1"), time_in_force=TimeInForce.GTC, client_order_id="after-invalid", price=Decimal("10"))
+    valid = UnifiedOrder(
+        instrument=_stock(),
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("1"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="after-invalid",
+        price=Decimal("10"),
+    )
     result = await connected_adapter.place_order(valid)
     assert result.client_order_id == "after-invalid"
     with contextlib.suppress(Exception):
@@ -49,10 +61,26 @@ async def test_order_not_found(connected_adapter: IBKRAdapter) -> None:
 
 async def test_usable_after_error(connected_adapter: IBKRAdapter) -> None:
     fake = Instrument(symbol="FAKE123XYZ", asset_class=AssetClass.STOCK, currency="USD")
-    bad = UnifiedOrder(instrument=fake, order_type=OrderType.LIMIT, side=OrderSide.BUY, quantity=Decimal("1"), time_in_force=TimeInForce.GTC, client_order_id="bad-after", price=Decimal("10"))
+    bad = UnifiedOrder(
+        instrument=fake,
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("1"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="bad-after",
+        price=Decimal("10"),
+    )
     with contextlib.suppress(UteError):
         await connected_adapter.place_order(bad)
-    valid = UnifiedOrder(instrument=_stock(), order_type=OrderType.LIMIT, side=OrderSide.BUY, quantity=Decimal("1"), time_in_force=TimeInForce.GTC, client_order_id="good-after", price=Decimal("10"))
+    valid = UnifiedOrder(
+        instrument=_stock(),
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("1"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="good-after",
+        price=Decimal("10"),
+    )
     result = await connected_adapter.place_order(valid)
     assert result.platform_order_id is not None
     with contextlib.suppress(Exception):
