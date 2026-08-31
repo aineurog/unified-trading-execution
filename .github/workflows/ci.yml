@@ -72,7 +72,7 @@ jobs:
         run: pip install pytest pytest-asyncio
 
       - name: Unit tests
-        run: pytest packages/ --ignore-glob=packages/*/tests/integration -v
+        run: pytest packages/ --ignore-glob=packages/*/tests/*_integration -v
 
   integration-tests:
     needs: unit-tests
@@ -102,8 +102,8 @@ jobs:
           BYBIT_TESTNET_API_KEY: ${{ secrets.BYBIT_TESTNET_API_KEY }}
           BYBIT_TESTNET_API_SECRET: ${{ secrets.BYBIT_TESTNET_API_SECRET }}
         run: |
-          if ls packages/adapter-bybit/tests/integration/test_*.py 1>/dev/null 2>&1; then
-            pytest packages/adapter-bybit/tests/integration/ -v
+          if ls packages/adapter-bybit/tests/bybit_integration/test_*.py 1>/dev/null 2>&1; then
+            pytest packages/adapter-bybit/tests/bybit_integration/ -v
           else
             echo "No integration test files found — skipping"
           fi
