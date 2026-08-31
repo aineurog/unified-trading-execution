@@ -665,7 +665,7 @@ class TestPushEvents:
             time=datetime.now(UTC),
         )
 
-        adapter._on_exec_details(trade, fill, execution)
+        adapter._on_exec_details(trade, fill)
 
         assert len(captured) == 1
         assert captured[0].fill.client_order_id == "cid-fill"
@@ -703,7 +703,7 @@ class TestPushEvents:
             ),
             time=datetime.now(UTC),
         )
-        adapter._on_exec_details(trade, fill, execution)
+        adapter._on_exec_details(trade, fill)
         assert len(captured) == 0
 
     def test_exec_details_skips_no_order_ref(self, adapter: IBKRAdapter) -> None:
@@ -745,7 +745,7 @@ class TestPushEvents:
             ),
             time=datetime.now(UTC),
         )
-        adapter._on_exec_details(trade, fill, execution)
+        adapter._on_exec_details(trade, fill)
         assert len(captured) == 0
 
 

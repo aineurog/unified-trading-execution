@@ -1158,11 +1158,16 @@ class IBKRAdapter(Adapter):
         except Exception as exc:
             logger.warning("Skipping accountValueEvent for %r: %s", value, exc)
 
-    def _on_exec_details(self, trade: Trade, fill: Any, execution: Any) -> None:
-        """Translate a live execution to ``FillEvent``."""
+    def _on_exec_details(self, trade: Trade, fill: Any) -> None:
+        """Translate a live execution to ``FillEvent``.
+
+        ``ib_async`` emits ``execDetailsEvent(trade, fill)`` — the execution
+        details live on ``fill.execution``, not as a third callback argument.
+        """
         try:
+            execution = getattr(fill, "execution", None)
             contract = getattr(fill, "contract", None) or getattr(trade, "contract", None)
-            if contract is None:
+            if execution is None or contract is None:
                 return
             instrument = from_ibkr_contract(contract)
             exec_price = Decimal(str(getattr(execution, "price", 0) or 0))
@@ -1180,8 +1185,14 @@ class IBKRAdapter(Adapter):
             exec_id = str(getattr(execution, "execId", "") or "")
             if not exec_id:
                 exec_id = f"{client_order_id}-{_new_id()[:8]}"
-            exec_time_raw = getattr(execution, "time", None) or getattr(fill, "time", None) or _utcnow()  # noqa: E501
-            exec_time = exec_time_raw if getattr(exec_time_raw, "tzinfo", None) else exec_time_raw.replace(tzinfo=UTC)  # noqa: E501
+            exec_time_raw = (
+                getattr(execution, "time", None) or getattr(fill, "time", None) or _utcnow()
+            )
+            exec_time = (
+                exec_time_raw
+                if getattr(exec_time_raw, "tzinfo", None)
+                else exec_time_raw.replace(tzinfo=UTC)
+            )
             commission = getattr(fill, "commissionReport", None)
             fee_amount: Decimal | None = None
             fee_currency: str | None = None
@@ -1218,7 +1229,7 @@ class IBKRAdapter(Adapter):
                 )
             )
         except Exception as exc:
-            logger.warning("Skipping execDetailsEvent for %r: %s", execution, exc)
+            logger.warning("Skipping execDetailsEvent for %r: %s", fill, exc)
 
     # ------------------------------------------------------------------
     # Internal helpers
