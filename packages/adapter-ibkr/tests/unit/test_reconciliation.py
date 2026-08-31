@@ -343,6 +343,42 @@ class TestFetchOpenOrders:
         with pytest.raises(PlatformConnectionError):
             await adapter.fetch_open_orders()
 
+    async def test_unknown_status_skipped(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        bad = _trade_for_order(order_ref="bad-status", status="SomeNewStatus")
+        good = _trade_for_order(order_ref="good")
+        mock_ib.openTrades.return_value = [bad, good]  # type: ignore[attr-defined]
+        orders = await adapter.fetch_open_orders()
+        assert "good" in orders
+        assert "bad-status" not in orders
+
+    async def test_side_mapping_slong_sshort(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        t_slong = _trade_for_order(action="SLONG", order_ref="slong")
+        t_sshort = _trade_for_order(action="SSHORT", order_ref="sshort")
+        mock_ib.openTrades.return_value = [t_slong, t_sshort]  # type: ignore[attr-defined]
+        orders = await adapter.fetch_open_orders()
+        assert orders["slong"].side.value == "BUY"
+        assert orders["sshort"].side.value == "SELL"
+
+    async def test_unknown_action_skipped(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        bad = _trade_for_order(action="FOO", order_ref="bad-action")
+        good = _trade_for_order(order_ref="good")
+        mock_ib.openTrades.return_value = [bad, good]  # type: ignore[attr-defined]
+        orders = await adapter.fetch_open_orders()
+        assert "good" in orders
+        assert "bad-action" not in orders
+
     async def test_orphan_fallback_to_platform_id(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
     ) -> None:

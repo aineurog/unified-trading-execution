@@ -43,7 +43,7 @@ from unified_trading_execution.ibkr.orders import (
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -379,7 +379,7 @@ class IBKRAdapter(Adapter):
                 "verify the Gateway/TWS GUI timezone is UTC before using fill watermarks"
             )
             return
-        if tws_tz.upper() not in ("UTC", "ETC/UTC", "GMT") and "UTC" not in tws_tz.upper():  # noqa: E501
+        if tws_tz.upper() not in ("UTC", "ETC/UTC", "GMT") and "UTC" not in tws_tz.upper():
             raise PlatformConnectionError(
                 f"TWS/Gateway Time Zone is {tws_tz!r} — "
                 "set TWS/Gateway → Configure → Settings → General → Time Zone = UTC "
@@ -391,9 +391,6 @@ class IBKRAdapter(Adapter):
         """Return the live ``IB`` or raise if not connected."""
         if self._ib is None or not self.is_connected:
             raise PlatformConnectionError("IBKR adapter is not connected — call connect() first")
-        # Enforce UTC on every operation, not just connect — user could change
-        # TWS setting mid-session without reconnecting.
-        self._assert_tws_utc(self._ib)
         return self._ib
 
     def _find_trade(self, client_order_id: str) -> Trade | None:
@@ -772,9 +769,18 @@ class IBKRAdapter(Adapter):
                 logger.warning("Skipping open order with unmappable contract %r: %s", contract, exc)
                 continue
 
-            # Map IBKR wire fields to unified enums
-            action = getattr(order, "action", "")
-            side = OrderSide.BUY if str(action).upper() == "BUY" else OrderSide.SELL
+            # Map IBKR wire fields to unified enums. IBKR has four order actions
+            # (BUY / SELL / SLONG / SSHORT); the unified side collapses the
+            # borrow direction — SLONG (buy-to-cover) is BUY, SSHORT is SELL.
+            action = str(getattr(order, "action", "")).upper()
+            if action in ("BUY", "SLONG"):
+                side = OrderSide.BUY
+            elif action in ("SELL", "SSHORT"):
+                side = OrderSide.SELL
+            else:
+                # Unknown action — skip rather than guess a side.
+                logger.warning("Skipping open order with unknown action %r", action)
+                continue
 
             otype = str(getattr(order, "orderType", "")).upper()
             if otype == "MKT":
@@ -800,17 +806,14 @@ class IBKRAdapter(Adapter):
             }
             time_in_force = tif_map.get(tif_raw, TimeInForce.GTC)
 
-            # Prices: UNSET_DOUBLE sentinel means not set
+            # Prices: UNSET_DOUBLE sentinel (DBL_MAX ~1.797e308) or float('inf')
+            # means "not set" — treat anything absurdly large as unset.
             def _as_decimal(val: object) -> Decimal | None:
                 try:
                     if val is None:
                         return None
-                    # ib_async uses float('inf') or UNSET_DOUBLE for unset
                     f = float(str(val))
                     if f in (float("inf"), float("-inf")) or abs(f) > 1e12:
-                        return None
-                    # UNSET_DOUBLE is ~1.797...e308, treat as unset
-                    if f == 0 and str(val) == "1.7976931348623157e+308":
                         return None
                     return Decimal(str(val))
                 except Exception:
@@ -837,15 +840,15 @@ class IBKRAdapter(Adapter):
             order_id = getattr(order, "orderId", 0) or 0
             platform_order_id = str(perm_id or order_id) if (perm_id or order_id) else None
 
-            # Status
+            # Status — an unknown IBKR status is skipped, never silently mapped
+            # to OPEN. ``map_ibkr_status`` raises PlatformError for a status it
+            # does not recognise (a new IBKR status must not be misrepresented).
             ib_status = str(getattr(status, "status", "") or "")
             try:
-                # Reuse orders mapping helper if available
-                from unified_trading_execution.ibkr.orders import map_ibkr_status
-
                 unified_status = map_ibkr_status(ib_status)
-            except Exception:
-                unified_status = OrderStatus.OPEN
+            except PlatformError as exc:
+                logger.warning("Skipping open order with unknown status %r: %s", ib_status, exc)
+                continue
 
             filled_qty = Decimal(str(getattr(status, "filled", 0) or 0))
             avg_price_raw = getattr(status, "avgFillPrice", 0) or 0
