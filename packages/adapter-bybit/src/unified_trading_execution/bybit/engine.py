@@ -22,7 +22,7 @@ from unified_trading_execution.adapter import RateLimits
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
-from unified_trading_execution.engine import Engine
+from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
@@ -50,7 +50,7 @@ class BybitEngine(Engine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
-        reconcile_interval_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         adapter = config if isinstance(config, BybitAdapter) else BybitAdapter(config)
         super().__init__(

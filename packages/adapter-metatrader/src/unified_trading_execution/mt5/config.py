@@ -13,6 +13,7 @@ from unified_trading_execution.types.enums import AssetClass
 
 DEFAULT_POLL_INTERVAL_SECONDS: float = 0.5
 DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS: float = 86400.0
+DEFAULT_BALANCE_POLL_INTERVAL_SECONDS: float = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,6 +31,14 @@ class MT5Config:
         instrument_spec_cache_ttl: Seconds a cached ``InstrumentSpec`` is
             trusted before being re-fetched.  Default 86400 (one day).
             ``None`` caches indefinitely, relying on invalidation only.
+        balance_poll_enabled: Whether account balance is polled periodically.
+            Default True.  The account *identity* is still checked every cycle
+            regardless of this flag; this only gates the heavier balance
+            snapshot.  Disable to reduce IPC load when balance changes are
+            handled out-of-band.
+        balance_poll_interval_seconds: Minimum seconds between balance polls.
+            Default 5.0.  Balance drift is corrected silently on the next
+            poll — it is not a halt condition.
     """
 
     login: int
@@ -38,6 +47,8 @@ class MT5Config:
     path: str | None = None
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS
     instrument_spec_cache_ttl: float | None = DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS
+    balance_poll_enabled: bool = True
+    balance_poll_interval_seconds: float = DEFAULT_BALANCE_POLL_INTERVAL_SECONDS
     # Broker-specific market-tree vocabulary.  Keys are ``symbol_info().path``
     # segments (matched case-insensitively), values the canonical AssetClass.
     # Extends and overrides the adapter's built-in thesaurus — the escape
@@ -52,3 +63,9 @@ class MT5Config:
         ttl = self.instrument_spec_cache_ttl
         if ttl is not None and ttl <= 0:
             raise ValueError(f"instrument_spec_cache_ttl must be > 0 or None, got {ttl}")
+
+        if self.balance_poll_interval_seconds <= 0:
+            raise ValueError(
+                "balance_poll_interval_seconds must be > 0, "
+                f"got {self.balance_poll_interval_seconds}"
+            )

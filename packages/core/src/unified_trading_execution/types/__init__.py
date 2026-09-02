@@ -3,6 +3,8 @@
 from unified_trading_execution.types.enums import (
     LIVE_ORDER_STATUSES,
     AssetClass,
+    FillEntry,
+    FillReason,
     HaltClearMode,
     HaltState,
     OptionRight,
@@ -28,6 +30,8 @@ __all__ = [
     "as_decimal",
     # Enums
     "AssetClass",
+    "FillEntry",
+    "FillReason",
     "HaltClearMode",
     "HaltState",
     "LIVE_ORDER_STATUSES",

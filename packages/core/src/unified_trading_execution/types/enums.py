@@ -68,6 +68,35 @@ class HaltState(StrEnum):
     HALTED = "HALTED"
 
 
+class FillReason(StrEnum):
+    """Why a fill happened — the platform's own classification of the deal.
+
+    A portable superset; each adapter maps its native reason codes into these.
+    ``UNKNOWN`` is the fallback for a platform that does not classify deals.
+    """
+
+    CLIENT = "CLIENT"  # manually placed / client terminal (MT5 CLIENT/MOBILE/WEB)
+    EXPERT = "EXPERT"  # expert advisor / automated strategy
+    DEALER = "DEALER"  # dealer / desk
+    STOP_LOSS = "STOP_LOSS"  # stop-loss triggered
+    TAKE_PROFIT = "TAKE_PROFIT"  # take-profit triggered
+    STOP_OUT = "STOP_OUT"  # margin stop-out
+    ROLLOVER = "ROLLOVER"  # swap / rollover
+    MARGIN = "MARGIN"  # variation-margin call
+    SPLIT = "SPLIT"  # corporate action (split)
+    UNKNOWN = "UNKNOWN"
+
+
+class FillEntry(StrEnum):
+    """Whether a fill opened or closed exposure (the platform's deal direction)."""
+
+    IN = "IN"  # opened a position
+    OUT = "OUT"  # closed a position
+    INOUT = "INOUT"  # reversed (close one way, open the other)
+    OUT_BY = "OUT_BY"  # closed by an opposite deal
+    UNKNOWN = "UNKNOWN"
+
+
 class HaltClearMode(StrEnum):
     AUTOMATIC = "AUTOMATIC"
     MANUAL = "MANUAL"

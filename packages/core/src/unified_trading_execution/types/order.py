@@ -7,7 +7,14 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.utils import as_decimal
 
@@ -174,6 +181,8 @@ class FillRecord:
     fee_amount: Decimal | None
     correlation_id: str
     position_id: str | None = None  # passthrough — links fill to a specific position leg (hedging)
+    reason: FillReason | None = None  # platform's own classification (SL/TP/stop-out/...)
+    entry: FillEntry | None = None  # opened (IN) vs closed (OUT) exposure
 
     def __post_init__(self) -> None:
         if self.fill_timestamp.tzinfo is None:

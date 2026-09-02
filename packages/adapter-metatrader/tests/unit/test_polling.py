@@ -32,7 +32,7 @@ from unified_trading_execution.events import (
     FillEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.mt5 import MT5Adapter
+from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.mt5.adapter import (
     _DEAL_QUERY_BACKLOG_SECONDS,
     _DEAL_QUERY_FORWARD_SECONDS,
@@ -369,6 +369,10 @@ class TestPollOnce:
         await adapter._poll_once()  # initial sighting
         balances.clear()
 
+        # Balance polling is throttled (default 5s); reset the throttle clock so
+        # the immediately-following poll still processes the balance change.
+        adapter._last_balance_poll_monotonic = 0.0
+
         mock_mt5_module.account_info.return_value = _account(
             balance=Decimal("1050.00"),
             equity=Decimal("1050.00"),
@@ -380,6 +384,56 @@ class TestPollOnce:
         assert balances[0].balance.total == Decimal("1050.00")
         assert balances[0].balance.free == Decimal("1050.00")
         assert balances[0].balance.used == Decimal("0")
+
+    async def test_balance_poll_throttled(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """Balance changes within ``balance_poll_interval_seconds`` are not re-published."""
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = int(_PAST.timestamp())
+
+        balances: list[BalanceUpdateEvent] = []
+        event_bus.subscribe(BalanceUpdateEvent, balances.append)
+
+        mock_mt5_module.account_info.return_value = _account()
+        await adapter._poll_once()  # seeds balance, publishes once
+        balances.clear()
+
+        # Changed balance, but the throttle clock is unchanged — no publish.
+        mock_mt5_module.account_info.return_value = _account(
+            balance=Decimal("1050.00"),
+            equity=Decimal("1050.00"),
+            margin_free=Decimal("1050.00"),
+        )
+        await adapter._poll_once()
+
+        assert balances == []
+
+    async def test_balance_poll_disabled_skips_publish(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """``balance_poll_enabled=False`` disables balance publishing entirely."""
+        adapter._config = MT5Config(
+            login=adapter._config.login,
+            password=adapter._config.password,
+            server=adapter._config.server,
+            path=adapter._config.path,
+            balance_poll_enabled=False,
+        )
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = int(_PAST.timestamp())
+
+        balances: list[BalanceUpdateEvent] = []
+        event_bus.subscribe(BalanceUpdateEvent, balances.append)
+
+        mock_mt5_module.account_info.return_value = _account()
+        await adapter._poll_once()
+
+        assert balances == []
 
     async def test_balance_float_rounding_satisfies_invariant(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus

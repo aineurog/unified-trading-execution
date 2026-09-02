@@ -6,6 +6,7 @@ __path__ = __import__("pkgutil").extend_path(__path__, __name__)
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import (
+    AccountChangedError,
     AccountHaltedError,
     ConnectionError,
     DuplicateOrderIdError,
@@ -13,6 +14,7 @@ from unified_trading_execution.errors import (
     InstrumentHaltedError,
     InsufficientBalanceError,
     InvalidSymbolError,
+    MarketClosedError,
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
@@ -43,6 +45,8 @@ from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.types import (
     # Enums
     AssetClass,
+    FillEntry,
+    FillReason,
     LIVE_ORDER_STATUSES,
     # Data types
     Balance,
@@ -67,6 +71,8 @@ from unified_trading_execution.types import (
 __all__ = [
     # Enums
     "AssetClass",
+    "FillEntry",
+    "FillReason",
     "HaltClearMode",
     "HaltState",
     "LIVE_ORDER_STATUSES",
@@ -111,6 +117,7 @@ __all__ = [
     "HaltClearedEvent",
     "HaltEvent",
     # Errors
+    "AccountChangedError",
     "AccountHaltedError",
     "ConnectionError",
     "PlatformConnectionError",
@@ -119,6 +126,7 @@ __all__ = [
     "InstrumentHaltedError",
     "InsufficientBalanceError",
     "InvalidSymbolError",
+    "MarketClosedError",
     "OrderNotFoundError",
     "PlatformError",
     "RateLimitError",

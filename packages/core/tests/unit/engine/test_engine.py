@@ -799,13 +799,14 @@ class TestReconcileMismatchCases:
         assert len(result.balance_mismatches) == 1
         assert result.balance_mismatches[0].mismatch_type == "balance"
 
-        # Resolution: local should be overwritten
+        # Resolution: local should be overwritten (corrected silently)
         stored = await engine.get_balance("USDT")
         assert stored is not None
         assert stored.free == Decimal("900")
 
-        # Balance mismatch must enter an account-wide halt (no instrument)
-        assert engine.halt_machine.is_account_halted()
+        # Balance drift is corrected silently — it never halts (equity/margin
+        # float with live P&L, so a delta is normal intraday movement).
+        assert not engine.halt_machine.is_account_halted()
 
     async def test_orphan_on_platform_imported(self, engine, mock_adapter):
         """Case 3: order exists on platform but not locally — import it."""
@@ -1114,6 +1115,7 @@ class TestPeriodicReconcile:
             state_store=store,
             event_bus=event_bus,
             get_reference_price=_ref_price,
+            reconcile_interval_seconds=None,
         )
         await eng.connect()
         try:

@@ -67,6 +67,11 @@ from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
 
+# Default cadence for the automatic reconciliation loop.  Reconciliation runs
+# by default so drift is caught without a manual step; pass
+# ``reconcile_interval_seconds=None`` to disable it entirely.
+DEFAULT_RECONCILE_INTERVAL_SECONDS: float = 30.0
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -145,7 +150,7 @@ class Engine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
-        reconcile_interval_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         self._adapter = adapter
         # Section 6.2: storage location is optional with a sensible default —
@@ -178,7 +183,7 @@ class Engine:
         self._last_connected: bool | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
 
-        # Periodic reconciliation (optional, opt-in).  None means disabled.
+        # Periodic reconciliation (on by default; None disables it).
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
             raise ValueError(
                 f"reconcile_interval_seconds must be > 0 or None, got {reconcile_interval_seconds}"
@@ -208,6 +213,10 @@ class Engine:
             self._known_order_ids = {o.client_order_id for o in existing}
         except Exception:
             logger.warning("Could not seed known_order_ids from state store")
+
+        # Restore any halts that were active when the engine last shut down
+        # (Section 6.4) so a restart never silently drops a protective halt.
+        await self._restore_halts_from_store()
 
         # Fetch initial rate limits
         await self._refresh_rate_limits()
@@ -720,29 +729,24 @@ class Engine:
                             cleared_by="automatic",
                         )
                     )
+                    await self._persist_halt_clear(entry.scope, entry.instrument)
             return
 
         if not self._halt_machine.config.auto_halt_enabled:
             return
 
-        # Only position and balance disagreements halt.  Orphan orders and
-        # partial-fill discrepancies are corrected without halting — they are
-        # order-level artefacts, not evidence of account-state drift.
+        # Only position disagreements halt.  Balance drift is corrected
+        # silently (platform truth is imported in _apply_reconciliation_result)
+        # but never halts: account equity/margin float with live P&L, so a
+        # balance delta is normal intraday movement, not evidence of
+        # account-state corruption.  Orphan orders and partial-fill
+        # discrepancies are likewise corrected without halting.
         for mismatch in result.position_mismatches:
             if mismatch.instrument is None:
                 continue  # defensive: position mismatches always carry an instrument
             await self._enter_halt(
                 scope="instrument",
                 instrument=mismatch.instrument,
-                reason=mismatch.mismatch_type,
-                detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                corr_id=corr_id,
-                timestamp=timestamp,
-            )
-        for mismatch in result.balance_mismatches:
-            await self._enter_halt(
-                scope="account",
-                instrument=None,
                 reason=mismatch.mismatch_type,
                 detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
                 corr_id=corr_id,
@@ -792,6 +796,42 @@ class Engine:
                 cleared_by=None,
             )
         )
+        await self._persist_halt(scope, instrument, reason, detail)
+
+    async def _restore_halts_from_store(self) -> None:
+        """Rehydrate persisted halts into the halt machine (Section 6.4)."""
+        try:
+            active = await self._state_store.get_active_halts()
+        except Exception:
+            logger.warning("Could not restore persisted halts from state store")
+            return
+        for scope, instrument, reason, detail in active:
+            try:
+                self._halt_machine.restore_halt(scope, instrument, reason, detail)
+            except Exception:
+                logger.warning("Could not restore halt (scope=%s) from state store", scope)
+
+    async def _persist_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Persist an entered halt; best-effort — never breaks the halt itself."""
+        try:
+            await self._state_store.upsert_halt(scope, instrument, reason, detail)
+        except Exception:
+            logger.warning("Failed to persist halt (scope=%s)", scope)
+
+    async def _persist_halt_clear(
+        self, scope: Literal["instrument", "account"], instrument: Instrument | None
+    ) -> None:
+        """Persist a cleared halt; best-effort."""
+        try:
+            await self._state_store.delete_halt(scope, instrument)
+        except Exception:
+            logger.warning("Failed to persist halt clear (scope=%s)", scope)
 
     # ── Manual halt clearing ───────────────────────────────────────
 
@@ -844,6 +884,7 @@ class Engine:
                     cleared_by="manual",
                 )
             )
+            await self._persist_halt_clear(scope, instrument)
         return cleared
 
     # ── State mirror access ────────────────────────────────────────
