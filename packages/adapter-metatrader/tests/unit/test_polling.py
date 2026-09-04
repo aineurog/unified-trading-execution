@@ -24,9 +24,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from uuid_extensions import uuid7
 
-from unified_trading_execution.errors import PlatformError
+from unified_trading_execution.errors import AccountChangedError, PlatformError
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     BalanceUpdateEvent,
+    ConnectionStateEvent,
     Event,
     EventBus,
     FillEvent,
@@ -36,6 +38,7 @@ from unified_trading_execution.mt5 import MT5Adapter, MT5Config
 from unified_trading_execution.mt5.adapter import (
     _DEAL_QUERY_BACKLOG_SECONDS,
     _DEAL_QUERY_FORWARD_SECONDS,
+    _connected_lock,
 )
 from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import AssetClass
@@ -385,6 +388,35 @@ class TestPollOnce:
         assert balances[0].balance.free == Decimal("1050.00")
         assert balances[0].balance.used == Decimal("0")
 
+    async def test_balance_total_uses_settled_balance_not_equity(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """``total`` is the settled cash balance, not the floating equity.
+
+        A live open position makes ``equity`` diverge from ``balance``; the
+        reconciliation dimension is the settled cash, so a floating-P&L swing
+        must not be reported as a balance change (nor leak into the mirror).
+        """
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.positions_get.return_value = ()
+        mock_mt5_module.history_deals_get.return_value = ()
+        adapter._last_deal_time = int(_PAST.timestamp())
+
+        balances: list[BalanceUpdateEvent] = []
+        event_bus.subscribe(BalanceUpdateEvent, balances.append)
+
+        mock_mt5_module.account_info.return_value = _account(
+            balance=Decimal("1000.00"),
+            equity=Decimal("1040.00"),  # +40 floating P&L — must be ignored
+            margin=Decimal("50.00"),
+        )
+        await adapter._poll_once()
+
+        assert len(balances) == 1
+        assert balances[0].balance.total == Decimal("1000.00")
+        assert balances[0].balance.used == Decimal("50.00")
+        assert balances[0].balance.free == Decimal("950.00")
+
     async def test_balance_poll_throttled(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:
@@ -440,11 +472,11 @@ class TestPollOnce:
     ) -> None:
         """Float account values (production shape) never break free+used==total.
 
-        MT5 reports ``margin``, ``equity``, and ``margin_free`` as three
-        independent floats; ``margin_free = equity - margin`` can round such
-        that ``Decimal(str())`` of all three no longer satisfies the core
-        Balance invariant.  ``_process_balance`` must derive one field from
-        the others so the invariant holds exactly.
+        MT5 reports ``balance`` and ``margin`` as independent floats;
+        ``margin_free = balance - margin`` can round such that
+        ``Decimal(str())`` of all three no longer satisfies the core
+        Balance invariant.  ``_build_balance`` must derive ``free`` from
+        ``total - used`` so the invariant holds exactly.
         """
         mock_mt5_module.orders_get.return_value = ()
         mock_mt5_module.positions_get.return_value = ()
@@ -454,6 +486,7 @@ class TestPollOnce:
         mock_mt5_module.account_info.return_value = MagicMock(
             currency="USD",
             margin=222.22,
+            balance=9876.54,
             equity=9876.54,
             margin_free=9876.54 - 222.22,  # 9654.320000000002 as a float
         )
@@ -902,3 +935,76 @@ class TestPollLoop:
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
+
+    async def test_account_change_stops_loop_and_tears_down(self, adapter: MT5Adapter) -> None:
+        """``AccountChangedError`` stops the loop and tears the connection down."""
+        adapter._connected = True
+        teardown = AsyncMock()
+
+        async def change_account() -> None:
+            raise AccountChangedError("account changed")
+
+        with (
+            patch.object(adapter, "_poll_once", new=change_account),
+            patch.object(adapter, "_teardown_after_account_change", new=teardown),
+            patch("asyncio.sleep", new=AsyncMock()),
+        ):
+            await adapter._poll_loop()
+
+        teardown.assert_awaited_once()
+
+
+class TestAccountChange:
+    """Mid-session account change: event published, halt signalled, fatal stop."""
+
+    async def test_detect_publishes_event_and_raises(
+        self, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """A changed account login publishes ``AccountChangedEvent`` and raises."""
+        adapter._account_login = 12345678
+        events: list[AccountChangedEvent] = []
+        event_bus.subscribe(AccountChangedEvent, events.append)
+
+        with pytest.raises(AccountChangedError):
+            adapter._detect_account_change(_account(login=99999999))
+
+        assert len(events) == 1
+        event = events[0]
+        assert event.account_id == "12345678"
+        assert event.new_account_id == "99999999"
+        assert "changed from 12345678 to 99999999" in event.detail
+
+    async def test_detect_unchanged_account_is_noop(
+        self, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """The same login publishes nothing and raises nothing."""
+        adapter._account_login = 12345678
+        events: list[AccountChangedEvent] = []
+        event_bus.subscribe(AccountChangedEvent, events.append)
+
+        adapter._detect_account_change(_account(login=12345678))
+
+        assert events == []
+
+    async def test_teardown_releases_guard_and_disconnects(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """``_teardown_after_account_change`` shuts down, drops the account, disconnects."""
+        assert _connected_lock.acquire(blocking=False)
+        adapter._guard_held = True
+        adapter._connected = True
+        adapter._account_login = 12345678
+        states: list[ConnectionStateEvent] = []
+        event_bus.subscribe(ConnectionStateEvent, states.append)
+
+        await adapter._teardown_after_account_change()
+
+        assert adapter._connected is False
+        assert adapter._account_login is None
+        mock_mt5_module.shutdown.assert_called_once()
+        assert len(states) == 1
+        assert states[0].connected is False
+        assert states[0].account_id == "12345678"  # falls back to config login
+        # The guard was released — re-acquiring succeeds (and clean up after).
+        assert _connected_lock.acquire(blocking=False)
+        _connected_lock.release()

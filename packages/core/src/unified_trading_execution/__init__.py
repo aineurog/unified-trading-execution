@@ -23,6 +23,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     AuditEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
@@ -107,6 +108,7 @@ __all__ = [
     "PositionUpdateEvent",
     "BalanceUpdateEvent",
     "ConnectionStateEvent",
+    "AccountChangedEvent",
     "OrderPlacedEvent",
     "OrderModifiedEvent",
     "OrderCancelledEvent",

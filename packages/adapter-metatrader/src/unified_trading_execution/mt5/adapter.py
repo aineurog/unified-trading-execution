@@ -46,6 +46,7 @@ from unified_trading_execution.errors import (
     UteError,
 )
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
@@ -142,7 +143,6 @@ _DEAL_ENTRY_TO_FILL_ENTRY: dict[int, FillEntry] = {
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
     from unified_trading_execution.state import StateStore
-    from unified_trading_execution.state.halt import HaltStateMachine
 
 # ---------------------------------------------------------------------------
 # Process-global connection guard
@@ -341,11 +341,10 @@ class MT5Adapter(Adapter):
 
         # Actual account login, resolved from terminal after connect().
         self._account_login: int | None = None
-
-        # Engine-owned halt state machine (attached by core via
-        # attach_halt_machine).  Used to halt the account on a mid-session
-        # account change.
-        self._halt_machine: HaltStateMachine | None = None
+        # True while this adapter holds the process-global connection guard.
+        # Tracked so teardown releases the lock exactly once even if
+        # ``disconnect()`` races the poll loop's account-change teardown.
+        self._guard_held = False
 
         # Background polling task — started in connect(), cancelled in disconnect().
         self._poll_task: asyncio.Task[None] | None = None
@@ -438,16 +437,6 @@ class MT5Adapter(Adapter):
         """
         self._state_store = state_store
 
-    def attach_halt_machine(self, halt_machine: HaltStateMachine | None) -> None:
-        """Store the engine's halt state machine for mid-session account-change halts.
-
-        The adapter enters an account-scoped halt directly when it detects the
-        terminal was switched to a different account (see
-        ``_detect_account_change``) — the halt blocks new orders account-wide
-        until the engine is reconnected to the configured account.
-        """
-        self._halt_machine = halt_machine
-
     async def connect(self) -> None:
         """Initialize the MT5 terminal connection and start the polling loop.
 
@@ -486,6 +475,7 @@ class MT5Adapter(Adapter):
                 "another MT5 adapter is already connected in this process — "
                 "MetaTrader5.initialize()/shutdown() is a process-wide singleton"
             )
+        self._guard_held = True
 
         try:
             mt5 = _get_mt5()
@@ -529,13 +519,13 @@ class MT5Adapter(Adapter):
             self._connected = False
             self._account_login = None
             self._poll_task = None
-            _connected_lock.release()
+            self._release_guard()
             raise
         except Exception as exc:
             self._connected = False
             self._account_login = None
             self._poll_task = None
-            _connected_lock.release()
+            self._release_guard()
             raise PlatformConnectionError(f"failed to connect to MT5 terminal: {exc}") from exc
 
     def _publish(self, event: Event) -> None:
@@ -557,6 +547,18 @@ class MT5Adapter(Adapter):
                 connected=connected,
             )
         )
+
+    def _release_guard(self) -> None:
+        """Release the process-global connection guard exactly once.
+
+        ``threading.Lock.release()`` raises on an unlocked lock.  Because
+        ``disconnect()`` and ``_teardown_after_account_change()`` can both
+        run near a mid-session account change (disconnect cancelling the poll
+        task while it is mid-teardown), the release must be idempotent.
+        """
+        if self._guard_held:
+            self._guard_held = False
+            _connected_lock.release()
 
     async def disconnect(self) -> None:
         """Cancel the polling loop and shut down the MT5 terminal connection.
@@ -591,7 +593,7 @@ class MT5Adapter(Adapter):
             # of whether shutdown() succeeded.
             self._connected = False
             self._account_login = None
-            _connected_lock.release()
+            self._release_guard()
             self._publish_connection_state(False)
 
     @property
@@ -1128,15 +1130,36 @@ class MT5Adapter(Adapter):
             try:
                 await self._poll_once()
             except AccountChangedError as exc:
-                # Account halt already entered; log once and keep the loop alive
-                # (detection is one-shot, so this fires a single time).
-                logger.error("Account changed mid-session; account halted: %s", exc)
+                # The account halt is entered by the engine (via the published
+                # AccountChangedEvent).  Stop trading and tear the connection
+                # down — the engine must reconnect to the configured account.
+                logger.error("Account changed mid-session; stopping and disconnecting: %s", exc)
+                await self._teardown_after_account_change()
+                return
             except Exception:
                 logger.warning(
                     "Poll cycle failed; last-known state preserved. Continuing.",
                     exc_info=True,
                 )
             await asyncio.sleep(self._config.poll_interval_seconds)
+
+    async def _teardown_after_account_change(self) -> None:
+        """Tear down the connection after a fatal mid-session account change.
+
+        Mirrors the tail of ``disconnect()`` without the self-cancel deadlock:
+        we are already inside the poll task, so cancelling it is impossible.
+        Releases the process-global guard, drops the account login (so
+        ``account_id`` falls back to the configured login), and publishes a
+        disconnected state — regardless of whether ``mt5.shutdown()`` fails.
+        """
+        try:
+            mt5 = _get_mt5()
+            await asyncio.to_thread(mt5.shutdown)
+        finally:
+            self._connected = False
+            self._account_login = None
+            self._release_guard()
+            self._publish_connection_state(False)
 
     async def _poll_once(self) -> None:
         """One complete poll cycle.
@@ -1184,26 +1207,34 @@ class MT5Adapter(Adapter):
         self._process_fills(deals, instruments, account, now)
 
     def _detect_account_change(self, account: Any) -> None:
-        """Halt and raise if the terminal's account differs from the connected one.
+        """Signal and raise if the terminal's account differs from the connected one.
 
         Runs every poll cycle — the account snapshot is fetched regardless of
         balance-poll throttling precisely so identity can be checked cheaply.
-        On the first detection the account-scoped caches/maps are reset and an
-        account halt is entered (blocking new orders); ``AccountChangedError``
-        is raised so the poll loop surfaces the event.  ``_account_login`` is
-        advanced to the new login, so detection is one-shot — subsequent cycles
-        match and neither re-halt nor re-log.
+        On detection the account-scoped caches/maps are reset, an
+        ``AccountChangedEvent`` is published (the engine reacts by entering and
+        persisting an account-scoped halt), and ``AccountChangedError`` is
+        raised so ``_poll_loop`` stops trading and tears the connection down.
         """
         login = int(account.login)
         if self._account_login is None or login == self._account_login:
             # No baseline yet (not connected) or unchanged — nothing to do.
             return
-        detail = f"MT5 account changed from {self._account_login} to {login} mid-session"
+        previous_login = self._account_login
+        detail = f"MT5 account changed from {previous_login} to {login} mid-session"
         logger.error(detail)
         self._reset_account_state()
-        if self._halt_machine is not None:
-            self._halt_machine.enter_halt("account", None, "account_changed", detail)
-        self._account_login = login
+        self._publish(
+            AccountChangedEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=str(previous_login),
+                correlation_id=None,
+                detail=detail,
+                new_account_id=str(login),
+            )
+        )
         raise AccountChangedError(detail)
 
     def _reset_account_state(self) -> None:
@@ -1309,16 +1340,16 @@ class MT5Adapter(Adapter):
     def _build_balance(self, account: Any, now: datetime) -> Balance:
         """Reconstruct a ``Balance`` from an ``account_info()`` snapshot.
 
-        MT5 reports ``equity``, ``margin``, and ``margin_free`` as three
-        independent floats.  Reconstructing all three via
-        ``Decimal(str(float))`` can break the core invariant
-        ``free + used == total`` on tiny float-rounding errors
-        (``Balance.__post_init__`` enforces exact Decimal equality), so
-        derive ``free`` from the two primary reported values instead of
-        using the raw ``margin_free``.
+        ``total`` is the settled cash ``balance`` — ``equity`` and
+        ``margin_free`` are live derivatives (floating P&L / margin) and are
+        deliberately ignored: reconciliation must compare settled facts, never
+        live values.  ``free`` is derived as ``total - used`` rather than read
+        from the raw ``margin_free`` float, so the core invariant
+        ``free + used == total`` holds exactly despite MT5's independent float
+        reporting (``Balance.__post_init__`` enforces exact Decimal equality).
         """
         used = Decimal(str(account.margin))
-        total = Decimal(str(account.equity))
+        total = Decimal(str(account.balance))
         return Balance(
             currency=str(account.currency),
             free=total - used,

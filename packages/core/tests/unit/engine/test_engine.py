@@ -25,6 +25,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     AuditEvent,
     EventBus,
     OrderCancelledEvent,
@@ -209,10 +210,20 @@ class TestEngineConstruction:
         import asyncio
 
         monkeypatch.chdir(tmp_path)
-        eng = Engine(adapter=mock_adapter)
-        asyncio.run(eng.connect())
-        assert eng.state_store.path != ":memory:"
-        assert (tmp_path / eng.state_store.path[2:]).exists()
+
+        async def _exercise() -> None:
+            eng = Engine(adapter=mock_adapter)
+            await eng.connect()
+            try:
+                assert eng.state_store.path != ":memory:"
+                assert (tmp_path / eng.state_store.path[2:]).exists()
+            finally:
+                await eng.ashutdown()
+
+        # Connect and shut down in the same loop: the store's aiosqlite
+        # connection is loop-bound and must be closed before the loop exits,
+        # or its worker thread leaks past teardown.
+        asyncio.run(_exercise())
 
     def test_accepts_risk_config(self, mock_adapter):
         store = SQLiteStateStore(":memory:")
@@ -497,6 +508,56 @@ class TestHaltEnforcement:
         assert cancel.status == OrderStatus.CANCELLED
 
 
+# ── account-change halt ───────────────────────────────────────────────
+
+
+class TestAccountChangedHalt:
+    async def test_account_changed_enters_halt_synchronously(self, engine, event_bus):
+        """Publishing AccountChangedEvent enters the account halt in-memory.
+
+        The engine is the single owner of halt entry: the adapter only signals
+        the change; the engine's subscriber blocks new orders immediately.
+        """
+        event = AccountChangedEvent(
+            event_id="acct-change-1",
+            timestamp=_utcnow(),
+            adapter_name="metatrader",
+            account_id="12345678",
+            correlation_id=None,
+            detail="MT5 account changed from 12345678 to 99999999 mid-session",
+            new_account_id="99999999",
+        )
+
+        event_bus.publish(event)
+
+        assert engine.halt_machine.is_account_halted()
+        # Drain the subscriber's ensure_future-scheduled persistence so no
+        # aiosqlite task is orphaned when the test's event loop closes.
+        for _ in range(200):
+            active = await engine.state_store.get_active_halts()
+            if any(row[0] == "account" and row[2] == "account_changed" for row in active):
+                break
+            await asyncio.sleep(0.005)
+
+    async def test_persist_account_change_writes_halt_rows(self, engine):
+        """The async persistence writes the current-state halts row (Issue #1)."""
+        detail = "MT5 account changed from 12345678 to 99999999 mid-session"
+        event = AccountChangedEvent(
+            event_id="acct-change-1",
+            timestamp=_utcnow(),
+            adapter_name="metatrader",
+            account_id="12345678",
+            correlation_id=None,
+            detail=detail,
+            new_account_id="99999999",
+        )
+
+        await engine._persist_account_change(event)
+
+        active = await engine.state_store.get_active_halts()
+        assert ("account", None, "account_changed", detail) in active
+
+
 # ── rate-limit tracking ──────────────────────────────────────────────
 
 
@@ -775,7 +836,7 @@ class TestReconcileMismatchCases:
         assert engine.halt_machine.is_instrument_halted(_instrument())
 
     async def test_balance_mismatch_detected(self, engine, mock_adapter):
-        """Case 2: local and platform balances differ."""
+        """Case 2: local and platform settled totals differ."""
         local_bal = Balance(
             currency="USDT",
             free=Decimal("1000"),
@@ -788,8 +849,8 @@ class TestReconcileMismatchCases:
         platform_bal = Balance(
             currency="USDT",
             free=Decimal("900"),
-            used=Decimal("100"),
-            total=Decimal("1000"),
+            used=Decimal("0"),
+            total=Decimal("900"),
             updated_at=_utcnow(),
         )
         mock_adapter.seed_balance(platform_bal)
@@ -802,11 +863,64 @@ class TestReconcileMismatchCases:
         # Resolution: local should be overwritten (corrected silently)
         stored = await engine.get_balance("USDT")
         assert stored is not None
-        assert stored.free == Decimal("900")
+        assert stored.total == Decimal("900")
 
-        # Balance drift is corrected silently — it never halts (equity/margin
-        # float with live P&L, so a delta is normal intraday movement).
+        # Balance drift is corrected silently — it never halts.
         assert not engine.halt_machine.is_account_halted()
+
+    async def test_instrument_halt_clears_when_position_reconciles_despite_dirty_pass(
+        self, engine, mock_adapter
+    ):
+        """A halted instrument is released once its position reconciles, even
+        when the overall pass is not clean (a benign balance mismatch)."""
+        inst = _instrument()
+
+        # 1. Position mismatch → instrument halt entered.
+        await engine.state_store.upsert_position(
+            Position(
+                instrument=inst,
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=_utcnow(),
+                position_id="1",
+            )
+        )
+        mock_adapter.seed_position(
+            Position(
+                instrument=inst,
+                quantity=Decimal("2"),
+                average_entry_price=Decimal("50000"),
+                updated_at=_utcnow(),
+                position_id="1",
+            )
+        )
+        await engine.reconcile()
+        assert engine.halt_machine.is_instrument_halted(inst)
+
+        # 2. Position now matches, but a settled-total balance mismatch keeps
+        #    the pass "dirty".  The instrument halt must still clear.
+        await engine.state_store.upsert_balance(
+            Balance(
+                currency="USDT",
+                free=Decimal("1000"),
+                used=Decimal("0"),
+                total=Decimal("1000"),
+                updated_at=_utcnow(),
+            )
+        )
+        mock_adapter.seed_balance(
+            Balance(
+                currency="USDT",
+                free=Decimal("900"),
+                used=Decimal("0"),
+                total=Decimal("900"),
+                updated_at=_utcnow(),
+            )
+        )
+
+        result = await engine.reconcile()
+        assert not result.is_clean  # balance mismatch persists
+        assert not engine.halt_machine.is_instrument_halted(inst)
 
     async def test_orphan_on_platform_imported(self, engine, mock_adapter):
         """Case 3: order exists on platform but not locally — import it."""
