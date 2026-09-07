@@ -36,7 +36,9 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
 from unified_trading_execution.errors import (
+    AccountChangedError,
     InvalidSymbolError,
+    MarketClosedError,
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
@@ -44,6 +46,7 @@ from unified_trading_execution.errors import (
     UteError,
 )
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
@@ -69,6 +72,8 @@ from unified_trading_execution.mt5.orders import (
 from unified_trading_execution.mt5.symbols import to_mt5_symbol
 from unified_trading_execution.types.enums import (
     AssetClass,
+    FillEntry,
+    FillReason,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -105,6 +110,35 @@ _MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
 # symbol_info_tick() can briefly return None.  MARKET orders retry the fetch.
 _MARKET_TICK_RETRIES = 3
 _MARKET_TICK_RETRY_DELAY_SECONDS = 0.1
+
+# Balance fetch resilience: account_info() can transiently return None during
+# an IPC hiccup; retry a few times, then fall back to the last-known-good
+# balance instead of aborting reconciliation.
+_BALANCE_FETCH_RETRIES = 3
+_BALANCE_RETRY_DELAY_SECONDS = 0.1
+
+# MT5 DEAL_REASON → FillReason.  The three client-side channels (manual,
+# mobile, web) collapse into CLIENT; there is no MT5 analogue of DEALER.
+_DEAL_REASON_TO_FILL_REASON: dict[int, FillReason] = {
+    0: FillReason.CLIENT,  # DEAL_REASON_CLIENT
+    1: FillReason.CLIENT,  # DEAL_REASON_MOBILE
+    2: FillReason.CLIENT,  # DEAL_REASON_WEB
+    3: FillReason.EXPERT,  # DEAL_REASON_EXPERT
+    4: FillReason.STOP_LOSS,  # DEAL_REASON_SL
+    5: FillReason.TAKE_PROFIT,  # DEAL_REASON_TP
+    6: FillReason.STOP_OUT,  # DEAL_REASON_SO
+    7: FillReason.ROLLOVER,  # DEAL_REASON_ROLLOVER
+    8: FillReason.MARGIN,  # DEAL_REASON_VMARGIN
+    9: FillReason.SPLIT,  # DEAL_REASON_SPLIT
+}
+
+# MT5 DEAL_ENTRY → FillEntry.
+_DEAL_ENTRY_TO_FILL_ENTRY: dict[int, FillEntry] = {
+    0: FillEntry.IN,  # DEAL_ENTRY_IN
+    1: FillEntry.OUT,  # DEAL_ENTRY_OUT
+    2: FillEntry.INOUT,  # DEAL_ENTRY_INOUT
+    3: FillEntry.OUT_BY,  # DEAL_ENTRY_OUT_BY
+}
 
 if TYPE_CHECKING:
     from unified_trading_execution.mt5.config import MT5Config
@@ -307,6 +341,10 @@ class MT5Adapter(Adapter):
 
         # Actual account login, resolved from terminal after connect().
         self._account_login: int | None = None
+        # True while this adapter holds the process-global connection guard.
+        # Tracked so teardown releases the lock exactly once even if
+        # ``disconnect()`` races the poll loop's account-change teardown.
+        self._guard_held = False
 
         # Background polling task — started in connect(), cancelled in disconnect().
         self._poll_task: asyncio.Task[None] | None = None
@@ -328,6 +366,9 @@ class MT5Adapter(Adapter):
         self._last_orders: dict[int, object] = {}
         self._last_positions: dict[tuple[Instrument, str], Position] = {}
         self._last_balance: Balance | None = None
+        # Monotonic clock of the last balance publish — throttles the heavier
+        # balance snapshot while account identity is still checked every cycle.
+        self._last_balance_poll_monotonic: float = 0.0
         # Deal dedup baseline in the server-as-epoch basis (raw deal.time).
         # Anchored lazily on the first window build after the server offset is
         # measured, then advanced to the newest deal seen.  Keeping it in the
@@ -434,6 +475,7 @@ class MT5Adapter(Adapter):
                 "another MT5 adapter is already connected in this process — "
                 "MetaTrader5.initialize()/shutdown() is a process-wide singleton"
             )
+        self._guard_held = True
 
         try:
             mt5 = _get_mt5()
@@ -460,17 +502,30 @@ class MT5Adapter(Adapter):
                 )
 
             self._account_login = int(account_info.login)
+            if self._account_login != int(self._config.login):
+                raise AccountChangedError(
+                    f"MT5 terminal is connected to account {self._account_login}, "
+                    f"but the engine was configured for account {self._config.login}"
+                )
             await self._seed_symbol_mappings_from_state_store()
             await self._seed_mappings_from_state_store()
             await asyncio.to_thread(self._recover_order_mappings, mt5)
             self._connected = True
             self._publish_connection_state(True)
             self._poll_task = asyncio.create_task(self._poll_loop())
+        except AccountChangedError:
+            # Preserve the specific type — a mismatched account must surface as
+            # AccountChangedError, not be wrapped into a generic connection error.
+            self._connected = False
+            self._account_login = None
+            self._poll_task = None
+            self._release_guard()
+            raise
         except Exception as exc:
             self._connected = False
             self._account_login = None
             self._poll_task = None
-            _connected_lock.release()
+            self._release_guard()
             raise PlatformConnectionError(f"failed to connect to MT5 terminal: {exc}") from exc
 
     def _publish(self, event: Event) -> None:
@@ -492,6 +547,18 @@ class MT5Adapter(Adapter):
                 connected=connected,
             )
         )
+
+    def _release_guard(self) -> None:
+        """Release the process-global connection guard exactly once.
+
+        ``threading.Lock.release()`` raises on an unlocked lock.  Because
+        ``disconnect()`` and ``_teardown_after_account_change()`` can both
+        run near a mid-session account change (disconnect cancelling the poll
+        task while it is mid-teardown), the release must be idempotent.
+        """
+        if self._guard_held:
+            self._guard_held = False
+            _connected_lock.release()
 
     async def disconnect(self) -> None:
         """Cancel the polling loop and shut down the MT5 terminal connection.
@@ -526,7 +593,7 @@ class MT5Adapter(Adapter):
             # of whether shutdown() succeeded.
             self._connected = False
             self._account_login = None
-            _connected_lock.release()
+            self._release_guard()
             self._publish_connection_state(False)
 
     @property
@@ -826,6 +893,10 @@ class MT5Adapter(Adapter):
             raise InvalidSymbolError(
                 f"MT5 symbol {mt5_symbol!r} is not tradable (trade mode disabled)"
             )
+        if info.trade_mode == 3:  # SYMBOL_TRADE_MODE_CLOSEONLY
+            raise MarketClosedError(
+                f"MT5 symbol {mt5_symbol!r} is in close-only mode (market closed)"
+            )
 
         volume_step = Decimal(str(info.volume_step))
         spec = InstrumentSpec(
@@ -896,16 +967,37 @@ class MT5Adapter(Adapter):
         return await asyncio.to_thread(_fetch)
 
     async def fetch_balances(self) -> dict[str, Balance]:
-        """Fetch account balances via ``mt5.account_info()``."""
+        """Fetch account balances via ``mt5.account_info()``.
+
+        A transient ``None`` (a brief IPC hiccup) is retried; if every attempt
+        fails, the last-known-good balance is returned rather than raising, so a
+        momentary terminal stall cannot abort a reconciliation pass.  Raises
+        only when no balance has ever been observed this session.
+        """
         mt5 = _get_mt5()
 
-        def _fetch() -> dict[str, Balance]:
+        def _fetch() -> Balance | None:
             account = mt5.account_info()
-            self._check_call_result("account_info", account)
-            balance = self._build_balance(account, _utcnow())
-            return {balance.currency: balance}
+            if account is None:
+                return None
+            return self._build_balance(account, _utcnow())
 
-        return await asyncio.to_thread(_fetch)
+        for _ in range(_BALANCE_FETCH_RETRIES):
+            balance = await asyncio.to_thread(_fetch)
+            if balance is not None:
+                self._last_balance = balance
+                return {balance.currency: balance}
+            await asyncio.sleep(_BALANCE_RETRY_DELAY_SECONDS)
+
+        if self._last_balance is not None:
+            logger.warning(
+                "account_info() returned None %d times; returning last-known-good balance",
+                _BALANCE_FETCH_RETRIES,
+            )
+            return {self._last_balance.currency: self._last_balance}
+
+        code, desc = mt5.last_error()
+        raise map_mt5_error(code, desc or "account_info() returned None")
 
     async def fetch_account_leverage(self) -> int:
         """Return the account-level leverage from ``account_info()`` (read-only).
@@ -1037,12 +1129,37 @@ class MT5Adapter(Adapter):
         while self._connected:
             try:
                 await self._poll_once()
+            except AccountChangedError as exc:
+                # The account halt is entered by the engine (via the published
+                # AccountChangedEvent).  Stop trading and tear the connection
+                # down — the engine must reconnect to the configured account.
+                logger.error("Account changed mid-session; stopping and disconnecting: %s", exc)
+                await self._teardown_after_account_change()
+                return
             except Exception:
                 logger.warning(
                     "Poll cycle failed; last-known state preserved. Continuing.",
                     exc_info=True,
                 )
             await asyncio.sleep(self._config.poll_interval_seconds)
+
+    async def _teardown_after_account_change(self) -> None:
+        """Tear down the connection after a fatal mid-session account change.
+
+        Mirrors the tail of ``disconnect()`` without the self-cancel deadlock:
+        we are already inside the poll task, so cancelling it is impossible.
+        Releases the process-global guard, drops the account login (so
+        ``account_id`` falls back to the configured login), and publishes a
+        disconnected state — regardless of whether ``mt5.shutdown()`` fails.
+        """
+        try:
+            mt5 = _get_mt5()
+            await asyncio.to_thread(mt5.shutdown)
+        finally:
+            self._connected = False
+            self._account_login = None
+            self._release_guard()
+            self._publish_connection_state(False)
 
     async def _poll_once(self) -> None:
         """One complete poll cycle.
@@ -1083,10 +1200,61 @@ class MT5Adapter(Adapter):
             _fetch_snapshot
         )
 
+        self._detect_account_change(account)
         self._process_orders(orders)
         self._process_positions(positions, instruments, now)
-        self._process_balance(account, now)
+        self._maybe_process_balance(account, now)
         self._process_fills(deals, instruments, account, now)
+
+    def _detect_account_change(self, account: Any) -> None:
+        """Signal and raise if the terminal's account differs from the connected one.
+
+        Runs every poll cycle — the account snapshot is fetched regardless of
+        balance-poll throttling precisely so identity can be checked cheaply.
+        On detection the account-scoped caches/maps are reset, an
+        ``AccountChangedEvent`` is published (the engine reacts by entering and
+        persisting an account-scoped halt), and ``AccountChangedError`` is
+        raised so ``_poll_loop`` stops trading and tears the connection down.
+        """
+        login = int(account.login)
+        if self._account_login is None or login == self._account_login:
+            # No baseline yet (not connected) or unchanged — nothing to do.
+            return
+        previous_login = self._account_login
+        detail = f"MT5 account changed from {previous_login} to {login} mid-session"
+        logger.error(detail)
+        self._reset_account_state()
+        self._publish(
+            AccountChangedEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=str(previous_login),
+                correlation_id=None,
+                detail=detail,
+                new_account_id=str(login),
+            )
+        )
+        raise AccountChangedError(detail)
+
+    def _reset_account_state(self) -> None:
+        """Drop all account-scoped mutable state on a detected account change.
+
+        A switched terminal must never reuse the previous account's symbol
+        mappings, order tickets, spec cache, or deal/position baselines — doing
+        so would corrupt the mirror with cross-account data.
+        """
+        self._last_orders = {}
+        self._last_positions = {}
+        self._last_balance = None
+        self._last_deal_time = None
+        self._last_deal_ticket = 0
+        self._symbol_to_instrument = {}
+        self._failed_symbols = set()
+        self._selected_symbols = set()
+        self._spec_cache = {}
+        self._order_id_to_ticket = {}
+        self._ticket_to_order_id = {}
 
     def _process_orders(self, orders: Any) -> None:
         """Update the last-known open-order snapshot; publish nothing.
@@ -1172,16 +1340,16 @@ class MT5Adapter(Adapter):
     def _build_balance(self, account: Any, now: datetime) -> Balance:
         """Reconstruct a ``Balance`` from an ``account_info()`` snapshot.
 
-        MT5 reports ``equity``, ``margin``, and ``margin_free`` as three
-        independent floats.  Reconstructing all three via
-        ``Decimal(str(float))`` can break the core invariant
-        ``free + used == total`` on tiny float-rounding errors
-        (``Balance.__post_init__`` enforces exact Decimal equality), so
-        derive ``free`` from the two primary reported values instead of
-        using the raw ``margin_free``.
+        ``total`` is the settled cash ``balance`` — ``equity`` and
+        ``margin_free`` are live derivatives (floating P&L / margin) and are
+        deliberately ignored: reconciliation must compare settled facts, never
+        live values.  ``free`` is derived as ``total - used`` rather than read
+        from the raw ``margin_free`` float, so the core invariant
+        ``free + used == total`` holds exactly despite MT5's independent float
+        reporting (``Balance.__post_init__`` enforces exact Decimal equality).
         """
         used = Decimal(str(account.margin))
-        total = Decimal(str(account.equity))
+        total = Decimal(str(account.balance))
         return Balance(
             currency=str(account.currency),
             free=total - used,
@@ -1189,6 +1357,23 @@ class MT5Adapter(Adapter):
             total=total,
             updated_at=now,
         )
+
+    def _maybe_process_balance(self, account: Any, now: datetime) -> None:
+        """Throttle the balance publish to ``balance_poll_interval_seconds``.
+
+        Account *identity* is checked every cycle (``_detect_account_change``),
+        but the heavier balance snapshot is gated: it is off when
+        ``balance_poll_enabled`` is False, and otherwise published at most once
+        per interval.  The first cycle always publishes (``_last_balance_poll_monotonic``
+        starts at 0) so an initial balance is seeded immediately.
+        """
+        if not self._config.balance_poll_enabled:
+            return
+        elapsed = time.monotonic() - self._last_balance_poll_monotonic
+        if elapsed < self._config.balance_poll_interval_seconds:
+            return
+        self._last_balance_poll_monotonic = time.monotonic()
+        self._process_balance(account, now)
 
     def _process_balance(self, account: Any, now: datetime) -> None:
         """Translate ``account_info()`` into a ``Balance`` and publish changes."""
@@ -1302,6 +1487,21 @@ class MT5Adapter(Adapter):
             or self._ticket_to_order_id.get(deal.ticket, "")
         )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
+        # ``reason``/``entry`` are absent on older terminal builds and on test
+        # mocks, so read defensively; a present-but-unmapped code falls back to
+        # UNKNOWN, while a missing attribute stays None (field not provided).
+        reason_code = getattr(deal, "reason", None)
+        entry_code = getattr(deal, "entry", None)
+        reason = (
+            _DEAL_REASON_TO_FILL_REASON.get(reason_code, FillReason.UNKNOWN)
+            if reason_code is not None
+            else None
+        )
+        entry = (
+            _DEAL_ENTRY_TO_FILL_ENTRY.get(entry_code, FillEntry.UNKNOWN)
+            if entry_code is not None
+            else None
+        )
         return FillRecord(
             client_order_id=client_order_id,
             platform_fill_id=str(deal.ticket),
@@ -1313,6 +1513,8 @@ class MT5Adapter(Adapter):
             fee_amount=fee if fee else None,
             correlation_id=client_order_id,
             position_id=str(deal.position_id) if deal.position_id else None,
+            reason=reason,
+            entry=entry,
         )
 
     def _server_time_offset_seconds(

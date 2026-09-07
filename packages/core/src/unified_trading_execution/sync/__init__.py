@@ -21,7 +21,7 @@ from decimal import Decimal
 from typing import Any, Literal, TypeVar
 
 from unified_trading_execution.adapter import Adapter
-from unified_trading_execution.engine import Engine
+from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import EventBus, HaltEvent, ReconciliationEvent
 from unified_trading_execution.risk import RiskConfig
@@ -75,7 +75,7 @@ class SyncEngine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
-        reconcile_interval_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         self._async_engine = Engine(
             adapter=adapter,

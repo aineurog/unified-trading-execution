@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -34,6 +34,7 @@ from unified_trading_execution.dispatch import (
 )
 from unified_trading_execution.errors import EngineShutdownError, ReconciliationError
 from unified_trading_execution.events import (
+    AccountChangedEvent,
     AuditEvent,
     BalanceUpdateEvent,
     ConnectionStateEvent,
@@ -66,6 +67,11 @@ from unified_trading_execution.types.order import (
 from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
+
+# Default cadence for the automatic reconciliation loop.  Reconciliation runs
+# by default so drift is caught without a manual step; pass
+# ``reconcile_interval_seconds=None`` to disable it entirely.
+DEFAULT_RECONCILE_INTERVAL_SECONDS: float = 30.0
 
 
 def _new_id() -> str:
@@ -145,7 +151,7 @@ class Engine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
-        reconcile_interval_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         self._adapter = adapter
         # Section 6.2: storage location is optional with a sensible default —
@@ -178,7 +184,7 @@ class Engine:
         self._last_connected: bool | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
 
-        # Periodic reconciliation (optional, opt-in).  None means disabled.
+        # Periodic reconciliation (on by default; None disables it).
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
             raise ValueError(
                 f"reconcile_interval_seconds must be > 0 or None, got {reconcile_interval_seconds}"
@@ -188,12 +194,17 @@ class Engine:
         # Serialises manual / reconnect / periodic reconciles so they never
         # run concurrently and never mutate the mirror at the same time.
         self._reconcile_lock = asyncio.Lock()
+        # Fire-and-forget persistence tasks scheduled from synchronous
+        # EventBus handlers.  Hold a strong reference so the loop cannot
+        # garbage-collect a task before it writes its DB record.
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
         # Wire up state-mirror subscriptions
         self._event_bus.subscribe(FillEvent, self._on_fill)
         self._event_bus.subscribe(PositionUpdateEvent, self._on_position_update)
         self._event_bus.subscribe(BalanceUpdateEvent, self._on_balance_update)
         self._event_bus.subscribe(ConnectionStateEvent, self._on_connection_state)
+        self._event_bus.subscribe(AccountChangedEvent, self._on_account_changed)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -208,6 +219,10 @@ class Engine:
             self._known_order_ids = {o.client_order_id for o in existing}
         except Exception:
             logger.warning("Could not seed known_order_ids from state store")
+
+        # Restore any halts that were active when the engine last shut down
+        # (Section 6.4) so a restart never silently drops a protective halt.
+        await self._restore_halts_from_store()
 
         # Fetch initial rate limits
         await self._refresh_rate_limits()
@@ -683,51 +698,31 @@ class Engine:
         corr_id: str,
         timestamp: datetime,
     ) -> None:
-        """Enter halts on mismatches, clear halts on clean pass."""
-        if result.is_clean:
-            # Clear all active halts — iterate over them directly
-            for entry in self._halt_machine.active_halts():
-                cleared = self._halt_machine.try_clear_halt(
-                    entry.scope,
-                    instrument=entry.instrument,
-                    reconciliation_is_clean=True,
-                )
-                if cleared:
-                    self._event_bus.publish(
-                        HaltClearedEvent(
-                            event_id=_new_id(),
-                            timestamp=timestamp,
-                            adapter_name=self._adapter.platform_name,
-                            account_id=self._adapter.account_id,
-                            correlation_id=corr_id,
-                            scope=entry.scope,
-                            instrument=entry.instrument,
-                            cleared_by="automatic",
-                        )
-                    )
-                    await self._state_store.write_halt_event(
-                        HaltEvent(
-                            event_id=_new_id(),
-                            timestamp=timestamp,
-                            adapter_name=self._adapter.platform_name,
-                            account_id=self._adapter.account_id,
-                            correlation_id=corr_id,
-                            action="cleared",
-                            scope=entry.scope,
-                            instrument=entry.instrument,
-                            reason="reconciliation_clean",
-                            detail="",
-                            cleared_by="automatic",
-                        )
-                    )
-            return
+        """Enter halts on position mismatches, clear halts that reconciled.
 
-        if not self._halt_machine.config.auto_halt_enabled:
-            return
+        Instrument halts are cleared *targeted*: as soon as a halted
+        instrument's position no longer mismatches in a pass, it is released —
+        independent of the global ``is_clean`` flag.  Balance, orphan and
+        partial-fill drift must never pin an instrument halt open: balance is
+        settled-cash only (see ``reconcile``), and the others are corrected
+        without halting.  The account-scoped halt (account change) is only
+        released on a fully clean pass or manually.
+        """
+        mismatched_symbols = {
+            m.instrument.symbol for m in result.position_mismatches if m.instrument is not None
+        }
 
-        # Only position and balance disagreements halt.  Orphan orders and
-        # partial-fill discrepancies are corrected without halting — they are
-        # order-level artefacts, not evidence of account-state drift.
+        # 1. Targeted instrument-halt clear — a halted instrument whose
+        #    position reconciled this pass is released immediately.
+        for entry in list(self._halt_machine.active_halts()):
+            if entry.scope != "instrument" or entry.instrument is None:
+                continue
+            if entry.instrument.symbol in mismatched_symbols:
+                continue  # still mismatched — keep halted
+            await self._clear_halt(entry.scope, entry.instrument, corr_id, timestamp)
+
+        # 2. Enter halts for any (new) position disagreement.  ``enter_halt``
+        #    is idempotent and honours ``auto_halt_enabled``.
         for mismatch in result.position_mismatches:
             if mismatch.instrument is None:
                 continue  # defensive: position mismatches always carry an instrument
@@ -739,15 +734,57 @@ class Engine:
                 corr_id=corr_id,
                 timestamp=timestamp,
             )
-        for mismatch in result.balance_mismatches:
-            await self._enter_halt(
-                scope="account",
-                instrument=None,
-                reason=mismatch.mismatch_type,
-                detail=f"local={mismatch.local_value} platform={mismatch.platform_value}",
-                corr_id=corr_id,
+
+        # 3. On a fully clean pass, release anything still halted (the account
+        #    halt and any instrument halt not already cleared above).
+        if result.is_clean:
+            for entry in list(self._halt_machine.active_halts()):
+                await self._clear_halt(entry.scope, entry.instrument, corr_id, timestamp)
+
+    async def _clear_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        corr_id: str,
+        timestamp: datetime,
+    ) -> bool:
+        """Attempt to clear one halt; publish + persist on success."""
+        cleared = self._halt_machine.try_clear_halt(
+            scope,
+            instrument=instrument,
+            reconciliation_is_clean=True,
+        )
+        if not cleared:
+            return False
+        self._event_bus.publish(
+            HaltClearedEvent(
+                event_id=_new_id(),
                 timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                scope=scope,
+                instrument=instrument,
+                cleared_by="automatic",
             )
+        )
+        await self._state_store.write_halt_event(
+            HaltEvent(
+                event_id=_new_id(),
+                timestamp=timestamp,
+                adapter_name=self._adapter.platform_name,
+                account_id=self._adapter.account_id,
+                correlation_id=corr_id,
+                action="cleared",
+                scope=scope,
+                instrument=instrument,
+                reason="reconciliation_clean",
+                detail="",
+                cleared_by="automatic",
+            )
+        )
+        await self._persist_halt_clear(scope, instrument)
+        return True
 
     async def _enter_halt(
         self,
@@ -792,6 +829,42 @@ class Engine:
                 cleared_by=None,
             )
         )
+        await self._persist_halt(scope, instrument, reason, detail)
+
+    async def _restore_halts_from_store(self) -> None:
+        """Rehydrate persisted halts into the halt machine (Section 6.4)."""
+        try:
+            active = await self._state_store.get_active_halts()
+        except Exception:
+            logger.warning("Could not restore persisted halts from state store")
+            return
+        for scope, instrument, reason, detail in active:
+            try:
+                self._halt_machine.restore_halt(scope, instrument, reason, detail)
+            except Exception:
+                logger.warning("Could not restore halt (scope=%s) from state store", scope)
+
+    async def _persist_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Persist an entered halt; best-effort — never breaks the halt itself."""
+        try:
+            await self._state_store.upsert_halt(scope, instrument, reason, detail)
+        except Exception:
+            logger.warning("Failed to persist halt (scope=%s)", scope)
+
+    async def _persist_halt_clear(
+        self, scope: Literal["instrument", "account"], instrument: Instrument | None
+    ) -> None:
+        """Persist a cleared halt; best-effort."""
+        try:
+            await self._state_store.delete_halt(scope, instrument)
+        except Exception:
+            logger.warning("Failed to persist halt clear (scope=%s)", scope)
 
     # ── Manual halt clearing ───────────────────────────────────────
 
@@ -844,6 +917,7 @@ class Engine:
                     cleared_by="manual",
                 )
             )
+            await self._persist_halt_clear(scope, instrument)
         return cleared
 
     # ── State mirror access ────────────────────────────────────────
@@ -1008,14 +1082,67 @@ class Engine:
 
     # ── Internal: EventBus subscribers (state mirror) ──────────────
 
+    def _schedule(self, awaitable: Awaitable[None]) -> None:
+        """Schedule a fire-and-forget coroutine, keeping a strong reference.
+
+        Synchronous EventBus handlers cannot ``await``; they schedule async
+        persistence on the running loop.  Without a retained reference the
+        task may be garbage-collected before it runs, silently dropping the
+        DB write — so we track it until it completes.
+        """
+        task = asyncio.ensure_future(awaitable)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     def _on_fill(self, event: FillEvent) -> None:
-        asyncio.ensure_future(self._persist_fill(event))
+        self._schedule(self._persist_fill(event))
 
     def _on_position_update(self, event: PositionUpdateEvent) -> None:
-        asyncio.ensure_future(self._persist_position(event))
+        self._schedule(self._persist_position(event))
 
     def _on_balance_update(self, event: BalanceUpdateEvent) -> None:
-        asyncio.ensure_future(self._persist_balance(event))
+        self._schedule(self._persist_balance(event))
+
+    def _on_account_changed(self, event: AccountChangedEvent) -> None:
+        """Enter the account halt synchronously (immediate order block) and
+        persist it via the event loop so a restart rehydrates it."""
+        self._halt_machine.enter_halt("account", None, "account_changed", event.detail)
+        self._schedule(self._persist_account_change(event))
+
+    async def _persist_account_change(self, event: AccountChangedEvent) -> None:
+        """Persist the account-change halt (event log + current-state table)."""
+        try:
+            self._event_bus.publish(
+                HaltEnteredEvent(
+                    event_id=_new_id(),
+                    timestamp=event.timestamp,
+                    adapter_name=self._adapter.platform_name,
+                    account_id=self._adapter.account_id,
+                    correlation_id=None,
+                    scope="account",
+                    instrument=None,
+                    reason="account_changed",
+                    detail=event.detail,
+                )
+            )
+            await self._state_store.write_halt_event(
+                HaltEvent(
+                    event_id=_new_id(),
+                    timestamp=event.timestamp,
+                    adapter_name=self._adapter.platform_name,
+                    account_id=self._adapter.account_id,
+                    correlation_id=None,
+                    action="entered",
+                    scope="account",
+                    instrument=None,
+                    reason="account_changed",
+                    detail=event.detail,
+                    cleared_by=None,
+                )
+            )
+            await self._state_store.upsert_halt("account", None, "account_changed", event.detail)
+        except Exception:
+            logger.exception("Failed to persist account-change halt")
 
     async def _stamp_fill_correlation(self, fill: FillRecord) -> FillRecord:
         """Stamp a fill with the placing action's correlation_id (Section 17.14).

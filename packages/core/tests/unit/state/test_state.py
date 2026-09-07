@@ -783,6 +783,76 @@ class TestReconciliation:
         assert len(result.balance_mismatches) == 1
         assert result.balance_mismatches[0].platform_value == "absent"
 
+    def test_balance_free_only_drift_is_not_flagged(self):
+        """``free``/``used`` drift (live P&L/margin) is not a balance mismatch.
+
+        Only the settled ``total`` is compared; ``free`` floats with open
+        positions every tick and is kept fresh via ``BalanceUpdateEvent``.
+        """
+        local = {
+            "USDT": Balance(
+                currency="USDT",
+                free=Decimal("9000"),
+                used=Decimal("1000"),
+                total=Decimal("10000"),
+                updated_at=NOW,
+            )
+        }
+        platform = {
+            "USDT": Balance(
+                currency="USDT",
+                free=Decimal("8500"),
+                used=Decimal("1500"),
+                total=Decimal("10000"),
+                updated_at=NOW,
+            )
+        }
+        result = reconcile(
+            local_positions=[],
+            platform_positions=[],
+            local_balances=local,
+            platform_balances=platform,
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
+        )
+        assert result.balance_mismatches == []
+        assert result.is_clean
+
+    def test_balance_total_drift_is_flagged(self):
+        """A settled-total change is a balance drift even when ``free`` matches."""
+        local = {
+            "USDT": Balance(
+                currency="USDT",
+                free=Decimal("9000"),
+                used=Decimal("1000"),
+                total=Decimal("10000"),
+                updated_at=NOW,
+            )
+        }
+        platform = {
+            "USDT": Balance(
+                currency="USDT",
+                free=Decimal("9000"),
+                used=Decimal("2000"),
+                total=Decimal("11000"),
+                updated_at=NOW,
+            )
+        }
+        result = reconcile(
+            local_positions=[],
+            platform_positions=[],
+            local_balances=local,
+            platform_balances=platform,
+            local_orders={},
+            platform_orders={},
+            local_fills={},
+            platform_fills={},
+        )
+        assert len(result.balance_mismatches) == 1
+        assert result.balance_mismatches[0].mismatch_type == "balance"
+
     def test_none_platform_dataset_is_skipped(self):
         """A ``None`` platform dataset (unsupported fetch) is skipped entirely.
 

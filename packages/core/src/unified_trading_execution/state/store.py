@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import aiosqlite
 
@@ -22,6 +22,8 @@ from unified_trading_execution.events import (
 from unified_trading_execution.types.enums import (
     LIVE_ORDER_STATUSES,
     AssetClass,
+    FillEntry,
+    FillReason,
     OptionRight,
     OrderSide,
     OrderStatus,
@@ -68,6 +70,11 @@ def default_state_store_path(platform_name: str, account_id: str) -> str:
 # ============================================================
 # Instrument serialisation helpers
 # ============================================================
+
+# One row of the current-state ``halts`` table: scope + instrument identity +
+# reason/detail.  ``scope`` is a closed set, typed literally so callers can
+# hand it straight to the halt state machine.
+ActiveHaltRow = tuple[Literal["instrument", "account"], Instrument | None, str, str]
 
 
 def _serialise_instrument(i: Instrument) -> dict[str, Any]:
@@ -232,6 +239,37 @@ class StateStore(ABC):
 
         Concrete default is a no-op; SQLite overrides this to write the value
         into the ``reconciliation_state`` table.
+        """
+        return None
+
+    async def get_active_halts(self) -> list[ActiveHaltRow]:
+        """Return currently-active halts as ``(scope, instrument, reason, detail)``.
+
+        Concrete default returns an empty list (no halt persistence).  SQLite
+        overrides this to read the ``halts`` current-state table so halts
+        survive a restart.
+        """
+        return []
+
+    async def upsert_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Record an active halt in the current-state ``halts`` table.
+
+        Concrete default is a no-op; SQLite overrides this to persist the halt.
+        """
+        return None
+
+    async def delete_halt(
+        self, scope: Literal["instrument", "account"], instrument: Instrument | None
+    ) -> None:
+        """Remove an active halt from the current-state ``halts`` table.
+
+        Concrete default is a no-op; SQLite overrides this to persist the clear.
         """
         return None
 
@@ -543,8 +581,8 @@ class SQLiteStateStore(StateStore):
                    (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                     exchange, currency, expiry, strike, option_right, multiplier,
                     platform_symbol, fill_quantity, fill_price, fill_timestamp,
-                    fee_currency, fee_amount, correlation_id, position_id)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    fee_currency, fee_amount, correlation_id, position_id, reason, entry)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(platform_fill_id) DO UPDATE SET
                            client_order_id = excluded.client_order_id,
                            symbol = excluded.symbol,
@@ -563,7 +601,9 @@ class SQLiteStateStore(StateStore):
                            fee_currency = excluded.fee_currency,
                            fee_amount = excluded.fee_amount,
                            correlation_id = excluded.correlation_id,
-                           position_id = excluded.position_id""",
+                           position_id = excluded.position_id,
+                           reason = excluded.reason,
+                           entry = excluded.entry""",
                 (
                     fill.client_order_id,
                     fill.platform_fill_id,
@@ -584,6 +624,8 @@ class SQLiteStateStore(StateStore):
                     str(fill.fee_amount) if fill.fee_amount else None,
                     fill.correlation_id,
                     fill.position_id,
+                    fill.reason.value if fill.reason else None,
+                    fill.entry.value if fill.entry else None,
                 ),
             )
 
@@ -612,8 +654,8 @@ class SQLiteStateStore(StateStore):
                (client_order_id, platform_fill_id, symbol, quote_currency, asset_class,
                 exchange, currency, expiry, strike, option_right, multiplier,
                 platform_symbol, fill_quantity, fill_price, fill_timestamp,
-                fee_currency, fee_amount, correlation_id, position_id)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                fee_currency, fee_amount, correlation_id, position_id, reason, entry)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(platform_fill_id) DO UPDATE SET
                        client_order_id = excluded.client_order_id,
                        symbol = excluded.symbol,
@@ -632,7 +674,9 @@ class SQLiteStateStore(StateStore):
                        fee_currency = excluded.fee_currency,
                        fee_amount = excluded.fee_amount,
                        correlation_id = excluded.correlation_id,
-                       position_id = excluded.position_id""",
+                       position_id = excluded.position_id,
+                       reason = excluded.reason,
+                       entry = excluded.entry""",
             (
                 fill.client_order_id,
                 fill.platform_fill_id,
@@ -653,6 +697,8 @@ class SQLiteStateStore(StateStore):
                 str(fill.fee_amount) if fill.fee_amount else None,
                 fill.correlation_id,
                 fill.position_id,
+                fill.reason.value if fill.reason else None,
+                fill.entry.value if fill.entry else None,
             ),
         )
 
@@ -890,6 +936,69 @@ class SQLiteStateStore(StateStore):
                 "INSERT OR REPLACE INTO reconciliation_state (key, value, updated_at) VALUES (?,?,?)",
                 (_RECONCILE_WATERMARK_KEY, watermark.isoformat(), now),
             )
+
+    # ---- Active-halt persistence (Section 6.4) ----
+
+    async def get_active_halts(self) -> list[ActiveHaltRow]:
+        """Read the current-state ``halts`` table for active halts."""
+        async with self._write_lock:
+            cursor = await self.conn.execute("SELECT * FROM halts")
+            results: list[ActiveHaltRow] = []
+            for row in await cursor.fetchall():
+                instrument = None
+                if row["symbol"]:
+                    instrument = _deserialise_instrument(dict(row))
+                results.append((row["scope"], instrument, row["reason"], row["detail"]))
+            return results
+
+    async def upsert_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """Persist an active halt; idempotent via the (scope, symbol, asset_class) key."""
+        i = _serialise_instrument(instrument) if instrument is not None else None
+        now = datetime.now(tz=UTC).isoformat()
+        async with self._write_lock:
+            await self.conn.execute(
+                """INSERT OR REPLACE INTO halts
+                   (scope, symbol, quote_currency, asset_class, exchange, currency,
+                    expiry, strike, option_right, multiplier, platform_symbol,
+                    reason, detail, entered_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    scope,
+                    i["symbol"] if i else "",
+                    i["quote_currency"] if i else None,
+                    i["asset_class"] if i else "",
+                    i["exchange"] if i else None,
+                    i["currency"] if i else None,
+                    i["expiry"] if i else None,
+                    i["strike"] if i else None,
+                    i["option_right"] if i else None,
+                    i["multiplier"] if i else None,
+                    i["platform_symbol"] if i else None,
+                    reason,
+                    detail,
+                    now,
+                ),
+            )
+
+    async def delete_halt(
+        self, scope: Literal["instrument", "account"], instrument: Instrument | None
+    ) -> None:
+        """Remove an active halt from the ``halts`` table."""
+        async with self._write_lock:
+            if instrument is None:
+                await self.conn.execute("DELETE FROM halts WHERE scope = ?", (scope,))
+            else:
+                i = _serialise_instrument(instrument)
+                await self.conn.execute(
+                    "DELETE FROM halts WHERE scope = ? AND symbol = ? AND asset_class = ?",
+                    (scope, i["symbol"], i["asset_class"]),
+                )
 
     # ---- Filtered queries ----
 
@@ -1190,4 +1299,6 @@ class SQLiteStateStore(StateStore):
             fee_amount=Decimal(row["fee_amount"]) if row["fee_amount"] else None,
             correlation_id=row["correlation_id"],
             position_id=row["position_id"],
+            reason=FillReason(row["reason"]) if row["reason"] else None,
+            entry=FillEntry(row["entry"]) if row["entry"] else None,
         )

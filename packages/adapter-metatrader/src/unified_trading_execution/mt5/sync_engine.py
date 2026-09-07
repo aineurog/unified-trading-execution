@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from decimal import Decimal
 
+from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5.adapter import MT5Adapter
 from unified_trading_execution.mt5.config import MT5Config
@@ -53,7 +54,7 @@ class SyncMT5Engine(SyncEngine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
-        reconcile_interval_seconds: float | None = None,
+        reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
     ) -> None:
         adapter = config if isinstance(config, MT5Adapter) else MT5Adapter(config)
         super().__init__(

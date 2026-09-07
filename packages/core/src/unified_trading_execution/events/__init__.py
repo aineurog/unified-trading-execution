@@ -92,6 +92,21 @@ class HaltClearedEvent(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class AccountChangedEvent(Event):
+    """The platform account changed underneath this engine mid-session.
+
+    Published by an adapter when it detects the terminal/broker is now on a
+    different account than the one the engine was configured for.  The engine
+    reacts by entering (and persisting) an account-scoped halt; the adapter is
+    expected to treat the change as fatal and stop trading (see the MT5
+    adapter, which stops its poll loop and tears the connection down).
+    """
+
+    detail: str  # human-readable, e.g. "MT5 account changed from 123 to 456"
+    new_account_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationMismatch:
     mismatch_type: Literal[
         "position_quantity",

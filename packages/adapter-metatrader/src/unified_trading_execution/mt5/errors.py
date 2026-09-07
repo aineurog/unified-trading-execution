@@ -21,6 +21,7 @@ from unified_trading_execution.errors import (
     InstrumentHaltedError,
     InsufficientBalanceError,
     InvalidSymbolError,
+    MarketClosedError,
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
@@ -36,7 +37,7 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10007: PlatformConnectionError,  # TRADE_RETCODE_CANCEL — server-canceled
     10012: PlatformConnectionError,  # TRADE_RETCODE_TIMEOUT
     10020: PlatformConnectionError,  # TRADE_RETCODE_PRICE_CHANGED
-    10021: PlatformConnectionError,  # TRADE_RETCODE_PRICE_OFF — no quotes
+    10021: MarketClosedError,  # TRADE_RETCODE_PRICE_OFF — no quotes (market closed)
     10028: PlatformConnectionError,  # TRADE_RETCODE_LOCKED — order locked
     10031: PlatformConnectionError,  # TRADE_RETCODE_CONNECTION — no connection
     # ---- Invalid symbol / params ----
@@ -44,7 +45,7 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10014: InvalidSymbolError,  # TRADE_RETCODE_INVALID_VOLUME
     10015: InvalidSymbolError,  # TRADE_RETCODE_INVALID_PRICE
     10016: InvalidSymbolError,  # TRADE_RETCODE_INVALID_STOPS
-    10018: InvalidSymbolError,  # TRADE_RETCODE_MARKET_CLOSED
+    10018: MarketClosedError,  # TRADE_RETCODE_MARKET_CLOSED
     10022: InvalidSymbolError,  # TRADE_RETCODE_INVALID_EXPIRATION
     10034: InvalidSymbolError,  # TRADE_RETCODE_LIMIT_VOLUME
     # ---- Insufficient balance ----

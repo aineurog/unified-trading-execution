@@ -224,7 +224,7 @@ class TestFetchBalances:
     ) -> None:
         """free is recomputed so free + used == total holds exactly."""
         mock_mt5_module.account_info.return_value = _account(
-            equity=1000.0,
+            balance=1000.0,
             margin=123.45,
         )
 

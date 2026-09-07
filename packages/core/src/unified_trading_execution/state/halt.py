@@ -129,6 +129,34 @@ class HaltStateMachine:
         self._instrument_halts[key] = entry
         return True
 
+    def restore_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        reason: str,
+        detail: str,
+    ) -> bool:
+        """Restore a previously-persisted halt, bypassing ``auto_halt_enabled``.
+
+        Used by the engine at connect time to rehydrate halts that were active
+        when the process last shut down.  Unlike :meth:`enter_halt`, this does
+        not consult ``auto_halt_enabled`` — a halt that was already entered is
+        re-applied verbatim, whether it was originally automatic or manual.
+        """
+        entry = _HaltEntry(scope=scope, instrument=instrument, reason=reason, detail=detail)
+        if scope == "account":
+            if self._account_halted is not None:
+                return False  # already halted
+            self._account_halted = entry
+            return True
+        if instrument is None:
+            raise ValueError("instrument required for instrument-scoped halt")
+        key = instrument.symbol
+        if key in self._instrument_halts:
+            return False  # already halted
+        self._instrument_halts[key] = entry
+        return True
+
     def try_clear_halt(
         self,
         scope: Literal["instrument", "account"],

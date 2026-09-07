@@ -86,7 +86,7 @@ def reconcile(
 
     Cases handled (Section 6.3):
       1. Position quantity mismatch (including presence/absence)
-      2. Balance mismatch (including presence/absence)
+      2. Balance mismatch on settled total (including presence/absence)
       3. Orphan order on platform (unknown to local)
       4. Orphan order in local (not on platform)
       5. Partial fill discrepancy
@@ -122,31 +122,31 @@ def reconcile(
                     )
                 )
 
-    # Case 2: Balance mismatch.  Absence on either side is normalised to zero.
+    # Case 2: Balance mismatch, compared on the settled ``total`` only.
+    #
+    # ``free``/``used`` are live derivatives (available margin / reserved
+    # margin) that float with open-position P&L and notional, so they change
+    # every tick and are already kept fresh via ``BalanceUpdateEvent`` — they
+    # are not a reconciliation dimension.  Only the settled cash total is a
+    # stable fact: it moves on realized P&L, deposits, withdrawals and swap,
+    # i.e. real events the mirror could have missed.  Absence on either side
+    # is normalised to zero.
     balance_mismatches: list[ReconciliationMismatch] = []
     if platform_balances is not None:
         all_currencies = set(local_balances.keys()) | set(platform_balances.keys())
         for cur in all_currencies:
             local_bal = local_balances.get(cur)
             platform_bal = platform_balances.get(cur)
-            local_free = local_bal.free if local_bal is not None else Decimal("0")
             local_total = local_bal.total if local_bal is not None else Decimal("0")
-            platform_free = platform_bal.free if platform_bal is not None else Decimal("0")
             platform_total = platform_bal.total if platform_bal is not None else Decimal("0")
-            if local_free != platform_free or local_total != platform_total:
+            if local_total != platform_total:
                 balance_mismatches.append(
                     ReconciliationMismatch(
                         mismatch_type="balance",
                         instrument=None,
-                        local_value=(
-                            "absent"
-                            if local_bal is None
-                            else f"free={local_free}, total={local_total}"
-                        ),
+                        local_value=("absent" if local_bal is None else f"total={local_total}"),
                         platform_value=(
-                            "absent"
-                            if platform_bal is None
-                            else f"free={platform_free}, total={platform_total}"
+                            "absent" if platform_bal is None else f"total={platform_total}"
                         ),
                     )
                 )

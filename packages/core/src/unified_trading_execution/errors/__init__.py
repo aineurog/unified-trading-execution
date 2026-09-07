@@ -22,6 +22,16 @@ class InvalidSymbolError(UteError):
     """The symbol/instrument is not recognised or tradable on this platform."""
 
 
+class MarketClosedError(InvalidSymbolError):
+    """The instrument's market is closed for trading right now.
+
+    Subclasses :class:`InvalidSymbolError` so existing ``except
+    InvalidSymbolError`` handlers keep working, while letting callers
+    distinguish "market is simply closed" (retry later) from "symbol does not
+    exist / is delisted" (permanent).
+    """
+
+
 class RateLimitError(UteError):
     """Request rate-limit exceeded — either platform-reported or self-throttled."""
 
@@ -43,6 +53,18 @@ class DuplicateOrderIdError(UteError):
 
 class PlatformConnectionError(UteError):
     """Connection to the platform failed or was lost."""
+
+
+class AccountChangedError(PlatformConnectionError):
+    """The platform account changed underneath this engine.
+
+    Raised when the connected platform reports a different account (or
+    broker/server) than the one the engine was configured for — e.g. the
+    terminal was switched to another account mid-session.  Subclasses
+    :class:`PlatformConnectionError` so existing connection-error handlers
+    keep working, while signalling that the engine must be reconnected to the
+    configured account before any further order activity.
+    """
 
 
 ConnectionError = PlatformConnectionError  # canonical name per Section 9.3
