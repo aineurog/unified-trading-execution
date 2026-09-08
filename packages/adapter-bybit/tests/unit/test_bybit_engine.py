@@ -30,10 +30,10 @@ class TestBybitEngine:
 
     def test_exposes_bybit_specific_methods(self) -> None:
         """Every public BybitAdapter-only method is on BybitEngine."""
-        # get_order_by_client_id is the adapter method — Engine provides get_order()
-        # modify_position_tpsl is MT5-specific (Pattern B: optional ABC method with
-        # NotImplementedError default); Bybit doesn't support it.
-        _skip = {"get_order_by_client_id", "modify_position_tpsl"}
+        # get_order_by_client_id is the adapter method — Engine provides get_order().
+        # resolve_account_id is an engine-internal adapter hook (called on connect
+        # to key the state store), not a user-facing method.
+        _skip = {"get_order_by_client_id", "resolve_account_id"}
         engine_methods = set(dir(Engine)) - set(dir(object))
         adapter_only = {
             name
@@ -54,7 +54,9 @@ class TestSyncBybitEngine:
 
     def test_exposes_bybit_specific_methods(self) -> None:
         """Every public BybitAdapter-only method is on SyncBybitEngine."""
-        _skip = {"get_order_by_client_id", "modify_position_tpsl"}
+        # get_order_by_client_id is the adapter method — Engine provides get_order().
+        # resolve_account_id is an engine-internal adapter hook, not user-facing.
+        _skip = {"get_order_by_client_id", "resolve_account_id"}
         sync_engine_methods = set(dir(SyncEngine)) - set(dir(object))
         adapter_only = {
             name

@@ -622,15 +622,19 @@ class IBKRAdapter(Adapter):
 
     async def modify_position_tpsl(
         self,
+        instrument: Instrument,
         position_id: str,
+        *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
         """Modify TP/SL on an existing open position.
 
         Places OCA-linked opposite-side orders for the position's contract.
-        ``position_id`` is ``str(contract.conId)`` from ``Position``.
-        At least one of ``take_profit``/``stop_loss`` must be provided.
+        ``position_id`` is ``str(contract.conId)`` from ``Position``; it is
+        globally unique, so *instrument* is accepted for interface uniformity
+        and not used to address the position.  At least one of
+        ``take_profit``/``stop_loss`` must be provided.
         Uses the same ``LMT``/``STP``/``STP LMT`` mapping as brackets.
         """
         if take_profit is None and stop_loss is None:

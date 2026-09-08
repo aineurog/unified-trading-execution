@@ -291,8 +291,12 @@ class SyncEngine:
         return self._async_engine.adapter
 
     @property
-    def state_store(self) -> StateStore:
-        """The state store — for direct access to its path (e.g. backups)."""
+    def state_store(self) -> StateStore | None:
+        """The state store — for direct access to its path (e.g. backups).
+
+        ``None`` until connect when no store was supplied at construction (the
+        underlying engine resolves it from the account identity on connect).
+        """
         return self._async_engine.state_store
 
     # ---- Adapter method auto-proxy ----

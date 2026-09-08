@@ -27,7 +27,7 @@ from unified_trading_execution.events import EventBus
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.order import FillRecord, OrderRecord
+from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
 
 
@@ -155,3 +155,21 @@ class BybitEngine(Engine):
 
     async def reconcile_user_intent(self) -> None:
         await self._adapter.reconcile_user_intent()
+
+    # ── position TP/SL ───────────────────────────────────────────────
+
+    async def modify_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Modify TP/SL on an open Bybit position (``position_id`` = ``positionIdx``)."""
+        await self._adapter.modify_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )

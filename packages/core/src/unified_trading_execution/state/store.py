@@ -426,8 +426,9 @@ class SQLiteStateStore(StateStore):
         async with self._write_lock:
             i = _serialise_instrument(instrument)
             await self.conn.execute(
-                "DELETE FROM positions WHERE symbol=? AND asset_class=? AND position_id=?",
-                (i["symbol"], i["asset_class"], position_id),
+                "DELETE FROM positions WHERE symbol=? AND quote_currency IS ? "
+                "AND asset_class=? AND position_id=?",
+                (i["symbol"], i["quote_currency"], i["asset_class"], position_id),
             )
 
     async def upsert_balance(self, balance: Balance) -> None:
@@ -826,8 +827,8 @@ class SQLiteStateStore(StateStore):
             i = _serialise_instrument(instrument)
             cursor = await self.conn.execute(
                 "SELECT quantity, average_entry_price, updated_at, position_id "
-                "FROM positions WHERE symbol=? AND asset_class=?",
-                (i["symbol"], i["asset_class"]),
+                "FROM positions WHERE symbol=? AND quote_currency IS ? AND asset_class=?",
+                (i["symbol"], i["quote_currency"], i["asset_class"]),
             )
             return [
                 Position(
@@ -971,7 +972,7 @@ class SQLiteStateStore(StateStore):
                 (
                     scope,
                     i["symbol"] if i else "",
-                    i["quote_currency"] if i else None,
+                    i["quote_currency"] if i else "",
                     i["asset_class"] if i else "",
                     i["exchange"] if i else None,
                     i["currency"] if i else None,
@@ -996,8 +997,9 @@ class SQLiteStateStore(StateStore):
             else:
                 i = _serialise_instrument(instrument)
                 await self.conn.execute(
-                    "DELETE FROM halts WHERE scope = ? AND symbol = ? AND asset_class = ?",
-                    (scope, i["symbol"], i["asset_class"]),
+                    "DELETE FROM halts WHERE scope = ? AND symbol = ? AND quote_currency IS ? "
+                    "AND asset_class = ?",
+                    (scope, i["symbol"], i["quote_currency"], i["asset_class"]),
                 )
 
     # ---- Filtered queries ----
@@ -1078,8 +1080,10 @@ class SQLiteStateStore(StateStore):
         query = "SELECT * FROM positions WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
-            query += " AND symbol=? AND asset_class=?"
-            params.extend([instrument.symbol, instrument.asset_class.value])
+            query += " AND symbol=? AND quote_currency IS ? AND asset_class=?"
+            params.extend(
+                [instrument.symbol, instrument.quote_currency, instrument.asset_class.value]
+            )
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         async with self._write_lock:

@@ -152,6 +152,7 @@ class TestAdapterZeroImplementation:
                 "attach_state_store",
                 "reconcile_user_intent",
                 "modify_position_tpsl",
+                "resolve_account_id",
             }
         )
         concrete = []

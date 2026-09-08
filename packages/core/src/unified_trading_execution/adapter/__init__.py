@@ -47,8 +47,10 @@ class Adapter(ABC):
     testnet/live switch, etc.) and a reference to the EventBus. The adapter
     publishes translated events to this bus from its internal websocket handlers.
 
-    The adapter never holds a reference to the StateStore — it produces events;
-    core's state mirror consumes them.
+    The adapter does not hold a reference to the state mirror — it produces
+    events that core's state mirror consumes.  ``attach_state_store`` is the one
+    documented exception, scoped to adapter-owned intent persistence (e.g.
+    leverage/margin-mode), never the mirror itself.
     """
 
     # ---- Identification ----
@@ -64,6 +66,19 @@ class Adapter(ABC):
     def account_id(self) -> str:
         """Unique account identifier on this platform."""
         ...
+
+    async def resolve_account_id(self) -> str:
+        """Return the canonical platform account identity.
+
+        Defaults to :attr:`account_id`.  Adapters whose configured account
+        label is not itself a unique platform identity override this to resolve
+        the real identifier from the platform — e.g. Bybit returns its account
+        ``uid`` from ``GET /v5/account/info``.  The engine calls this on connect
+        to key the auto-derived state-store path, so two accounts of the same
+        platform never collide on one file.  Implementations should degrade to
+        ``self.account_id`` rather than raise when resolution is unavailable.
+        """
+        return self.account_id
 
     # ---- Connection lifecycle ----
 
@@ -159,7 +174,9 @@ class Adapter(ABC):
 
     async def modify_position_tpsl(
         self,
+        instrument: Instrument,
         position_id: str,
+        *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
@@ -167,14 +184,18 @@ class Adapter(ABC):
 
         Optional — raises ``NotImplementedError`` by default.  Platforms that
         support modifying TP/SL on positions (MT5 via ``TRADE_ACTION_SLTP``,
-        IBKR, cTrader) override this method.  At least one of *take_profit*
-        or *stop_loss* must be provided.
+        IBKR via OCA orders, Bybit via ``set_trading_stop``) override this
+        method.  At least one of *take_profit* or *stop_loss* must be provided.
 
-        *position_id* is the platform-assigned position identifier (MT5
-        ticket, etc.).  It is **not** the same as ``UnifiedOrder.position_id``
-        (which is a client-side passthrough); it is the platform's own
-        position reference obtained from ``PositionUpdateEvent`` or the
-        state store.
+        *position_id* is the platform-assigned position identifier (MT5 ticket,
+        Bybit ``positionIdx``, IBKR ``conId``, ...).  It is scoped by
+        *instrument* because some platforms reuse the same ``position_id``
+        across instruments (e.g. Bybit's ``positionIdx`` is ``0`` for every
+        one-way symbol).  Adapters whose ``position_id`` is globally unique may
+        ignore *instrument*.  It is **not** the same as
+        ``UnifiedOrder.position_id`` (a client-side passthrough); it is the
+        platform's own position reference obtained from ``PositionUpdateEvent``
+        or the state store.
         """
         raise NotImplementedError(
             f"{self.platform_name} does not support modifying TP/SL on open positions"

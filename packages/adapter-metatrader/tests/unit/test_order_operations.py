@@ -721,6 +721,7 @@ class TestModifyPositionTpsl:
         _send_success(mock_mt5_module)
 
         await adapter.modify_position_tpsl(
+            _instrument(),
             "789",
             take_profit=TpSlAttachment(Decimal("1.3000")),
             stop_loss=TpSlAttachment(Decimal("1.0000")),
@@ -738,7 +739,9 @@ class TestModifyPositionTpsl:
         """Only the provided level is sent."""
         _send_success(mock_mt5_module)
 
-        await adapter.modify_position_tpsl("789", stop_loss=TpSlAttachment(Decimal("1.0000")))
+        await adapter.modify_position_tpsl(
+            _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0000"))
+        )
 
         request = _request(mock_mt5_module)
         assert request["sl"] == 1.0
@@ -750,11 +753,11 @@ class TestModifyPositionTpsl:
         """limit_price on a TP/SL attachment raises UnsupportedOrderTypeError."""
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_position_tpsl(
-                "789", take_profit=TpSlAttachment(Decimal("1.3000"), Decimal("1.2990"))
+                _instrument(), "789", take_profit=TpSlAttachment(Decimal("1.3000"), Decimal("1.2990"))
             )
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_position_tpsl(
-                "789", stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010"))
+                _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0000"), Decimal("1.0010"))
             )
 
     async def test_no_levels_raises(
@@ -762,4 +765,4 @@ class TestModifyPositionTpsl:
     ) -> None:
         """modify_position_tpsl with neither level raises ValueError."""
         with pytest.raises(ValueError):
-            await adapter.modify_position_tpsl("789")
+            await adapter.modify_position_tpsl(_instrument(), "789")

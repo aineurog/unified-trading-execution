@@ -437,6 +437,7 @@ class TestModifyPositionTpsl:
         mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
 
         await adapter.modify_position_tpsl(
+            AAPL,
             "111",
             take_profit=TpSlAttachment(Decimal("150")),
             stop_loss=TpSlAttachment(Decimal("90")),
@@ -466,7 +467,7 @@ class TestModifyPositionTpsl:
 
         mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
 
-        await adapter.modify_position_tpsl("222", take_profit=TpSlAttachment(Decimal("1.20")))
+        await adapter.modify_position_tpsl(EURUSD, "222", take_profit=TpSlAttachment(Decimal("1.20")))
 
         assert captured[0][0].exchange == "IDEALPRO"
         assert captured[0][1].orderType == "LMT"
@@ -480,11 +481,11 @@ class TestModifyPositionTpsl:
         mock_ib.placeOrder.side_effect = lambda c, o: _trade(
             order_ref=o.orderRef, order_id=1, perm_id=1
         )  # type: ignore[attr-defined]
-        await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("10")))
+        await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("10")))
         assert mock_ib.placeOrder.call_count == 1  # type: ignore[attr-defined]
         mock_ib.placeOrder.reset_mock()  # type: ignore[attr-defined]
         await adapter.modify_position_tpsl(
-            "111", stop_loss=TpSlAttachment(Decimal("9"), limit_price=Decimal("8.9"))
+            AAPL, "111", stop_loss=TpSlAttachment(Decimal("9"), limit_price=Decimal("8.9"))
         )
         assert mock_ib.placeOrder.call_count == 1  # type: ignore[attr-defined]
         # STP LMT
@@ -503,7 +504,7 @@ class TestModifyPositionTpsl:
             return _trade(order_ref=o.orderRef, order_id=1, perm_id=1)
 
         mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
-        await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("90")))
+        await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("90")))
         assert captured[0].action == "BUY"
 
     async def test_no_position_raises(
@@ -513,7 +514,7 @@ class TestModifyPositionTpsl:
         mock_ib = mock_ib_async_module
         mock_ib.positions.return_value = []  # type: ignore[attr-defined]
         with pytest.raises(OrderNotFoundError):
-            await adapter.modify_position_tpsl("999", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(AAPL, "999", take_profit=TpSlAttachment(Decimal("1")))
 
     async def test_flat_position_raises(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
@@ -522,14 +523,14 @@ class TestModifyPositionTpsl:
         mock_ib = mock_ib_async_module
         mock_ib.positions.return_value = [self._pos(con_id=111, qty=0)]  # type: ignore[attr-defined]
         with pytest.raises(OrderNotFoundError, match="flat"):
-            await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("1")))
 
     async def test_no_tp_sl_raises(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
     ) -> None:
         await adapter.connect()
         with pytest.raises(ValueError, match="at least one"):
-            await adapter.modify_position_tpsl("111")
+            await adapter.modify_position_tpsl(AAPL, "111")
 
     async def test_tp_limit_price_rejected(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
@@ -537,12 +538,12 @@ class TestModifyPositionTpsl:
         await adapter.connect()
         with pytest.raises(ValueError, match="limit_price"):
             await adapter.modify_position_tpsl(
-                "111", take_profit=TpSlAttachment(Decimal("1"), limit_price=Decimal("2"))
+                AAPL, "111", take_profit=TpSlAttachment(Decimal("1"), limit_price=Decimal("2"))
             )
 
     async def test_not_connected(self, adapter: IBKRAdapter) -> None:
         with pytest.raises(PlatformConnectionError):
-            await adapter.modify_position_tpsl("111", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("1")))
 
 
 # ---------------------------------------------------------------------------

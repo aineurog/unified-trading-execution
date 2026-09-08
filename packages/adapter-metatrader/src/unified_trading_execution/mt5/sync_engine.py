@@ -11,7 +11,7 @@ Usage::
     ))
     engine.connect()
     result = engine.place_order(order)
-    engine.modify_position_tpsl("12345", take_profit=...)
+    engine.modify_position_tpsl(instrument, "12345", take_profit=...)
     engine.shutdown()
 
 Adapter-specific methods (``modify_position_tpsl``, ``fetch_positions``,

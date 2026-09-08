@@ -821,14 +821,18 @@ class MT5Adapter(Adapter):
 
     async def modify_position_tpsl(
         self,
+        instrument: Instrument,
         position_id: str,
+        *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
         """Modify TP/SL on an existing position via ``TRADE_ACTION_SLTP``.
 
-        *position_id* is the MT5 position ticket (as a string).  At least
-        one of *take_profit* or *stop_loss* must be provided.
+        *position_id* is the MT5 position ticket (as a string); it is globally
+        unique, so *instrument* is accepted for interface uniformity and not
+        used to address the position.  At least one of *take_profit* or
+        *stop_loss* must be provided.
 
         Raises ``UnsupportedOrderTypeError`` if an attachment carries a
         ``limit_price`` — MT5 TP/SL are price levels, not orders.
