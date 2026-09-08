@@ -63,6 +63,7 @@ from unified_trading_execution.bybit.streams import (
     translate_fill,
     translate_order_entry,
     translate_position,
+    translate_tp_sl,
     translate_wallet_member,
 )
 from unified_trading_execution.bybit.symbols import from_bybit_symbol, to_bybit_symbol
@@ -1779,11 +1780,16 @@ class BybitAdapter(Adapter):
         for entry in message.get("data") or []:
             if entry.get("execType") != "Trade":
                 continue
+            client_order_id = entry.get("orderLinkId") or ""
+            if not client_order_id:
+                # Native TP/SL child fills (and any execution placed without a
+                # client id) carry an empty orderLinkId; mirror fetch_fills and
+                # skip them so the WS mirror and REST snapshot stay symmetric.
+                continue
             try:
                 instrument = self._resolve_instrument(
                     entry.get("symbol") or "", entry.get("category") or ""
                 )
-                client_order_id = entry.get("orderLinkId") or ""
                 fill = translate_fill(entry, instrument=instrument, client_order_id=client_order_id)
             except Exception:
                 logger.exception("Skipping malformed Bybit execution stream entry: %s", entry)
@@ -1986,6 +1992,47 @@ class BybitAdapter(Adapter):
             stop_loss=stop_loss,
         )
         await self._run_request(self._session.set_trading_stop, **payload)
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open position as ``(take_profit, stop_loss)``.
+
+        *position_id* is the Bybit ``positionIdx`` (``"0"`` one-way, ``"1"``/
+        ``"2"`` hedge long/short), scoped by *instrument* — mirroring
+        ``modify_position_tpsl``.
+
+        Returns ``None`` when there is no open position at that ``positionIdx``
+        (flat/closed) or for spot.  Each element is ``None`` when that side has
+        no stop set.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        try:
+            position_idx = int(position_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"position_id must be a Bybit positionIdx integer string, got {position_id!r}"
+            ) from exc
+
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return (
+                    translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
+                    translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
+                )
+        return None
 
     async def _run_request(
         self,

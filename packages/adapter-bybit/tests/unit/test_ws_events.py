@@ -314,6 +314,33 @@ class TestStreamEmission:
         )
         assert len(captured) == 1
 
+    def test_execution_skips_empty_order_link_id(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # A native TP/SL child fill carries no orderLinkId; it must not enter
+        # the fill mirror (fetch_fills skips the same executions), otherwise the
+        # WS/REST snapshots diverge into a permanent partial_fill discrepancy.
+        assert captured == []
+
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
         captured: list[PositionUpdateEvent] = []
@@ -373,6 +400,29 @@ class TestStreamEmission:
         assert len(placed) == 1
         assert len(cancelled) == 1
         assert cancelled[0].client_order_id == "client-1"
+
+    def test_order_skips_native_tp_sl_children(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+
+        adapter._on_order_message(
+            {
+                "data": [
+                    _base_order_entry(
+                        orderLinkId="",
+                        orderId="cffa-child",
+                        createType="CreateByStopLoss",
+                    )
+                ]
+            }
+        )
+
+        # Native TP/SL children are position TP/SL state, not user orders —
+        # they must never surface as phantom OrderPlacedEvents in the mirror.
+        assert placed == []
 
     def test_order_terminal_echo_not_replaced(
         self, adapter: BybitAdapter, event_bus: EventBus
@@ -441,6 +491,7 @@ class TestStreamEmission:
                             "symbol": "BTCUSDT",
                             "category": "linear",
                             "execId": "exec-1",
+                            "orderLinkId": "client-1",
                             "execType": "Trade",
                             "execQty": "0.5",
                             "execPrice": "95900.1",

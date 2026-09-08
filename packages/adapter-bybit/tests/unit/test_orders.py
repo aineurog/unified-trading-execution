@@ -1107,3 +1107,88 @@ class TestGetOrderByClientId:
 
         assert result is not None
         assert result.status is OrderStatus.CANCELLED
+
+
+class TestGetPositionTpSl:
+    async def test_reads_tp_sl(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {
+                "result": {
+                    "list": [
+                        {
+                            "positionIdx": 0,
+                            "takeProfit": "120000",
+                            "tpLimitPrice": "121000",
+                            "stopLoss": "90000",
+                            "slLimitPrice": "",
+                        }
+                    ]
+                }
+            },
+            None,
+            {},
+        )
+
+        result = await adapter.get_position_tpsl(_futures_instrument(), "0")
+
+        assert result is not None
+        take_profit, stop_loss = result
+        assert take_profit is not None
+        assert take_profit.trigger_price == Decimal("120000")
+        assert take_profit.limit_price == Decimal("121000")
+        assert stop_loss is not None
+        assert stop_loss.trigger_price == Decimal("90000")
+        assert stop_loss.limit_price is None
+        mock_pybit_http.get_positions.assert_called_once_with(category="linear", symbol="BTCUSDT")
+
+    async def test_returns_none_none_when_unset(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {"result": {"list": [{"positionIdx": 0, "takeProfit": "", "stopLoss": "0"}]}},
+            None,
+            {},
+        )
+
+        result = await adapter.get_position_tpsl(_futures_instrument(), "0")
+
+        assert result == (None, None)
+
+    async def test_returns_none_when_flat(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {"result": {"list": []}},
+            None,
+            {},
+        )
+
+        result = await adapter.get_position_tpsl(_futures_instrument(), "0")
+
+        assert result is None
+
+    async def test_spot_returns_none_without_network(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        result = await adapter.get_position_tpsl(_spot_instrument(), "0")
+
+        assert result is None
+        mock_pybit_http.get_positions.assert_not_called()
+
+    async def test_invalid_position_id_raises(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        with pytest.raises(ValueError):
+            await adapter.get_position_tpsl(_futures_instrument(), "not-an-int")

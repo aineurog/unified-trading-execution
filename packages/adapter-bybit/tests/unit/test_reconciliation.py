@@ -270,6 +270,31 @@ class TestFetchOpenOrders:
         assert list(result) == ["order-7"]
         assert result["order-7"].platform_order_id == "order-7"
 
+    async def test_filters_native_tp_sl_children(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        child = _open_order(orderLinkId="", orderId="cffa-child", createType="CreateByTakeProfit")
+        user_order = _open_order(orderLinkId="client-1", orderId="order-1")
+        mock_pybit_http.get_open_orders.side_effect = [
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            (
+                {"result": {"list": [child, user_order], "nextPageCursor": ""}},
+                None,
+                {},
+            ),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
+        ]
+
+        result = await adapter.fetch_open_orders()
+
+        # Native TP/SL children (createType=CreateBy*) are position TP/SL
+        # state, not user orders — they must not surface as open orders.
+        assert list(result) == ["client-1"]
+
 
 class TestFetchFills:
     async def test_filters_trade_and_groups_by_client_order_id(

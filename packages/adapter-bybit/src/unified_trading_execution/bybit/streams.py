@@ -235,8 +235,8 @@ def translate_order_entry(entry: dict[str, Any], *, instrument: Instrument) -> O
         stop_price=_optional_decimal(entry.get("triggerPrice")),
         reduce_only=bool(entry.get("reduceOnly")),
         client_tag=None,
-        take_profit=_translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
-        stop_loss=_translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
+        take_profit=translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
+        stop_loss=translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
         platform_order_id=platform_order_id,
         status=map_order_status(_required_string(entry, "orderStatus")),
         filled_quantity=_decimal(entry.get("cumExecQty") or "0", "cumExecQty"),
@@ -262,7 +262,12 @@ def is_final_order_status(status: OrderStatus) -> bool:
     return status in _FINAL_ORDER_STATUSES
 
 
-def _translate_tp_sl(trigger_raw: object, limit_raw: object) -> TpSlAttachment | None:
+def translate_tp_sl(trigger_raw: object, limit_raw: object) -> TpSlAttachment | None:
+    """Build a ``TpSlAttachment`` from a Bybit TP/SL trigger + optional limit.
+
+    Returns ``None`` when the trigger is unset (``None``/empty string) or zero
+    — the wire representation Bybit uses for "no stop on this side".
+    """
     if trigger_raw in _EMPTY:
         return None
     trigger = _decimal(trigger_raw, "takeProfit/stopLoss")
