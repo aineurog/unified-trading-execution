@@ -72,6 +72,21 @@ class OrderCancelledEvent(Event):
 
 
 @dataclass(frozen=True, slots=True)
+class OrderStatusEvent(Event):
+    """A live order's latest snapshot as reported by the platform.
+
+    Unlike :class:`OrderPlacedEvent` (first sighting) and
+    :class:`OrderCancelledEvent` (terminal cancel), this carries the full
+    current ``OrderRecord`` for an already-seen order that changed state on the
+    platform — e.g. ``OPEN`` → ``PARTIALLY_FILLED`` → ``FILLED`` — so the
+    engine's mirror can follow the order lifecycle (and drop a filled order
+    from the open set) without waiting for a reconciliation pass.
+    """
+
+    order: OrderRecord
+
+
+@dataclass(frozen=True, slots=True)
 class ReconciliationCompleteEvent(Event):
     mismatches: tuple[ReconciliationMismatch, ...]  # empty tuple = clean
 

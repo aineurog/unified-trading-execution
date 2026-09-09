@@ -43,6 +43,7 @@ from unified_trading_execution.events import (
     HaltClearedEvent,
     HaltEnteredEvent,
     HaltEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
     ReconciliationCompleteEvent,
     ReconciliationEvent,
@@ -197,6 +198,7 @@ class Engine:
 
         # Wire up state-mirror subscriptions
         self._event_bus.subscribe(FillEvent, self._on_fill)
+        self._event_bus.subscribe(OrderStatusEvent, self._on_order_status)
         self._event_bus.subscribe(PositionUpdateEvent, self._on_position_update)
         self._event_bus.subscribe(BalanceUpdateEvent, self._on_balance_update)
         self._event_bus.subscribe(ConnectionStateEvent, self._on_connection_state)
@@ -447,6 +449,13 @@ class Engine:
 
         self._known_order_ids.add(result.client_order_id)
         self._rate_limit_budget -= 1
+
+        # A synchronously-filled order's position leg can lag the fill on the
+        # WS by a beat; seed it now so a reconcile running in that gap cannot
+        # flag a phantom position mismatch (and enter a false instrument halt).
+        if result.filled_quantity > 0:
+            await self._seed_position_after_fill(order.instrument)
+
         return result
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
@@ -1190,6 +1199,9 @@ class Engine:
     def _on_fill(self, event: FillEvent) -> None:
         self._schedule(self._persist_fill(event))
 
+    def _on_order_status(self, event: OrderStatusEvent) -> None:
+        self._schedule(self._persist_order_status(event))
+
     def _on_position_update(self, event: PositionUpdateEvent) -> None:
         self._schedule(self._persist_position(event))
 
@@ -1264,6 +1276,19 @@ class Engine:
         except Exception:
             logger.exception("Failed to persist fill %s", event.event_id)
 
+    async def _persist_order_status(self, event: OrderStatusEvent) -> None:
+        order = event.order
+        try:
+            # The WS order carries only ``client_order_id``; preserve the richer
+            # dispatch-time ``correlation_id`` already stored for the order so a
+            # status update never overwrites the placing action's trace id.
+            existing = await self._store.get_order(order.client_order_id)
+            if existing is not None and existing.correlation_id:
+                order = replace(order, correlation_id=existing.correlation_id)
+            await self._store.upsert_order(order)
+        except Exception:
+            logger.exception("Failed to persist order status for %s", order.client_order_id)
+
     async def _persist_position(self, event: PositionUpdateEvent) -> None:
         try:
             position = event.position
@@ -1281,6 +1306,34 @@ class Engine:
             await self._store.upsert_balance(event.balance)
         except Exception:
             logger.exception("Failed to persist balance %s", event.event_id)
+
+    async def _seed_position_after_fill(self, instrument: Instrument) -> None:
+        """Seed the position leg right after a synchronously-filled order.
+
+        The WS ``position`` stream is the primary source of position truth, but
+        it can arrive a beat after a synchronous fill.  Pulling the platform's
+        own REST snapshot for the filled instrument closes that window for the
+        immediately-filled case, so a reconciliation running in the gap cannot
+        flag a phantom ``position_quantity`` mismatch (and enter a false
+        instrument halt).  Best-effort by design: a fetch or persist failure
+        must never fail the order placement that triggered it.
+        """
+        try:
+            positions = await self._adapter.fetch_positions()
+        except NotImplementedError:
+            return
+        except Exception:
+            logger.exception(
+                "Failed to fetch positions to seed after fill for %s", instrument.symbol
+            )
+            return
+        for position in positions:
+            if position.instrument != instrument:
+                continue
+            try:
+                await self._store.upsert_position(position)
+            except Exception:
+                logger.exception("Failed to seed position after fill for %s", instrument.symbol)
 
     # ── Internal: guards ───────────────────────────────────────────
 

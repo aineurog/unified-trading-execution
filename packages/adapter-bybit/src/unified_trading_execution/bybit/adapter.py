@@ -89,6 +89,7 @@ from unified_trading_execution.events import (
     HaltEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.state.halt import HaltStateMachine
@@ -1734,11 +1735,13 @@ class BybitAdapter(Adapter):
     def _on_order_message(self, message: dict[str, Any]) -> None:
         """Translate ``order`` stream entries into reconcile-safe order events.
 
-        Emits ``OrderPlacedEvent`` for a newly-seen order and
+        Emits ``OrderPlacedEvent`` for a newly-seen order,
         ``OrderCancelledEvent`` for a previously-seen order that reaches a
-        terminal cancelled state.  ``OrderModifiedEvent`` is deliberately not
-        emitted — the stream carries no ``previous`` state, so core's mirror
-        diffs updates instead (Section 6.1).
+        terminal cancelled state, and ``OrderStatusEvent`` for any other
+        status/fill change on a previously-seen order (e.g. ``OPEN`` →
+        ``PARTIALLY_FILLED`` → ``FILLED``) so the engine's mirror can follow
+        the platform's order lifecycle.  ``OrderModifiedEvent`` is deliberately
+        not emitted — the stream carries no ``previous`` state.
 
         Seen-order bookkeeping is bounded: ``_open_order_ids`` holds only live
         (non-final) orders and is pruned as they finalise, while
@@ -1779,9 +1782,12 @@ class BybitAdapter(Adapter):
                     continue
 
                 if platform_id in self._open_order_ids:
-                    # Previously-seen live order.  Emit a cancel only when it now
-                    # reaches a terminal cancelled state; a fill is final without
-                    # being a cancellation, so it emits no event of its own.
+                    # Previously-seen live order.  A terminal cancelled state
+                    # emits OrderCancelledEvent; every other change — including
+                    # OPEN → PARTIALLY_FILLED → FILLED — emits OrderStatusEvent
+                    # so the engine's mirror follows the platform (and a filled
+                    # order drops out of the open set).  FILLED is final for the
+                    # live set but is not a cancellation.
                     if is_terminal_order_status(order.status):
                         self._move_to_final(platform_id)
                         self._publish_from_ws(
@@ -1795,8 +1801,19 @@ class BybitAdapter(Adapter):
                                 instrument=instrument,
                             )
                         )
-                    elif is_final_order_status(order.status):
-                        self._move_to_final(platform_id)
+                    else:
+                        self._publish_from_ws(
+                            OrderStatusEvent(
+                                event_id=_new_id(),
+                                timestamp=_utcnow(),
+                                adapter_name=self.platform_name,
+                                account_id=self.account_id,
+                                correlation_id=order.client_order_id or None,
+                                order=order,
+                            )
+                        )
+                        if is_final_order_status(order.status):
+                            self._move_to_final(platform_id)
                     continue
 
                 # Brand-new order — first sighting.

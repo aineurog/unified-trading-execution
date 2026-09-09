@@ -23,6 +23,7 @@ from unified_trading_execution.events import (
     FillEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.types.enums import (
@@ -490,6 +491,66 @@ class TestStreamEmission:
         assert len(placed) == 1
         assert len(cancelled) == 1
         assert cancelled[0].client_order_id == "client-1"
+
+    def test_order_fill_emits_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        statuses: list[OrderStatusEvent] = []
+        cancelled: list[OrderCancelledEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+        event_bus.subscribe(OrderCancelledEvent, cancelled.append)
+
+        # First sighting → OrderPlacedEvent only.
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        assert len(placed) == 1
+        assert statuses == []
+
+        # OPEN → FILLED → OrderStatusEvent carrying the filled snapshot.
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="Filled", cumExecQty="0.5")]}
+        )
+        assert len(placed) == 1
+        assert len(statuses) == 1
+        assert statuses[0].order.status == OrderStatus.FILLED
+        assert statuses[0].order.filled_quantity == Decimal("0.5")
+        assert cancelled == []
+
+        # A terminal echo of FILLED must not re-emit a second status event.
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="Filled", cumExecQty="0.5")]}
+        )
+        assert len(statuses) == 1
+
+    def test_order_partial_fill_emits_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        statuses: list[OrderStatusEvent] = []
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="PartiallyFilled", cumExecQty="0.1")]}
+        )
+        assert len(statuses) == 1
+        assert statuses[0].order.status == OrderStatus.PARTIALLY_FILLED
+
+    def test_order_terminal_cancel_emits_no_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        statuses: list[OrderStatusEvent] = []
+        cancelled: list[OrderCancelledEvent] = []
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+        event_bus.subscribe(OrderCancelledEvent, cancelled.append)
+
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        adapter._on_order_message({"data": [_base_order_entry(orderStatus="Cancelled")]})
+        assert statuses == []
+        assert len(cancelled) == 1
 
     def test_order_skips_native_tp_sl_children(
         self, adapter: BybitAdapter, event_bus: EventBus

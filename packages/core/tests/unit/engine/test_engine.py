@@ -7,6 +7,7 @@ without hitting a real platform.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -696,6 +697,101 @@ class TestStateMirrorSubscriptions:
         stored = await engine.get_balance("USDT")
         assert stored is not None
         assert stored.total == Decimal("10000")
+
+    async def test_order_status_event_updates_store(self, engine, mock_adapter):
+        """A WS OrderStatusEvent (FILLED) must move the stored order to FILLED."""
+        result = await engine.place_order(_order(client_order_id="status-update"))
+        stored = await engine.state_store.get_order(result.client_order_id)
+        assert stored is not None
+        assert stored.status == OrderStatus.OPEN  # MockAdapter default
+
+        filled = replace(
+            stored,
+            status=OrderStatus.FILLED,
+            filled_quantity=stored.quantity,
+        )
+        mock_adapter.inject_order_status(filled)
+        await asyncio.sleep(0.01)
+
+        updated = await engine.state_store.get_order(result.client_order_id)
+        assert updated is not None
+        assert updated.status == OrderStatus.FILLED
+        assert updated.filled_quantity == stored.quantity
+
+    async def test_order_status_event_preserves_correlation_id(self, engine, mock_adapter):
+        """A WS order snapshot carries only client_order_id; the engine must not
+        overwrite the dispatch-time correlation_id already stored."""
+        result = await engine.place_order(_order(client_order_id="corr-preserve"))
+        stored = await engine.state_store.get_order(result.client_order_id)
+        assert stored is not None
+        original_corr = stored.correlation_id
+        assert original_corr
+
+        # Simulate the adapter's translation: correlation_id == client_order_id.
+        filled = replace(
+            stored,
+            status=OrderStatus.FILLED,
+            filled_quantity=stored.quantity,
+            correlation_id=stored.client_order_id,
+        )
+        mock_adapter.inject_order_status(filled)
+        await asyncio.sleep(0.01)
+
+        updated = await engine.state_store.get_order(result.client_order_id)
+        assert updated is not None
+        assert updated.status == OrderStatus.FILLED
+        assert updated.correlation_id == original_corr
+
+
+# ── position seed after fill ─────────────────────────────────────────
+
+
+class TestPositionSeedAfterFill:
+    async def test_seeds_position_after_filled_order(self, engine, mock_adapter):
+        """A synchronously-filled order must seed its position leg so a reconcile
+        in the WS gap cannot flag a phantom position mismatch."""
+        now = _utcnow()
+        result = OrderResult(
+            client_order_id="filled-order",
+            platform_order_id="mock-1",
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("1"),
+            average_fill_price=Decimal("50000"),
+            created_at=now,
+            updated_at=now,
+        )
+        mock_adapter.queue_place_order_response(result)
+        instrument = _instrument()
+        mock_adapter.seed_position(
+            Position(
+                instrument=instrument,
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=now,
+                position_id="0",
+            )
+        )
+
+        await engine.place_order(_order(client_order_id="filled-order", instrument=instrument))
+
+        stored = await engine.get_positions(instrument)
+        assert len(stored) == 1
+        assert stored[0].quantity == Decimal("1")
+
+    async def test_no_seed_when_order_not_filled(self, engine, mock_adapter):
+        """An unfilled (OPEN) order must not trigger a position fetch/seed."""
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=_utcnow(),
+                position_id="0",
+            )
+        )
+        result = await engine.place_order(_order(client_order_id="still-open"))
+        assert result.status == OrderStatus.OPEN
+        assert await engine.get_positions(_instrument()) == []
 
 
 # ── shutdown behaviour ───────────────────────────────────────────────
