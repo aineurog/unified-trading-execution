@@ -22,7 +22,14 @@ from typing import Any
 
 from unified_trading_execution.bybit.orders import map_order_status
 from unified_trading_execution.errors import PlatformError
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
@@ -48,6 +55,17 @@ _BYBIT_TO_TIME_IN_FORCE: dict[str, TimeInForce] = {
 # ``orderType``; a non-empty ``stopOrderType`` marks it as conditional.
 _EMPTY: frozenset[Any] = frozenset({None, ""})
 _UNKNOWN = "UNKNOWN"
+
+# Native TP/SL children (created by Bybit when a parent order carries
+# ``takeProfit``/``stopLoss``) report their origin in ``createType``.  A fill
+# from one of these is a reduce-only close — classify it so the store can tell
+# a TP/SL close apart from an ordinary user fill.
+_CREATE_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
+    "CreateByTakeProfit": FillReason.TAKE_PROFIT,
+    "CreateByPartialTakeProfit": FillReason.TAKE_PROFIT,
+    "CreateByStopLoss": FillReason.STOP_LOSS,
+    "CreateByPartialStopLoss": FillReason.STOP_LOSS,
+}
 
 # Terminal states that free the order from the live order set and may be
 # echoed by the exchange (Bybit can repeat a ``Filled`` status when a cancel
@@ -114,10 +132,14 @@ def translate_fill(
     instrument :
         The resolved canonical instrument for ``entry["symbol"]``.
     client_order_id :
-        The Bybit ``orderLinkId`` or an empty string when the order was placed
-        without a client id.  Used as the fill's ``correlation_id`` so a fill
-        remains attributable to the request that caused it.
+        The fill's store key — the Bybit ``orderLinkId`` for a user order, or a
+        synthesized ``bybit-tpsl-<orderId>`` for a native TP/SL child.  Used as
+        the fill's ``correlation_id`` so a fill remains attributable to the
+        request that caused it.
     """
+    create_type = entry.get("createType")
+    reason = _CREATE_TYPE_TO_FILL_REASON.get(create_type) if isinstance(create_type, str) else None
+    position_idx = entry.get("positionIdx")
     return FillRecord(
         client_order_id=client_order_id,
         platform_fill_id=_required_string(entry, "execId"),
@@ -128,6 +150,9 @@ def translate_fill(
         fee_currency=_optional_string(entry, "feeCurrency"),
         fee_amount=_parse_fee(entry.get("execFee")),
         correlation_id=client_order_id,
+        position_id=str(position_idx) if position_idx not in _EMPTY else None,
+        reason=reason,
+        entry=FillEntry.OUT if reason is not None else None,
     )
 
 

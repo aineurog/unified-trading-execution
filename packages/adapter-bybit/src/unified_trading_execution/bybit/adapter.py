@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
@@ -135,6 +136,39 @@ _TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
         "CreateByPartialTakeProfit",
     }
 )
+
+
+def _api_key_identity(api_key: str) -> str:
+    """A stable, per-key placeholder identity (sha256 prefix) for ``account_id``.
+
+    Used only as a last-resort value before the real Bybit ``userID`` has been
+    resolved — never the empty string, and never a constant shared across
+    accounts, so two keys can never silently collapse onto one store path.
+    """
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return f"bybit-{digest}"
+
+
+def _execution_client_key(entry: dict[str, Any]) -> str | None:
+    """Return the fill key for one ``execution`` entry, or ``None`` to skip it.
+
+    User orders carry an ``orderLinkId``; native TP/SL children (and any order
+    placed without a client id) carry an empty ``orderLinkId`` and are keyed by
+    the platform ``orderId`` instead — prefixed for TP/SL children so their
+    closing fills are self-describing in the store.  An entry with neither id
+    cannot be attributed and is skipped.
+    """
+    link = entry.get("orderLinkId") or ""
+    if link:
+        return link
+    order_id = entry.get("orderId") or ""
+    if not order_id:
+        return None
+    if entry.get("createType") in _TP_SL_CREATE_TYPES:
+        return f"bybit-tpsl-{order_id}"
+    return order_id
+
+
 _LEVERAGE_KIND_PREFIX = "leverage."
 _POSITION_MODE_KIND_PREFIX = "position_mode."
 # Per-instrument leverage behavior knobs, stored flat (one key per knob under
@@ -1280,28 +1314,41 @@ class BybitAdapter(Adapter):
 
     @property
     def account_id(self) -> str:
-        return self._config.account_id
+        """The account identity as it is currently known.
 
-    async def resolve_account_id(self) -> str:
-        """Resolve the canonical platform account identity (the Bybit ``uid``).
-
-        The configured ``account_id`` is a user label, not a platform identity,
-        so two Bybit accounts configured with the same label would collide on
-        one state-store path.  This fetches the real ``uid`` from
-        ``GET /v5/account/info`` and caches it for the adapter lifetime.  It
-        degrades to the configured label rather than raising when the ``uid``
-        is unavailable (e.g. a mock without the field, or a transient error).
+        Prefers the resolved platform ``userID``, then an explicit configured
+        label, then a stable per-key placeholder — never a shared constant, so
+        two accounts can never collide on one store path even before resolution.
         """
         if self._resolved_account_id is not None:
             return self._resolved_account_id
-        try:
-            data, _ = await self._run_request(self._session.get_account_info, read=True)
-            uid = (data.get("result") or {}).get("uid")
-            if uid is not None:
-                self._resolved_account_id = str(uid)
-        except Exception:
-            logger.warning("Could not resolve Bybit account uid; using configured account_id")
-        return self._resolved_account_id or self._config.account_id
+        if self._config.account_id:
+            return self._config.account_id
+        return _api_key_identity(self._config.api_key)
+
+    async def resolve_account_id(self) -> str:
+        """Resolve the canonical platform account identity (the Bybit ``userID``).
+
+        An explicit configured ``account_id`` wins unchanged.  Otherwise the
+        real ``userID`` is fetched from ``GET /v5/user/query-api`` (the API key
+        is bound to exactly one account) and cached for the adapter lifetime.
+        A missing ``userID`` raises ``PlatformConnectionError`` rather than
+        silently falling back to a shared constant — two accounts must never
+        collapse onto one state-store path.
+        """
+        if self._resolved_account_id is not None:
+            return self._resolved_account_id
+        if self._config.account_id:
+            self._resolved_account_id = self._config.account_id
+            return self._resolved_account_id
+        data, _ = await self._run_request(self._session.get_api_key_information, read=True)
+        user_id = (data.get("result") or {}).get("userID")
+        if user_id is None or user_id == "":
+            raise PlatformConnectionError(
+                "Bybit /v5/user/query-api returned no userID; cannot resolve account identity"
+            )
+        self._resolved_account_id = str(user_id)
+        return self._resolved_account_id
 
     # ---- Connection lifecycle ----
 
@@ -1780,11 +1827,9 @@ class BybitAdapter(Adapter):
         for entry in message.get("data") or []:
             if entry.get("execType") != "Trade":
                 continue
-            client_order_id = entry.get("orderLinkId") or ""
-            if not client_order_id:
-                # Native TP/SL child fills (and any execution placed without a
-                # client id) carry an empty orderLinkId; mirror fetch_fills and
-                # skip them so the WS mirror and REST snapshot stay symmetric.
+            client_order_id = _execution_client_key(entry)
+            if client_order_id is None:
+                logger.error("Skipping Bybit execution stream entry with no order id: %s", entry)
                 continue
             try:
                 instrument = self._resolve_instrument(
@@ -2461,9 +2506,11 @@ class BybitAdapter(Adapter):
 
         Only ``Trade`` executions are returned — the WebSocket ``execution``
         stream reports real trades and excludes funding/adl/bust events, so
-        filtering here keeps REST and WS views identical.  Executions without
-        an ``orderLinkId`` cannot be attributed in core and are skipped with
-        a log.
+        filtering here keeps REST and WS views identical.  User orders are
+        keyed by ``orderLinkId``; native TP/SL child fills (empty ``orderLinkId``)
+        are keyed by ``bybit-tpsl-<orderId>`` and classified with their TP/SL
+        reason, so a triggered take-profit/stop-loss is still recorded.  An
+        execution with neither id cannot be attributed and is skipped with a log.
 
         *since* is an optional lower bound (aware UTC).  It is pushed down to
         Bybit's ``startTime`` parameter so the API does the heavy filtering
@@ -2480,9 +2527,9 @@ class BybitAdapter(Adapter):
             async for entry in self._paged_results(self._session.get_executions, category, **extra):
                 if entry.get("execType") != "Trade":
                     continue
-                client_order_id = entry.get("orderLinkId") or ""
-                if not client_order_id:
-                    logger.error("Skipping Bybit execution without orderLinkId: %s", entry)
+                client_order_id = _execution_client_key(entry)
+                if client_order_id is None:
+                    logger.error("Skipping Bybit execution with no order id: %s", entry)
                     continue
                 try:
                     instrument = self._resolve_instrument(entry.get("symbol") or "", category)

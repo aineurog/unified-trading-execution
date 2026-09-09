@@ -12,7 +12,7 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.symbols import from_bybit_symbol
 from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError
-from unified_trading_execution.types.enums import OrderStatus
+from unified_trading_execution.types.enums import FillEntry, FillReason, OrderStatus
 from unified_trading_execution.types.instrument import Instrument
 
 _EMPTY: tuple[dict[str, Any], None, dict[str, str]] = ({"result": {"list": []}}, None, {})
@@ -332,6 +332,42 @@ class TestFetchFills:
         fills = result["client-1"]
         assert len(fills) == 2
         assert sum(f.fill_quantity for f in fills) == Decimal("0.5")
+
+    async def test_native_tp_sl_fill_recorded(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        mock_pybit_http.get_executions.side_effect = [
+            _EMPTY,
+            (
+                {
+                    "result": {
+                        "list": [
+                            _execution(
+                                orderLinkId="",
+                                orderId="cffa-child",
+                                createType="CreateByTakeProfit",
+                            ),
+                        ],
+                        "nextPageCursor": "",
+                    }
+                },
+                None,
+                {},
+            ),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_fills()
+
+        # A triggered TP/SL child is a real closing fill — recorded under a
+        # synthesized key (not dropped for lack of a client order id).
+        assert set(result) == {"bybit-tpsl-cffa-child"}
+        fill = result["bybit-tpsl-cffa-child"][0]
+        assert fill.reason == FillReason.TAKE_PROFIT
+        assert fill.entry == FillEntry.OUT
 
 
 class TestErrorTranslation:

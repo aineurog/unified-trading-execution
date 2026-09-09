@@ -41,7 +41,7 @@ class TestConnect:
         event = events[0]
         assert event.connected is True
         assert event.adapter_name == "bybit"
-        assert event.account_id == "bybit-account"
+        assert event.account_id == adapter.account_id
         assert event.correlation_id is None
         assert isinstance(event.event_id, str) and event.event_id
         assert event.timestamp.tzinfo is not None

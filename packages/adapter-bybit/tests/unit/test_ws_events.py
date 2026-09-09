@@ -25,7 +25,14 @@ from unified_trading_execution.events import (
     OrderPlacedEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 
 
 class _SyncLoop:
@@ -86,6 +93,58 @@ class TestStreamsTranslation:
         assert fill.fee_currency == "USDT"
         assert fill.fee_amount == Decimal("26.37")
         assert fill.correlation_id == "client-1"
+
+    def test_translate_fill_classifies_native_tp_sl(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-1",
+                "orderLinkId": "",
+                "orderId": "cffa-child",
+                "createType": "CreateByTakeProfit",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="bybit-tpsl-cffa-child",
+        )
+        assert fill.reason == FillReason.TAKE_PROFIT
+        assert fill.entry == FillEntry.OUT
+
+    def test_translate_fill_stop_loss_reason(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-2",
+                "orderLinkId": "",
+                "orderId": "cffa-child",
+                "createType": "CreateByStopLoss",
+                "execQty": "1",
+                "execPrice": "95000",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="bybit-tpsl-cffa-child",
+        )
+        assert fill.reason == FillReason.STOP_LOSS
+        assert fill.entry == FillEntry.OUT
+
+    def test_translate_fill_plain_fill_is_unclassified(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-3",
+                "orderLinkId": "client-1",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="client-1",
+        )
+        assert fill.reason is None
+        assert fill.entry is None
 
     def test_translate_position_long(self) -> None:
         pos = streams.translate_position(
@@ -314,7 +373,7 @@ class TestStreamEmission:
         )
         assert len(captured) == 1
 
-    def test_execution_skips_empty_order_link_id(
+    def test_execution_skips_entry_without_order_id(
         self, adapter: BybitAdapter, event_bus: EventBus
     ) -> None:
         adapter = self._wired_adapter(adapter)
@@ -336,10 +395,41 @@ class TestStreamEmission:
                 ]
             }
         )
-        # A native TP/SL child fill carries no orderLinkId; it must not enter
-        # the fill mirror (fetch_fills skips the same executions), otherwise the
-        # WS/REST snapshots diverge into a permanent partial_fill discrepancy.
+        # A Trade with neither orderLinkId nor orderId cannot be attributed to
+        # any order — it is skipped (never collapsed onto an empty key).
         assert captured == []
+
+    def test_execution_records_native_tp_sl_fill(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "orderId": "cffa-child",
+                        "createType": "CreateByStopLoss",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # A triggered TP/SL child is a real closing fill — it must be recorded
+        # (keyed by the platform order id) with its SL/TP reason, not dropped.
+        assert len(captured) == 1
+        assert captured[0].correlation_id == "bybit-tpsl-cffa-child"
+        assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-child"
+        assert captured[0].fill.reason == FillReason.STOP_LOSS
+        assert captured[0].fill.entry == FillEntry.OUT
 
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
