@@ -21,6 +21,7 @@ from decimal import Decimal
 from typing import Any
 
 from unified_trading_execution.bybit.orders import map_order_status
+from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.types.enums import (
     FillEntry,
@@ -161,8 +162,8 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
 
     ``quantity`` follows the core convention: positive = long (``Buy``),
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
-    ``position_id`` is the Bybit ``positionIdx`` (0 = one-way, 1/2 = hedge
-    side), scoped to the instrument.
+    ``position_id`` is ``{venue_symbol}:{positionIdx}`` (e.g. ``BTCUSDT:0``)
+    — ``positionIdx`` alone collides across symbols (BTCUSDT 0 vs BTCUSD 0).
     """
     side = entry.get("side")
     size = _decimal(entry.get("size"), "size")
@@ -173,12 +174,16 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
     else:
         quantity = Decimal("0")
 
+    idx = str(entry.get("positionIdx", 0))
+
+    venue_symbol = to_bybit_symbol(instrument)
+    position_id = f"{venue_symbol}:{idx}"
     return Position(
         instrument=instrument,
         quantity=quantity,
         average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
-        position_id=str(entry.get("positionIdx", 0)),
+        position_id=position_id,
     )
 
 
