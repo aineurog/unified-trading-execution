@@ -118,9 +118,9 @@ class TestFetchPositions:
         assert len(result) == 2
         by_symbol = {p.instrument.symbol: p for p in result}
         assert by_symbol["BTC"].quantity == Decimal("1.5")
-        assert by_symbol["BTC"].position_id == "0"
+        assert by_symbol["BTC"].position_id == "BTCUSDT:0"
         assert by_symbol["ETH"].quantity == Decimal("-2")
-        assert by_symbol["ETH"].position_id == "0"
+        assert by_symbol["ETH"].position_id == "ETHUSDT:0"
 
     async def test_paginates_across_cursor(
         self,

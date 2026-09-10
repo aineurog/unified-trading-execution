@@ -22,7 +22,11 @@ from datetime import datetime
 from decimal import Decimal
 
 from unified_trading_execution.adapter import RateLimits
-from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
+from unified_trading_execution.engine import (
+    DEFAULT_FILL_SETTLE_LAG_SECONDS,
+    DEFAULT_RECONCILE_INTERVAL_SECONDS,
+    Engine,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5.adapter import MT5Adapter
 from unified_trading_execution.mt5.config import MT5Config
@@ -57,6 +61,7 @@ class MT5Engine(Engine):
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
         adapter = config if isinstance(config, MT5Adapter) else MT5Adapter(config)
         super().__init__(
@@ -67,6 +72,7 @@ class MT5Engine(Engine):
             risk_config=risk_config,
             halt_config=halt_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
+            fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
 
     # ── Position TP/SL modification ───────────────────────────────────

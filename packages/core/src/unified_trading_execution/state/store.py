@@ -138,7 +138,11 @@ class StateStore(ABC):
     async def delete_orders_by_client_ids(self, client_order_ids: list[str]) -> None: ...
     @abstractmethod
     async def delete_fills_by_client_ids(
-        self, client_order_ids: list[str], *, since: datetime | None = None
+        self,
+        client_order_ids: list[str],
+        *,
+        since: datetime | None = None,
+        end: datetime | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -720,26 +724,32 @@ class SQLiteStateStore(StateStore):
                 )
 
     async def delete_fills_by_client_ids(
-        self, client_order_ids: list[str], *, since: datetime | None = None
+        self,
+        client_order_ids: list[str],
+        *,
+        since: datetime | None = None,
+        end: datetime | None = None,
     ) -> None:
         """Delete fill rows by client id, holding the write lock.
 
-        When *since* is given, only fills with ``fill_timestamp >= since`` are
-        removed, so reconciliation can correct a window of fills without
-        disturbing pre-watermark history.
+        ``since`` and ``end`` bound the ``fill_timestamp`` window removed, so
+        reconciliation can correct a slice of fills without disturbing
+        pre-watermark history (``since``) or a still-in-flight tail (``end``).
         """
         async with self._write_lock:
             for client_order_id in client_order_ids:
-                if since is None:
-                    await self.conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ?",
-                        (client_order_id,),
-                    )
-                else:
-                    await self.conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ? AND fill_timestamp >= ?",
-                        (client_order_id, since.isoformat()),
-                    )
+                conditions = ["client_order_id = ?"]
+                params: list[Any] = [client_order_id]
+                if since is not None:
+                    conditions.append("fill_timestamp >= ?")
+                    params.append(since.isoformat())
+                if end is not None:
+                    conditions.append("fill_timestamp <= ?")
+                    params.append(end.isoformat())
+                await self.conn.execute(
+                    f"DELETE FROM fills WHERE {' AND '.join(conditions)}",
+                    params,
+                )
 
     # ---- Audit trail (append-only) ----
 

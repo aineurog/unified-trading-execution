@@ -21,7 +21,11 @@ from decimal import Decimal
 from typing import Any, Literal, TypeVar
 
 from unified_trading_execution.adapter import Adapter
-from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
+from unified_trading_execution.engine import (
+    DEFAULT_FILL_SETTLE_LAG_SECONDS,
+    DEFAULT_RECONCILE_INTERVAL_SECONDS,
+    Engine,
+)
 from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import EventBus, HaltEvent, ReconciliationEvent
 from unified_trading_execution.risk import RiskConfig
@@ -76,6 +80,7 @@ class SyncEngine:
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
         self._async_engine = Engine(
             adapter=adapter,
@@ -85,6 +90,7 @@ class SyncEngine:
             risk_config=risk_config,
             halt_config=halt_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
+            fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None

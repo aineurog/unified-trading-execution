@@ -502,6 +502,56 @@ class TestDeleteFillsSince:
         assert len(remaining) == 1
         assert remaining[0].platform_fill_id == "fill-old"
 
+    @pytest.mark.asyncio
+    async def test_delete_with_end_preserves_newer_fills(self, store):
+        from datetime import timedelta
+
+        # Three fills spanning the window: old / mid / new.
+        old = FillRecord(
+            client_order_id="abc",
+            platform_fill_id="fill-old",
+            instrument=make_inst(),
+            fill_quantity=Decimal("0.1"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW - timedelta(hours=1),
+            fee_currency="USDT",
+            fee_amount=Decimal("0.05"),
+            correlation_id="corr-old",
+        )
+        mid = FillRecord(
+            client_order_id="abc",
+            platform_fill_id="fill-mid",
+            instrument=make_inst(),
+            fill_quantity=Decimal("0.2"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW - timedelta(minutes=30),
+            fee_currency="USDT",
+            fee_amount=Decimal("0.05"),
+            correlation_id="corr-mid",
+        )
+        new = FillRecord(
+            client_order_id="abc",
+            platform_fill_id="fill-new",
+            instrument=make_inst(),
+            fill_quantity=Decimal("0.3"),
+            fill_price=Decimal("50000"),
+            fill_timestamp=NOW,
+            fee_currency="USDT",
+            fee_amount=Decimal("0.05"),
+            correlation_id="corr-new",
+        )
+        for fill in (old, mid, new):
+            await store.upsert_fill(fill)
+
+        # Delete only the middle slice: within [since, end].  Old is below the
+        # window and new is above it — both must survive.
+        await store.delete_fills_by_client_ids(
+            ["abc"], since=NOW - timedelta(minutes=45), end=NOW - timedelta(minutes=15)
+        )
+
+        remaining = await store.query_fills()
+        assert {f.platform_fill_id for f in remaining} == {"fill-old", "fill-new"}
+
 
 # ============================================================
 # SQLiteStateStore — audit events

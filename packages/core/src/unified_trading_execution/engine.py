@@ -20,7 +20,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -74,6 +74,14 @@ logger = logging.getLogger(__name__)
 # ``reconcile_interval_seconds=None`` to disable it entirely.
 DEFAULT_RECONCILE_INTERVAL_SECONDS: float = 30.0
 
+# Default fill settle lag: the leading edge of the reconciliation fill window
+# (in seconds) that is left un-compared, because an execution-stream event can
+# land a beat after the REST snapshot already sees the fill.  Comparing that
+# still-in-flight tail would flag a phantom ``partial_fill`` for an
+# immediately-filled order or its native TP/SL child.  Pass
+# ``fill_settle_lag_seconds=0`` to compare fills up to "now" (no settle window).
+DEFAULT_FILL_SETTLE_LAG_SECONDS: float = 5.0
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -106,6 +114,7 @@ class _ReconcileContext:
     apply phase so resolution never re-fetches per mismatch."""
 
     window_start: datetime
+    fill_compare_end: datetime
     local_positions: list[Position]
     local_balances: dict[str, Balance]
     local_fills: dict[str, list[FillRecord]]
@@ -153,6 +162,7 @@ class Engine:
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
         self._adapter = adapter
         # Section 6.2: the state store is resolved at connect time.  When the
@@ -187,6 +197,11 @@ class Engine:
                 f"reconcile_interval_seconds must be > 0 or None, got {reconcile_interval_seconds}"
             )
         self._reconcile_interval_seconds = reconcile_interval_seconds
+        if fill_settle_lag_seconds < 0:
+            raise ValueError(
+                f"fill_settle_lag_seconds must be >= 0, got {fill_settle_lag_seconds}"
+            )
+        self._fill_settle_lag_seconds = fill_settle_lag_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
         # Serialises manual / reconnect / periodic reconciles so they never
         # run concurrently and never mutate the mirror at the same time.
@@ -549,17 +564,28 @@ class Engine:
         # bootstrap — on the first pass there is no persisted watermark, so we
         # treat "now" as the clean point and compare only fills newer than it.
         # Positions/balances/open-orders are always full current snapshots.
+        now = _utcnow()
         watermark = await self._store.get_reconcile_watermark()
         if watermark is None:
-            watermark = _utcnow()
+            watermark = now
         window_start = watermark
+
+        # Fill settle lag: the execution stream can land a fill a beat after
+        # the REST snapshot already sees it.  Compare only fills older than
+        # ``fill_compare_end`` so a still-in-flight fill is never flagged as a
+        # phantom ``partial_fill`` (and its WS event, when it lands, reconciles
+        # cleanly next pass).  With a lag of 0 the boundary degenerates to
+        # ``now`` — fills are compared up to the pass start.
+        fill_compare_end = now - timedelta(seconds=self._fill_settle_lag_seconds)
 
         # -- 1. Gather local state --
         local_positions = await self._gather_local_positions()
         local_balances = await self._gather_local_balances()
         local_orders_list = await self._store.query_open_orders(limit=100_000)
         local_orders = {o.client_order_id: o for o in local_orders_list}
-        local_fills_list = await self._store.query_fills(limit=100_000, start=window_start)
+        local_fills_list = await self._store.query_fills(
+            limit=100_000, start=window_start, end=fill_compare_end
+        )
         local_fills: dict[str, list[FillRecord]] = {}
         for f in local_fills_list:
             local_fills.setdefault(f.client_order_id, []).append(f)
@@ -569,6 +595,15 @@ class Engine:
         platform_balances = await self._fetch_platform_balances()
         platform_orders = await self._fetch_platform_orders()
         platform_fills = await self._fetch_platform_fills(since=window_start)
+        if platform_fills is not None:
+            # Bound the platform side to the same settle boundary as the local
+            # side so both snapshots cover the identical window.
+            settled_fills: dict[str, list[FillRecord]] = {}
+            for cid, fills in platform_fills.items():
+                kept = [f for f in fills if f.fill_timestamp <= fill_compare_end]
+                if kept:
+                    settled_fills[cid] = kept
+            platform_fills = settled_fills
 
         # -- 3. Detect mismatches --
         result = reconcile(
@@ -587,6 +622,7 @@ class Engine:
         # -- 4. Apply resolution using the already-fetched snapshots --
         context = _ReconcileContext(
             window_start=window_start,
+            fill_compare_end=fill_compare_end,
             local_positions=local_positions,
             local_balances=local_balances,
             local_fills=local_fills,
@@ -598,8 +634,10 @@ class Engine:
         await self._apply_reconciliation_result(result, context)
 
         # -- 5. Advance watermark only on a clean pass --
+        # The watermark trails ``now`` by the settle lag, so the trailing
+        # in-flight tail is re-checked next pass once its WS event has landed.
         if result.is_clean:
-            await self._store.set_reconcile_watermark(_utcnow())
+            await self._store.set_reconcile_watermark(fill_compare_end)
 
         # -- 6. Publish + audit --
         corr_id = _new_id()
@@ -763,7 +801,7 @@ class Engine:
             for cid in _fill_discrepant_order_ids(context.local_fills, context.platform_fills):
                 try:
                     await self._store.delete_fills_by_client_ids(
-                        [cid], since=context.window_start
+                        [cid], since=context.window_start, end=context.fill_compare_end
                     )
                     for fill in context.platform_fills.get(cid, []):
                         fill = await self._stamp_fill_correlation(fill)
