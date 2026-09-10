@@ -176,7 +176,8 @@ class SyncBybitEngine(SyncEngine):
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
-        """Modify TP/SL on an open Bybit position (``position_id`` = ``positionIdx``)."""
+        """Modify TP/SL on an open Bybit position (``position_id`` = ``positionIdx``
+        or the composite ``"{venue_symbol}:{idx}"`` from ``fetch_positions``)."""
         self._run(
             self._adapter.modify_position_tpsl(
                 instrument,

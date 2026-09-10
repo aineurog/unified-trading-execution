@@ -1192,3 +1192,126 @@ class TestGetPositionTpSl:
     ) -> None:
         with pytest.raises(ValueError):
             await adapter.get_position_tpsl(_futures_instrument(), "not-an-int")
+
+    async def test_composite_position_id_reads_tp_sl(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {
+                "result": {
+                    "list": [
+                        {
+                            "positionIdx": 0,
+                            "takeProfit": "120000",
+                            "tpLimitPrice": "",
+                            "stopLoss": "90000",
+                            "slLimitPrice": "",
+                        }
+                    ]
+                }
+            },
+            None,
+            {},
+        )
+
+        result = await adapter.get_position_tpsl(_futures_instrument(), "BTCUSDT:0")
+
+        assert result is not None
+        take_profit, stop_loss = result
+        assert take_profit is not None
+        assert take_profit.trigger_price == Decimal("120000")
+        assert stop_loss is not None
+        assert stop_loss.trigger_price == Decimal("90000")
+
+    async def test_mismatched_venue_symbol_raises(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        with pytest.raises(ValueError, match="venue symbol does not match"):
+            await adapter.get_position_tpsl(_futures_instrument(), "ETHUSDT:0")
+        mock_pybit_http.get_positions.assert_not_called()
+
+
+class TestModifyPositionTpSl:
+    async def test_composite_position_id_builds_payload(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = (
+            {"retCode": 0, "retMsg": "OK", "result": {}},
+            None,
+            {},
+        )
+        tp = TpSlAttachment(trigger_price=Decimal("120000"))
+
+        await adapter.modify_position_tpsl(_futures_instrument(), "BTCUSDT:0", take_profit=tp)
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=0,
+            tpslMode="Full",
+            takeProfit="120000",
+            tpOrderType="Market",
+        )
+
+    async def test_bare_position_idx_still_works(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = (
+            {"retCode": 0, "retMsg": "OK", "result": {}},
+            None,
+            {},
+        )
+        sl = TpSlAttachment(trigger_price=Decimal("90000"))
+
+        await adapter.modify_position_tpsl(_futures_instrument(), "1", stop_loss=sl)
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=1,
+            tpslMode="Full",
+            stopLoss="90000",
+            slOrderType="Market",
+        )
+
+    async def test_mismatched_venue_symbol_raises(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        tp = TpSlAttachment(trigger_price=Decimal("120000"))
+        with pytest.raises(ValueError, match="venue symbol does not match"):
+            await adapter.modify_position_tpsl(
+                _futures_instrument(), "ETHUSDT:0", take_profit=tp
+            )
+        mock_pybit_http.set_trading_stop.assert_not_called()
+
+    async def test_non_numeric_idx_raises(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        tp = TpSlAttachment(trigger_price=Decimal("120000"))
+        with pytest.raises(ValueError):
+            await adapter.modify_position_tpsl(
+                _futures_instrument(), "BTCUSDT:not-an-int", take_profit=tp
+            )
+        mock_pybit_http.set_trading_stop.assert_not_called()
+
+    async def test_spot_raises(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        tp = TpSlAttachment(trigger_price=Decimal("120000"))
+        with pytest.raises(UnsupportedOrderTypeError):
+            await adapter.modify_position_tpsl(_spot_instrument(), "0", take_profit=tp)
+        mock_pybit_http.set_trading_stop.assert_not_called()

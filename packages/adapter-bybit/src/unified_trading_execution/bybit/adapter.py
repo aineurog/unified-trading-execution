@@ -2012,6 +2012,32 @@ class BybitAdapter(Adapter):
 
     # ---- Position TP/SL modification ----
 
+    @staticmethod
+    def _parse_position_idx(instrument: Instrument, position_id: str) -> int:
+        """Resolve a Bybit ``positionIdx`` integer from a ``position_id``.
+
+        Accepts either the bare ``positionIdx`` (``"0"`` one-way, ``"1"``/
+        ``"2"`` hedge long/short) or the composite ``"{venue_symbol}:{idx}"``
+        form produced by ``translate_position`` (e.g. ``"BTCUSDT:0"``).  When
+        the composite form is used its venue symbol must match *instrument*; a
+        mismatch is a caller error rather than a silent mis-target.
+        """
+        symbol = to_bybit_symbol(instrument)
+        if position_id.startswith(f"{symbol}:"):
+            idx = position_id[len(symbol) + 1 :]
+        elif ":" in position_id:
+            raise ValueError(
+                f"position_id venue symbol does not match instrument {symbol}: {position_id!r}"
+            )
+        else:
+            idx = position_id
+        try:
+            return int(idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"position_id must be a Bybit positionIdx or '{symbol}:<idx>', got {position_id!r}"
+            ) from exc
+
     async def modify_position_tpsl(
         self,
         instrument: Instrument,
@@ -2022,10 +2048,11 @@ class BybitAdapter(Adapter):
     ) -> None:
         """Modify TP/SL on an open position via ``set_trading_stop``.
 
-        *position_id* is the Bybit ``positionIdx`` (``"0"`` one-way, ``"1"``/
-        ``"2"`` hedge long/short), scoped by *instrument* — Bybit reuses the
-        same ``positionIdx`` across every symbol, so *instrument* is required
-        to address the correct leg.
+        *position_id* is either the Bybit ``positionIdx`` (``"0"`` one-way,
+        ``"1"``/``"2"`` hedge long/short) or the composite
+        ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
+        ``translate_position`` — Bybit reuses the same ``positionIdx`` across
+        every symbol, so *instrument* is required to address the correct leg.
 
         Spot has no position concept on Bybit, so this raises
         ``UnsupportedOrderTypeError`` for spot instruments.
@@ -2039,12 +2066,7 @@ class BybitAdapter(Adapter):
                 "position TP/SL modification is not supported for spot on Bybit"
             )
 
-        try:
-            position_idx = int(position_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"position_id must be a Bybit positionIdx integer string, got {position_id!r}"
-            ) from exc
+        position_idx = self._parse_position_idx(instrument, position_id)
 
         payload = build_set_trading_stop_payload(
             category=category,
@@ -2062,9 +2084,10 @@ class BybitAdapter(Adapter):
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
         """Read the current TP/SL on an open position as ``(take_profit, stop_loss)``.
 
-        *position_id* is the Bybit ``positionIdx`` (``"0"`` one-way, ``"1"``/
-        ``"2"`` hedge long/short), scoped by *instrument* — mirroring
-        ``modify_position_tpsl``.
+        *position_id* is either the Bybit ``positionIdx`` (``"0"`` one-way,
+        ``"1"``/``"2"`` hedge long/short) or the composite
+        ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
+        ``translate_position`` — mirroring ``modify_position_tpsl``.
 
         Returns ``None`` when there is no open position at that ``positionIdx``
         (flat/closed) or for spot.  Each element is ``None`` when that side has
@@ -2074,12 +2097,7 @@ class BybitAdapter(Adapter):
         if category == "spot":
             return None
 
-        try:
-            position_idx = int(position_id)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"position_id must be a Bybit positionIdx integer string, got {position_id!r}"
-            ) from exc
+        position_idx = self._parse_position_idx(instrument, position_id)
 
         data, _ = await self._run_request(
             self._session.get_positions,
