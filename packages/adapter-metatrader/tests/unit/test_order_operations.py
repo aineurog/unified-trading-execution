@@ -729,6 +729,7 @@ class TestModifyPositionTpsl:
 
         request = _request(mock_mt5_module)
         assert request["action"] == mock_mt5_module.TRADE_ACTION_SLTP
+        assert request["symbol"] == "EURUSD.m"
         assert request["position"] == 789
         assert request["tp"] == 1.3
         assert request["sl"] == 1.0
@@ -744,6 +745,7 @@ class TestModifyPositionTpsl:
         )
 
         request = _request(mock_mt5_module)
+        assert request["symbol"] == "EURUSD.m"
         assert request["sl"] == 1.0
         assert "tp" not in request
 
@@ -766,3 +768,53 @@ class TestModifyPositionTpsl:
         """modify_position_tpsl with neither level raises ValueError."""
         with pytest.raises(ValueError):
             await adapter.modify_position_tpsl(_instrument(), "789")
+
+
+class TestGetPositionTpSl:
+    """get_position_tpsl — read-back via positions_get(ticket=...)."""
+
+    async def test_reads_tp_sl(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.positions_get.return_value = (
+            SimpleNamespace(ticket=789, tp=1.3, sl=1.0),
+        )
+
+        result = await adapter.get_position_tpsl(_instrument(), "789")
+
+        assert result is not None
+        take_profit, stop_loss = result
+        assert take_profit is not None
+        assert take_profit.trigger_price == Decimal("1.3")
+        assert take_profit.limit_price is None
+        assert stop_loss is not None
+        assert stop_loss.trigger_price == Decimal("1.0")
+        mock_mt5_module.positions_get.assert_called_once_with(ticket=789)
+
+    async def test_returns_none_none_when_unset(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.positions_get.return_value = (
+            SimpleNamespace(ticket=789, tp=0.0, sl=0.0),
+        )
+
+        result = await adapter.get_position_tpsl(_instrument(), "789")
+
+        assert result == (None, None)
+
+    async def test_returns_none_when_flat(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.positions_get.return_value = ()
+
+        result = await adapter.get_position_tpsl(_instrument(), "789")
+
+        assert result is None
+
+    async def test_positions_get_none_raises(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.positions_get.return_value = None
+
+        with pytest.raises(PlatformError):
+            await adapter.get_position_tpsl(_instrument(), "789")

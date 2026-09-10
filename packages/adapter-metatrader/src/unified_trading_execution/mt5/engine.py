@@ -87,9 +87,9 @@ class MT5Engine(Engine):
     ) -> None:
         """Modify TP/SL on an existing position via ``TRADE_ACTION_SLTP``.
 
-        *position_id* is the MT5 position ticket (globally unique, so
-        *instrument* is accepted but unused). At least one of *take_profit*
-        or *stop_loss* must be provided.
+        *position_id* is the MT5 position ticket; *instrument* resolves the
+        broker symbol the terminal requires alongside the ticket.  At least
+        one of *take_profit* or *stop_loss* must be provided.
         """
         await self._adapter.modify_position_tpsl(
             instrument,
@@ -97,6 +97,14 @@ class MT5Engine(Engine):
             take_profit=take_profit,
             stop_loss=stop_loss,
         )
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an MT5 position as ``(take_profit, stop_loss)``."""
+        return await self._adapter.get_position_tpsl(instrument, position_id)
 
     # ── Snapshots / reads ─────────────────────────────────────────────
 

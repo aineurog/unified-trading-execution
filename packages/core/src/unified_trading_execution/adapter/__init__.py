@@ -201,6 +201,23 @@ class Adapter(ABC):
             f"{self.platform_name} does not support modifying TP/SL on open positions"
         )
 
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an existing open position.
+
+        Optional — raises ``NotImplementedError`` by default.  Returns
+        ``(take_profit, stop_loss)`` where each element is ``None`` when that
+        side has no stop set, or ``None`` when there is no open position at
+        *position_id*.  ``position_id`` and *instrument* follow the same
+        conventions as :meth:`modify_position_tpsl`.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support reading TP/SL on open positions"
+        )
+
     # ---- Reconciliation data (optional — not required for basic operation) ----
 
     async def fetch_positions(self) -> list[Position]:

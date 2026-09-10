@@ -830,9 +830,9 @@ class MT5Adapter(Adapter):
         """Modify TP/SL on an existing position via ``TRADE_ACTION_SLTP``.
 
         *position_id* is the MT5 position ticket (as a string); it is globally
-        unique, so *instrument* is accepted for interface uniformity and not
-        used to address the position.  At least one of *take_profit* or
-        *stop_loss* must be provided.
+        unique, but the terminal still requires the broker symbol alongside the
+        ticket for ``TRADE_ACTION_SLTP``, so *instrument* is used to resolve it.
+        At least one of *take_profit* or *stop_loss* must be provided.
 
         Raises ``UnsupportedOrderTypeError`` if an attachment carries a
         ``limit_price`` — MT5 TP/SL are price levels, not orders.
@@ -846,10 +846,13 @@ class MT5Adapter(Adapter):
                 "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
             )
         mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
 
         def _modify() -> None:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
             request = build_mt5_sltp_request(
                 position_id,
+                mt5_symbol,
                 take_profit=float(take_profit.trigger_price) if take_profit is not None else None,
                 stop_loss=float(stop_loss.trigger_price) if stop_loss is not None else None,
                 mt5_module=mt5,
@@ -860,6 +863,37 @@ class MT5Adapter(Adapter):
             parse_mt5_result(result, position_id, mt5_module=mt5)
 
         await asyncio.to_thread(_modify)
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open position via ``positions_get()``.
+
+        *position_id* is the MT5 position ticket (as a string); it is globally
+        unique, so *instrument* is accepted for interface uniformity and not
+        used.  Returns ``(take_profit, stop_loss)`` — each element ``None``
+        when that side has no stop set — or ``None`` when no such position
+        exists (flat/closed).  MT5 TP/SL are price levels, so each returned
+        attachment has ``limit_price=None``.
+        """
+        mt5 = _get_mt5()
+
+        def _read() -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+            positions = mt5.positions_get(ticket=int(position_id))
+            self._check_call_result("positions_get", positions)
+            if not positions:
+                return None
+            pos = positions[0]
+            tp = getattr(pos, "tp", 0.0)
+            sl = getattr(pos, "sl", 0.0)
+            return (
+                TpSlAttachment(trigger_price=Decimal(str(tp))) if tp else None,
+                TpSlAttachment(trigger_price=Decimal(str(sl))) if sl else None,
+            )
+
+        return await asyncio.to_thread(_read)
 
     # ------------------------------------------------------------------
     # Instrument metadata
