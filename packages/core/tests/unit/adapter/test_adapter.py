@@ -147,6 +147,7 @@ class TestAdapterZeroImplementation:
                 "fetch_balances",
                 "fetch_open_orders",
                 "fetch_fills",
+                "fetch_ticker",
                 "attach_halt_machine",
                 "attach_event_bus",
                 "attach_state_store",

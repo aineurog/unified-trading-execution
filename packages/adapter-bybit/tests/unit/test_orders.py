@@ -34,6 +34,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     OrderModification,
     TpSlAttachment,
@@ -1313,3 +1314,112 @@ class TestModifyPositionTpSl:
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_position_tpsl(_spot_instrument(), "0", take_profit=tp)
         mock_pybit_http.set_trading_stop.assert_not_called()
+
+
+class TestFetchTicker:
+    async def test_futures_ticker_populates_last_bid_ask_mark(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_tickers.return_value = (
+            {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastPrice": "100000.5",
+                            "markPrice": "100001",
+                            "bid1Price": "99999.5",
+                            "ask1Price": "100000.5",
+                        }
+                    ]
+                }
+            },
+            None,
+            {},
+        )
+
+        result = await adapter.fetch_ticker(_futures_instrument())
+
+        assert isinstance(result, Ticker)
+        assert result is not None
+        assert result.bid == Decimal("99999.5")
+        assert result.ask == Decimal("100000.5")
+        assert result.last == Decimal("100000.5")
+        assert result.mark == Decimal("100001")
+        assert result.mid == Decimal("100000.0")
+        mock_pybit_http.get_tickers.assert_called_once_with(category="linear", symbol="BTCUSDT")
+
+    async def test_spot_ticker_has_no_mark(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_tickers.return_value = (
+            {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastPrice": "100000.5",
+                            "markPrice": "",
+                            "bid1Price": "99999.5",
+                            "ask1Price": "100000.5",
+                        }
+                    ]
+                }
+            },
+            None,
+            {},
+        )
+
+        result = await adapter.fetch_ticker(_spot_instrument())
+
+        assert result is not None
+        assert result.last == Decimal("100000.5")
+        assert result.mark is None
+        mock_pybit_http.get_tickers.assert_called_once_with(category="spot", symbol="BTCUSDT")
+
+    async def test_returns_none_when_no_entry(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_tickers.return_value = (
+            {"result": {"list": []}},
+            None,
+            {},
+        )
+
+        result = await adapter.fetch_ticker(_futures_instrument())
+
+        assert result is None
+
+    async def test_mid_falls_back_to_last_when_no_bid_ask(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_tickers.return_value = (
+            {
+                "result": {
+                    "list": [
+                        {
+                            "symbol": "BTCUSDT",
+                            "lastPrice": "100000.5",
+                            "markPrice": "100001",
+                            "bid1Price": "",
+                            "ask1Price": "",
+                        }
+                    ]
+                }
+            },
+            None,
+            {},
+        )
+
+        result = await adapter.fetch_ticker(_futures_instrument())
+
+        assert result is not None
+        assert result.mid == Decimal("100000.5")

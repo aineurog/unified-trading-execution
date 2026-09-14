@@ -33,6 +33,7 @@ from unified_trading_execution.mt5.config import MT5Config
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderRecord,
@@ -110,6 +111,10 @@ class MT5Engine(Engine):
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         return await self._adapter.fetch_instrument_spec(instrument)
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        """Fetch the current MT5 bid/ask/last for *instrument* as a :class:`Ticker`."""
+        return await self._adapter.fetch_ticker(instrument)
 
     async def resolve_instrument(self, platform_symbol: str) -> Instrument:
         """Discover the canonical ``Instrument`` for an MT5 ``platform_symbol``."""

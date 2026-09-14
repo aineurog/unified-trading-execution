@@ -59,6 +59,7 @@ from unified_trading_execution.bybit.orders import (
     parse_order_result,
 )
 from unified_trading_execution.bybit.streams import (
+    _optional_decimal,
     is_final_order_status,
     is_terminal_order_status,
     translate_fill,
@@ -101,6 +102,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -2355,6 +2357,36 @@ class BybitAdapter(Adapter):
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        """Fetch the latest price snapshot for *instrument* via ``get_tickers``.
+
+        Populates the fields Bybit provides for the category: ``last`` and best
+        ``bid``/``ask`` for every category, plus ``mark`` for derivatives
+        (linear/inverse).  ``mark`` is ``None`` for spot.  Returns ``None`` when
+        the endpoint has no entry for the symbol (halted/delisted — no live
+        quote).  A syntactically-invalid instrument still raises
+        ``InvalidSymbolError`` from ``to_bybit_symbol``/``_instrument_to_category``.
+        """
+        category = self._instrument_to_category(instrument)
+        bybit_symbol = to_bybit_symbol(instrument)
+
+        data, _ = await self._run_request(
+            self._session.get_tickers,
+            category=category,
+            symbol=bybit_symbol,
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        if not entries:
+            return None
+        entry = entries[0]
+        return Ticker(
+            bid=_optional_decimal(entry.get("bid1Price")),
+            ask=_optional_decimal(entry.get("ask1Price")),
+            last=_optional_decimal(entry.get("lastPrice")),
+            mark=_optional_decimal(entry.get("markPrice")),
+        )
 
     # ---- Capability reporting ----
 

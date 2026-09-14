@@ -49,6 +49,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     OrderModification,
     TpSlAttachment,
@@ -814,3 +815,68 @@ class TestGetPositionTpSl:
 
         with pytest.raises(PlatformError):
             await adapter.get_position_tpsl(_instrument(), "789")
+
+
+class TestFetchTicker:
+    """fetch_ticker — read current bid/ask/last via symbol_info_tick()."""
+
+    async def test_reads_bid_ask_last(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.symbol_info_tick.return_value = MagicMock(
+            bid=1.0998, ask=1.1002, last=1.1000
+        )
+
+        result = await adapter.fetch_ticker(_instrument())
+
+        assert isinstance(result, Ticker)
+        assert result is not None
+        assert result.bid == Decimal("1.0998")
+        assert result.ask == Decimal("1.1002")
+        assert result.last == Decimal("1.1000")
+        assert result.mark is None
+        assert result.mid == Decimal("1.1000")
+        mock_mt5_module.symbol_info_tick.assert_called_once_with("EURUSD.m")
+
+    async def test_last_none_when_no_trade(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.symbol_info_tick.return_value = MagicMock(bid=1.0998, ask=1.1002, last=0.0)
+
+        result = await adapter.fetch_ticker(_instrument())
+
+        assert result is not None
+        assert result.bid == Decimal("1.0998")
+        assert result.ask == Decimal("1.1002")
+        assert result.last is None
+
+    async def test_selects_symbol_before_tick(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.symbol_info_tick.return_value = MagicMock(bid=1.0998, ask=1.1002, last=0.0)
+
+        await adapter.fetch_ticker(_instrument())
+
+        mock_mt5_module.symbol_select.assert_called_once_with("EURUSD.m", True)
+
+    async def test_returns_none_when_no_quote(
+        self,
+        mock_mt5_module: MagicMock,
+        adapter: MT5Adapter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("unified_trading_execution.mt5.adapter.time.sleep", lambda _: None)
+        mock_mt5_module.symbol_info_tick.return_value = None
+
+        result = await adapter.fetch_ticker(_instrument())
+
+        assert result is None
+
+    async def test_unknown_symbol_raises(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        mock_mt5_module.symbol_select.return_value = False
+        mock_mt5_module.last_error.return_value = (4301, "unknown symbol")
+
+        with pytest.raises(InvalidSymbolError):
+            await adapter.fetch_ticker(_instrument())

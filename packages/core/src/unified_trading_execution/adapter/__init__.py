@@ -16,6 +16,7 @@ from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -169,6 +170,29 @@ class Adapter(ABC):
         (TTL determined by interval_seconds) rather than calling on every dispatch.
         """
         ...
+
+    # ---- Market data (optional) ----
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        """Fetch the latest price snapshot for a single *instrument*.
+
+        Optional — raises ``NotImplementedError`` by default.  Returns a
+        :class:`Ticker` whose populated fields reflect what the platform
+        provides for the instrument's category: ``bid``/``ask``/``last`` where
+        available, and ``mark`` only for derivatives (never for spot/forex).
+        Returns ``None`` when the symbol is known but has no live quote (market
+        closed, halted, or no data subscription) — distinct from a bad symbol,
+        which must raise ``InvalidSymbolError``, and from an unsupported
+        platform, which keeps the ``NotImplementedError`` default.
+
+        This is a fresh snapshot, not a cache; callers should not poll it in a
+        hot loop.  It is intentionally not wired into the engine's
+        reference-price sanity check — that remains the caller-supplied
+        ``get_reference_price`` callback.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support fetching a current price snapshot"
+        )
 
     # ---- Position TP/SL modification (optional) ----
 

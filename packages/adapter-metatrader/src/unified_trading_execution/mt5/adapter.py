@@ -82,6 +82,7 @@ from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
 )
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -948,6 +949,32 @@ class MT5Adapter(Adapter):
         )
         self._spec_cache[instrument] = (spec, _utcnow())
         return spec
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        """Fetch the current bid/ask/last for *instrument* via ``symbol_info_tick()``.
+
+        MT5 quotes a bid/ask spread natively and has no mark price, so ``mark``
+        is always ``None`` and ``last`` is ``None`` when the instrument has not
+        traded yet.  The symbol is selected in Market Watch first (quotes only
+        stream for selected symbols) and the tick is retried briefly to absorb
+        the terminal's async subscription.  Returns ``None`` when the market is
+        closed / no quote is available; a symbol the broker does not provide
+        still raises ``InvalidSymbolError`` from ``_ensure_symbol_selected``.
+        """
+        mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
+
+        def _read() -> Ticker | None:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
+            tick = _wait_for_market_tick(mt5, mt5_symbol)
+            if tick is None:
+                return None
+            bid = Decimal(str(tick.bid)) if tick.bid else None
+            ask = Decimal(str(tick.ask)) if tick.ask else None
+            last = Decimal(str(tick.last)) if getattr(tick, "last", 0.0) else None
+            return Ticker(bid=bid, ask=ask, last=last, mark=None)
+
+        return await asyncio.to_thread(_read)
 
     # ------------------------------------------------------------------
     # Capability reporting
