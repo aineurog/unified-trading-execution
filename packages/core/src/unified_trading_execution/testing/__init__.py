@@ -22,6 +22,7 @@ from unified_trading_execution.events import (
     ConnectionStateEvent,
     EventBus,
     FillEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.types.enums import (
@@ -195,6 +196,19 @@ class MockAdapter(Adapter):
                 account_id=self._account_id,
                 correlation_id=None,
                 balance=balance,
+            )
+        )
+
+    def inject_order_status(self, order: OrderRecord) -> None:
+        """Publish an OrderStatusEvent to the bus as if received from a stream."""
+        self._event_bus.publish(
+            OrderStatusEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self._platform_name,
+                account_id=self._account_id,
+                correlation_id=order.client_order_id or None,
+                order=order,
             )
         )
 

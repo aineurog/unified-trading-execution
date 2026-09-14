@@ -504,7 +504,8 @@ no such call).
 
 ```python
 engine.modify_position_tpsl(
-    position_id="12345678",                  # MT5 position ticket
+    instrument,                               # Instrument (accepted; MT5 ticket is globally unique)
+    "12345678",                               # MT5 position ticket
     take_profit=TpSlAttachment(trigger_price=1.13000),
     stop_loss=TpSlAttachment(trigger_price=1.09500),
 )

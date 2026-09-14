@@ -15,6 +15,7 @@ Usage::
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import threading
 import time
@@ -24,6 +25,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
 
+import requests
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 from uuid_extensions import uuid7
@@ -53,6 +55,7 @@ from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
     build_place_order_payload,
+    build_set_trading_stop_payload,
     parse_order_result,
 )
 from unified_trading_execution.bybit.streams import (
@@ -61,6 +64,7 @@ from unified_trading_execution.bybit.streams import (
     translate_fill,
     translate_order_entry,
     translate_position,
+    translate_tp_sl,
     translate_wallet_member,
 )
 from unified_trading_execution.bybit.symbols import from_bybit_symbol, to_bybit_symbol
@@ -68,7 +72,9 @@ from unified_trading_execution.bybit.websocket import BybitWebSocket
 from unified_trading_execution.errors import (
     InvalidSymbolError,
     OrderNotFoundError,
+    PlatformConnectionError,
     PlatformError,
+    UnsupportedOrderTypeError,
     UteError,
 )
 from unified_trading_execution.events import (
@@ -83,6 +89,7 @@ from unified_trading_execution.events import (
     HaltEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.state.halt import HaltStateMachine
@@ -99,6 +106,7 @@ from unified_trading_execution.types.order import (
     OrderModification,
     OrderRecord,
     OrderResult,
+    TpSlAttachment,
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
@@ -114,6 +122,54 @@ _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 # promoted to BybitConfig — mirroring the hardcoded-categories pattern above.
 _ACCOUNT_TYPE = "UNIFIED"
 _MAX_TRACKED_FINAL_ORDER_IDS = 10_000
+# Read-request retry policy: reads are idempotent so transient network failures
+# are retried a bounded number of times with linear backoff before surfacing
+# PlatformConnectionError.  Mutations are never retried here — see _run_request.
+_READ_RETRIES = 3
+_READ_RETRY_BACKOFF_SECONDS = 0.5
+# Native TP/SL child orders Bybit auto-creates on a parent order/position.
+# These are not user orders and must be excluded from the open-order mirror.
+_TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
+    {
+        "CreateByTakeProfit",
+        "CreateByStopLoss",
+        "CreateByPartialStopLoss",
+        "CreateByPartialTakeProfit",
+    }
+)
+
+
+def _api_key_identity(api_key: str) -> str:
+    """A stable, per-key placeholder identity (sha256 prefix) for ``account_id``.
+
+    Used only as a last-resort value before the real Bybit ``userID`` has been
+    resolved — never the empty string, and never a constant shared across
+    accounts, so two keys can never silently collapse onto one store path.
+    """
+    digest = hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
+    return f"bybit-{digest}"
+
+
+def _execution_client_key(entry: dict[str, Any]) -> str | None:
+    """Return the fill key for one ``execution`` entry, or ``None`` to skip it.
+
+    User orders carry an ``orderLinkId``; native TP/SL children (and any order
+    placed without a client id) carry an empty ``orderLinkId`` and are keyed by
+    the platform ``orderId`` instead — prefixed for TP/SL children so their
+    closing fills are self-describing in the store.  An entry with neither id
+    cannot be attributed and is skipped.
+    """
+    link = entry.get("orderLinkId") or ""
+    if link:
+        return link
+    order_id = entry.get("orderId") or ""
+    if not order_id:
+        return None
+    if entry.get("createType") in _TP_SL_CREATE_TYPES:
+        return f"bybit-tpsl-{order_id}"
+    return order_id
+
+
 _LEVERAGE_KIND_PREFIX = "leverage."
 _POSITION_MODE_KIND_PREFIX = "position_mode."
 # Per-instrument leverage behavior knobs, stored flat (one key per knob under
@@ -260,6 +316,9 @@ class BybitAdapter(Adapter):
         self._last_rate_limits = _parse_rate_limits({})
         self._order_refs: dict[str, tuple[str, str]] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
+        # Cached platform account ``uid`` — resolved lazily on first request and
+        # used as the canonical store-path identity (see ``resolve_account_id``).
+        self._resolved_account_id: str | None = None
         self._instruments: dict[tuple[str, str], Instrument] = {}
         # Cache of fetched InstrumentSpecs, keyed by the canonical Instrument.
         # Each value carries the time.monotonic() wall-clock at fetch so the
@@ -383,6 +442,7 @@ class BybitAdapter(Adapter):
             self._session.get_positions,
             category=category,
             symbol=to_bybit_symbol(instrument),
+            read=True,
         )
         entries = (data.get("result") or {}).get("list") or []
         for entry in entries:
@@ -501,6 +561,7 @@ class BybitAdapter(Adapter):
             self._session.get_positions,
             category=category,
             symbol=to_bybit_symbol(instrument),
+            read=True,
         )
         entries = (data.get("result") or {}).get("list") or []
         if not entries:
@@ -626,6 +687,7 @@ class BybitAdapter(Adapter):
             self._session.get_positions,
             category=category,
             symbol=to_bybit_symbol(instrument),
+            read=True,
         )
         entries = (data.get("result") or {}).get("list") or []
         if not entries:
@@ -751,7 +813,7 @@ class BybitAdapter(Adapter):
         ``REGULAR_MARGIN`` → cross, ``ISOLATED_MARGIN`` → isolated.
         ``PORTFOLIO_MARGIN`` is not mapped and returns None.
         """
-        data, _ = await self._run_request(self._session.get_account_info)
+        data, _ = await self._run_request(self._session.get_account_info, read=True)
         margin_mode = (data.get("result") or {}).get("marginMode")
         if margin_mode == "ISOLATED_MARGIN":
             return MarginMode.ISOLATED
@@ -1253,7 +1315,41 @@ class BybitAdapter(Adapter):
 
     @property
     def account_id(self) -> str:
-        return self._config.account_id
+        """The account identity as it is currently known.
+
+        Prefers the resolved platform ``userID``, then an explicit configured
+        label, then a stable per-key placeholder — never a shared constant, so
+        two accounts can never collide on one store path even before resolution.
+        """
+        if self._resolved_account_id is not None:
+            return self._resolved_account_id
+        if self._config.account_id:
+            return self._config.account_id
+        return _api_key_identity(self._config.api_key)
+
+    async def resolve_account_id(self) -> str:
+        """Resolve the canonical platform account identity (the Bybit ``userID``).
+
+        An explicit configured ``account_id`` wins unchanged.  Otherwise the
+        real ``userID`` is fetched from ``GET /v5/user/query-api`` (the API key
+        is bound to exactly one account) and cached for the adapter lifetime.
+        A missing ``userID`` raises ``PlatformConnectionError`` rather than
+        silently falling back to a shared constant — two accounts must never
+        collapse onto one state-store path.
+        """
+        if self._resolved_account_id is not None:
+            return self._resolved_account_id
+        if self._config.account_id:
+            self._resolved_account_id = self._config.account_id
+            return self._resolved_account_id
+        data, _ = await self._run_request(self._session.get_api_key_information, read=True)
+        user_id = (data.get("result") or {}).get("userID")
+        if user_id is None or user_id == "":
+            raise PlatformConnectionError(
+                "Bybit /v5/user/query-api returned no userID; cannot resolve account identity"
+            )
+        self._resolved_account_id = str(user_id)
+        return self._resolved_account_id
 
     # ---- Connection lifecycle ----
 
@@ -1581,6 +1677,7 @@ class BybitAdapter(Adapter):
                     kwargs["cursor"] = cursor
                 data, _ = await self._run_request(
                     self._session.get_instruments_info,
+                    read=True,
                     **kwargs,
                 )
                 result = data.get("result") or {}
@@ -1638,11 +1735,13 @@ class BybitAdapter(Adapter):
     def _on_order_message(self, message: dict[str, Any]) -> None:
         """Translate ``order`` stream entries into reconcile-safe order events.
 
-        Emits ``OrderPlacedEvent`` for a newly-seen order and
+        Emits ``OrderPlacedEvent`` for a newly-seen order,
         ``OrderCancelledEvent`` for a previously-seen order that reaches a
-        terminal cancelled state.  ``OrderModifiedEvent`` is deliberately not
-        emitted — the stream carries no ``previous`` state, so core's mirror
-        diffs updates instead (Section 6.1).
+        terminal cancelled state, and ``OrderStatusEvent`` for any other
+        status/fill change on a previously-seen order (e.g. ``OPEN`` →
+        ``PARTIALLY_FILLED`` → ``FILLED``) so the engine's mirror can follow
+        the platform's order lifecycle.  ``OrderModifiedEvent`` is deliberately
+        not emitted — the stream carries no ``previous`` state.
 
         Seen-order bookkeeping is bounded: ``_open_order_ids`` holds only live
         (non-final) orders and is pruned as they finalise, while
@@ -1651,6 +1750,10 @@ class BybitAdapter(Adapter):
         states) so an echo is never misclassified as a brand-new placement.
         """
         for entry in message.get("data") or []:
+            # Native TP/SL children are not user orders — skip so they never
+            # surface as phantom user orders in the mirror.
+            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+                continue
             try:
                 instrument = self._resolve_instrument(
                     entry.get("symbol") or "", entry.get("category") or ""
@@ -1679,9 +1782,12 @@ class BybitAdapter(Adapter):
                     continue
 
                 if platform_id in self._open_order_ids:
-                    # Previously-seen live order.  Emit a cancel only when it now
-                    # reaches a terminal cancelled state; a fill is final without
-                    # being a cancellation, so it emits no event of its own.
+                    # Previously-seen live order.  A terminal cancelled state
+                    # emits OrderCancelledEvent; every other change — including
+                    # OPEN → PARTIALLY_FILLED → FILLED — emits OrderStatusEvent
+                    # so the engine's mirror follows the platform (and a filled
+                    # order drops out of the open set).  FILLED is final for the
+                    # live set but is not a cancellation.
                     if is_terminal_order_status(order.status):
                         self._move_to_final(platform_id)
                         self._publish_from_ws(
@@ -1695,8 +1801,19 @@ class BybitAdapter(Adapter):
                                 instrument=instrument,
                             )
                         )
-                    elif is_final_order_status(order.status):
-                        self._move_to_final(platform_id)
+                    else:
+                        self._publish_from_ws(
+                            OrderStatusEvent(
+                                event_id=_new_id(),
+                                timestamp=_utcnow(),
+                                adapter_name=self.platform_name,
+                                account_id=self.account_id,
+                                correlation_id=order.client_order_id or None,
+                                order=order,
+                            )
+                        )
+                        if is_final_order_status(order.status):
+                            self._move_to_final(platform_id)
                     continue
 
                 # Brand-new order — first sighting.
@@ -1727,11 +1844,14 @@ class BybitAdapter(Adapter):
         for entry in message.get("data") or []:
             if entry.get("execType") != "Trade":
                 continue
+            client_order_id = _execution_client_key(entry)
+            if client_order_id is None:
+                logger.error("Skipping Bybit execution stream entry with no order id: %s", entry)
+                continue
             try:
                 instrument = self._resolve_instrument(
                     entry.get("symbol") or "", entry.get("category") or ""
                 )
-                client_order_id = entry.get("orderLinkId") or ""
                 fill = translate_fill(entry, instrument=instrument, client_order_id=client_order_id)
             except Exception:
                 logger.exception("Skipping malformed Bybit execution stream entry: %s", entry)
@@ -1890,21 +2010,161 @@ class BybitAdapter(Adapter):
             )
         return result
 
+    # ---- Position TP/SL modification ----
+
+    @staticmethod
+    def _parse_position_idx(instrument: Instrument, position_id: str) -> int:
+        """Resolve a Bybit ``positionIdx`` integer from a ``position_id``.
+
+        Accepts either the bare ``positionIdx`` (``"0"`` one-way, ``"1"``/
+        ``"2"`` hedge long/short) or the composite ``"{venue_symbol}:{idx}"``
+        form produced by ``translate_position`` (e.g. ``"BTCUSDT:0"``).  When
+        the composite form is used its venue symbol must match *instrument*; a
+        mismatch is a caller error rather than a silent mis-target.
+        """
+        symbol = to_bybit_symbol(instrument)
+        if position_id.startswith(f"{symbol}:"):
+            idx = position_id[len(symbol) + 1 :]
+        elif ":" in position_id:
+            raise ValueError(
+                f"position_id venue symbol does not match instrument {symbol}: {position_id!r}"
+            )
+        else:
+            idx = position_id
+        try:
+            return int(idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"position_id must be a Bybit positionIdx or '{symbol}:<idx>', got {position_id!r}"
+            ) from exc
+
+    async def modify_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Modify TP/SL on an open position via ``set_trading_stop``.
+
+        *position_id* is either the Bybit ``positionIdx`` (``"0"`` one-way,
+        ``"1"``/``"2"`` hedge long/short) or the composite
+        ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
+        ``translate_position`` — Bybit reuses the same ``positionIdx`` across
+        every symbol, so *instrument* is required to address the correct leg.
+
+        Spot has no position concept on Bybit, so this raises
+        ``UnsupportedOrderTypeError`` for spot instruments.
+        """
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss is required")
+
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError(
+                "position TP/SL modification is not supported for spot on Bybit"
+            )
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+
+        payload = build_set_trading_stop_payload(
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            position_idx=position_idx,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open position as ``(take_profit, stop_loss)``.
+
+        *position_id* is either the Bybit ``positionIdx`` (``"0"`` one-way,
+        ``"1"``/``"2"`` hedge long/short) or the composite
+        ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
+        ``translate_position`` — mirroring ``modify_position_tpsl``.
+
+        Returns ``None`` when there is no open position at that ``positionIdx``
+        (flat/closed) or for spot.  Each element is ``None`` when that side has
+        no stop set.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return (
+                    translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
+                    translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
+                )
+        return None
+
     async def _run_request(
         self,
         method: Callable[..., Any],
+        *,
+        read: bool = False,
         **kwargs: Any,
     ) -> tuple[dict[str, Any], dict[str, str]]:
-        """Invoke a pybit HTTP method, translating native errors and rate limits."""
-        try:
-            result = await asyncio.to_thread(method, **kwargs)
-        except FailedRequestError as exc:
-            raise map_bybit_error(http_status=exc.status_code, ret_msg=exc.message) from exc
-        except InvalidRequestError as exc:
-            raise map_bybit_error(ret_code=exc.status_code, ret_msg=exc.message) from exc
-        data, _, response_headers = result
-        self._update_rate_limits(response_headers or {})
-        return data, response_headers
+        """Invoke a pybit HTTP method, translating native errors and rate limits.
+
+        *read* selects the retry/error policy, because reads and mutations have
+        fundamentally different failure semantics:
+
+        - Reads (``read=True`` — every ``get_*`` / fetch) are idempotent, so a
+          transient network failure or 5xx server error is retried a bounded
+          number of times with backoff before surfacing as
+          ``PlatformConnectionError``.
+        - Mutations (``read=False`` — place/amend/cancel, leverage/margin/position
+          mode) are **never** retried here: the request may have executed
+          server-side before the failure, so a retry could double-submit.  A
+          timeout is re-raised as builtin ``TimeoutError`` so the engine's
+          idempotency re-query (Section 9.2) can check whether the order landed;
+          a connection error surfaces as ``PlatformConnectionError``.
+        """
+        attempts = _READ_RETRIES if read else 1
+        for attempt in range(attempts):
+            try:
+                result = await asyncio.to_thread(method, **kwargs)
+            except FailedRequestError as exc:
+                mapped = map_bybit_error(http_status=exc.status_code, ret_msg=exc.message)
+                if read and isinstance(mapped, PlatformConnectionError) and attempt < attempts - 1:
+                    await asyncio.sleep(_READ_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise mapped from exc
+            except InvalidRequestError as exc:
+                raise map_bybit_error(ret_code=exc.status_code, ret_msg=exc.message) from exc
+            except (TimeoutError, requests.exceptions.Timeout) as exc:
+                if read and attempt < attempts - 1:
+                    await asyncio.sleep(_READ_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise TimeoutError(str(exc)) from exc
+            except requests.exceptions.RequestException as exc:
+                if read and attempt < attempts - 1:
+                    await asyncio.sleep(_READ_RETRY_BACKOFF_SECONDS * (attempt + 1))
+                    continue
+                raise PlatformConnectionError(str(exc)) from exc
+            data, _, response_headers = result
+            self._update_rate_limits(response_headers or {})
+            return data, response_headers
+        # Unreachable: the final attempt above always returns or raises.  Kept
+        # so the function cannot fall off the end of the loop silently.
+        raise PlatformConnectionError("Bybit request failed after retries")
 
     async def _query_order_entry(
         self,
@@ -1933,7 +2193,7 @@ class BybitAdapter(Adapter):
         query: dict[str, Any],
     ) -> dict[str, Any] | None:
         try:
-            data, _ = await self._run_request(self._session.get_open_orders, **query)
+            data, _ = await self._run_request(self._session.get_open_orders, read=True, **query)
         except OrderNotFoundError:
             return None
         return self._find_entry_in(data, client_order_id)
@@ -1944,7 +2204,7 @@ class BybitAdapter(Adapter):
         query: dict[str, Any],
     ) -> dict[str, Any] | None:
         try:
-            data, _ = await self._run_request(self._session.get_order_history, **query)
+            data, _ = await self._run_request(self._session.get_order_history, read=True, **query)
         except OrderNotFoundError:
             return None
         return self._find_entry_in(data, client_order_id)
@@ -2028,6 +2288,7 @@ class BybitAdapter(Adapter):
             self._session.get_instruments_info,
             category=category,
             symbol=bybit_symbol,
+            read=True,
         )
 
         listings = (data.get("result", {}) or {}).get("list", [])
@@ -2135,7 +2396,7 @@ class BybitAdapter(Adapter):
             kwargs: dict[str, Any] = {"category": category, **extra}
             if cursor:
                 kwargs["cursor"] = cursor
-            data, _ = await self._run_request(method, **kwargs)
+            data, _ = await self._run_request(method, read=True, **kwargs)
             result = data.get("result") or {}
             for entry in result.get("list") or []:
                 yield entry
@@ -2167,6 +2428,14 @@ class BybitAdapter(Adapter):
           balances are reconciled via ``fetch_balances`` instead.
         """
         result: list[Position] = []
+        seen: set[tuple[Instrument, str | None]] = set()
+
+        def _add(position: Position) -> None:
+            key = (position.instrument, position.position_id)
+            if key in seen:
+                return
+            seen.add(key)
+            result.append(position)
 
         # linear — must be split by settleCoin to cover both USDT and USDC perps.
         for settle_coin in ("USDT", "USDC"):
@@ -2180,7 +2449,7 @@ class BybitAdapter(Adapter):
                     logger.exception("Skipping malformed Bybit linear position entry: %s", entry)
                     continue
                 if position.quantity != 0:
-                    result.append(position)
+                    _add(position)
 
         # inverse — category alone is sufficient; no settleCoin required.
         async for entry in self._paged_results(self._session.get_positions, "inverse"):
@@ -2191,7 +2460,7 @@ class BybitAdapter(Adapter):
                 logger.exception("Skipping malformed Bybit inverse position entry: %s", entry)
                 continue
             if position.quantity != 0:
-                result.append(position)
+                _add(position)
 
         return result
 
@@ -2200,19 +2469,21 @@ class BybitAdapter(Adapter):
 
         Reuses ``translate_wallet_member`` so the REST snapshot and the
         WebSocket wallet stream produce identical ``Balance`` records.  The
-        account does not support cursor pagination and returns a single
-        per-coin member at ``result.list[0]``.
+        wallet endpoint returns one member per account type; every member is
+        translated (not just ``list[0]``) so coins reported under any member
+        are captured.
         """
         data, _ = await self._run_request(
             self._session.get_wallet_balance,
             accountType=_ACCOUNT_TYPE,
+            read=True,
         )
         members = (data.get("result") or {}).get("list") or []
-        if not members:
-            return {}
         result: dict[str, Balance] = {}
-        for balance in translate_wallet_member(members[0], timestamp=_utcnow()):
-            result[balance.currency] = balance
+        timestamp = _utcnow()
+        for member in members:
+            for balance in translate_wallet_member(member, timestamp=timestamp):
+                result[balance.currency] = balance
         return result
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
@@ -2235,6 +2506,10 @@ class BybitAdapter(Adapter):
         result: dict[str, OrderRecord] = {}
 
         def _collect(entry: dict[str, Any], category: str) -> None:
+            # Native TP/SL children are not user orders — exclude them so they
+            # are never reconciled as phantom orphan orders.
+            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+                return
             try:
                 instrument = self._resolve_instrument(entry.get("symbol") or "", category)
                 order = translate_order_entry(entry, instrument=instrument)
@@ -2266,23 +2541,30 @@ class BybitAdapter(Adapter):
 
         Only ``Trade`` executions are returned — the WebSocket ``execution``
         stream reports real trades and excludes funding/adl/bust events, so
-        filtering here keeps REST and WS views identical.  Executions without
-        an ``orderLinkId`` cannot be attributed in core and are skipped with
-        a log.
+        filtering here keeps REST and WS views identical.  User orders are
+        keyed by ``orderLinkId``; native TP/SL child fills (empty ``orderLinkId``)
+        are keyed by ``bybit-tpsl-<orderId>`` and classified with their TP/SL
+        reason, so a triggered take-profit/stop-loss is still recorded.  An
+        execution with neither id cannot be attributed and is skipped with a log.
 
-        *since* is an optional lower bound (aware UTC).  Bybit's executions
-        endpoint has no server-side ``since`` filter, so fills older than
-        *since* are dropped client-side to give reconciliation a symmetric
-        watermark-bounded window.
+        *since* is an optional lower bound (aware UTC).  It is pushed down to
+        Bybit's ``startTime`` parameter so the API does the heavy filtering
+        instead of paging the full execution history; a client-side guard is
+        kept because the API boundary is inclusive and timestamp rounding can
+        let a fill at exactly *since* through.
         """
+        extra: dict[str, Any] = {}
+        if since is not None:
+            extra["startTime"] = int(since.timestamp() * 1000)
+
         result: dict[str, list[FillRecord]] = {}
         for category in _ORDER_CATEGORIES:
-            async for entry in self._paged_results(self._session.get_executions, category):
+            async for entry in self._paged_results(self._session.get_executions, category, **extra):
                 if entry.get("execType") != "Trade":
                     continue
-                client_order_id = entry.get("orderLinkId") or ""
-                if not client_order_id:
-                    logger.error("Skipping Bybit execution without orderLinkId: %s", entry)
+                client_order_id = _execution_client_key(entry)
+                if client_order_id is None:
+                    logger.error("Skipping Bybit execution with no order id: %s", entry)
                     continue
                 try:
                     instrument = self._resolve_instrument(entry.get("symbol") or "", category)

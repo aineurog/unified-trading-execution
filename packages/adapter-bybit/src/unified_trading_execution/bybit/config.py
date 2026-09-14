@@ -27,7 +27,11 @@ class BybitConfig:
             ``"isolated"``).  A static default (cross) — set here at adapter
             construction, not at runtime.
         platform_name: Human-readable platform identifier.
-        account_id: Unique account label on this platform.
+        account_id: Optional explicit account label on this platform.  When
+            ``None``, the adapter resolves the real Bybit ``userID`` (uid) from
+            the API key (``GET /v5/user/query-api``) and uses that as the
+            canonical store-path identity — so two accounts never collide on
+            one state file.
         instrument_spec_cache_ttl: Seconds a cached ``InstrumentSpec`` is trusted
             before being re-fetched.  Defaults to one day
             (``DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS``); ``None`` caches
@@ -40,7 +44,7 @@ class BybitConfig:
     demo: bool = False
     margin_mode: MarginMode | str = MarginMode.CROSS
     platform_name: str = "bybit"
-    account_id: str = "bybit-account"
+    account_id: str | None = None
     instrument_spec_cache_ttl: float | None = DEFAULT_INSTRUMENT_SPEC_CACHE_TTL_SECONDS
 
     def __post_init__(self) -> None:

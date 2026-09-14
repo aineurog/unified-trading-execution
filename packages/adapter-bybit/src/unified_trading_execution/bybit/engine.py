@@ -22,12 +22,16 @@ from unified_trading_execution.adapter import RateLimits
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
-from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
+from unified_trading_execution.engine import (
+    DEFAULT_FILL_SETTLE_LAG_SECONDS,
+    DEFAULT_RECONCILE_INTERVAL_SECONDS,
+    Engine,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.order import FillRecord, OrderRecord
+from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
 
 
@@ -51,6 +55,7 @@ class BybitEngine(Engine):
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
         adapter = config if isinstance(config, BybitAdapter) else BybitAdapter(config)
         super().__init__(
@@ -61,6 +66,7 @@ class BybitEngine(Engine):
             risk_config=risk_config,
             halt_config=halt_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
+            fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
 
     # ── leverage intent ───────────────────────────────────────────────
@@ -155,3 +161,30 @@ class BybitEngine(Engine):
 
     async def reconcile_user_intent(self) -> None:
         await self._adapter.reconcile_user_intent()
+
+    # ── position TP/SL ───────────────────────────────────────────────
+
+    async def modify_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Modify TP/SL on an open Bybit position (``position_id`` = ``positionIdx``
+        or the composite ``"{venue_symbol}:{idx}"`` from ``fetch_positions``)."""
+        await self._adapter.modify_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open Bybit position as ``(take_profit, stop_loss)``."""
+        return await self._adapter.get_position_tpsl(instrument, position_id)

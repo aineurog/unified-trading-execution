@@ -11,7 +11,7 @@ Usage::
     ))
     await engine.connect()
     result = await engine.place_order(order)
-    await engine.modify_position_tpsl("12345", take_profit=...)
+    await engine.modify_position_tpsl(instrument, "12345", take_profit=...)
     await engine.ashutdown()
 """
 
@@ -22,7 +22,11 @@ from datetime import datetime
 from decimal import Decimal
 
 from unified_trading_execution.adapter import RateLimits
-from unified_trading_execution.engine import DEFAULT_RECONCILE_INTERVAL_SECONDS, Engine
+from unified_trading_execution.engine import (
+    DEFAULT_FILL_SETTLE_LAG_SECONDS,
+    DEFAULT_RECONCILE_INTERVAL_SECONDS,
+    Engine,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.mt5.adapter import MT5Adapter
 from unified_trading_execution.mt5.config import MT5Config
@@ -57,6 +61,7 @@ class MT5Engine(Engine):
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
+        fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
         adapter = config if isinstance(config, MT5Adapter) else MT5Adapter(config)
         super().__init__(
@@ -67,12 +72,14 @@ class MT5Engine(Engine):
             risk_config=risk_config,
             halt_config=halt_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
+            fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
 
     # ── Position TP/SL modification ───────────────────────────────────
 
     async def modify_position_tpsl(
         self,
+        instrument: Instrument,
         position_id: str,
         *,
         take_profit: TpSlAttachment | None = None,
@@ -80,14 +87,24 @@ class MT5Engine(Engine):
     ) -> None:
         """Modify TP/SL on an existing position via ``TRADE_ACTION_SLTP``.
 
-        *position_id* is the MT5 position ticket. At least one of
-        *take_profit* or *stop_loss* must be provided.
+        *position_id* is the MT5 position ticket; *instrument* resolves the
+        broker symbol the terminal requires alongside the ticket.  At least
+        one of *take_profit* or *stop_loss* must be provided.
         """
         await self._adapter.modify_position_tpsl(
+            instrument,
             position_id,
             take_profit=take_profit,
             stop_loss=stop_loss,
         )
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an MT5 position as ``(take_profit, stop_loss)``."""
+        return await self._adapter.get_position_tpsl(instrument, position_id)
 
     # ── Snapshots / reads ─────────────────────────────────────────────
 

@@ -12,7 +12,7 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.symbols import from_bybit_symbol
 from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError
-from unified_trading_execution.types.enums import OrderStatus
+from unified_trading_execution.types.enums import FillEntry, FillReason, OrderStatus
 from unified_trading_execution.types.instrument import Instrument
 
 _EMPTY: tuple[dict[str, Any], None, dict[str, str]] = ({"result": {"list": []}}, None, {})
@@ -118,9 +118,9 @@ class TestFetchPositions:
         assert len(result) == 2
         by_symbol = {p.instrument.symbol: p for p in result}
         assert by_symbol["BTC"].quantity == Decimal("1.5")
-        assert by_symbol["BTC"].position_id == "0"
+        assert by_symbol["BTC"].position_id == "BTCUSDT:0"
         assert by_symbol["ETH"].quantity == Decimal("-2")
-        assert by_symbol["ETH"].position_id == "0"
+        assert by_symbol["ETH"].position_id == "ETHUSDT:0"
 
     async def test_paginates_across_cursor(
         self,
@@ -270,6 +270,31 @@ class TestFetchOpenOrders:
         assert list(result) == ["order-7"]
         assert result["order-7"].platform_order_id == "order-7"
 
+    async def test_filters_native_tp_sl_children(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        child = _open_order(orderLinkId="", orderId="cffa-child", createType="CreateByTakeProfit")
+        user_order = _open_order(orderLinkId="client-1", orderId="order-1")
+        mock_pybit_http.get_open_orders.side_effect = [
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            (
+                {"result": {"list": [child, user_order], "nextPageCursor": ""}},
+                None,
+                {},
+            ),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
+        ]
+
+        result = await adapter.fetch_open_orders()
+
+        # Native TP/SL children (createType=CreateBy*) are position TP/SL
+        # state, not user orders — they must not surface as open orders.
+        assert list(result) == ["client-1"]
+
 
 class TestFetchFills:
     async def test_filters_trade_and_groups_by_client_order_id(
@@ -307,6 +332,42 @@ class TestFetchFills:
         fills = result["client-1"]
         assert len(fills) == 2
         assert sum(f.fill_quantity for f in fills) == Decimal("0.5")
+
+    async def test_native_tp_sl_fill_recorded(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        mock_pybit_http.get_executions.side_effect = [
+            _EMPTY,
+            (
+                {
+                    "result": {
+                        "list": [
+                            _execution(
+                                orderLinkId="",
+                                orderId="cffa-child",
+                                createType="CreateByTakeProfit",
+                            ),
+                        ],
+                        "nextPageCursor": "",
+                    }
+                },
+                None,
+                {},
+            ),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_fills()
+
+        # A triggered TP/SL child is a real closing fill — recorded under a
+        # synthesized key (not dropped for lack of a client order id).
+        assert set(result) == {"bybit-tpsl-cffa-child"}
+        fill = result["bybit-tpsl-cffa-child"][0]
+        assert fill.reason == FillReason.TAKE_PROFIT
+        assert fill.entry == FillEntry.OUT
 
 
 class TestErrorTranslation:

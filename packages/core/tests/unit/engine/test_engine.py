@@ -7,6 +7,7 @@ without hitting a real platform.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -194,17 +195,32 @@ class TestEngineConstruction:
         assert eng.event_bus is not None
 
     def test_auto_creates_state_store_when_none_provided(self, mock_adapter):
-        eng = Engine(adapter=mock_adapter)
-        assert isinstance(eng.state_store, SQLiteStateStore)
-        assert eng.state_store.path != ":memory:"
+        async def _exercise() -> None:
+            eng = Engine(adapter=mock_adapter)
+            await eng.connect()
+            try:
+                assert isinstance(eng.state_store, SQLiteStateStore)
+                assert eng.state_store.path != ":memory:"
+            finally:
+                await eng.ashutdown()
+
+        asyncio.run(_exercise())
 
     def test_default_state_store_path_is_user_visible(self, mock_adapter, monkeypatch, tmp_path):
         monkeypatch.chdir(tmp_path)
-        eng = Engine(adapter=mock_adapter)
-        path = eng.state_store.path
-        assert path.endswith(".db")
-        assert "mock" in path
-        assert "mock_account" in path
+
+        async def _exercise() -> None:
+            eng = Engine(adapter=mock_adapter)
+            await eng.connect()
+            try:
+                path = eng.state_store.path
+                assert path.endswith(".db")
+                assert "mock" in path
+                assert "mock_account" in path
+            finally:
+                await eng.ashutdown()
+
+        asyncio.run(_exercise())
 
     def test_default_state_store_initializes_to_file(self, mock_adapter, monkeypatch, tmp_path):
         import asyncio
@@ -682,6 +698,101 @@ class TestStateMirrorSubscriptions:
         assert stored is not None
         assert stored.total == Decimal("10000")
 
+    async def test_order_status_event_updates_store(self, engine, mock_adapter):
+        """A WS OrderStatusEvent (FILLED) must move the stored order to FILLED."""
+        result = await engine.place_order(_order(client_order_id="status-update"))
+        stored = await engine.state_store.get_order(result.client_order_id)
+        assert stored is not None
+        assert stored.status == OrderStatus.OPEN  # MockAdapter default
+
+        filled = replace(
+            stored,
+            status=OrderStatus.FILLED,
+            filled_quantity=stored.quantity,
+        )
+        mock_adapter.inject_order_status(filled)
+        await asyncio.sleep(0.01)
+
+        updated = await engine.state_store.get_order(result.client_order_id)
+        assert updated is not None
+        assert updated.status == OrderStatus.FILLED
+        assert updated.filled_quantity == stored.quantity
+
+    async def test_order_status_event_preserves_correlation_id(self, engine, mock_adapter):
+        """A WS order snapshot carries only client_order_id; the engine must not
+        overwrite the dispatch-time correlation_id already stored."""
+        result = await engine.place_order(_order(client_order_id="corr-preserve"))
+        stored = await engine.state_store.get_order(result.client_order_id)
+        assert stored is not None
+        original_corr = stored.correlation_id
+        assert original_corr
+
+        # Simulate the adapter's translation: correlation_id == client_order_id.
+        filled = replace(
+            stored,
+            status=OrderStatus.FILLED,
+            filled_quantity=stored.quantity,
+            correlation_id=stored.client_order_id,
+        )
+        mock_adapter.inject_order_status(filled)
+        await asyncio.sleep(0.01)
+
+        updated = await engine.state_store.get_order(result.client_order_id)
+        assert updated is not None
+        assert updated.status == OrderStatus.FILLED
+        assert updated.correlation_id == original_corr
+
+
+# ── position seed after fill ─────────────────────────────────────────
+
+
+class TestPositionSeedAfterFill:
+    async def test_seeds_position_after_filled_order(self, engine, mock_adapter):
+        """A synchronously-filled order must seed its position leg so a reconcile
+        in the WS gap cannot flag a phantom position mismatch."""
+        now = _utcnow()
+        result = OrderResult(
+            client_order_id="filled-order",
+            platform_order_id="mock-1",
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("1"),
+            average_fill_price=Decimal("50000"),
+            created_at=now,
+            updated_at=now,
+        )
+        mock_adapter.queue_place_order_response(result)
+        instrument = _instrument()
+        mock_adapter.seed_position(
+            Position(
+                instrument=instrument,
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=now,
+                position_id="0",
+            )
+        )
+
+        await engine.place_order(_order(client_order_id="filled-order", instrument=instrument))
+
+        stored = await engine.get_positions(instrument)
+        assert len(stored) == 1
+        assert stored[0].quantity == Decimal("1")
+
+    async def test_no_seed_when_order_not_filled(self, engine, mock_adapter):
+        """An unfilled (OPEN) order must not trigger a position fetch/seed."""
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("50000"),
+                updated_at=_utcnow(),
+                position_id="0",
+            )
+        )
+        result = await engine.place_order(_order(client_order_id="still-open"))
+        assert result.status == OrderStatus.OPEN
+        assert await engine.get_positions(_instrument()) == []
+
 
 # ── shutdown behaviour ───────────────────────────────────────────────
 
@@ -1032,6 +1143,10 @@ class TestReconcileMismatchCases:
             )
         )
 
+        # Fill timestamps comfortably older than the settle lag so they are
+        # inside the compared (settled) window, not the in-flight tail.
+        settled = datetime.now(tz=UTC) - timedelta(minutes=1)
+
         # Seed a local fill
         local_fill = FillRecord(
             client_order_id="fill-disc",
@@ -1039,7 +1154,7 @@ class TestReconcileMismatchCases:
             instrument=_instrument(),
             fill_quantity=Decimal("0.3"),
             fill_price=Decimal("50000"),
-            fill_timestamp=_utcnow(),
+            fill_timestamp=settled,
             fee_currency="USDT",
             fee_amount=Decimal("1"),
             correlation_id="corr-local",
@@ -1053,7 +1168,7 @@ class TestReconcileMismatchCases:
             instrument=_instrument(),
             fill_quantity=Decimal("0.7"),
             fill_price=Decimal("50000"),
-            fill_timestamp=_utcnow(),
+            fill_timestamp=settled,
             fee_currency="USDT",
             fee_amount=Decimal("1"),
             correlation_id="corr-platform",
@@ -1132,6 +1247,7 @@ class TestReconcileHaltScoping:
                 updated_at=_utcnow(),
             )
         )
+        settled = datetime.now(tz=UTC) - timedelta(minutes=1)
         await engine.state_store.upsert_fill(
             FillRecord(
                 client_order_id="fill-disc",
@@ -1139,7 +1255,7 @@ class TestReconcileHaltScoping:
                 instrument=_instrument(),
                 fill_quantity=Decimal("0.3"),
                 fill_price=Decimal("50000"),
-                fill_timestamp=_utcnow(),
+                fill_timestamp=settled,
                 fee_currency="USDT",
                 fee_amount=Decimal("1"),
                 correlation_id="corr-local",
@@ -1152,7 +1268,7 @@ class TestReconcileHaltScoping:
                 instrument=_instrument(),
                 fill_quantity=Decimal("0.7"),
                 fill_price=Decimal("50000"),
-                fill_timestamp=_utcnow(),
+                fill_timestamp=settled,
                 fee_currency="USDT",
                 fee_amount=Decimal("1"),
                 correlation_id="corr-platform",
@@ -1162,6 +1278,165 @@ class TestReconcileHaltScoping:
         result = await engine.reconcile()
         assert len(result.partial_fill_discrepancies) == 1
         assert engine.halt_machine.active_halts() == []
+
+
+class TestFillSettleLag:
+    """The reconcile fill window leaves its leading (still-in-flight) edge
+    un-compared, so a fill the REST snapshot sees but whose WS event has not
+    yet landed is deferred rather than flagged as a phantom partial fill."""
+
+    async def test_in_flight_fill_not_flagged(self, engine, mock_adapter):
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="in-flight"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+
+        # Platform REST already sees the fill; local has nothing yet because the
+        # execution-stream event is still in flight.  Its timestamp falls inside
+        # the settle-lag window, so it must not be flagged.
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="in-flight",
+                platform_fill_id="pf-inflight",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(seconds=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-inflight",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert result.partial_fill_discrepancies == []
+
+    async def test_settled_fill_is_flagged(self, engine, mock_adapter):
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="settled-miss"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+
+        # The same platform-only fill, but older than the settle lag: genuine
+        # drift (a truly missed WS event) and must be flagged.
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="settled-miss",
+                platform_fill_id="pf-settled",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.003"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(minutes=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-settled",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert len(result.partial_fill_discrepancies) == 1
+
+    async def test_correction_preserves_in_flight_fills(self, engine, mock_adapter):
+        """Correcting a settled discrepancy must not delete a still-in-flight
+        local fill whose timestamp falls inside the settle-lag window."""
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="mixed"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+
+        # Local: a settled fill (0.3) that disagrees with platform, plus an
+        # in-flight fill (0.1) the WS just delivered.
+        await engine.state_store.upsert_fill(
+            FillRecord(
+                client_order_id="mixed",
+                platform_fill_id="lf-settled",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.3"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(minutes=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-local",
+            )
+        )
+        await engine.state_store.upsert_fill(
+            FillRecord(
+                client_order_id="mixed",
+                platform_fill_id="lf-inflight",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.1"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(seconds=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-inflight",
+            )
+        )
+
+        # Platform: the settled truth (0.7) and the same in-flight fill (0.1).
+        # Both are returned by the REST fetch, but the settle-lag boundary drops
+        # the in-flight one from the comparison/correction window.
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="mixed",
+                platform_fill_id="pf-settled",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.7"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(minutes=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-platform",
+            )
+        )
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="mixed",
+                platform_fill_id="lf-inflight",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.1"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=datetime.now(tz=UTC) - timedelta(seconds=1),
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-inflight",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert len(result.partial_fill_discrepancies) == 1
+
+        # The settled discrepancy is corrected to platform truth, and the
+        # in-flight fill survives the correction (not deleted by the window).
+        fills_after = await engine.get_fill_history()
+        ids = {f.platform_fill_id for f in fills_after}
+        assert "pf-settled" in ids
+        assert "lf-inflight" in ids
+        assert "lf-settled" not in ids
 
 
 class TestReconcileTriState:
@@ -1240,6 +1515,10 @@ class TestPeriodicReconcile:
     def test_invalid_interval_raises(self, mock_adapter, event_bus):
         with pytest.raises(ValueError):
             Engine(adapter=mock_adapter, event_bus=event_bus, reconcile_interval_seconds=0)
+
+    def test_invalid_fill_settle_lag_raises(self, mock_adapter, event_bus):
+        with pytest.raises(ValueError):
+            Engine(adapter=mock_adapter, event_bus=event_bus, fill_settle_lag_seconds=-1)
 
 
 # ── timeout idempotency (Section 9.2) ───────────────────────────────

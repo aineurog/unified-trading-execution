@@ -21,8 +21,16 @@ from decimal import Decimal
 from typing import Any
 
 from unified_trading_execution.bybit.orders import map_order_status
+from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.errors import PlatformError
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
@@ -48,6 +56,17 @@ _BYBIT_TO_TIME_IN_FORCE: dict[str, TimeInForce] = {
 # ``orderType``; a non-empty ``stopOrderType`` marks it as conditional.
 _EMPTY: frozenset[Any] = frozenset({None, ""})
 _UNKNOWN = "UNKNOWN"
+
+# Native TP/SL children (created by Bybit when a parent order carries
+# ``takeProfit``/``stopLoss``) report their origin in ``createType``.  A fill
+# from one of these is a reduce-only close — classify it so the store can tell
+# a TP/SL close apart from an ordinary user fill.
+_CREATE_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
+    "CreateByTakeProfit": FillReason.TAKE_PROFIT,
+    "CreateByPartialTakeProfit": FillReason.TAKE_PROFIT,
+    "CreateByStopLoss": FillReason.STOP_LOSS,
+    "CreateByPartialStopLoss": FillReason.STOP_LOSS,
+}
 
 # Terminal states that free the order from the live order set and may be
 # echoed by the exchange (Bybit can repeat a ``Filled`` status when a cancel
@@ -114,10 +133,14 @@ def translate_fill(
     instrument :
         The resolved canonical instrument for ``entry["symbol"]``.
     client_order_id :
-        The Bybit ``orderLinkId`` or an empty string when the order was placed
-        without a client id.  Used as the fill's ``correlation_id`` so a fill
-        remains attributable to the request that caused it.
+        The fill's store key — the Bybit ``orderLinkId`` for a user order, or a
+        synthesized ``bybit-tpsl-<orderId>`` for a native TP/SL child.  Used as
+        the fill's ``correlation_id`` so a fill remains attributable to the
+        request that caused it.
     """
+    create_type = entry.get("createType")
+    reason = _CREATE_TYPE_TO_FILL_REASON.get(create_type) if isinstance(create_type, str) else None
+    position_idx = entry.get("positionIdx")
     return FillRecord(
         client_order_id=client_order_id,
         platform_fill_id=_required_string(entry, "execId"),
@@ -128,6 +151,9 @@ def translate_fill(
         fee_currency=_optional_string(entry, "feeCurrency"),
         fee_amount=_parse_fee(entry.get("execFee")),
         correlation_id=client_order_id,
+        position_id=str(position_idx) if position_idx not in _EMPTY else None,
+        reason=reason,
+        entry=FillEntry.OUT if reason is not None else None,
     )
 
 
@@ -136,8 +162,8 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
 
     ``quantity`` follows the core convention: positive = long (``Buy``),
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
-    ``position_id`` is the Bybit ``positionIdx`` (0 = one-way, 1/2 = hedge
-    side), scoped to the instrument.
+    ``position_id`` is ``{venue_symbol}:{positionIdx}`` (e.g. ``BTCUSDT:0``)
+    — ``positionIdx`` alone collides across symbols (BTCUSDT 0 vs BTCUSD 0).
     """
     side = entry.get("side")
     size = _decimal(entry.get("size"), "size")
@@ -148,12 +174,16 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
     else:
         quantity = Decimal("0")
 
+    idx = str(entry.get("positionIdx", 0))
+
+    venue_symbol = to_bybit_symbol(instrument)
+    position_id = f"{venue_symbol}:{idx}"
     return Position(
         instrument=instrument,
         quantity=quantity,
         average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
-        position_id=str(entry.get("positionIdx", 0)),
+        position_id=position_id,
     )
 
 
@@ -235,8 +265,8 @@ def translate_order_entry(entry: dict[str, Any], *, instrument: Instrument) -> O
         stop_price=_optional_decimal(entry.get("triggerPrice")),
         reduce_only=bool(entry.get("reduceOnly")),
         client_tag=None,
-        take_profit=_translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
-        stop_loss=_translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
+        take_profit=translate_tp_sl(entry.get("takeProfit"), entry.get("tpLimitPrice")),
+        stop_loss=translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
         platform_order_id=platform_order_id,
         status=map_order_status(_required_string(entry, "orderStatus")),
         filled_quantity=_decimal(entry.get("cumExecQty") or "0", "cumExecQty"),
@@ -262,7 +292,12 @@ def is_final_order_status(status: OrderStatus) -> bool:
     return status in _FINAL_ORDER_STATUSES
 
 
-def _translate_tp_sl(trigger_raw: object, limit_raw: object) -> TpSlAttachment | None:
+def translate_tp_sl(trigger_raw: object, limit_raw: object) -> TpSlAttachment | None:
+    """Build a ``TpSlAttachment`` from a Bybit TP/SL trigger + optional limit.
+
+    Returns ``None`` when the trigger is unset (``None``/empty string) or zero
+    — the wire representation Bybit uses for "no stop on this side".
+    """
     if trigger_raw in _EMPTY:
         return None
     trigger = _decimal(trigger_raw, "takeProfit/stopLoss")

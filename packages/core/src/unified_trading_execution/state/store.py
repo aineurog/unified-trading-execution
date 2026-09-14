@@ -138,7 +138,11 @@ class StateStore(ABC):
     async def delete_orders_by_client_ids(self, client_order_ids: list[str]) -> None: ...
     @abstractmethod
     async def delete_fills_by_client_ids(
-        self, client_order_ids: list[str], *, since: datetime | None = None
+        self,
+        client_order_ids: list[str],
+        *,
+        since: datetime | None = None,
+        end: datetime | None = None,
     ) -> None: ...
 
     @abstractmethod
@@ -426,8 +430,9 @@ class SQLiteStateStore(StateStore):
         async with self._write_lock:
             i = _serialise_instrument(instrument)
             await self.conn.execute(
-                "DELETE FROM positions WHERE symbol=? AND asset_class=? AND position_id=?",
-                (i["symbol"], i["asset_class"], position_id),
+                "DELETE FROM positions WHERE symbol=? AND quote_currency IS ? "
+                "AND asset_class=? AND position_id=?",
+                (i["symbol"], i["quote_currency"], i["asset_class"], position_id),
             )
 
     async def upsert_balance(self, balance: Balance) -> None:
@@ -719,26 +724,32 @@ class SQLiteStateStore(StateStore):
                 )
 
     async def delete_fills_by_client_ids(
-        self, client_order_ids: list[str], *, since: datetime | None = None
+        self,
+        client_order_ids: list[str],
+        *,
+        since: datetime | None = None,
+        end: datetime | None = None,
     ) -> None:
         """Delete fill rows by client id, holding the write lock.
 
-        When *since* is given, only fills with ``fill_timestamp >= since`` are
-        removed, so reconciliation can correct a window of fills without
-        disturbing pre-watermark history.
+        ``since`` and ``end`` bound the ``fill_timestamp`` window removed, so
+        reconciliation can correct a slice of fills without disturbing
+        pre-watermark history (``since``) or a still-in-flight tail (``end``).
         """
         async with self._write_lock:
             for client_order_id in client_order_ids:
-                if since is None:
-                    await self.conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ?",
-                        (client_order_id,),
-                    )
-                else:
-                    await self.conn.execute(
-                        "DELETE FROM fills WHERE client_order_id = ? AND fill_timestamp >= ?",
-                        (client_order_id, since.isoformat()),
-                    )
+                conditions = ["client_order_id = ?"]
+                params: list[Any] = [client_order_id]
+                if since is not None:
+                    conditions.append("fill_timestamp >= ?")
+                    params.append(since.isoformat())
+                if end is not None:
+                    conditions.append("fill_timestamp <= ?")
+                    params.append(end.isoformat())
+                await self.conn.execute(
+                    f"DELETE FROM fills WHERE {' AND '.join(conditions)}",
+                    params,
+                )
 
     # ---- Audit trail (append-only) ----
 
@@ -826,8 +837,8 @@ class SQLiteStateStore(StateStore):
             i = _serialise_instrument(instrument)
             cursor = await self.conn.execute(
                 "SELECT quantity, average_entry_price, updated_at, position_id "
-                "FROM positions WHERE symbol=? AND asset_class=?",
-                (i["symbol"], i["asset_class"]),
+                "FROM positions WHERE symbol=? AND quote_currency IS ? AND asset_class=?",
+                (i["symbol"], i["quote_currency"], i["asset_class"]),
             )
             return [
                 Position(
@@ -971,7 +982,7 @@ class SQLiteStateStore(StateStore):
                 (
                     scope,
                     i["symbol"] if i else "",
-                    i["quote_currency"] if i else None,
+                    i["quote_currency"] if i else "",
                     i["asset_class"] if i else "",
                     i["exchange"] if i else None,
                     i["currency"] if i else None,
@@ -996,8 +1007,9 @@ class SQLiteStateStore(StateStore):
             else:
                 i = _serialise_instrument(instrument)
                 await self.conn.execute(
-                    "DELETE FROM halts WHERE scope = ? AND symbol = ? AND asset_class = ?",
-                    (scope, i["symbol"], i["asset_class"]),
+                    "DELETE FROM halts WHERE scope = ? AND symbol = ? AND quote_currency IS ? "
+                    "AND asset_class = ?",
+                    (scope, i["symbol"], i["quote_currency"], i["asset_class"]),
                 )
 
     # ---- Filtered queries ----
@@ -1078,8 +1090,10 @@ class SQLiteStateStore(StateStore):
         query = "SELECT * FROM positions WHERE 1=1"
         params: list[Any] = []
         if instrument is not None:
-            query += " AND symbol=? AND asset_class=?"
-            params.extend([instrument.symbol, instrument.asset_class.value])
+            query += " AND symbol=? AND quote_currency IS ? AND asset_class=?"
+            params.extend(
+                [instrument.symbol, instrument.quote_currency, instrument.asset_class.value]
+            )
         query += " ORDER BY updated_at DESC LIMIT ?"
         params.append(limit)
         async with self._write_lock:

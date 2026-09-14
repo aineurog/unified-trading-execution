@@ -43,7 +43,9 @@ class HaltStateMachine:
 
     def __init__(self, config: HaltConfig | None = None) -> None:
         self._config = config or HaltConfig()
-        self._instrument_halts: dict[str, _HaltEntry] = {}  # keyed by symbol
+        # Keyed by the full Instrument so two instruments that share a base
+        # symbol (BTCUSDT linear vs BTCUSD inverse) halt independently.
+        self._instrument_halts: dict[Instrument, _HaltEntry] = {}
         self._account_halted: _HaltEntry | None = None
 
     @property
@@ -56,13 +58,13 @@ class HaltStateMachine:
         return self._account_halted is not None
 
     def is_instrument_halted(self, instrument: Instrument) -> bool:
-        return instrument.symbol in self._instrument_halts
+        return instrument in self._instrument_halts
 
     def is_halted(self, instrument: Instrument | None = None) -> bool:
         """Check if either the specific instrument or the account is halted."""
         if self._account_halted is not None:
             return True
-        if instrument is not None and instrument.symbol in self._instrument_halts:
+        if instrument is not None and instrument in self._instrument_halts:
             return True
         return False
 
@@ -78,7 +80,7 @@ class HaltStateMachine:
         """
         if scope == "account":
             return HaltState.HALTED if self._account_halted is not None else HaltState.ACTIVE
-        if instrument is not None and instrument.symbol in self._instrument_halts:
+        if instrument is not None and instrument in self._instrument_halts:
             return HaltState.HALTED
         return HaltState.ACTIVE
 
@@ -123,7 +125,7 @@ class HaltStateMachine:
 
         if instrument is None:
             raise ValueError("instrument required for instrument-scoped halt")
-        key = instrument.symbol
+        key = instrument
         if key in self._instrument_halts:
             return False  # already halted
         self._instrument_halts[key] = entry
@@ -151,7 +153,7 @@ class HaltStateMachine:
             return True
         if instrument is None:
             raise ValueError("instrument required for instrument-scoped halt")
-        key = instrument.symbol
+        key = instrument
         if key in self._instrument_halts:
             return False  # already halted
         self._instrument_halts[key] = entry
@@ -174,7 +176,7 @@ class HaltStateMachine:
         if scope == "account":
             entry = self._account_halted
         elif instrument is not None:
-            entry = self._instrument_halts.get(instrument.symbol)
+            entry = self._instrument_halts.get(instrument)
 
         if entry is None:
             return False  # not halted
@@ -189,6 +191,6 @@ class HaltStateMachine:
         if scope == "account":
             self._account_halted = None
         elif instrument is not None:
-            del self._instrument_halts[instrument.symbol]
+            del self._instrument_halts[instrument]
 
         return True

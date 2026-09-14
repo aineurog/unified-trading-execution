@@ -395,32 +395,38 @@ class TestBuildMT5SltpRequest:
     """TP/SL → TRADE_ACTION_SLTP translation."""
 
     def test_sltp_request(self, mock_mt5_module, mt5_constants) -> None:
-        """SLTP request has TRADE_ACTION_SLTP and correct position_id."""
+        """SLTP request has TRADE_ACTION_SLTP, symbol, and correct position_id."""
         request = build_mt5_sltp_request(
             "789",
+            "EURUSD.m",
             take_profit=1.3,
             stop_loss=1.0,
             mt5_module=mock_mt5_module,
         )
         assert request["action"] == mock_mt5_module.TRADE_ACTION_SLTP
+        assert request["symbol"] == "EURUSD.m"
         assert request["position"] == 789
         assert request["tp"] == 1.3
         assert request["sl"] == 1.0
 
     def test_sltp_accepts_only_one_level(self, mock_mt5_module, mt5_constants) -> None:
         """SLTP request with only take_profit or only stop_loss."""
-        request = build_mt5_sltp_request("789", take_profit=1.3, mt5_module=mock_mt5_module)
+        request = build_mt5_sltp_request(
+            "789", "EURUSD.m", take_profit=1.3, mt5_module=mock_mt5_module
+        )
         assert request["tp"] == 1.3
         assert "sl" not in request
 
-        request = build_mt5_sltp_request("789", stop_loss=1.0, mt5_module=mock_mt5_module)
+        request = build_mt5_sltp_request(
+            "789", "EURUSD.m", stop_loss=1.0, mt5_module=mock_mt5_module
+        )
         assert request["sl"] == 1.0
         assert "tp" not in request
 
     def test_sltp_requires_at_least_one_level(self, mock_mt5_module, mt5_constants) -> None:
         """SLTP request without any level raises ValueError."""
         with pytest.raises(ValueError):
-            build_mt5_sltp_request("789", mt5_module=mock_mt5_module)
+            build_mt5_sltp_request("789", "EURUSD.m", mt5_module=mock_mt5_module)
 
 
 class TestParseMT5Result:

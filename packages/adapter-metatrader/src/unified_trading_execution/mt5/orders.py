@@ -225,6 +225,7 @@ def build_mt5_cancel_request(
 
 def build_mt5_sltp_request(
     position_id: str,
+    symbol: str,
     *,
     take_profit: float | None = None,
     stop_loss: float | None = None,
@@ -233,8 +234,12 @@ def build_mt5_sltp_request(
     """Build an MT5 ``TRADE_ACTION_SLTP`` request dict to modify TP/SL on an
     existing position.
 
-    *position_id* is the MT5 position ticket (as a string).
-    At least one of *take_profit* or *stop_loss* must be provided (as float).
+    *position_id* is the MT5 position ticket (as a string); *symbol* is the
+    broker symbol the position belongs to.  MT5 requires **both** — the
+    terminal does not resolve the symbol from the ticket alone and rejects
+    the request with ``TRADE_RETCODE_INVALID`` (10013) when *symbol* is
+    absent.  At least one of *take_profit* or *stop_loss* must be provided
+    (as float).
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
     """
@@ -243,6 +248,7 @@ def build_mt5_sltp_request(
 
     request: dict[str, Any] = {
         "action": mt5_module.TRADE_ACTION_SLTP,
+        "symbol": symbol,
         "position": int(position_id),
     }
     if take_profit is not None:

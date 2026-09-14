@@ -23,9 +23,17 @@ from unified_trading_execution.events import (
     FillEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 
 
 class _SyncLoop:
@@ -86,6 +94,58 @@ class TestStreamsTranslation:
         assert fill.fee_currency == "USDT"
         assert fill.fee_amount == Decimal("26.37")
         assert fill.correlation_id == "client-1"
+
+    def test_translate_fill_classifies_native_tp_sl(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-1",
+                "orderLinkId": "",
+                "orderId": "cffa-child",
+                "createType": "CreateByTakeProfit",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="bybit-tpsl-cffa-child",
+        )
+        assert fill.reason == FillReason.TAKE_PROFIT
+        assert fill.entry == FillEntry.OUT
+
+    def test_translate_fill_stop_loss_reason(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-2",
+                "orderLinkId": "",
+                "orderId": "cffa-child",
+                "createType": "CreateByStopLoss",
+                "execQty": "1",
+                "execPrice": "95000",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="bybit-tpsl-cffa-child",
+        )
+        assert fill.reason == FillReason.STOP_LOSS
+        assert fill.entry == FillEntry.OUT
+
+    def test_translate_fill_plain_fill_is_unclassified(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-3",
+                "orderLinkId": "client-1",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="client-1",
+        )
+        assert fill.reason is None
+        assert fill.entry is None
 
     def test_translate_position_long(self) -> None:
         pos = streams.translate_position(
@@ -314,6 +374,64 @@ class TestStreamEmission:
         )
         assert len(captured) == 1
 
+    def test_execution_skips_entry_without_order_id(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # A Trade with neither orderLinkId nor orderId cannot be attributed to
+        # any order — it is skipped (never collapsed onto an empty key).
+        assert captured == []
+
+    def test_execution_records_native_tp_sl_fill(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "orderId": "cffa-child",
+                        "createType": "CreateByStopLoss",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # A triggered TP/SL child is a real closing fill — it must be recorded
+        # (keyed by the platform order id) with its SL/TP reason, not dropped.
+        assert len(captured) == 1
+        assert captured[0].correlation_id == "bybit-tpsl-cffa-child"
+        assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-child"
+        assert captured[0].fill.reason == FillReason.STOP_LOSS
+        assert captured[0].fill.entry == FillEntry.OUT
+
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
         captured: list[PositionUpdateEvent] = []
@@ -373,6 +491,89 @@ class TestStreamEmission:
         assert len(placed) == 1
         assert len(cancelled) == 1
         assert cancelled[0].client_order_id == "client-1"
+
+    def test_order_fill_emits_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        statuses: list[OrderStatusEvent] = []
+        cancelled: list[OrderCancelledEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+        event_bus.subscribe(OrderCancelledEvent, cancelled.append)
+
+        # First sighting → OrderPlacedEvent only.
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        assert len(placed) == 1
+        assert statuses == []
+
+        # OPEN → FILLED → OrderStatusEvent carrying the filled snapshot.
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="Filled", cumExecQty="0.5")]}
+        )
+        assert len(placed) == 1
+        assert len(statuses) == 1
+        assert statuses[0].order.status == OrderStatus.FILLED
+        assert statuses[0].order.filled_quantity == Decimal("0.5")
+        assert cancelled == []
+
+        # A terminal echo of FILLED must not re-emit a second status event.
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="Filled", cumExecQty="0.5")]}
+        )
+        assert len(statuses) == 1
+
+    def test_order_partial_fill_emits_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        statuses: list[OrderStatusEvent] = []
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        adapter._on_order_message(
+            {"data": [_base_order_entry(orderStatus="PartiallyFilled", cumExecQty="0.1")]}
+        )
+        assert len(statuses) == 1
+        assert statuses[0].order.status == OrderStatus.PARTIALLY_FILLED
+
+    def test_order_terminal_cancel_emits_no_status_event(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        statuses: list[OrderStatusEvent] = []
+        cancelled: list[OrderCancelledEvent] = []
+        event_bus.subscribe(OrderStatusEvent, statuses.append)
+        event_bus.subscribe(OrderCancelledEvent, cancelled.append)
+
+        adapter._on_order_message({"data": [_base_order_entry()]})
+        adapter._on_order_message({"data": [_base_order_entry(orderStatus="Cancelled")]})
+        assert statuses == []
+        assert len(cancelled) == 1
+
+    def test_order_skips_native_tp_sl_children(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+
+        adapter._on_order_message(
+            {
+                "data": [
+                    _base_order_entry(
+                        orderLinkId="",
+                        orderId="cffa-child",
+                        createType="CreateByStopLoss",
+                    )
+                ]
+            }
+        )
+
+        # Native TP/SL children are position TP/SL state, not user orders —
+        # they must never surface as phantom OrderPlacedEvents in the mirror.
+        assert placed == []
 
     def test_order_terminal_echo_not_replaced(
         self, adapter: BybitAdapter, event_bus: EventBus
@@ -441,6 +642,7 @@ class TestStreamEmission:
                             "symbol": "BTCUSDT",
                             "category": "linear",
                             "execId": "exec-1",
+                            "orderLinkId": "client-1",
                             "execType": "Trade",
                             "execQty": "0.5",
                             "execPrice": "95900.1",

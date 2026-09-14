@@ -313,6 +313,7 @@ async def test_modify_position_tpsl(connected_adapter: IBKRAdapter) -> None:
     assert nvda is not None and nvda.position_id is not None, "no NVDA position for tpsl test"
     # Place TP/SL
     await adapter.modify_position_tpsl(
+        nvda.instrument,
         nvda.position_id,
         take_profit=TpSlAttachment(Decimal("300")),
         stop_loss=TpSlAttachment(Decimal("200")),

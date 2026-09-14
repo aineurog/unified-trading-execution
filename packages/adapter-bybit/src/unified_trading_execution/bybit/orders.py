@@ -269,6 +269,49 @@ def build_cancel_payload(
     }
 
 
+def build_set_trading_stop_payload(
+    *,
+    category: str,
+    symbol: str,
+    position_idx: int,
+    take_profit: TpSlAttachment | None,
+    stop_loss: TpSlAttachment | None,
+) -> dict[str, Any]:
+    """Translate a position TP/SL modification into ``set_trading_stop`` params.
+
+    Mirrors the placement/amend TP/SL conventions: a ``limit_price`` on either
+    attachment makes the whole request a ``Partial`` tpsl (that leg is a limit
+    order); when both are market the mode is ``Full``.
+    """
+    payload: dict[str, Any] = {
+        "category": category,
+        "symbol": symbol,
+        "positionIdx": position_idx,
+    }
+
+    any_limit = (
+        take_profit is not None and take_profit.limit_price is not None
+    ) or (stop_loss is not None and stop_loss.limit_price is not None)
+    payload["tpslMode"] = "Partial" if any_limit else "Full"
+
+    if take_profit is not None:
+        payload["takeProfit"] = str(take_profit.trigger_price)
+        if take_profit.limit_price is not None:
+            payload["tpOrderType"] = "Limit"
+            payload["tpLimitPrice"] = str(take_profit.limit_price)
+        else:
+            payload["tpOrderType"] = "Market"
+    if stop_loss is not None:
+        payload["stopLoss"] = str(stop_loss.trigger_price)
+        if stop_loss.limit_price is not None:
+            payload["slOrderType"] = "Limit"
+            payload["slLimitPrice"] = str(stop_loss.limit_price)
+        else:
+            payload["slOrderType"] = "Market"
+
+    return payload
+
+
 def map_order_status(bybit_status: str) -> OrderStatus:
     """Map a Bybit ``orderStatus`` string to the unified ``OrderStatus``.
 

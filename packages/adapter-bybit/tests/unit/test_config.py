@@ -37,7 +37,7 @@ class TestBybitConfig:
 
     def test_account_id_default(self) -> None:
         config = BybitConfig(api_key="k", api_secret="s")
-        assert config.account_id == "bybit-account"
+        assert config.account_id is None
 
     def test_custom_platform_name(self) -> None:
         config = BybitConfig(api_key="k", api_secret="s", platform_name="my-bybit")
