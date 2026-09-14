@@ -467,7 +467,9 @@ class TestModifyPositionTpsl:
 
         mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
 
-        await adapter.modify_position_tpsl(EURUSD, "222", take_profit=TpSlAttachment(Decimal("1.20")))
+        await adapter.modify_position_tpsl(
+            EURUSD, "222", take_profit=TpSlAttachment(Decimal("1.20"))
+        )
 
         assert captured[0][0].exchange == "IDEALPRO"
         assert captured[0][1].orderType == "LMT"
@@ -514,7 +516,9 @@ class TestModifyPositionTpsl:
         mock_ib = mock_ib_async_module
         mock_ib.positions.return_value = []  # type: ignore[attr-defined]
         with pytest.raises(OrderNotFoundError):
-            await adapter.modify_position_tpsl(AAPL, "999", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(
+                AAPL, "999", take_profit=TpSlAttachment(Decimal("1"))
+            )
 
     async def test_flat_position_raises(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
@@ -523,7 +527,9 @@ class TestModifyPositionTpsl:
         mock_ib = mock_ib_async_module
         mock_ib.positions.return_value = [self._pos(con_id=111, qty=0)]  # type: ignore[attr-defined]
         with pytest.raises(OrderNotFoundError, match="flat"):
-            await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(
+                AAPL, "111", take_profit=TpSlAttachment(Decimal("1"))
+            )
 
     async def test_no_tp_sl_raises(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
@@ -543,7 +549,9 @@ class TestModifyPositionTpsl:
 
     async def test_not_connected(self, adapter: IBKRAdapter) -> None:
         with pytest.raises(PlatformConnectionError):
-            await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("1")))
+            await adapter.modify_position_tpsl(
+                AAPL, "111", take_profit=TpSlAttachment(Decimal("1"))
+            )
 
 
 # ---------------------------------------------------------------------------

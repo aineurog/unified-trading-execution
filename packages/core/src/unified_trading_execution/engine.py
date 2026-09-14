@@ -198,9 +198,7 @@ class Engine:
             )
         self._reconcile_interval_seconds = reconcile_interval_seconds
         if fill_settle_lag_seconds < 0:
-            raise ValueError(
-                f"fill_settle_lag_seconds must be >= 0, got {fill_settle_lag_seconds}"
-            )
+            raise ValueError(f"fill_settle_lag_seconds must be >= 0, got {fill_settle_lag_seconds}")
         self._fill_settle_lag_seconds = fill_settle_lag_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
         # Serialises manual / reconnect / periodic reconciles so they never
@@ -751,9 +749,7 @@ class Engine:
                 for local in context.local_positions:
                     if (local.instrument, local.position_id) not in platform_keys:
                         if local.position_id is not None:
-                            await self._store.delete_position(
-                                local.instrument, local.position_id
-                            )
+                            await self._store.delete_position(local.instrument, local.position_id)
             except Exception:
                 logger.exception("Failed to sync positions to platform truth")
 

@@ -289,9 +289,9 @@ def build_set_trading_stop_payload(
         "positionIdx": position_idx,
     }
 
-    any_limit = (
-        take_profit is not None and take_profit.limit_price is not None
-    ) or (stop_loss is not None and stop_loss.limit_price is not None)
+    any_limit = (take_profit is not None and take_profit.limit_price is not None) or (
+        stop_loss is not None and stop_loss.limit_price is not None
+    )
     payload["tpslMode"] = "Partial" if any_limit else "Full"
 
     if take_profit is not None:

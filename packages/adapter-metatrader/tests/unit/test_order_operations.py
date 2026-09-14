@@ -755,7 +755,9 @@ class TestModifyPositionTpsl:
         """limit_price on a TP/SL attachment raises UnsupportedOrderTypeError."""
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_position_tpsl(
-                _instrument(), "789", take_profit=TpSlAttachment(Decimal("1.3000"), Decimal("1.2990"))
+                _instrument(),
+                "789",
+                take_profit=TpSlAttachment(Decimal("1.3000"), Decimal("1.2990")),
             )
         with pytest.raises(UnsupportedOrderTypeError):
             await adapter.modify_position_tpsl(
@@ -773,12 +775,8 @@ class TestModifyPositionTpsl:
 class TestGetPositionTpSl:
     """get_position_tpsl — read-back via positions_get(ticket=...)."""
 
-    async def test_reads_tp_sl(
-        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
-    ) -> None:
-        mock_mt5_module.positions_get.return_value = (
-            SimpleNamespace(ticket=789, tp=1.3, sl=1.0),
-        )
+    async def test_reads_tp_sl(self, mock_mt5_module: MagicMock, adapter: MT5Adapter) -> None:
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
 
         result = await adapter.get_position_tpsl(_instrument(), "789")
 
@@ -794,9 +792,7 @@ class TestGetPositionTpSl:
     async def test_returns_none_none_when_unset(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:
-        mock_mt5_module.positions_get.return_value = (
-            SimpleNamespace(ticket=789, tp=0.0, sl=0.0),
-        )
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=0.0, sl=0.0),)
 
         result = await adapter.get_position_tpsl(_instrument(), "789")
 

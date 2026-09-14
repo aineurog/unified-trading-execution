@@ -1289,9 +1289,7 @@ class TestModifyPositionTpSl:
     ) -> None:
         tp = TpSlAttachment(trigger_price=Decimal("120000"))
         with pytest.raises(ValueError, match="venue symbol does not match"):
-            await adapter.modify_position_tpsl(
-                _futures_instrument(), "ETHUSDT:0", take_profit=tp
-            )
+            await adapter.modify_position_tpsl(_futures_instrument(), "ETHUSDT:0", take_profit=tp)
         mock_pybit_http.set_trading_stop.assert_not_called()
 
     async def test_non_numeric_idx_raises(
