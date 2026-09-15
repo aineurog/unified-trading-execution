@@ -157,15 +157,32 @@ class IBKRAdapter(Adapter):
         """Return the resolved account ID (e.g., 'DU123456').
 
         After ``connect()`` succeeds, this is the actual managed account.
-        Before connect, falls back to the config account (if any).  When
-        neither is set, a stable ``"ibkr-account"`` placeholder keeps the
-        default state-store path (``./unified_trading_execution_data/ibkr_ibkr-account.db``)
-        deterministic across restarts — set ``IBKRConfig.account`` to get a
-        per-account store file.
+        Before connect, falls back to the config account (if any). When
+        neither is set, a deterministic per-connection placeholder
+        (``ibkr-<host>-<port>-<client_id>``) keeps the default state-store
+        path unique per gateway connection across restarts — unlike a shared
+        constant, two connections can never collide on one store file. Set
+        ``IBKRConfig.account`` to pin the identity when several accounts
+        share one gateway login.
         """
         if self._managed_account is not None:
             return self._managed_account
-        return self._config.account or "ibkr-account"
+        if self._config.account:
+            return self._config.account
+        return f"ibkr-{self._config.host}-{self._config.port}-{self._config.client_id}"
+
+    async def resolve_account_id(self) -> str:
+        """Resolve the canonical platform account identity for store-path keying.
+
+        Returns ``self.account_id``: the live managed account once connected,
+        otherwise the configured account or the per-connection placeholder.
+        Unlike REST-based platforms, IBKR exposes no identity endpoint before
+        the socket is up (``managedAccounts()`` needs a live connection, and
+        the engine resolves the store path before ``connect()``), so there is
+        nothing to fetch pre-connect. This override exists to document that
+        contract and degrades gracefully rather than raising, per the ABC.
+        """
+        return self.account_id
 
     # ------------------------------------------------------------------
     # Connection lifecycle
@@ -254,8 +271,8 @@ class IBKRAdapter(Adapter):
             elif accounts:
                 self._managed_account = accounts[0]
             else:
-                # Leave None — account_id falls back to config.account, then to
-                # the deterministic "ibkr-account" placeholder (see account_id).
+                # Leave None — account_id falls back to the per-connection
+                # placeholder (see account_id).
                 self._managed_account = None
 
             self._connected = True
