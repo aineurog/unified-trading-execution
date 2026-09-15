@@ -29,6 +29,7 @@ from unified_trading_execution.ibkr.config import IBKRConfig
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
 
@@ -85,6 +86,9 @@ class IBKREngine(Engine):
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         return await self._adapter.fetch_instrument_spec(instrument)
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        return await self._adapter.fetch_ticker(instrument)
 
     async def get_rate_limits(self) -> RateLimits:
         return await self._adapter.get_rate_limits()

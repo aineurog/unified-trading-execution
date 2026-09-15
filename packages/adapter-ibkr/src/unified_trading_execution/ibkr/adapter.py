@@ -17,6 +17,7 @@ import asyncio
 import contextlib
 import copy
 import logging
+import math
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -51,6 +52,7 @@ from unified_trading_execution.ibkr.orders import (
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
 from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -75,6 +77,24 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _snapshot_price(value: object) -> Decimal | None:
+    """Normalize an ``ib_async`` snapshot price to ``Decimal`` or ``None``.
+
+    Unset snapshot fields arrive as ``NaN`` (ib_async convention); ``None``,
+    non-numeric, non-finite, and non-positive values all mean "no quote on
+    this side" and normalize to ``None`` — never an exception.
+    """
+    if value is None:
+        return None
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(number) or math.isinf(number) or number <= 0:
+        return None
+    return Decimal(str(value))
 
 
 # ---------------------------------------------------------------------------
@@ -605,6 +625,71 @@ class IBKRAdapter(Adapter):
         )
         self._spec_cache[instrument] = (spec, _utcnow())
         return spec
+
+    # ------------------------------------------------------------------
+    # Market data (optional ABC method)
+    # ------------------------------------------------------------------
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        """Fetch the latest price snapshot for *instrument*.
+
+        Uses ``IB.reqTickersAsync()`` — a one-shot snapshot request that
+        cleans up after itself, so no streaming ``reqMktData`` subscription
+        lifecycle is held. ``ib_async`` reports unset prices as ``NaN``;
+        each side normalizes to ``None`` via ``_snapshot_price``.
+
+        Returns ``None`` when the contract is known but has no live quote
+        (market closed, halted, or no market-data subscription). A contract the gateway does not know raises
+        ``InvalidSymbolError`` via the ``reqContractDetailsAsync`` pre-check
+        (TWS request-failure shapes are undocumented, so the snapshot call
+        itself is never used for symbol validation).
+
+        ``mark`` is always ``None``: the snapshot exposes no distinct mark
+        price, and unsupported fields are never approximated.
+        """
+        ib = self._require_ib()
+        contract = to_ibkr_contract(instrument, self._config)
+
+        try:
+            details_list = await ib.reqContractDetailsAsync(contract)
+        except UteError:
+            raise
+        except Exception as exc:
+            raise PlatformConnectionError(
+                f"failed to qualify {instrument.symbol!r} for ticker: {exc}"
+            ) from exc
+        if not details_list:
+            raise InvalidSymbolError(
+                f"IBKR symbol {instrument.symbol!r} is not available: no contract details"
+            )
+
+        try:
+            tickers = await asyncio.wait_for(
+                ib.reqTickersAsync(contract),
+                timeout=self._config.timeout_seconds,
+            )
+        except UteError:
+            raise
+        except TimeoutError as exc:
+            raise PlatformConnectionError(
+                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+            ) from exc
+        except Exception as exc:
+            raise PlatformConnectionError(
+                f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
+            ) from exc
+
+        if not tickers:
+            return None
+        snapshot = tickers[0]
+        if bool(getattr(snapshot, "halted", False)):
+            return None
+        bid = _snapshot_price(getattr(snapshot, "bid", None))
+        ask = _snapshot_price(getattr(snapshot, "ask", None))
+        last = _snapshot_price(getattr(snapshot, "last", None))
+        if bid is None and ask is None and last is None:
+            return None
+        return Ticker(bid=bid, ask=ask, last=last, mark=None)
 
     # ------------------------------------------------------------------
     # Capability reporting
