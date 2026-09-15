@@ -36,6 +36,7 @@ def mock_ib_async_module():
         for _evt_name in (
             "connectedEvent",
             "disconnectedEvent",
+            "errorEvent",
             "positionEvent",
             "accountValueEvent",
             "execDetailsEvent",

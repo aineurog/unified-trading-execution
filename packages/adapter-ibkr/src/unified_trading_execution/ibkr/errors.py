@@ -1,13 +1,21 @@
 """IBKR native error → unified exception hierarchy translation.
 
-IBKR's error model: The API returns errors via integer error codes
-(e.g., 100, 110, 200) and string messages. Every code must be translated
-into an exception from ``unified_trading_execution.errors`` before it
-crosses the adapter boundary.
+IBKR's error model: errors arrive via integer error codes (e.g., 100, 110,
+200) with string messages, delivered asynchronously through
+``IB.errorEvent(reqId, errorCode, errorString, contract)`` (see
+``ib_async.ib.IB`` / ``ib_async.wrapper.Wrapper.error``). Every code must be
+translated into an exception from ``unified_trading_execution.errors``
+before it crosses the adapter boundary.
 
-Informational and warning codes (such as connectivity restored or
-historical data farm messages) are not mapped to exceptions — they
-indicate state changes or warnings rather than execution failures.
+Code reference: IBKR TWS API "Error Codes" table
+(``docs/tws-api/doc/error-handling/error-codes``) and "System Message Codes"
+(``docs/tws-api/doc/error-handling/system-message-codes``). Only codes whose
+TWS message text was verified against those tables are mapped below.
+
+Informational codes (farm-OK / restored notifications) are not mapped to
+exceptions — see ``IGNORED_IBKR_CODES``. They indicate state changes rather
+than execution failures and are filtered by the adapter's ``_on_error``
+handler before translation.
 """
 
 from __future__ import annotations
@@ -16,6 +24,7 @@ from typing import Any
 
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
+    InstrumentHaltedError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -25,11 +34,30 @@ from unified_trading_execution.errors import (
     UteError,
 )
 
+# Notification codes — verified "not a true error condition" / "safely
+# ignore" in the official Error Codes table, or connectivity-restored on the
+# System Message Codes page. The adapter's ``_on_error`` handler filters
+# these to a debug log and never translates them into exceptions.
+IGNORED_IBKR_CODES: frozenset[int] = frozenset(
+    {
+        2104,  # Market data farm connection is OK.
+        2106,  # A historical data farm is connected.
+        2107,  # A historical data farm connection has become inactive.
+        2108,  # A market data farm connection has become inactive.
+        2119,  # Market data farm is connecting.
+        2158,  # Sec-def data farm connection is OK.
+        1101,  # Connectivity between IB and TWS restored — data lost.
+        1102,  # Connectivity between IB and TWS restored — data maintained.
+    }
+)
+
 # Maps IBKR error codes → unified exception types.
 # Codes not in this dict fall through to PlatformError with full context.
-# We intentionally omit code 201 ("Order Rejected") as it acts as a generic
-# catch-all for margin, shorting, and compliance errors; it correctly falls
-# through to PlatformError where the specific string context is preserved.
+# Code 201 ("Order rejected - Reason:") and 202 ("Order cancelled -
+# Reason:") are intentionally omitted: the docs table gives only the prefix
+# and the distinguishing reason is appended at runtime (funds, short, halt,
+# closed, ...), with no enumerated suffix list to verify against. They fall
+# through to PlatformError where the raw string context is preserved.
 _IBKR_ERROR_CODE_MAP: dict[int, type[UteError]] = {
     # ---- Rate limiting ----
     100: RateLimitError,  # Max rate of messages per second has been exceeded.
@@ -37,19 +65,27 @@ _IBKR_ERROR_CODE_MAP: dict[int, type[UteError]] = {
     # ---- Duplicate Order ----
     103: DuplicateOrderIdError,  # Duplicate order ID.
     # ---- Unsupported / Invalid Parameters ----
+    106: UnsupportedOrderTypeError,  # Can't transmit order ID: invalid type/formatting.
     109: UnsupportedOrderTypeError,  # Price out of range defined by precautionary settings.
     110: UnsupportedOrderTypeError,  # Price does not conform to the minimum price variation.
     111: UnsupportedOrderTypeError,  # The TIF and the order type are incompatible.
     113: UnsupportedOrderTypeError,  # The TIF option should be set to DAY for MOC and LOC orders.
     # ---- Invalid Symbol ----
     116: InvalidSymbolError,  # The order cannot be transmitted to a dead exchange.
+    124: InvalidSymbolError,  # No market rule for conid: non-tradeable instrument e.g. Index.
+    138: InvalidSymbolError,  # Could not parse ticker request: invalid symbols.
     162: InvalidSymbolError,  # Historical Market Data Service error (invalid symbol/permissions).
     200: InvalidSymbolError,  # No security definition has been found for the request.
+    203: InvalidSymbolError,  # Security not available or allowed for this account.
+    # ---- Halted ----
+    154: InstrumentHaltedError,  # Orders cannot be transmitted for a halted security.
     # ---- Order Not Found ----
     104: OrderNotFoundError,  # Can't modify a filled order (no longer active).
     105: OrderNotFoundError,  # Order being modified does not match original order.
+    134: OrderNotFoundError,  # Modify order failed: already executed or cancelled.
     135: OrderNotFoundError,  # Can't find order with ID.
     136: OrderNotFoundError,  # This order cannot be cancelled (usually terminal already).
+    161: OrderNotFoundError,  # Cancel attempted when order is not in a cancellable state.
     10147: OrderNotFoundError,  # Order to be canceled was not found.
     # ---- Connection Errors ----
     326: PlatformConnectionError,  # Client id already in use — connect with a unique id.
@@ -59,8 +95,11 @@ _IBKR_ERROR_CODE_MAP: dict[int, type[UteError]] = {
     504: PlatformConnectionError,  # Not connected.
     509: PlatformConnectionError,  # Exception caught while reading socket.
     1100: PlatformConnectionError,  # Connectivity between IB and TWS has been lost.
+    1300: PlatformConnectionError,  # TWS socket port reset — reconnect on the new port.
+    2102: PlatformConnectionError,  # Unable to modify: order still being processed (transient).
     2103: PlatformConnectionError,  # Market data farm connection is broken.
     2105: PlatformConnectionError,  # HMDS data farm connection is broken.
+    2110: PlatformConnectionError,  # Connectivity between TWS and server is broken.
 }
 
 
@@ -88,8 +127,12 @@ def check_ibkr_result(result: Any, description: str = "") -> None:
 
     In ib_async, some failures are returned as empty lists, ``None``, or raise
     built-in Python exceptions (e.g. asyncio.TimeoutError). This helper standardizes
-    result validation.
+    result validation. Already-mapped ``UteError`` instances are re-raised
+    unchanged so their specific type is never flattened.
     """
+    if isinstance(result, UteError):
+        raise result
+
     if result is None:
         raise PlatformError(f"{description} failed: returned None.")
 

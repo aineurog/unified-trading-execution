@@ -30,6 +30,7 @@ from unified_trading_execution.errors import (
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
+    UteError,
 )
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
@@ -39,6 +40,7 @@ from unified_trading_execution.events import (
     FillEvent,
     PositionUpdateEvent,
 )
+from unified_trading_execution.ibkr.errors import IGNORED_IBKR_CODES, map_ibkr_error
 from unified_trading_execution.ibkr.orders import (
     apply_ibkr_modification,
     build_ibkr_orders,
@@ -274,6 +276,7 @@ class IBKRAdapter(Adapter):
         """Subscribe adapter callbacks to ib_async push events (eventkit +=)."""
         ib.connectedEvent += self._on_connected
         ib.disconnectedEvent += self._on_disconnected
+        ib.errorEvent += self._on_error
         # Push streams — keep wired even though handlers are still stubs;
         # they become live without a reconnect when implemented.
         ib.positionEvent += self._on_position_update
@@ -285,6 +288,7 @@ class IBKRAdapter(Adapter):
         for event_name, handler in (
             ("connectedEvent", self._on_connected),
             ("disconnectedEvent", self._on_disconnected),
+            ("errorEvent", self._on_error),
             ("positionEvent", self._on_position_update),
             ("accountValueEvent", self._on_account_value),
             ("execDetailsEvent", self._on_exec_details),
@@ -529,6 +533,8 @@ class IBKRAdapter(Adapter):
 
         try:
             details_list = await ib.reqContractDetailsAsync(contract)
+        except UteError:
+            raise
         except Exception as exc:
             # Connection-level failures (socket closed, timeout) bubble as
             # PlatformConnectionError so Engine can retry; contract-level
@@ -722,6 +728,8 @@ class IBKRAdapter(Adapter):
         account = self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
         try:
             raw_positions = ib.positions(account=account) if account else ib.positions()
+        except UteError:
+            raise
         except Exception as exc:
             raise PlatformConnectionError(f"failed to fetch IBKR positions: {exc}") from exc
 
@@ -767,6 +775,8 @@ class IBKRAdapter(Adapter):
         account = self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
         try:
             values = ib.accountValues(account=account) if account else ib.accountValues()
+        except UteError:
+            raise
         except Exception as exc:
             raise PlatformConnectionError(f"failed to fetch IBKR account values: {exc}") from exc
 
@@ -824,6 +834,8 @@ class IBKRAdapter(Adapter):
         now = _utcnow()
         try:
             trades = ib.openTrades()
+        except UteError:
+            raise
         except Exception as exc:
             raise PlatformConnectionError(f"failed to fetch IBKR open orders: {exc}") from exc
 
@@ -984,6 +996,8 @@ class IBKRAdapter(Adapter):
         ib = self._require_ib()
         try:
             fills = ib.fills()
+        except UteError:
+            raise
         except Exception as exc:
             raise PlatformConnectionError(f"failed to fetch IBKR fills: {exc}") from exc
 
@@ -1068,6 +1082,40 @@ class IBKRAdapter(Adapter):
     # ------------------------------------------------------------------
     # Event Callbacks (adapter-internal push handlers)
     # ------------------------------------------------------------------
+
+    def _on_error(
+        self,
+        req_id: int,
+        error_code: int,
+        error_string: str,
+        contract: Any = None,
+        *args: Any,
+    ) -> None:
+        """Translate a live ``IB`` error into the unified hierarchy for logging.
+
+        ``ib_async`` emits ``errorEvent(reqId, errorCode, errorString,
+        contract)`` asynchronously — including order rejections (201/202)
+        that arrive after ``place_order`` has already returned. There is no
+        caller to raise to here, so this handler never raises: informational
+        codes are debug-logged, everything else is warning-logged with the
+        mapped type and full native context preserved. Rejected orders
+        surface authoritatively on the next ``reconcile()`` pass via their
+        terminal status.
+        """
+        try:
+            if error_code in IGNORED_IBKR_CODES:
+                logger.debug("IBKR notification %s: %s", error_code, error_string)
+                return
+            mapped = map_ibkr_error(error_code, error_string)
+            logger.warning(
+                "IBKR error %s (reqId=%s) mapped to %s: %s",
+                error_code,
+                req_id,
+                type(mapped).__name__,
+                error_string,
+            )
+        except Exception as exc:
+            logger.warning("Skipping errorEvent %r: %s", error_code, exc)
 
     def _on_connected(self, *args: Any) -> None:
         """Callback fired by ib_async when connection is established.

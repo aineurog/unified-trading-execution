@@ -205,3 +205,35 @@ class TestIBKRConnectionLifecycle:
         )
         await fresh.disconnect()
         assert len(fresh_captured) == 0
+
+
+class TestIBKRErrorEvent:
+    """errorEvent is wired on connect, unwired on disconnect, and never raises."""
+
+    async def test_error_event_wired_on_connect(
+        self, adapter: IBKRAdapter, mock_ib_async_module: object
+    ) -> None:
+        """connect() subscribes the error handler alongside the other streams."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module  # type: ignore[assignment]
+        mock_ib.errorEvent.__iadd__.assert_called_once_with(adapter._on_error)  # type: ignore[attr-defined]
+
+    async def test_error_handler_never_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: object
+    ) -> None:
+        """Ignored, mapped, and unknown codes are logged — never raised."""
+        await adapter.connect()
+        # ib_async signature: errorEvent(reqId, errorCode, errorString, contract)
+        adapter._on_error(-1, 2104, "Market data farm connection is OK.", None)
+        adapter._on_error(42, 201, "Order rejected - Reason: test rejection", None)
+        adapter._on_error(43, 154, "Orders cannot be transmitted for a halted security.", None)
+        adapter._on_error(44, 99999, "some future unmapped failure", None)
+
+    async def test_error_event_unwired_on_disconnect(
+        self, adapter: IBKRAdapter, mock_ib_async_module: object
+    ) -> None:
+        """disconnect() unsubscribes the error handler."""
+        await adapter.connect()
+        await adapter.disconnect()
+        mock_ib = mock_ib_async_module  # type: ignore[assignment]
+        mock_ib.errorEvent.__isub__.assert_called_with(adapter._on_error)  # type: ignore[attr-defined]

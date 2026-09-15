@@ -14,6 +14,7 @@ import pytest
 
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
+    InstrumentHaltedError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -22,7 +23,11 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
     UteError,
 )
-from unified_trading_execution.ibkr.errors import check_ibkr_result, map_ibkr_error
+from unified_trading_execution.ibkr.errors import (
+    IGNORED_IBKR_CODES,
+    check_ibkr_result,
+    map_ibkr_error,
+)
 
 
 class TestMapIBKRError:
@@ -37,19 +42,27 @@ class TestMapIBKRError:
             # ---- Duplicate Order ----
             (103, DuplicateOrderIdError),  # Duplicate order ID
             # ---- Unsupported / Invalid Parameters ----
+            (106, UnsupportedOrderTypeError),  # Can't transmit order ID
             (109, UnsupportedOrderTypeError),  # Price out of precautionary range
             (110, UnsupportedOrderTypeError),  # Minimum price variation mismatch
             (111, UnsupportedOrderTypeError),  # TIF and order type incompatible
             (113, UnsupportedOrderTypeError),  # TIF must be DAY for MOC/LOC
             # ---- Invalid Symbol ----
             (116, InvalidSymbolError),  # Dead exchange
+            (124, InvalidSymbolError),  # No market rule for conid (non-tradeable)
+            (138, InvalidSymbolError),  # Could not parse ticker request
             (162, InvalidSymbolError),  # HMDS error / invalid symbol
             (200, InvalidSymbolError),  # Security definition not found
+            (203, InvalidSymbolError),  # Security not available for account
+            # ---- Halted ----
+            (154, InstrumentHaltedError),  # Halted security
             # ---- Order Not Found ----
             (104, OrderNotFoundError),  # Can't modify filled order
             (105, OrderNotFoundError),  # Modified order mismatch
+            (134, OrderNotFoundError),  # Modify failed: already done
             (135, OrderNotFoundError),  # Order ID not found
             (136, OrderNotFoundError),  # Order cannot be cancelled
+            (161, OrderNotFoundError),  # Cancel when not cancellable
             (10147, OrderNotFoundError),  # Order to be canceled was not found
             # ---- Connection Errors ----
             (326, PlatformConnectionError),  # Client ID in use
@@ -59,13 +72,35 @@ class TestMapIBKRError:
             (504, PlatformConnectionError),  # Not connected
             (509, PlatformConnectionError),  # Socket exception
             (1100, PlatformConnectionError),  # Connectivity lost
+            (1300, PlatformConnectionError),  # Socket port reset
+            (2102, PlatformConnectionError),  # Modify while still processing
             (2103, PlatformConnectionError),  # Market data farm broken
             (2105, PlatformConnectionError),  # HMDS farm broken
+            (2110, PlatformConnectionError),  # TWS-server connectivity broken
         ]
         for code, expected in cases:
             err = map_ibkr_error(code, "test error description")
             assert isinstance(err, expected)
             assert "test error description" in str(err)
+
+    def test_overloaded_reject_stays_generic(self) -> None:
+        """201/202 carry runtime reasons — preserved as PlatformError context."""
+        for code in (201, 202):
+            err = map_ibkr_error(code, "Order rejected - Reason: funds exceeded")
+            assert type(err) is PlatformError
+            ctx = err.platform_error
+            assert isinstance(ctx, dict)
+            assert ctx.get("ibkr_error_code") == code
+            assert "funds exceeded" in str(ctx.get("ibkr_error_string"))
+
+    def test_ignored_codes_are_filtered(self) -> None:
+        """Farm-OK / restored notifications never become exceptions."""
+        assert 2104 in IGNORED_IBKR_CODES
+        assert 2106 in IGNORED_IBKR_CODES
+        assert 2119 in IGNORED_IBKR_CODES
+        assert 2158 in IGNORED_IBKR_CODES
+        assert 1101 in IGNORED_IBKR_CODES
+        assert 1102 in IGNORED_IBKR_CODES
 
     def test_unmapped_code_becomes_platform_error(self) -> None:
         """Unknown codes fall through to PlatformError with raw context."""
@@ -103,6 +138,15 @@ class TestCheckIBKRResult:
         exc = TimeoutError("Connection timed out")
         with pytest.raises(PlatformError, match="reqContractDetails failed: Connection timed out"):
             check_ibkr_result(exc, "reqContractDetails")
+
+    def test_mapped_error_passthrough(self) -> None:
+        """Already-mapped UteError instances are re-raised unchanged."""
+        from unified_trading_execution.errors import InvalidSymbolError as _ISE
+
+        original = _ISE("bad symbol")
+        with pytest.raises(_ISE) as exc_info:
+            check_ibkr_result(original, "reqContractDetails")
+        assert exc_info.value is original
 
     def test_success_result_passes_through(self) -> None:
         """Valid result returns without raising."""
