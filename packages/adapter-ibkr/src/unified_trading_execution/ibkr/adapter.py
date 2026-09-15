@@ -638,8 +638,16 @@ class IBKRAdapter(Adapter):
         lifecycle is held. ``ib_async`` reports unset prices as ``NaN``;
         each side normalizes to ``None`` via ``_snapshot_price``.
 
+        A live snapshot is tried first; when the gateway has no live feed
+        it answers error 2186 ("requires additional subscription") and the
+        snapshot future never completes. On timeout the session is switched
+        to delayed data (``reqMarketDataType(3)``) and the snapshot is
+        retried once, so paper logins without a live subscription still get
+        a quote (``marketDataType == 3``) instead of a timeout.
+
         Returns ``None`` when the contract is known but has no live quote
-        (market closed, halted, or no market-data subscription). A contract the gateway does not know raises
+        (market closed, halted, or no market-data subscription). A contract
+        the gateway does not know raises
         ``InvalidSymbolError`` via the ``reqContractDetailsAsync`` pre-check
         (TWS request-failure shapes are undocumented, so the snapshot call
         itself is never used for symbol validation).
@@ -662,18 +670,48 @@ class IBKRAdapter(Adapter):
             raise InvalidSymbolError(
                 f"IBKR symbol {instrument.symbol!r} is not available: no contract details"
             )
+        # reqTickersAsync requires a qualified contract (with conId) —
+        # the raw contract from to_ibkr_contract() is not hashable by
+        # ib_async until qualified via reqContractDetails.
+        qualified = getattr(details_list[0], "contract", None) or contract
 
         try:
             tickers = await asyncio.wait_for(
-                ib.reqTickersAsync(contract),
+                ib.reqTickersAsync(qualified),
                 timeout=self._config.timeout_seconds,
             )
+        except TimeoutError:
+            # No live feed (TWS error 2186: live requires a subscription).
+            # Fall back to delayed data and retry once — the mode switch is
+            # session-wide and sticky, which is exactly what we want: every
+            # later snapshot on this connection reuses the working mode.
+            logger.warning(
+                "IBKR live snapshot for %r timed out — retrying with delayed data",
+                instrument.symbol,
+            )
+            try:
+                ib.reqMarketDataType(3)
+            except Exception as exc:
+                raise PlatformConnectionError(
+                    f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+                ) from exc
+            try:
+                tickers = await asyncio.wait_for(
+                    ib.reqTickersAsync(qualified),
+                    timeout=self._config.timeout_seconds,
+                )
+            except UteError:
+                raise
+            except TimeoutError as exc:
+                raise PlatformConnectionError(
+                    f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+                ) from exc
+            except Exception as exc:
+                raise PlatformConnectionError(
+                    f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
+                ) from exc
         except UteError:
             raise
-        except TimeoutError as exc:
-            raise PlatformConnectionError(
-                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
-            ) from exc
         except Exception as exc:
             raise PlatformConnectionError(
                 f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
@@ -682,7 +720,26 @@ class IBKRAdapter(Adapter):
         if not tickers:
             return None
         snapshot = tickers[0]
-        if bool(getattr(snapshot, "halted", False)):
+
+        # ib_async leaves halt flags as NaN when unset — and bool(nan) is
+        # True, so a naive truthiness check treats every live snapshot as
+        # halted. Only a real set flag (1/True/non-zero string) means halted;
+        # delayed feeds report it via delayedHalted instead of halted.
+        def _is_halted(value: object) -> bool:
+            if value is None or value is False:
+                return False
+            if isinstance(value, float) and math.isnan(value):
+                return False
+            if isinstance(value, str):
+                return value.strip().lower() not in ("", "0", "0.0", "false", "nan")
+            try:
+                return bool(int(float(str(value))))
+            except (TypeError, ValueError):
+                return bool(value)
+
+        if _is_halted(getattr(snapshot, "halted", None)) or _is_halted(
+            getattr(snapshot, "delayedHalted", None)
+        ):
             return None
         bid = _snapshot_price(getattr(snapshot, "bid", None))
         ask = _snapshot_price(getattr(snapshot, "ask", None))

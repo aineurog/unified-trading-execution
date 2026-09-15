@@ -143,10 +143,47 @@ class TestFetchTicker:
             await adapter.fetch_ticker(BOND)
         mock_ib.reqContractDetailsAsync.assert_not_awaited()
 
+    async def test_nan_halted_returns_quote(
+        self, adapter: IBKRAdapter, mock_ib_async_module: Any
+    ) -> None:
+        """Live snapshots carry halted=NaN when unset — NaN is not halted."""
+        mock_ib = mock_ib_async_module
+        _known_contract(mock_ib)
+        mock_ib.reqTickersAsync = AsyncMock(
+            return_value=[_snapshot(bid=150.25, ask=150.30, last=150.28, halted=float("nan"))]
+        )
+
+        await adapter.connect()
+        ticker = await adapter.fetch_ticker(AAPL)
+
+        assert ticker is not None
+        assert ticker.bid == Decimal("150.25")
+
+    async def test_live_timeout_falls_back_to_delayed(
+        self, adapter: IBKRAdapter, mock_ib_async_module: Any
+    ) -> None:
+        """No live feed (TWS 2186) → reqMarketDataType(3) + one delayed retry."""
+        mock_ib = mock_ib_async_module
+        _known_contract(mock_ib)
+        mock_ib.reqTickersAsync = AsyncMock(
+            side_effect=[
+                TimeoutError("live needs subscription"),
+                [_snapshot(bid=150.25, ask=150.30, last=150.28)],
+            ]
+        )
+
+        await adapter.connect()
+        ticker = await adapter.fetch_ticker(AAPL)
+
+        assert ticker is not None
+        assert ticker.bid == Decimal("150.25")
+        mock_ib.reqMarketDataType.assert_called_once_with(3)
+        assert mock_ib.reqTickersAsync.await_count == 2
+
     async def test_snapshot_timeout_raises_connection_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
     ) -> None:
-        """A snapshot that never completes → PlatformConnectionError."""
+        """Live and delayed snapshots both timing out → PlatformConnectionError."""
         mock_ib = mock_ib_async_module
         _known_contract(mock_ib)
         mock_ib.reqTickersAsync = AsyncMock(side_effect=TimeoutError("slow farm"))
@@ -154,6 +191,7 @@ class TestFetchTicker:
         await adapter.connect()
         with pytest.raises(PlatformConnectionError, match="timed out"):
             await adapter.fetch_ticker(AAPL)
+        assert mock_ib.reqTickersAsync.await_count == 2
 
     async def test_snapshot_failure_raises_connection_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
