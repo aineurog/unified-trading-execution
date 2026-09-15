@@ -4,13 +4,9 @@ Tests cases:
     - Every mapped IBKR error code produces the correct exception type
     - Unmapped codes fall through to PlatformError with raw context
     - map_ibkr_error returns exception instances (not classes)
-    - check_ibkr_result raises on None / empty list / exception objects
-    - check_ibkr_result passes through on valid successful results
 """
 
 from __future__ import annotations
-
-import pytest
 
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
@@ -25,7 +21,6 @@ from unified_trading_execution.errors import (
 )
 from unified_trading_execution.ibkr.errors import (
     IGNORED_IBKR_CODES,
-    check_ibkr_result,
     map_ibkr_error,
 )
 
@@ -116,41 +111,3 @@ class TestMapIBKRError:
         err = map_ibkr_error(100)
         assert isinstance(err, RateLimitError)
         assert not isinstance(err, type)
-
-
-class TestCheckIBKRResult:
-    """Test check_ibkr_result guard."""
-
-    def test_none_result_raises(self) -> None:
-        """None result triggers failure check and raises PlatformError."""
-        with pytest.raises(PlatformError, match=r"reqContractDetails failed: returned None\."):
-            check_ibkr_result(None, "reqContractDetails")
-
-    def test_empty_list_result_raises(self) -> None:
-        """Empty list result triggers failure check and raises PlatformError."""
-        with pytest.raises(
-            PlatformError, match=r"reqContractDetails failed: returned empty list\."
-        ):
-            check_ibkr_result([], "reqContractDetails")
-
-    def test_exception_result_raises(self) -> None:
-        """Exception object returned in place of result wraps in PlatformError."""
-        exc = TimeoutError("Connection timed out")
-        with pytest.raises(PlatformError, match="reqContractDetails failed: Connection timed out"):
-            check_ibkr_result(exc, "reqContractDetails")
-
-    def test_mapped_error_passthrough(self) -> None:
-        """Already-mapped UteError instances are re-raised unchanged."""
-        from unified_trading_execution.errors import InvalidSymbolError as _ISE
-
-        original = _ISE("bad symbol")
-        with pytest.raises(_ISE) as exc_info:
-            check_ibkr_result(original, "reqContractDetails")
-        assert exc_info.value is original
-
-    def test_success_result_passes_through(self) -> None:
-        """Valid result returns without raising."""
-        check_ibkr_result([1, 2, 3])
-        check_ibkr_result({"status": "Filled"})
-        check_ibkr_result(True)
-        check_ibkr_result("Success")

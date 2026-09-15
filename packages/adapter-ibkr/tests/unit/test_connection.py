@@ -229,6 +229,68 @@ class TestIBKRErrorEvent:
         adapter._on_error(43, 154, "Orders cannot be transmitted for a halted security.", None)
         adapter._on_error(44, 99999, "some future unmapped failure", None)
 
+    async def test_spec_stale_rejection_invalidates_cache(
+        self, adapter: IBKRAdapter, mock_ib_async_module: object
+    ) -> None:
+        """A tick-price rejection (110) drops the cached spec for its contract."""
+        from datetime import UTC, datetime
+        from decimal import Decimal
+
+        from ib_async import Stock
+
+        from unified_trading_execution.ibkr.symbols import from_ibkr_contract
+        from unified_trading_execution.types.instrument import InstrumentSpec
+
+        await adapter.connect()
+        contract = Stock("AAPL", "SMART", "USD")
+        instrument = from_ibkr_contract(contract)
+        spec = InstrumentSpec(
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            max_qty=Decimal("1000000000"),
+            min_notional=Decimal("0"),
+            price_precision=2,
+            qty_precision=0,
+        )
+        adapter._spec_cache[instrument] = (spec, datetime.now(UTC))
+        # ib_async emits errorEvent(reqId, errorCode, errorString, contract)
+        adapter._on_error(
+            42,
+            110,
+            "Price does not conform to the minimum price variation",
+            contract,
+        )
+        assert instrument not in adapter._spec_cache
+
+    async def test_other_rejection_keeps_spec_cache(
+        self, adapter: IBKRAdapter, mock_ib_async_module: object
+    ) -> None:
+        """A non-tick rejection (201) leaves unrelated cached specs untouched."""
+        from datetime import UTC, datetime
+        from decimal import Decimal
+
+        from ib_async import Stock
+
+        from unified_trading_execution.ibkr.symbols import from_ibkr_contract
+        from unified_trading_execution.types.instrument import InstrumentSpec
+
+        await adapter.connect()
+        contract = Stock("AAPL", "SMART", "USD")
+        instrument = from_ibkr_contract(contract)
+        spec = InstrumentSpec(
+            tick_size=Decimal("0.01"),
+            lot_size=Decimal("1"),
+            min_qty=Decimal("1"),
+            max_qty=Decimal("1000000000"),
+            min_notional=Decimal("0"),
+            price_precision=2,
+            qty_precision=0,
+        )
+        adapter._spec_cache[instrument] = (spec, datetime.now(UTC))
+        adapter._on_error(42, 201, "Order rejected - Reason: test rejection", contract)
+        assert instrument in adapter._spec_cache
+
     async def test_error_event_unwired_on_disconnect(
         self, adapter: IBKRAdapter, mock_ib_async_module: object
     ) -> None:

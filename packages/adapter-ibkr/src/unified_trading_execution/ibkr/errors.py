@@ -20,8 +20,6 @@ handler before translation.
 
 from __future__ import annotations
 
-from typing import Any
-
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
     InstrumentHaltedError,
@@ -120,24 +118,3 @@ def map_ibkr_error(error_code: int, error_string: str = "") -> UteError:
         error_string or f"unmapped IBKR error {error_code}",
         platform_error={"ibkr_error_code": error_code, "ibkr_error_string": error_string},
     )
-
-
-def check_ibkr_result(result: Any, description: str = "") -> None:
-    """Check *result* from an IBKR function call and raise if it indicates failure.
-
-    In ib_async, some failures are returned as empty lists, ``None``, or raise
-    built-in Python exceptions (e.g. asyncio.TimeoutError). This helper standardizes
-    result validation. Already-mapped ``UteError`` instances are re-raised
-    unchanged so their specific type is never flattened.
-    """
-    if isinstance(result, UteError):
-        raise result
-
-    if result is None:
-        raise PlatformError(f"{description} failed: returned None.")
-
-    if isinstance(result, list) and len(result) == 0:
-        raise PlatformError(f"{description} failed: returned empty list.")
-
-    if isinstance(result, Exception):
-        raise PlatformError(f"{description} failed: {result}")

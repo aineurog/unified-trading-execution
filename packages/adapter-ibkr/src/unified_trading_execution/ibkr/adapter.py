@@ -70,6 +70,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Error codes whose rejection signals that the instrument's cached
+# ``InstrumentSpec`` no longer matches platform rules. Code 110 ("Price does
+# not conform to the minimum price variation") names the cached ``tick_size``
+# directly — a changed minTick between spec fetch and order placement is the
+# classic stale-cache cause, so a rejection here drops the cached spec and
+# forces a re-query. The 201/202 rejection family carries its reason in an
+# unparseable runtime suffix and is deliberately not sniffed (see errors.py),
+# which keeps this set minimal by construction.
+_SPEC_STALE_ERROR_CODES: frozenset[int] = frozenset({110})
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -1265,6 +1275,15 @@ class IBKRAdapter(Adapter):
             if error_code in IGNORED_IBKR_CODES:
                 logger.debug("IBKR notification %s: %s", error_code, error_string)
                 return
+            if error_code in _SPEC_STALE_ERROR_CODES:
+                # Rejection implies the platform's rules changed after the
+                # spec was cached — drop it so the next fetch re-queries.
+                # Best-effort: no contract → no instrument → no-op; an
+                # unmappable contract is caught by the outer guard.
+                candidate = contract if contract is not None else (args[0] if args else None)
+                if candidate is not None:
+                    instrument = from_ibkr_contract(candidate)
+                    self._invalidate_spec_cache(instrument)
             mapped = map_ibkr_error(error_code, error_string)
             logger.warning(
                 "IBKR error %s (reqId=%s) mapped to %s: %s",
