@@ -781,3 +781,152 @@ class TestTwsUtcEnforcement:
         mock_ib.TimezoneTWS = "US/Eastern"
         positions = await adapter.fetch_positions()
         assert isinstance(positions, list)
+
+
+# ---------------------------------------------------------------------------
+# orderStatusEvent push handler
+# ---------------------------------------------------------------------------
+
+
+def _status_contract() -> Contract:
+    contract = Contract()
+    contract.symbol = "AAPL"
+    contract.secType = "STK"
+    contract.exchange = "SMART"
+    contract.currency = "USD"
+    return contract
+
+
+def _status_trade(
+    order_ref: str = "cid-status",
+    status: str = "Submitted",
+    filled: float = 0,
+    total_qty: float = 10,
+    perm_id: int = 999,
+) -> Trade:
+    order = Order(
+        orderId=42,
+        permId=perm_id,
+        orderRef=order_ref,
+        action="BUY",
+        totalQuantity=total_qty,
+        orderType="LMT",
+        lmtPrice=Decimal("101.5"),
+        tif="GTC",
+    )
+    order_status = IBOrderStatus(
+        orderId=42,
+        status=status,
+        filled=filled,
+        remaining=total_qty - filled,
+        avgFillPrice=0,
+        permId=perm_id,
+    )
+    return Trade(contract=_status_contract(), order=order, orderStatus=order_status)
+
+
+class TestOrderStatusEvent:
+    def test_open_publishes_status(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="Submitted"))
+
+        assert len(captured) == 1
+        assert captured[0].order.client_order_id == "cid-status"
+        assert captured[0].order.status is OrderStatus.OPEN
+
+    def test_partial_fill_derived(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="Submitted", filled=4))
+
+        assert len(captured) == 1
+        assert captured[0].order.status is OrderStatus.PARTIALLY_FILLED
+        assert captured[0].order.filled_quantity == Decimal("4")
+
+    def test_cancel_publishes_once_then_suppresses_echo(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="Cancelled"))
+        adapter._on_order_status(_status_trade(status="Cancelled"))
+        adapter._on_order_status(_status_trade(status="Cancelled"))
+
+        assert len(captured) == 1
+        assert captured[0].order.status is OrderStatus.CANCELLED
+
+    def test_filled_suppresses_repeat(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="Filled", filled=10))
+        adapter._on_order_status(_status_trade(status="Filled", filled=10))
+
+        assert len(captured) == 1
+        assert captured[0].order.status is OrderStatus.FILLED
+
+    def test_live_replay_still_publishes(self, adapter: IBKRAdapter) -> None:
+        """Reconnect replays (open states) are idempotent upserts, not echoes."""
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="Submitted"))
+        adapter._on_order_status(_status_trade(status="Submitted", filled=4))
+
+        assert len(captured) == 2
+        assert captured[1].order.status is OrderStatus.PARTIALLY_FILLED
+
+    def test_manual_order_falls_back_to_perm_id(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(order_ref="", status="Submitted", perm_id=555))
+
+        assert len(captured) == 1
+        assert captured[0].order.client_order_id == "555"
+
+    def test_unknown_status_skipped(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_order_status(_status_trade(status="SomeNewState"))
+
+        assert len(captured) == 0
+
+    def test_unmappable_contract_skipped(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        trade = _status_trade(status="Submitted")
+        trade.contract.secType = "IND"
+
+        adapter._on_order_status(trade)
+
+        assert len(captured) == 0
+
+    async def test_wired_on_connect_unwired_on_disconnect(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.orderStatusEvent.__iadd__.assert_called_once_with(adapter._on_order_status)
+        await adapter.disconnect()
+        mock_ib.orderStatusEvent.__isub__.assert_called_once_with(adapter._on_order_status)

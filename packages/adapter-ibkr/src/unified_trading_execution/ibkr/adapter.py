@@ -5,11 +5,12 @@ Connection handler: local TCP socket to IB Gateway or TWS via the
 
 Unlike MT5, this adapter is fully asynchronous and event-driven.
 State updates arrive via push callbacks (``execDetailsEvent``,
-``positionEvent``, ``accountValueEvent``) plus ``errorEvent`` for
-rejections, rather than polling loops. Order *status* has no push
-handler by design — ``orderStatusEvent`` is deliberately not wired;
-status is read authoritatively via ``fetch_open_orders`` on each
-reconcile pass, where rejections surface as terminal states.
+``positionEvent``, ``accountValueEvent``, ``orderStatusEvent``) plus
+``errorEvent`` for rejections, rather than polling loops. Order *status*
+streams live via ``orderStatusEvent`` so the engine mirror follows
+transitions (OPEN → PARTIALLY_FILLED → FILLED/CANCELLED) without waiting
+for a reconcile pass; ``fetch_open_orders`` remains the authoritative
+read reconcile compares against.
 
 This module contains no business logic, no retry policy, no risk decisions.
 """
@@ -21,11 +22,12 @@ import contextlib
 import copy
 import logging
 import math
+import threading
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from ib_async import IB, ExecutionFilter, Order, Trade
+from ib_async import IB, Contract, ExecutionFilter, Order, Trade
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
@@ -42,6 +44,7 @@ from unified_trading_execution.events import (
     Event,
     EventBus,
     FillEvent,
+    OrderStatusEvent,
     PositionUpdateEvent,
 )
 from unified_trading_execution.ibkr.errors import IGNORED_IBKR_CODES, map_ibkr_error
@@ -83,6 +86,10 @@ logger = logging.getLogger(__name__)
 # which keeps this set minimal by construction.
 _SPEC_STALE_ERROR_CODES: frozenset[int] = frozenset({110})
 
+# Cap for the orderStatusEvent final-state set — TWS repeats terminal
+# states and a long session must not grow the suppression set forever.
+_STATUS_FINAL_CAP = 1000
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -108,6 +115,143 @@ def _snapshot_price(value: object) -> Decimal | None:
     if math.isnan(number) or math.isinf(number) or number <= 0:
         return None
     return Decimal(str(value))
+
+
+def _is_not_subscribed(exc: PlatformError) -> bool:
+    """True when *exc* is TWS error 354 (live market data not subscribed).
+
+    354 arrives unmapped as ``PlatformError`` carrying
+    ``platform_error={"ibkr_error_code": 354, ...}`` — the only signal that
+    delayed data should be tried instead of failing outright.
+    """
+    context = getattr(exc, "platform_error", None)
+    return isinstance(context, dict) and context.get("ibkr_error_code") == 354
+
+
+def _trade_to_record(trade: Trade) -> OrderRecord | None:
+    """Translate an ``ib_async.Trade`` to an ``OrderRecord`` (None = skip).
+
+    Shared by ``fetch_open_orders`` and the ``orderStatusEvent`` handler so
+    the polled and streamed views of an order can never disagree on field
+    mapping. Attribution matches the fills path: ``orderRef``, falling back
+    to the permId-based platform id for manual TWS orders. Status (with
+    PARTIALLY_FILLED/FILLED derivation) comes from ``parse_ibkr_trade``.
+    Unmappable contracts, unknown actions/types/statuses, and zero
+    quantities are skipped with a warning — never guessed.
+    """
+    order = getattr(trade, "order", None)
+    status = getattr(trade, "orderStatus", None)
+    contract = getattr(trade, "contract", None)
+    if order is None or status is None or contract is None:
+        return None
+    try:
+        instrument = from_ibkr_contract(contract)
+    except Exception as exc:
+        logger.warning("Skipping order with unmappable contract %r: %s", contract, exc)
+        return None
+
+    # IBKR has four order actions (BUY / SELL / SLONG / SSHORT); the unified
+    # side collapses the borrow direction — SLONG (buy-to-cover) is BUY.
+    action = str(getattr(order, "action", "")).upper()
+    if action in ("BUY", "SLONG"):
+        side = OrderSide.BUY
+    elif action in ("SELL", "SSHORT"):
+        side = OrderSide.SELL
+    else:
+        logger.warning("Skipping order with unknown action %r", action)
+        return None
+
+    otype = str(getattr(order, "orderType", "")).upper()
+    if otype == "MKT":
+        order_type = OrderType.MARKET
+    elif otype == "LMT":
+        order_type = OrderType.LIMIT
+    elif otype == "STP":
+        order_type = OrderType.STOP
+    elif otype in ("STP LMT", "STP_LMT"):
+        order_type = OrderType.STOP_LIMIT
+    else:
+        logger.warning("Skipping order with unknown orderType %r", otype)
+        return None
+
+    tif_raw = str(getattr(order, "tif", "")).upper()
+    time_in_force = {
+        "GTC": TimeInForce.GTC,
+        "DAY": TimeInForce.DAY,
+        "IOC": TimeInForce.IOC,
+        "FOK": TimeInForce.FOK,
+        "GTD": TimeInForce.GTD,
+    }.get(tif_raw, TimeInForce.GTC)
+
+    # Prices: UNSET_DOUBLE sentinel (DBL_MAX ~1.797e308) or float('inf')
+    # means "not set" — treat anything absurdly large as unset.
+    def _as_decimal(val: object) -> Decimal | None:
+        try:
+            if val is None:
+                return None
+            f = float(str(val))
+            if f in (float("inf"), float("-inf")) or abs(f) > 1e12:
+                return None
+            return Decimal(str(val))
+        except Exception:
+            return None
+
+    price = _as_decimal(getattr(order, "lmtPrice", None))
+    # lmtPrice 0 or UNSET means no limit
+    if price is not None and price == 0:
+        price = None
+    stop_price = _as_decimal(getattr(order, "auxPrice", None))
+    if stop_price is not None and stop_price == 0:
+        stop_price = None
+
+    try:
+        qty = Decimal(str(getattr(order, "totalQuantity", 0) or 0))
+    except Exception:
+        qty = Decimal("0")
+    if qty == 0:
+        return None
+
+    # Status — an unknown IBKR status is skipped, never silently mapped
+    # to OPEN. ``parse_ibkr_trade`` raises PlatformError for a status it
+    # does not recognise (a new IBKR status must not be misrepresented)
+    # and derives PARTIALLY_FILLED/FILLED from filled vs total.
+    try:
+        parsed = parse_ibkr_trade(trade)
+    except PlatformError as exc:
+        logger.warning("Skipping order with unknown status: %s", exc)
+        return None
+
+    raw_cid = str(getattr(order, "orderRef", "") or "")
+    client_order_id = raw_cid or parsed.platform_order_id or ""
+    if not client_order_id:
+        return None
+
+    # GTD expiry not available on wire — keep None
+    try:
+        return OrderRecord(
+            instrument=instrument,
+            order_type=order_type,
+            side=side,
+            quantity=qty,
+            time_in_force=time_in_force,
+            client_order_id=client_order_id,
+            price=price,
+            stop_price=stop_price,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id=parsed.platform_order_id,
+            status=parsed.status,
+            filled_quantity=parsed.filled_quantity,
+            average_fill_price=parsed.average_fill_price,
+            correlation_id=raw_cid,
+            created_at=parsed.created_at,
+            updated_at=parsed.updated_at,
+        )
+    except Exception as exc:
+        logger.warning("Skipping invalid OrderRecord for %r: %s", client_order_id, exc)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +285,13 @@ class IBKRAdapter(Adapter):
 
         # Serialize overlapping connect() calls — prevents duplicate IB instances.
         self._connect_lock = asyncio.Lock()
+
+        # orderStatusEvent bookkeeping: client order ids already at a final
+        # status. TWS repeats terminal states; echoes are suppressed so each
+        # transition publishes once. Guarded by a lock — ib_async emits from
+        # its own I/O thread.
+        self._status_final_ids: dict[str, None] = {}
+        self._status_lock = threading.Lock()
 
         # Whether the adapter considers itself connected (mirrors IB.isConnected).
         self._connected = False
@@ -336,6 +487,7 @@ class IBKRAdapter(Adapter):
         ib.positionEvent += self._on_position_update
         ib.accountValueEvent += self._on_account_value
         ib.execDetailsEvent += self._on_exec_details
+        ib.orderStatusEvent += self._on_order_status
 
     def _unwire_events(self, ib: IB) -> None:
         """Unsubscribe adapter callbacks (eventkit -=) — best-effort, never raises."""
@@ -346,6 +498,7 @@ class IBKRAdapter(Adapter):
             ("positionEvent", self._on_position_update),
             ("accountValueEvent", self._on_account_value),
             ("execDetailsEvent", self._on_exec_details),
+            ("orderStatusEvent", self._on_order_status),
         ):
             try:
                 event = getattr(ib, event_name, None)
@@ -662,10 +815,13 @@ class IBKRAdapter(Adapter):
 
         A live snapshot is tried first; when the gateway has no live feed
         it answers error 2186 ("requires additional subscription") and the
-        snapshot future never completes. On timeout the session is switched
-        to delayed data (``reqMarketDataType(3)``) and the snapshot is
-        retried once, so paper logins without a live subscription still get
-        a quote (``marketDataType == 3``) instead of a timeout.
+        snapshot future never completes, or error 354 ("requested market
+        data is not subscribed") which fails the request outright. On
+        timeout — or on a 354 — the session is switched to delayed data
+        (``reqMarketDataType(3)``) and the snapshot is retried once, so
+        paper logins without a live subscription still get a quote
+        (``marketDataType == 3``) instead of an error. The 354 text itself
+        advertises this: "Delayed market data is available".
 
         Returns ``None`` when the contract is known but has no live quote
         (market closed, halted, or no market-data subscription). A contract
@@ -711,27 +867,17 @@ class IBKRAdapter(Adapter):
                 "IBKR live snapshot for %r timed out — retrying with delayed data",
                 instrument.symbol,
             )
-            try:
-                ib.reqMarketDataType(3)
-            except Exception as exc:
-                raise PlatformConnectionError(
-                    f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
-                ) from exc
-            try:
-                tickers = await asyncio.wait_for(
-                    ib.reqTickersAsync(qualified),
-                    timeout=self._config.timeout_seconds,
-                )
-            except UteError:
+            tickers = await self._delayed_snapshot_retry(ib, instrument, qualified)
+        except PlatformError as exc:
+            # TWS error 354: live not subscribed for this contract. Same
+            # fallback as the 2186 timeout — delayed is advertised available.
+            if not _is_not_subscribed(exc):
                 raise
-            except TimeoutError as exc:
-                raise PlatformConnectionError(
-                    f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
-                ) from exc
-            except Exception as exc:
-                raise PlatformConnectionError(
-                    f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
-                ) from exc
+            logger.warning(
+                "IBKR live snapshot for %r not subscribed (354) — retrying with delayed data",
+                instrument.symbol,
+            )
+            tickers = await self._delayed_snapshot_retry(ib, instrument, qualified)
         except UteError:
             raise
         except Exception as exc:
@@ -769,6 +915,36 @@ class IBKRAdapter(Adapter):
         if bid is None and ask is None and last is None:
             return None
         return Ticker(bid=bid, ask=ask, last=last, mark=None)
+
+    async def _delayed_snapshot_retry(
+        self, ib: IB, instrument: Instrument, qualified: Contract
+    ) -> list[Any]:
+        """Switch the session to delayed data and retry one snapshot.
+
+        The mode switch is session-wide and sticky: every later snapshot on
+        this connection reuses delayed mode without another switch.
+        """
+        try:
+            ib.reqMarketDataType(3)
+        except Exception as exc:
+            raise PlatformConnectionError(
+                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+            ) from exc
+        try:
+            return await asyncio.wait_for(
+                ib.reqTickersAsync(qualified),
+                timeout=self._config.timeout_seconds,
+            )
+        except UteError:
+            raise
+        except TimeoutError as exc:
+            raise PlatformConnectionError(
+                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+            ) from exc
+        except Exception as exc:
+            raise PlatformConnectionError(
+                f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Capability reporting
@@ -1006,13 +1182,12 @@ class IBKRAdapter(Adapter):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch all open orders from ``IB.openTrades()``.
 
-        Translates each ``Trade`` to an ``OrderRecord`` via ``from_ibkr_contract``
-        + order-field mapping. Skips unmappable contracts with a warning.
+        Translates each ``Trade`` to an ``OrderRecord`` via
+        ``_trade_to_record`` (shared with the ``orderStatusEvent`` handler).
         Keyed by ``client_order_id`` (``orderRef``) falling back to
         ``platform_order_id`` so orphans remain reconcilable.
         """
         ib = self._require_ib()
-        now = _utcnow()
         try:
             trades = ib.openTrades()
         except UteError:
@@ -1022,149 +1197,10 @@ class IBKRAdapter(Adapter):
 
         result: dict[str, OrderRecord] = {}
         for trade in trades:
-            order = getattr(trade, "order", None)
-            status = getattr(trade, "orderStatus", None)
-            contract = getattr(trade, "contract", None)
-            if order is None or status is None or contract is None:
+            record = _trade_to_record(trade)
+            if record is None:
                 continue
-            try:
-                instrument = from_ibkr_contract(contract)
-            except Exception as exc:
-                logger.warning("Skipping open order with unmappable contract %r: %s", contract, exc)
-                continue
-
-            # Map IBKR wire fields to unified enums. IBKR has four order actions
-            # (BUY / SELL / SLONG / SSHORT); the unified side collapses the
-            # borrow direction — SLONG (buy-to-cover) is BUY, SSHORT is SELL.
-            action = str(getattr(order, "action", "")).upper()
-            if action in ("BUY", "SLONG"):
-                side = OrderSide.BUY
-            elif action in ("SELL", "SSHORT"):
-                side = OrderSide.SELL
-            else:
-                # Unknown action — skip rather than guess a side.
-                logger.warning("Skipping open order with unknown action %r", action)
-                continue
-
-            otype = str(getattr(order, "orderType", "")).upper()
-            if otype == "MKT":
-                order_type = OrderType.MARKET
-            elif otype == "LMT":
-                order_type = OrderType.LIMIT
-            elif otype == "STP":
-                order_type = OrderType.STOP
-            elif otype in ("STP LMT", "STP_LMT"):
-                order_type = OrderType.STOP_LIMIT
-            else:
-                # Unknown order type — skip rather than guess
-                logger.warning("Skipping order with unknown orderType %r", otype)
-                continue
-
-            tif_raw = str(getattr(order, "tif", "")).upper()
-            tif_map = {
-                "GTC": TimeInForce.GTC,
-                "DAY": TimeInForce.DAY,
-                "IOC": TimeInForce.IOC,
-                "FOK": TimeInForce.FOK,
-                "GTD": TimeInForce.GTD,
-            }
-            time_in_force = tif_map.get(tif_raw, TimeInForce.GTC)
-
-            # Prices: UNSET_DOUBLE sentinel (DBL_MAX ~1.797e308) or float('inf')
-            # means "not set" — treat anything absurdly large as unset.
-            def _as_decimal(val: object) -> Decimal | None:
-                try:
-                    if val is None:
-                        return None
-                    f = float(str(val))
-                    if f in (float("inf"), float("-inf")) or abs(f) > 1e12:
-                        return None
-                    return Decimal(str(val))
-                except Exception:
-                    return None
-
-            price = _as_decimal(getattr(order, "lmtPrice", None))
-            # lmtPrice 0 or UNSET means no limit
-            if price is not None and price == 0:
-                price = None
-            stop_price = _as_decimal(getattr(order, "auxPrice", None))
-            if stop_price is not None and stop_price == 0:
-                stop_price = None
-
-            # Quantity
-            try:
-                qty = Decimal(str(getattr(order, "totalQuantity", 0) or 0))
-            except Exception:
-                qty = Decimal("0")
-            if qty == 0:
-                continue
-
-            client_order_id = str(getattr(order, "orderRef", "") or "")
-            perm_id = getattr(order, "permId", 0) or 0
-            order_id = getattr(order, "orderId", 0) or 0
-            platform_order_id = str(perm_id or order_id) if (perm_id or order_id) else None
-
-            # Status — an unknown IBKR status is skipped, never silently mapped
-            # to OPEN. ``map_ibkr_status`` raises PlatformError for a status it
-            # does not recognise (a new IBKR status must not be misrepresented).
-            ib_status = str(getattr(status, "status", "") or "")
-            try:
-                unified_status = map_ibkr_status(ib_status)
-            except PlatformError as exc:
-                logger.warning("Skipping open order with unknown status %r: %s", ib_status, exc)
-                continue
-
-            filled_qty = Decimal(str(getattr(status, "filled", 0) or 0))
-            avg_price_raw = getattr(status, "avgFillPrice", 0) or 0
-            try:
-                avg_fill = Decimal(str(avg_price_raw)) if avg_price_raw else None
-            except Exception:
-                avg_fill = None
-
-            # Timestamps from Trade log — ib_async already UTC
-            created_at = now
-            updated_at = now
-            log = getattr(trade, "log", None)
-            if log:
-                try:
-                    first = log[0].time
-                    last = log[-1].time
-                    if first is not None:
-                        created_at = first if first.tzinfo else first.replace(tzinfo=UTC)
-                    if last is not None:
-                        updated_at = last if last.tzinfo else last.replace(tzinfo=UTC)
-                except Exception:
-                    pass
-
-            # GTD expiry not available on wire — keep None
-            try:
-                record = OrderRecord(
-                    instrument=instrument,
-                    order_type=order_type,
-                    side=side,
-                    quantity=qty,
-                    time_in_force=time_in_force,
-                    client_order_id=client_order_id or platform_order_id or str(order_id),
-                    price=price,
-                    stop_price=stop_price,
-                    reduce_only=False,
-                    client_tag=None,
-                    take_profit=None,
-                    stop_loss=None,
-                    platform_order_id=platform_order_id,
-                    status=unified_status,
-                    filled_quantity=filled_qty,
-                    average_fill_price=avg_fill,
-                    correlation_id=client_order_id,
-                    created_at=created_at,
-                    updated_at=updated_at,
-                )
-            except Exception as exc:
-                logger.warning("Skipping invalid OrderRecord for %r: %s", client_order_id, exc)
-                continue
-
-            key = record.client_order_id or record.platform_order_id or str(order_id)
-            result[key] = record
+            result[record.client_order_id] = record
         return result
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
@@ -1527,6 +1563,47 @@ class IBKRAdapter(Adapter):
             )
         except Exception as exc:
             logger.warning("Skipping execDetailsEvent for %r: %s", fill, exc)
+
+    def _on_order_status(self, trade: Trade) -> None:
+        """Translate a live order-status change to ``OrderStatusEvent``.
+
+        ``ib_async`` emits ``orderStatusEvent(trade)`` on every transition
+        (OPEN → PARTIALLY_FILLED → FILLED, cancels, rejections). The engine
+        upserts the carried ``OrderRecord`` into its mirror, so transitions
+        land without waiting for a reconcile pass.
+
+        Only status events are published: ``OrderPlacedEvent`` is owned by
+        dispatch at placement time (re-emitting on first sighting would
+        duplicate it), and a terminal cancel reaches the mirror as a status
+        upsert — no separate cancel event is needed engine-side. TWS replays
+        open orders on every reconnect; replays upsert identical live states
+        (idempotent), while repeats of an already-final state are suppressed
+        via the bounded final set.
+        """
+        try:
+            record = _trade_to_record(trade)
+            if record is None:
+                return
+            cid = record.client_order_id
+            with self._status_lock:
+                if cid in self._status_final_ids:
+                    return
+                if is_final_order_status(record.status):
+                    self._status_final_ids[cid] = None
+                    while len(self._status_final_ids) > _STATUS_FINAL_CAP:
+                        self._status_final_ids.pop(next(iter(self._status_final_ids)))
+            self._publish(
+                OrderStatusEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=cid,
+                    order=record,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping orderStatusEvent for %r: %s", trade, exc)
 
     # ------------------------------------------------------------------
     # Internal helpers

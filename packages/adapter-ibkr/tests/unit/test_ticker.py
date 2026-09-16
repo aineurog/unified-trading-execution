@@ -180,6 +180,29 @@ class TestFetchTicker:
         mock_ib.reqMarketDataType.assert_called_once_with(3)
         assert mock_ib.reqTickersAsync.await_count == 2
 
+    async def test_not_subscribed_falls_back_to_delayed(
+        self, adapter: IBKRAdapter, mock_ib_async_module: Any
+    ) -> None:
+        """Live 354 (not subscribed) → reqMarketDataType(3) + one delayed retry."""
+        from unified_trading_execution.ibkr.errors import map_ibkr_error
+
+        mock_ib = mock_ib_async_module
+        _known_contract(mock_ib)
+        mock_ib.reqTickersAsync = AsyncMock(
+            side_effect=[
+                map_ibkr_error(354, "Requested market data is not subscribed"),
+                [_snapshot(bid=150.25, ask=150.30, last=150.28)],
+            ]
+        )
+
+        await adapter.connect()
+        ticker = await adapter.fetch_ticker(AAPL)
+
+        assert ticker is not None
+        assert ticker.bid == Decimal("150.25")
+        mock_ib.reqMarketDataType.assert_called_once_with(3)
+        assert mock_ib.reqTickersAsync.await_count == 2
+
     async def test_snapshot_timeout_raises_connection_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
     ) -> None:

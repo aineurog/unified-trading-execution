@@ -41,6 +41,7 @@ def mock_ib_async_module():
             "positionEvent",
             "accountValueEvent",
             "execDetailsEvent",
+            "orderStatusEvent",
         ):
             evt = MagicMock()
             # eventkit's __iadd__/__isub__ return the event itself
