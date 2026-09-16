@@ -52,6 +52,7 @@ ES_FUT = Instrument(
     currency="USD",
     expiry=date(2026, 9, 18),
     multiplier=50,
+    exchange="GLOBEX",
 )
 
 
@@ -103,6 +104,21 @@ class TestToIBKRContract:
         assert contract.lastTradeDateOrContractMonth == "20260918"
         assert contract.multiplier == "50"
         assert contract.currency == "USD"
+        assert contract.exchange == "GLOBEX"
+
+    def test_futures_without_venue_raises(self) -> None:
+        """FUTURES with no venue fails loud instead of sending SMART to TWS."""
+        from unified_trading_execution.ibkr.config import IBKRConfig
+
+        bare = Instrument(
+            symbol="ES",
+            asset_class=AssetClass.FUTURES,
+            currency="USD",
+            expiry=date(2026, 9, 18),
+            multiplier=50,
+        )
+        with pytest.raises(ValueError, match="requires the listing exchange"):
+            to_ibkr_contract(bare, IBKRConfig(default_exchange="SMART"))
 
     def test_cfd_mapping(self) -> None:
         """CFD instrument maps to CFD contract."""

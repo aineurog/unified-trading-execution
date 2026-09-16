@@ -132,6 +132,24 @@ class TestIBKRConnectionLifecycle:
         assert adapter.is_connected is False
         assert adapter._ib is None
 
+    async def test_connect_pins_empty_timezone_to_utc(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: object,
+    ) -> None:
+        """Empty TimezoneTWS is pinned to UTC — ib_async never learns it over the API.
+
+        Without the pin, the decoder falls back to the client machine's local
+        zone and silently skews every execution timestamp by hours.
+        """
+        mock_ib = mock_ib_async_module  # type: ignore[assignment]
+        mock_ib.TimezoneTWS = ""  # type: ignore[attr-defined]
+
+        await adapter.connect()
+
+        assert adapter.is_connected is True
+        assert mock_ib.TimezoneTWS == "UTC"  # type: ignore[attr-defined]
+
     async def test_connect_failure_raises_platform_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: object, event_bus: object
     ) -> None:

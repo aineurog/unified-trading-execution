@@ -427,19 +427,24 @@ class IBKRAdapter(Adapter):
     # ------------------------------------------------------------------
 
     def _assert_tws_utc(self, ib: IB) -> None:
-        """Reject a known non-UTC TWS/Gateway timezone.
+        """Enforce the UTC-only policy for TWS timestamps.
 
         Engine is UTC-only (watermark `since` is UTC). TWS sends
-        Execution.time naive in its display zone. ``ib_async`` does not expose
-        the Gateway GUI timezone reliably: an empty ``TimezoneTWS`` means
-        unknown, not necessarily non-UTC.
+        Execution.time naive in its display zone, and ``ib_async`` never
+        learns that zone over the API — ``TimezoneTWS`` stays empty unless
+        the client sets it, in which case the decoder falls back to the
+        *client machine's* local zone and silently skews fills by hours
+        (observed: PKT machine + UTC gateway = -5h on every execution).
+
+        Policy: the gateway/workstation MUST run in UTC (Configure →
+        Settings → General → Time Zone = UTC). Since a UTC gateway sends
+        UTC, an empty ``TimezoneTWS`` is pinned to ``"UTC"`` here so decodes
+        are labeled correctly. An explicitly non-UTC value is rejected —
+        non-UTC gateways are unsupported and would mistimestamp fills.
         """
         tws_tz = str(getattr(ib, "TimezoneTWS", "") or "").strip()
         if not tws_tz:
-            logger.warning(
-                "IBKR TWS/Gateway timezone is unknown (ib_async TimezoneTWS is empty); "
-                "verify the Gateway/TWS GUI timezone is UTC before using fill watermarks"
-            )
+            ib.TimezoneTWS = "UTC"
             return
         if tws_tz.upper() not in ("UTC", "ETC/UTC", "GMT") and "UTC" not in tws_tz.upper():
             raise PlatformConnectionError(

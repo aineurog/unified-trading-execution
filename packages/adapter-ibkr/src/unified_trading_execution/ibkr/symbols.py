@@ -35,6 +35,10 @@ Fallbacks (per ``IBKRConfig``):
 
 - ``exchange``: ``instrument.exchange`` else ``config.default_exchange``
   (empty everywhere leaves the ib_async default — ``IDEALPRO`` for Forex).
+  Exception: ``FUTURES`` never takes the ``SMART`` default (no SMART routing
+  for futures — TWS answers Error 200), so a missing venue raises
+  ``ValueError`` unless the instrument or a deliberate non-SMART config
+  default names the listing exchange (e.g. ``GLOBEX``).
 - ``currency``: non-pair instruments use ``instrument.currency`` else
   ``config.default_currency``; FX/crypto pairs use ``quote_currency``
   (required by core for pairs).
@@ -142,11 +146,23 @@ def to_ibkr_contract(
         )
 
     if instrument.asset_class is AssetClass.FUTURES:
+        # Futures have no SMART routing — TWS needs the listing exchange
+        # (e.g. GLOBEX) and rejects SMART with Error 200. The stock/option
+        # default must never leak in here, so an absent venue fails loud
+        # instead of sending a doomed contract.
+        venue = instrument.exchange
+        if not venue and config is not None and config.default_exchange.upper() != "SMART":
+            venue = config.default_exchange
+        if not venue:
+            raise ValueError(
+                f"Instrument {instrument.symbol!r} has no exchange — "
+                "FUTURES requires the listing exchange (e.g. exchange='GLOBEX')"
+            )
         return Future(
             instrument.symbol,
             lastTradeDateOrContractMonth=_format_expiry(instrument),
             multiplier=_multiplier_as_str(instrument),
-            **_exchange_kwarg(exchange),
+            exchange=venue,
             **_currency_kwargs(instrument, config),
             **local,
         )
