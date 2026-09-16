@@ -54,8 +54,11 @@ IGNORED_IBKR_CODES: frozenset[int] = frozenset(
 # Code 201 ("Order rejected - Reason:") and 202 ("Order cancelled -
 # Reason:") are intentionally omitted: the docs table gives only the prefix
 # and the distinguishing reason is appended at runtime (funds, short, halt,
-# closed, ...), with no enumerated suffix list to verify against. They fall
-# through to PlatformError where the raw string context is preserved.
+# closed, ...), with no enumerated suffix list to verify against. Sniffing
+# the free-text suffix would be guesswork, so they fall through to
+# PlatformError where the raw string context is preserved. Rejections still
+# surface authoritatively: _on_error logs the mapped type and the order's
+# terminal status is read on the next reconcile pass via fetch_open_orders.
 _IBKR_ERROR_CODE_MAP: dict[int, type[UteError]] = {
     # ---- Rate limiting ----
     100: RateLimitError,  # Max rate of messages per second has been exceeded.

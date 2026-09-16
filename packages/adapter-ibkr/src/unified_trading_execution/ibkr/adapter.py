@@ -5,8 +5,11 @@ Connection handler: local TCP socket to IB Gateway or TWS via the
 
 Unlike MT5, this adapter is fully asynchronous and event-driven.
 State updates arrive via push callbacks (``execDetailsEvent``,
-``orderStatusEvent``, ``positionEvent``, ``accountValueEvent``)
-rather than polling loops.
+``positionEvent``, ``accountValueEvent``) plus ``errorEvent`` for
+rejections, rather than polling loops. Order *status* has no push
+handler by design — ``orderStatusEvent`` is deliberately not wired;
+status is read authoritatively via ``fetch_open_orders`` on each
+reconcile pass, where rejections surface as terminal states.
 
 This module contains no business logic, no retry policy, no risk decisions.
 """
@@ -227,6 +230,12 @@ class IBKRAdapter(Adapter):
         - Resolves the managed account ID.
         - Publishes ``ConnectionStateEvent(connected=True)``.
 
+        The managed account is resolved once here and never re-checked
+        mid-session: on a multi-account gateway login, switching the active
+        account in TWS afterwards is not detected (fills/positions would
+        silently follow the new account). Pin ``IBKRConfig.account`` when
+        several accounts share one gateway login.
+
         Raises ``PlatformConnectionError`` if connection fails or times out.
         Idempotent — a second call while already connected is a no-op.
         Overlapping concurrent calls are serialized so only one IB instance
@@ -324,8 +333,6 @@ class IBKRAdapter(Adapter):
         ib.connectedEvent += self._on_connected
         ib.disconnectedEvent += self._on_disconnected
         ib.errorEvent += self._on_error
-        # Push streams — keep wired even though handlers are still stubs;
-        # they become live without a reconnect when implemented.
         ib.positionEvent += self._on_position_update
         ib.accountValueEvent += self._on_account_value
         ib.execDetailsEvent += self._on_exec_details
