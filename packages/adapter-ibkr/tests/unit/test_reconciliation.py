@@ -582,3 +582,90 @@ class TestFetchFills:
         mock_ib.fills.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
         with pytest.raises(PlatformConnectionError):
             await adapter.fetch_fills()
+
+    # -- historical executions (reqExecutionsAsync) --
+
+    async def test_historical_fills_merged(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Pre-restart fills from reqExecutionsAsync join session fills."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        pre = datetime(2026, 8, 27, 10, 0, tzinfo=UTC)
+        post = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+        mock_ib.fills.return_value = [self._fill(exec_id="session-1", time=post)]  # type: ignore[attr-defined]
+        mock_ib.reqExecutionsAsync.return_value = [self._fill(exec_id="hist-1", time=pre)]  # type: ignore[attr-defined]
+        grouped = await adapter.fetch_fills(since=pre)
+        all_ids = [f.platform_fill_id for lst in grouped.values() for f in lst]
+        assert "session-1" in all_ids
+        assert "hist-1" in all_ids
+
+    async def test_historical_overlap_deduped(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """An execId present in both sources appears exactly once."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        at = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+        mock_ib.fills.return_value = [self._fill(exec_id="dup", time=at)]  # type: ignore[attr-defined]
+        mock_ib.reqExecutionsAsync.return_value = [self._fill(exec_id="dup", time=at)]  # type: ignore[attr-defined]
+        grouped = await adapter.fetch_fills(since=at)
+        all_ids = [f.platform_fill_id for lst in grouped.values() for f in lst]
+        assert all_ids.count("dup") == 1
+
+    async def test_historical_failure_with_session_falls_back(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Historical failure mid-session warns and returns session fills."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = [self._fill(exec_id="s1")]  # type: ignore[attr-defined]
+        mock_ib.reqExecutionsAsync.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
+        grouped = await adapter.fetch_fills(since=datetime(2026, 8, 27, 10, 0, tzinfo=UTC))
+        all_ids = [f.platform_fill_id for lst in grouped.values() for f in lst]
+        assert all_ids == ["s1"]
+
+    async def test_historical_failure_empty_session_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Historical failure on a blind window raises — never partial data."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = []  # type: ignore[attr-defined]
+        mock_ib.reqExecutionsAsync.side_effect = RuntimeError("boom")  # type: ignore[attr-defined]
+        with pytest.raises(PlatformConnectionError, match="historical executions"):
+            await adapter.fetch_fills(since=datetime(2026, 8, 27, 10, 0, tzinfo=UTC))
+
+    async def test_historical_mapped_error_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """A mapped UteError from history propagates even with session fills."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = [self._fill(exec_id="s1")]  # type: ignore[attr-defined]
+        mock_ib.reqExecutionsAsync.side_effect = PlatformConnectionError("dead")  # type: ignore[attr-defined]
+        with pytest.raises(PlatformConnectionError):
+            await adapter.fetch_fills(since=datetime(2026, 8, 27, 10, 0, tzinfo=UTC))
+
+    async def test_no_since_skips_historical(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Without since only the session cache is read."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = [self._fill(exec_id="s1")]  # type: ignore[attr-defined]
+        await adapter.fetch_fills()
+        mock_ib.reqExecutionsAsync.assert_not_called()  # type: ignore[attr-defined]
+
+    async def test_historical_filter_scoped(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """The execution filter carries our account and the window start."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = []  # type: ignore[attr-defined]
+        since = datetime(2026, 8, 27, 10, 30, tzinfo=UTC)
+        await adapter.fetch_fills(since=since)
+        filt = mock_ib.reqExecutionsAsync.await_args.args[0]  # type: ignore[attr-defined]
+        assert filt.acctCode == "DU_TEST"
+        assert filt.time == "20260827-10:30:00"

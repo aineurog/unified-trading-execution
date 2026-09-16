@@ -22,7 +22,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from ib_async import IB, Order, Trade
+from ib_async import IB, ExecutionFilter, Order, Trade
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
@@ -1156,11 +1156,16 @@ class IBKRAdapter(Adapter):
         return result
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
-        """Fetch fills from ``IB.fills()`` grouped by ``client_order_id``.
+        """Fetch fills grouped by ``client_order_id``.
 
-        Uses the session's ``Fill`` cache (``Execution`` + ``CommissionReport``).
-        Filters with ``since`` on ``Execution.time`` when provided. Skips
-        fills with unmappable contracts or zero quantity/price.
+        Merges two sources with identical ``Fill`` shape (``Execution`` +
+        ``CommissionReport``): the session cache (``IB.fills()``) and, when
+        *since* is given, historical executions (``reqExecutionsAsync``) so a
+        restart does not blind reconcile to pre-restart fills. The two
+        sources overlap — records dedupe on the platform fill id. Filters
+        with *since* on ``Execution.time``. Skips fills with unmappable
+        contracts or zero quantity/price. With *since* omitted only the
+        session cache is read (historical executions are always windowed).
         """
         ib = self._require_ib()
         try:
@@ -1170,7 +1175,11 @@ class IBKRAdapter(Adapter):
         except Exception as exc:
             raise PlatformConnectionError(f"failed to fetch IBKR fills: {exc}") from exc
 
+        if since is not None:
+            fills = [*fills, *await self._fetch_historical_fills(ib, since, bool(fills))]
+
         grouped: dict[str, list[FillRecord]] = {}
+        seen_fill_ids: set[str] = set()
         for fill in fills:
             execution = getattr(fill, "execution", None)
             contract = getattr(fill, "contract", None)
@@ -1212,6 +1221,10 @@ class IBKRAdapter(Adapter):
             exec_id = str(getattr(execution, "execId", "") or "")
             if not exec_id:
                 exec_id = f"{client_order_id}-{exec_time.isoformat()}"
+            if exec_id in seen_fill_ids:
+                # Session and historical sources overlap — keep the first.
+                continue
+            seen_fill_ids.add(exec_id)
             fee_amount: Decimal | None = None
             fee_currency: str | None = None
             if commission is not None:
@@ -1247,6 +1260,48 @@ class IBKRAdapter(Adapter):
         for lst in grouped.values():
             lst.sort(key=lambda r: r.fill_timestamp)
         return grouped
+
+    async def _fetch_historical_fills(
+        self, ib: IB, since: datetime, session_has_fills: bool
+    ) -> list[Any]:
+        """Request executions at/after *since* from TWS (``reqExecutionsAsync``).
+
+        Covers what the session cache cannot: fills from before this process
+        connected. Without this, the first post-restart reconcile compares
+        stored fills against an empty platform snapshot and deletes them.
+
+        Degradation follows the information state: when the session cache
+        already holds fills the historical request is supplementary, so a
+        failure warns and yields nothing; when the session is empty the
+        window is blind, so a failure raises and the reconcile pass aborts
+        instead of comparing against partial data.
+        """
+        filt = ExecutionFilter()
+        account = self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
+        if account:
+            # Scope to our account; clientId is deliberately unset so fills
+            # from other sessions (e.g. manual TWS orders) still arrive.
+            filt.acctCode = account
+        # TWS wire format for the execution time filter; the parse loop's
+        # *since* comparison stays authoritative if TWS is loose about it.
+        bound = since if since.tzinfo is not None else since.replace(tzinfo=UTC)
+        filt.time = bound.astimezone(UTC).strftime("%Y%m%d-%H:%M:%S")
+        try:
+            return await asyncio.wait_for(
+                ib.reqExecutionsAsync(filt),
+                timeout=self._config.timeout_seconds,
+            )
+        except UteError:
+            raise
+        except Exception as exc:
+            if session_has_fills:
+                logger.warning(
+                    "IBKR historical executions unavailable; using session fills only: %s", exc
+                )
+                return []
+            raise PlatformConnectionError(
+                f"failed to fetch IBKR historical executions: {exc}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # Event Callbacks (adapter-internal push handlers)

@@ -29,6 +29,7 @@ def mock_ib_async_module():
         mock_ib.disconnect = MagicMock()
         mock_ib.isConnected.return_value = True
         mock_ib.reqContractDetailsAsync = AsyncMock(return_value=[])
+        mock_ib.reqExecutionsAsync = AsyncMock(return_value=[])
         mock_ib.managedAccounts = MagicMock(return_value=["DU_TEST"])
         mock_ib.TimezoneTWS = "UTC"
 
