@@ -1009,6 +1009,27 @@ class TestBalanceAccumulator:
     async def test_seed_at_connect_completes_first_event(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
     ) -> None:
+        """Seed with a partial tag set: the first event completes the Balance."""
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        mock_ib = mock_ib_async_module
+        mock_ib.accountValues.return_value = [  # type: ignore[attr-defined]
+            _account_value("NetLiquidation", "87577.47"),
+        ]
+        await adapter.connect()
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_account_value(_account_value("AvailableFunds", "78248.49"))
+
+        assert len(captured) == 1
+        assert captured[0].balance.total == Decimal("87577.47")
+        assert captured[0].balance.free == Decimal("78248.49")
+
+    async def test_seed_suppresses_identical_first_events(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Seeded aggregate is stored in _balance_last: re-pushed same values publish nothing."""
         from unified_trading_execution.events import BalanceUpdateEvent
 
         mock_ib = mock_ib_async_module
@@ -1020,8 +1041,71 @@ class TestBalanceAccumulator:
 
         captured: list[BalanceUpdateEvent] = []
         adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
-        adapter._on_account_value(_account_value("CashBalance", "100141.04"))
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47"))
+        adapter._on_account_value(_account_value("AvailableFunds", "78248.49"))
+
+        assert len(captured) == 0
+
+        # A genuinely changed tag still publishes.
+        adapter._on_account_value(_account_value("NetLiquidation", "87433.38"))
+        assert len(captured) == 1
+        assert captured[0].balance.total == Decimal("87433.38")
+
+
+# ---------------------------------------------------------------------------
+# positionEvent entry-price scaling
+# ---------------------------------------------------------------------------
+
+
+def _futures_position_contract() -> Contract:
+    c = Contract()
+    c.symbol = "ES"
+    c.secType = "FUT"
+    c.exchange = "CME"
+    c.currency = "USD"
+    c.conId = 515416632
+    c.lastTradeDateOrContractMonth = "20261218"
+    c.multiplier = "50"
+    c.localSymbol = "ESZ6"
+    return c
+
+
+class TestPositionUpdateEvent:
+    def test_futures_avg_cost_scaled_to_per_unit(self, adapter: IBKRAdapter) -> None:
+        from ib_async.objects import Position as IBPosition
+
+        from unified_trading_execution.events import PositionUpdateEvent
+
+        captured: list[PositionUpdateEvent] = []
+        adapter._event_bus.subscribe(PositionUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_position_update(
+            IBPosition(
+                account="DU_TEST",
+                contract=_futures_position_contract(),
+                position=1,
+                avgCost=382925,
+            )
+        )
 
         assert len(captured) == 1
-        assert captured[0].balance.total == Decimal("87577.47")
-        assert captured[0].balance.free == Decimal("78248.49")
+        assert captured[0].position.average_entry_price == Decimal("7658.5")
+        assert captured[0].position.position_id == "515416632"
+
+    def test_stock_avg_cost_unchanged(self, adapter: IBKRAdapter) -> None:
+        from ib_async.objects import Position as IBPosition
+
+        from unified_trading_execution.events import PositionUpdateEvent
+
+        captured: list[PositionUpdateEvent] = []
+        adapter._event_bus.subscribe(PositionUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        adapter._on_position_update(
+            IBPosition(account="DU_TEST", contract=contract, position=10, avgCost=150)
+        )
+
+        assert len(captured) == 1
+        assert captured[0].position.average_entry_price == Decimal("150")

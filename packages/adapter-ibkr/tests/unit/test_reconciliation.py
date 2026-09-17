@@ -44,6 +44,26 @@ def _position(contract: Contract, qty: float = 100, avg_cost: float = 150.0) -> 
     return IBPosition(account="DU_TEST", contract=contract, position=qty, avgCost=avg_cost)
 
 
+def _futures_contract(
+    symbol: str = "ES",
+    con_id: int = 515416632,
+    exchange: str = "CME",
+    currency: str = "USD",
+    expiry: str = "20261218",
+    multiplier: str = "50",
+) -> Contract:
+    c = Contract()
+    c.symbol = symbol
+    c.secType = "FUT"
+    c.exchange = exchange
+    c.currency = currency
+    c.conId = con_id
+    c.lastTradeDateOrContractMonth = expiry
+    c.multiplier = multiplier
+    c.localSymbol = "ESZ6"
+    return c
+
+
 def _account_value(
     tag: str, value: str, currency: str = "USD", account: str = "DU_TEST"
 ) -> AccountValue:
@@ -113,6 +133,25 @@ class TestFetchPositions:
         assert by_id["111"].quantity == Decimal("10")
         assert by_id["222"].quantity == Decimal("-5")
         assert by_id["111"].instrument.symbol == "AAPL"
+        # Stocks carry no multiplier — avgCost passes through as the entry price.
+        assert by_id["111"].average_entry_price == Decimal("150")
+        assert by_id["222"].average_entry_price == Decimal("200")
+
+    async def test_futures_avg_cost_scaled_to_per_unit(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """IBKR scales futures avgCost by the multiplier — entry is per-unit."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [  # type: ignore[attr-defined]
+            _position(_futures_contract(), qty=1, avg_cost=382925),
+        ]
+
+        positions = await adapter.fetch_positions()
+
+        assert len(positions) == 1
+        assert positions[0].instrument.multiplier == 50
+        assert positions[0].average_entry_price == Decimal("7658.5")
 
     async def test_zero_qty_skipped(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock

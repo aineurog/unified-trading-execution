@@ -164,6 +164,20 @@ def _balance_from_tags(tags: dict[str, Decimal], currency: str, now: datetime) -
         return None
 
 
+def _entry_price(avg_cost: Decimal, instrument: Instrument) -> Decimal:
+    """Convert IBKR ``avgCost`` to a per-unit entry price.
+
+    IBKR reports ``avgCost`` scaled by the contract multiplier for
+    multiplier instruments (futures, options) — e.g. 1x ES at 7658.5
+    arrives as 382925 (x50). Divide back out so ``average_entry_price``
+    is always a per-unit price; instruments without a multiplier
+    (stocks, FX, spot, CFDs) pass through untouched.
+    """
+    if instrument.multiplier:
+        return avg_cost / Decimal(instrument.multiplier)
+    return avg_cost
+
+
 def _trade_to_record(trade: Trade) -> OrderRecord | None:
     """Translate an ``ib_async.Trade`` to an ``OrderRecord`` (None = skip).
 
@@ -1150,7 +1164,9 @@ class IBKRAdapter(Adapter):
                 )
                 continue
             avg_price = Decimal(str(pos.avgCost)) if pos.avgCost else Decimal("0")
-            # IBKR avgCost is per-share cost; for FX it's the price. Use as entry price.
+            # IBKR avgCost is scaled by the contract multiplier for futures /
+            # options (ES 7658.5 arrives as 382925); scale back to per-unit.
+            avg_price = _entry_price(avg_price, instrument)
             position_id = str(pos.contract.conId) if getattr(pos.contract, "conId", 0) else None
             try:
                 result.append(
@@ -1471,6 +1487,8 @@ class IBKRAdapter(Adapter):
             instrument = from_ibkr_contract(contract)
             qty = Decimal(str(getattr(position, "position", 0) or 0))
             avg_cost = Decimal(str(getattr(position, "avgCost", 0) or 0))
+            # Same multiplier scaling as fetch_positions — per-unit entry price.
+            avg_cost = _entry_price(avg_cost, instrument)
             pos_id = str(contract.conId) if getattr(contract, "conId", 0) else None
             pos = Position(
                 instrument=instrument,
@@ -1497,8 +1515,11 @@ class IBKRAdapter(Adapter):
 
         Resets tag state for the fresh connection (TWS re-pushes the full
         set anyway) and fills it so the first streamed event already
-        computes a complete Balance. Never raises — a failed seed only
-        means the first events publish once tags fill in.
+        computes a complete Balance. The seeded aggregate is also stored
+        in ``_balance_last`` so that first event is suppressed when it
+        recomputes an identical Balance (no seed+echo double row).
+        Never raises — a failed seed only means the first events publish
+        once tags fill in.
         """
         try:
             with self._balance_lock:
@@ -1508,6 +1529,7 @@ class IBKRAdapter(Adapter):
                 self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
             )
             values = ib.accountValues(account=account) if account else ib.accountValues()
+            now = _utcnow()
             with self._balance_lock:
                 for av in values or []:
                     tag = getattr(av, "tag", "")
@@ -1525,6 +1547,10 @@ class IBKRAdapter(Adapter):
                         continue
                     acct = str(getattr(av, "account", "") or "") or account
                     self._balance_tags.setdefault((acct, ccy), {})[tag] = dec
+                for (acct, ccy), tags in self._balance_tags.items():
+                    balance = _balance_from_tags(tags, ccy, now)
+                    if balance is not None:
+                        self._balance_last[(acct, ccy)] = balance
         except Exception as exc:
             logger.debug("Balance tag seed skipped: %s", exc)
 
