@@ -930,3 +930,98 @@ class TestOrderStatusEvent:
         mock_ib.orderStatusEvent.__iadd__.assert_called_once_with(adapter._on_order_status)
         await adapter.disconnect()
         mock_ib.orderStatusEvent.__isub__.assert_called_once_with(adapter._on_order_status)
+
+
+# ---------------------------------------------------------------------------
+# accountValueEvent balance accumulator
+# ---------------------------------------------------------------------------
+
+
+def _account_value(tag: str, value: str, currency: str = "USD"):
+    from ib_async.objects import AccountValue
+
+    return AccountValue(account="DU_TEST", tag=tag, value=value, currency=currency, modelCode="")
+
+
+class TestBalanceAccumulator:
+    def test_single_tag_publishes_partial_balance(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47"))
+
+        assert len(captured) == 1
+        assert captured[0].balance.total == Decimal("87577.47")
+        assert captured[0].balance.free == Decimal("87577.47")
+        assert captured[0].balance.used == Decimal("0")
+
+    def test_burst_collapses_to_changes_only(self, adapter: IBKRAdapter) -> None:
+        """The connect-burst flapping (one event per tag) publishes real changes only."""
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47"))
+        adapter._on_account_value(_account_value("TotalCashValue", "100141.04"))
+        adapter._on_account_value(_account_value("AvailableFunds", "78248.49"))
+        # Repeats of the same tag values — previously one junk row each.
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47"))
+        adapter._on_account_value(_account_value("AvailableFunds", "78248.49"))
+
+        # TotalCashValue changes nothing (free clamps to NetLiquidation),
+        # so only the first sighting and the AvailableFunds move publish.
+        assert len(captured) == 2
+        last = captured[-1].balance
+        assert (last.free, last.used, last.total) == (
+            Decimal("78248.49"),
+            Decimal("9328.98"),
+            Decimal("87577.47"),
+        )
+
+    def test_irrelevant_tag_change_suppressed(self, adapter: IBKRAdapter) -> None:
+        """A tag that does not move the aggregate publishes nothing."""
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47"))
+        adapter._on_account_value(_account_value("AvailableFunds", "78248.49"))
+        assert len(captured) == 2
+        # CashBalance is shadowed by higher-precedence tags — no publish.
+        adapter._on_account_value(_account_value("CashBalance", "78248.49"))
+        assert len(captured) == 2
+
+    def test_base_rollup_and_unknown_tags_skipped(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        adapter._on_account_value(_account_value("NetLiquidation", "87577.47", currency="BASE"))
+        adapter._on_account_value(_account_value("LookAheadExcessLiquidity", "1", currency="USD"))
+
+        assert len(captured) == 0
+
+    async def test_seed_at_connect_completes_first_event(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import BalanceUpdateEvent
+
+        mock_ib = mock_ib_async_module
+        mock_ib.accountValues.return_value = [  # type: ignore[attr-defined]
+            _account_value("NetLiquidation", "87577.47"),
+            _account_value("AvailableFunds", "78248.49"),
+        ]
+        await adapter.connect()
+
+        captured: list[BalanceUpdateEvent] = []
+        adapter._event_bus.subscribe(BalanceUpdateEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_account_value(_account_value("CashBalance", "100141.04"))
+
+        assert len(captured) == 1
+        assert captured[0].balance.total == Decimal("87577.47")
+        assert captured[0].balance.free == Decimal("78248.49")

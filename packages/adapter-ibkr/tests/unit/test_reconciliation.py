@@ -243,6 +243,20 @@ class TestFetchBalances:
         mock_ib.accountValues.return_value = []  # type: ignore[attr-defined]
         assert await adapter.fetch_balances() == {}
 
+    async def test_base_rollup_skipped(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """BASE-denominated rows duplicate the native set — never stored."""
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.accountValues.return_value = [  # type: ignore[attr-defined]
+            _account_value("NetLiquidation", "87577.47", currency="USD"),
+            _account_value("NetLiquidation", "90000", currency="BASE"),
+        ]
+        bals = await adapter.fetch_balances()
+        assert set(bals) == {"USD"}
+        assert bals["USD"].total == Decimal("87577.47")
+
     async def test_not_connected(self, adapter: IBKRAdapter) -> None:
         with pytest.raises(PlatformConnectionError):
             await adapter.fetch_balances()

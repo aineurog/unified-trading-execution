@@ -90,6 +90,12 @@ _SPEC_STALE_ERROR_CODES: frozenset[int] = frozenset({110})
 # states and a long session must not grow the suppression set forever.
 _STATUS_FINAL_CAP = 1000
 
+# Account-value tags that form a Balance. TWS pushes the whole account
+# summary per tag; only these four feed the mirror.
+_BALANCE_TAGS: frozenset[str] = frozenset(
+    {"TotalCashValue", "NetLiquidation", "CashBalance", "AvailableFunds"}
+)
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -126,6 +132,36 @@ def _is_not_subscribed(exc: PlatformError) -> bool:
     """
     context = getattr(exc, "platform_error", None)
     return isinstance(context, dict) and context.get("ibkr_error_code") == 354
+
+
+def _balance_from_tags(tags: dict[str, Decimal], currency: str, now: datetime) -> Balance | None:
+    """Build a ``Balance`` from accumulated account-value tags (None = unusable).
+
+    Shared rule for ``fetch_balances`` and the ``accountValueEvent``
+    accumulator so the polled and streamed views can never disagree:
+    total = NetLiquidation ?? TotalCashValue ?? CashBalance;
+    free = AvailableFunds ?? TotalCashValue ?? CashBalance (clamped to
+    total); used = total - free.
+    """
+    total = tags.get("NetLiquidation")
+    if total is None:
+        total = tags.get("TotalCashValue")
+    if total is None:
+        total = tags.get("CashBalance")
+    if total is None:
+        return None
+    free = tags.get("AvailableFunds")
+    if free is None:
+        free = tags.get("TotalCashValue")
+    if free is None:
+        free = tags.get("CashBalance", total)
+    # Clamp free to total
+    if free > total:
+        free = total
+    try:
+        return Balance(currency=currency, free=free, used=total - free, total=total, updated_at=now)
+    except Exception:
+        return None
 
 
 def _trade_to_record(trade: Trade) -> OrderRecord | None:
@@ -292,6 +328,14 @@ class IBKRAdapter(Adapter):
         # its own I/O thread.
         self._status_final_ids: dict[str, None] = {}
         self._status_lock = threading.Lock()
+
+        # accountValueEvent accumulator: (account, currency) -> {tag: value}.
+        # A single tag is not a balance; tags accumulate and each arrival
+        # recomputes the full Balance. _balance_last gates publishing so only
+        # real changes hit the bus. Same lock reason as above.
+        self._balance_tags: dict[tuple[str, str], dict[str, Decimal]] = {}
+        self._balance_last: dict[tuple[str, str], Balance] = {}
+        self._balance_lock = threading.Lock()
 
         # Whether the adapter considers itself connected (mirrors IB.isConnected).
         self._connected = False
@@ -466,6 +510,9 @@ class IBKRAdapter(Adapter):
                 self._managed_account = None
 
             self._connected = True
+            # Seed the balance tag accumulator so the first accountValueEvent
+            # computes a complete Balance immediately (best-effort).
+            self._seed_balance_tags(ib)
             self._publish_connection_state(True)
 
     async def _cleanup_after_failed_connect(self, ib: IB) -> None:
@@ -1122,10 +1169,10 @@ class IBKRAdapter(Adapter):
     async def fetch_balances(self) -> dict[str, Balance]:
         """Fetch account balances from ``IB.accountValues()``.
 
-        Groups ``AccountValue`` by currency and uses ``TotalCashValue`` as
-        ``free`` and ``NetLiquidation`` as ``total`` (``used = total - free``).
-        Falls back to ``CashBalance``/``AvailableFunds`` when the primary tags
-        are absent. Skips currencies with no usable value.
+        Groups ``AccountValue`` by currency and builds each ``Balance`` with
+        ``_balance_from_tags`` (shared with the ``accountValueEvent``
+        accumulator). Skips the ``BASE`` rollup rows (they duplicate the
+        native-currency set) and currencies with no usable value.
         """
         ib = self._require_ib()
         now = _utcnow()
@@ -1140,6 +1187,8 @@ class IBKRAdapter(Adapter):
         per_ccy: dict[str, dict[str, Decimal]] = {}
         for av in values:
             ccy = (getattr(av, "currency", "") or "").strip() or "USD"
+            if ccy.upper() == "BASE":
+                continue
             tag = getattr(av, "tag", "")
             raw = getattr(av, "value", "")
             if not tag or raw in (None, ""):
@@ -1154,29 +1203,10 @@ class IBKRAdapter(Adapter):
 
         result: dict[str, Balance] = {}
         for ccy, tags in per_ccy.items():
-            # Prefer NetLiquidation as total, else TotalCashValue, else CashBalance
-            total = tags.get("NetLiquidation")
-            if total is None:
-                total = tags.get("TotalCashValue")
-            if total is None:
-                total = tags.get("CashBalance")
-            if total is None:
+            balance = _balance_from_tags(tags, ccy, now)
+            if balance is None:
                 continue
-            free = tags.get("AvailableFunds")
-            if free is None:
-                free = tags.get("TotalCashValue")
-            if free is None:
-                free = tags.get("CashBalance", total)
-            # Clamp free to total
-            if free > total:
-                free = total
-            used = total - free
-            try:
-                result[ccy] = Balance(
-                    currency=ccy, free=free, used=used, total=total, updated_at=now
-                )
-            except Exception as exc:
-                logger.warning("Skipping balance for %s: %s", ccy, exc)
+            result[ccy] = balance
         return result
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
@@ -1462,22 +1492,83 @@ class IBKRAdapter(Adapter):
         except Exception as exc:
             logger.warning("Skipping positionEvent for %r: %s", position, exc)
 
+    def _seed_balance_tags(self, ib: IB) -> None:
+        """Best-effort seed of the balance accumulator from ``accountValues()``.
+
+        Resets tag state for the fresh connection (TWS re-pushes the full
+        set anyway) and fills it so the first streamed event already
+        computes a complete Balance. Never raises — a failed seed only
+        means the first events publish once tags fill in.
+        """
+        try:
+            with self._balance_lock:
+                self._balance_tags.clear()
+                self._balance_last.clear()
+            account = (
+                self._managed_account if self._managed_account not in (None, "UNKNOWN") else ""
+            )
+            values = ib.accountValues(account=account) if account else ib.accountValues()
+            with self._balance_lock:
+                for av in values or []:
+                    tag = getattr(av, "tag", "")
+                    if tag not in _BALANCE_TAGS:
+                        continue
+                    ccy = (getattr(av, "currency", "") or "").strip() or "USD"
+                    if ccy.upper() == "BASE":
+                        continue
+                    raw = getattr(av, "value", "")
+                    if raw in (None, ""):
+                        continue
+                    try:
+                        dec = Decimal(str(raw))
+                    except Exception:
+                        continue
+                    acct = str(getattr(av, "account", "") or "") or account
+                    self._balance_tags.setdefault((acct, ccy), {})[tag] = dec
+        except Exception as exc:
+            logger.debug("Balance tag seed skipped: %s", exc)
+
     def _on_account_value(self, value: Any) -> None:
-        """Translate a live ``AccountValue`` to ``BalanceUpdateEvent``."""
+        """Accumulate a live ``AccountValue`` and publish the recomputed ``Balance``.
+
+        TWS pushes the whole account summary per tag; a single tag is not a
+        balance. Tags accumulate per (account, currency) and each arrival
+        recomputes the full Balance with the ``fetch_balances`` rule —
+        publishing only when the result changed, so a connect burst
+        collapses instead of flapping the mirror. BASE rollup rows are
+        skipped (they duplicate the native-currency set).
+        """
         try:
             tag = str(getattr(value, "tag", "") or "")
-            if tag not in ("TotalCashValue", "NetLiquidation", "CashBalance", "AvailableFunds"):
+            if tag not in _BALANCE_TAGS:
                 return
             ccy = str(getattr(value, "currency", "") or "").strip() or "USD"
+            if ccy.upper() == "BASE":
+                return
             raw = getattr(value, "value", "")
             if raw in (None, ""):
                 return
-            dec = Decimal(str(raw))
-            # Push is per-tag; for live mirror use tag value as total with free=total
-            # fetch_balances() does the full per-currency aggregation for reconcile
-            bal = Balance(
-                currency=ccy, free=dec, used=Decimal("0"), total=dec, updated_at=_utcnow()
-            )
+            try:
+                dec = Decimal(str(raw))
+            except Exception:
+                return
+            account = str(getattr(value, "account", "") or "") or self._managed_account or ""
+            key = (account, ccy)
+            with self._balance_lock:
+                bucket = self._balance_tags.setdefault(key, {})
+                bucket[tag] = dec
+                balance = _balance_from_tags(bucket, ccy, _utcnow())
+                if balance is None:
+                    return
+                last = self._balance_last.get(key)
+                if (
+                    last is not None
+                    and last.free == balance.free
+                    and last.used == balance.used
+                    and last.total == balance.total
+                ):
+                    return
+                self._balance_last[key] = balance
             self._publish(
                 BalanceUpdateEvent(
                     event_id=_new_id(),
@@ -1485,7 +1576,7 @@ class IBKRAdapter(Adapter):
                     adapter_name=self.platform_name,
                     account_id=self.account_id,
                     correlation_id=None,
-                    balance=bal,
+                    balance=balance,
                 )
             )
         except Exception as exc:
