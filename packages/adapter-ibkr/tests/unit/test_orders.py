@@ -310,6 +310,26 @@ class TestBracketOrders:
         assert tp.ocaGroup
         assert sl.ocaGroup == tp.ocaGroup
 
+    def test_children_carry_deterministic_refs(self) -> None:
+        """Bracket children are attributed: {parent}:tp / {parent}:sl."""
+        order = make_order(
+            take_profit=TpSlAttachment(trigger_price=Decimal("110")),
+            stop_loss=TpSlAttachment(trigger_price=Decimal("95")),
+        )
+        parent, tp, sl = build_ibkr_orders(order)
+
+        cid = "01900000-0000-7000-8000-000000000001"
+        assert parent.orderRef == cid
+        assert tp.orderRef == f"{cid}:tp"
+        assert sl.orderRef == f"{cid}:sl"
+
+    def test_lone_child_ref(self) -> None:
+        """A single-leg bracket still attributes its child."""
+        order = make_order(stop_loss=TpSlAttachment(trigger_price=Decimal("95")))
+        parent, sl = build_ibkr_orders(order)
+        assert parent.orderRef == "01900000-0000-7000-8000-000000000001"
+        assert sl.orderRef == "01900000-0000-7000-8000-000000000001:sl"
+
     def test_single_take_profit_bracket(self) -> None:
         """A lone TP still brackets: parent staged, child transmits."""
         order = make_order(take_profit=TpSlAttachment(trigger_price=Decimal("110")))

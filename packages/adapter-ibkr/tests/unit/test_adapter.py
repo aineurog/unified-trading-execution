@@ -681,6 +681,51 @@ class TestPushEvents:
         assert captured[0].fill.fill_quantity == Decimal("10")
         assert captured[0].fill.fill_price == Decimal("100")
 
+    def test_exec_details_child_reason_inferred(self, adapter: IBKRAdapter) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        from unified_trading_execution.events import FillEvent
+        from unified_trading_execution.types.enums import FillEntry, FillReason
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.conId = 1
+        trade = _trade(order_ref="cid:sl", order_id=1, perm_id=1)
+        execution = Execution(
+            execId="exec-1",
+            time=datetime.now(UTC),
+            orderRef="cid:sl",
+            shares=10,
+            price=100,
+            permId=1,
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=CommissionReport(
+                execId="exec-1",
+                commission=0,
+                currency="USD",
+                realizedPNL=0,
+                yield_=0,
+                yieldRedemptionDate=0,
+            ),
+            time=datetime.now(UTC),
+        )
+        adapter._on_exec_details(trade, fill)
+
+        assert len(captured) == 1
+        assert captured[0].fill.reason is FillReason.STOP_LOSS
+        assert captured[0].fill.entry is FillEntry.OUT
+
     def test_exec_details_skips_zero_qty(self, adapter: IBKRAdapter) -> None:
         from datetime import UTC, datetime
 

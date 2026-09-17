@@ -56,7 +56,13 @@ from unified_trading_execution.ibkr.orders import (
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
-from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
+from unified_trading_execution.types.enums import (
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
@@ -176,6 +182,21 @@ def _entry_price(avg_cost: Decimal, instrument: Instrument) -> Decimal:
     if instrument.multiplier:
         return avg_cost / Decimal(instrument.multiplier)
     return avg_cost
+
+
+def _fill_reason_entry(cid: str) -> tuple[FillReason | None, FillEntry | None]:
+    """Infer fill reason/entry from a bracket-child client_order_id.
+
+    Bracket children (``{parent}:tp`` / ``{parent}:sl``) and position-TP/SL
+    legs (``{position}-tp-…`` / ``{position}-sl-…``) always close exposure,
+    so their fills are ``OUT`` with the matching reason. Anything else
+    carries no platform classification — ``(None, None)``.
+    """
+    if cid.endswith(":tp") or "-tp-" in cid:
+        return FillReason.TAKE_PROFIT, FillEntry.OUT
+    if cid.endswith(":sl") or "-sl-" in cid:
+        return FillReason.STOP_LOSS, FillEntry.OUT
+    return None, None
 
 
 def _trade_to_record(trade: Trade) -> OrderRecord | None:
@@ -1332,6 +1353,7 @@ class IBKRAdapter(Adapter):
                     fee_amount = None
                     fee_currency = None
             # position_id not applicable to IBKR fills — keep None
+            reason, entry = _fill_reason_entry(client_order_id)
             try:
                 record = FillRecord(
                     client_order_id=client_order_id,
@@ -1344,6 +1366,8 @@ class IBKRAdapter(Adapter):
                     fee_amount=fee_amount,
                     correlation_id=client_order_id,
                     position_id=None,
+                    reason=reason,
+                    entry=entry,
                 )
             except Exception as exc:
                 logger.warning("Skipping invalid FillRecord for %r: %s", client_order_id, exc)
@@ -1656,6 +1680,7 @@ class IBKRAdapter(Adapter):
                 except Exception:
                     fee_amount = None
                     fee_currency = None
+            reason, entry = _fill_reason_entry(client_order_id)
             fill_record = FillRecord(
                 client_order_id=client_order_id,
                 platform_fill_id=exec_id,
@@ -1667,6 +1692,8 @@ class IBKRAdapter(Adapter):
                 fee_amount=fee_amount,
                 correlation_id=client_order_id,
                 position_id=None,
+                reason=reason,
+                entry=entry,
             )
             self._publish(
                 FillEvent(

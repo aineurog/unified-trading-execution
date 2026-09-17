@@ -519,6 +519,25 @@ class TestFetchFills:
         assert set(grouped.keys()) == {"cid-a", "cid-b"}
         assert len(grouped["cid-a"]) == 2
 
+    async def test_bracket_child_reason_inferred(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        """Child fills carry TAKE_PROFIT/STOP_LOSS + OUT; plain fills stay None."""
+        from unified_trading_execution.types.enums import FillEntry, FillReason
+
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.fills.return_value = [
+            self._fill(order_ref="cid:tp", exec_id="1"),
+            self._fill(order_ref="cid:sl", exec_id="2"),
+            self._fill(order_ref="cid", exec_id="3"),
+        ]  # type: ignore[attr-defined]
+        grouped = await adapter.fetch_fills()
+        tp, sl, plain = grouped["cid:tp"][0], grouped["cid:sl"][0], grouped["cid"][0]
+        assert (tp.reason, tp.entry) == (FillReason.TAKE_PROFIT, FillEntry.OUT)
+        assert (sl.reason, sl.entry) == (FillReason.STOP_LOSS, FillEntry.OUT)
+        assert (plain.reason, plain.entry) == (None, None)
+
     async def test_since_filter(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
     ) -> None:

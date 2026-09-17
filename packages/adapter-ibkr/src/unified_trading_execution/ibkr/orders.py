@@ -28,6 +28,9 @@ IBKR has no native attachment on a single order.  A ``UnifiedOrder`` with
 TP and/or SL becomes a parent plus linked child orders:
 
 - children reverse the parent's action and copy its quantity and TIF;
+- children carry deterministic refs (``{parent}:tp`` / ``{parent}:sl``)
+  so fills, status events, and cancels attribute back to the bracket
+  instead of falling back to the bare permId;
 - the take-profit is always ``LMT`` at the trigger price (an IBKR
   profit-taker has no market form — a ``TpSlAttachment.limit_price`` on the
   TP raises ``UnsupportedOrderTypeError``);
@@ -245,6 +248,7 @@ def build_ibkr_orders(order: UnifiedOrder) -> list[Order]:
             action=child_action,
             totalQuantity=quantity,
             lmtPrice=order.take_profit.trigger_price,
+            orderRef=f"{order.client_order_id}:tp",
             **tif_kwargs,
         )
         children.append(tp)
@@ -254,6 +258,7 @@ def build_ibkr_orders(order: UnifiedOrder) -> list[Order]:
             "action": child_action,
             "totalQuantity": quantity,
             "auxPrice": order.stop_loss.trigger_price,
+            "orderRef": f"{order.client_order_id}:sl",
         }
         if order.stop_loss.limit_price is not None:
             sl_fields["lmtPrice"] = order.stop_loss.limit_price
