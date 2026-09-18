@@ -726,6 +726,109 @@ class TestPushEvents:
         assert captured[0].fill.reason is FillReason.STOP_LOSS
         assert captured[0].fill.entry is FillEntry.OUT
 
+    def _commission_fill(
+        self, adapter: IBKRAdapter, order_ref: str = "cid-fee", exec_id: str = "exec-fee"
+    ) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.conId = 1
+        trade = _trade(order_ref=order_ref, order_id=1, perm_id=1)
+        execution = Execution(
+            execId=exec_id,
+            time=datetime.now(UTC),
+            orderRef=order_ref,
+            shares=10,
+            price=100,
+            permId=1,
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=CommissionReport(
+                execId=exec_id,
+                commission=0,
+                currency="USD",
+                realizedPNL=0,
+                yield_=0,
+                yieldRedemptionDate=0,
+            ),
+            time=datetime.now(UTC),
+        )
+        adapter._on_exec_details(trade, fill)
+
+    def _commission_report(self, exec_id: str, amount: float):
+        from ib_async.objects import CommissionReport
+
+        return CommissionReport(
+            execId=exec_id,
+            commission=amount,
+            currency="USD",
+            realizedPNL=0,
+            yield_=0,
+            yieldRedemptionDate=0,
+        )
+
+    def test_late_commission_republishes_with_fee(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        self._commission_fill(adapter)
+
+        assert len(captured) == 1
+        assert captured[0].fill.fee_amount is None
+
+        adapter._on_commission_report(None, None, self._commission_report("exec-fee", 1.5))
+
+        assert len(captured) == 2
+        assert captured[1].fill.platform_fill_id == "exec-fee"
+        assert captured[1].fill.fee_amount == Decimal("1.5")
+        assert captured[1].fill.fee_currency == "USD"
+
+    def test_duplicate_commission_suppressed(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        self._commission_fill(adapter)
+        adapter._on_commission_report(None, None, self._commission_report("exec-fee", 1.5))
+        assert len(captured) == 2
+
+        adapter._on_commission_report(None, None, self._commission_report("exec-fee", 1.5))
+        assert len(captured) == 2
+
+    def test_early_commission_joins_fill(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_commission_report(None, None, self._commission_report("exec-fee", 2.25))
+        assert len(captured) == 0
+
+        self._commission_fill(adapter)
+
+        assert len(captured) == 1
+        assert captured[0].fill.fee_amount == Decimal("2.25")
+
+    def test_zero_commission_ignored(self, adapter: IBKRAdapter) -> None:
+        from unified_trading_execution.events import FillEvent
+
+        captured: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_commission_report(None, None, self._commission_report("exec-ghost", 0))
+        self._commission_fill(adapter)
+
+        assert len(captured) == 1
+        assert captured[0].fill.fee_amount is None
+        assert "exec-ghost" not in adapter._fill_pending_fees
+
     def test_exec_details_skips_zero_qty(self, adapter: IBKRAdapter) -> None:
         from datetime import UTC, datetime
 

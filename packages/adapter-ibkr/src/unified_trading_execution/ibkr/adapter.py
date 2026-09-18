@@ -23,6 +23,7 @@ import copy
 import logging
 import math
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
@@ -95,6 +96,12 @@ _SPEC_STALE_ERROR_CODES: frozenset[int] = frozenset({110})
 # Cap for the orderStatusEvent final-state set — TWS repeats terminal
 # states and a long session must not grow the suppression set forever.
 _STATUS_FINAL_CAP = 1000
+
+# Cap for the fill/commission join maps (execId -> record/fee). TWS sends
+# commission on its own event, possibly before or after the execution, so
+# both sides wait for each other briefly — but a long session must not
+# grow the maps forever.
+_FILL_JOIN_CAP = 5000
 
 # Account-value tags that form a Balance. TWS pushes the whole account
 # summary per tag; only these four feed the mirror.
@@ -182,6 +189,23 @@ def _entry_price(avg_cost: Decimal, instrument: Instrument) -> Decimal:
     if instrument.multiplier:
         return avg_cost / Decimal(instrument.multiplier)
     return avg_cost
+
+
+def _parse_commission(commission: Any) -> tuple[Decimal, str | None] | None:
+    """Extract (amount, currency) from a commission report (None = none/zero).
+
+    Zero commissions normalize to None — a zero fee and an unknown fee are
+    indistinguishable downstream, and storing 0 would fake precision.
+    """
+    if commission is None:
+        return None
+    try:
+        amount = Decimal(str(getattr(commission, "commission", 0) or 0))
+        if amount == 0:
+            return None
+        return amount, str(getattr(commission, "currency", "") or "") or None
+    except Exception:
+        return None
 
 
 def _fill_reason_entry(cid: str) -> tuple[FillReason | None, FillEntry | None]:
@@ -371,6 +395,14 @@ class IBKRAdapter(Adapter):
         self._balance_tags: dict[tuple[str, str], dict[str, Decimal]] = {}
         self._balance_last: dict[tuple[str, str], Balance] = {}
         self._balance_lock = threading.Lock()
+
+        # Fill/commission join: TWS delivers the execution and its
+        # commission on separate events in either order. Published fills
+        # (by platform_fill_id/execId) wait for a late commission; early
+        # commissions wait for their fill. Same lock reason as above.
+        self._fill_records: dict[str, FillRecord] = {}
+        self._fill_pending_fees: dict[str, tuple[Decimal, str | None]] = {}
+        self._fill_lock = threading.Lock()
 
         # Whether the adapter considers itself connected (mirrors IB.isConnected).
         self._connected = False
@@ -569,6 +601,7 @@ class IBKRAdapter(Adapter):
         ib.positionEvent += self._on_position_update
         ib.accountValueEvent += self._on_account_value
         ib.execDetailsEvent += self._on_exec_details
+        ib.commissionReportEvent += self._on_commission_report
         ib.orderStatusEvent += self._on_order_status
 
     def _unwire_events(self, ib: IB) -> None:
@@ -580,6 +613,7 @@ class IBKRAdapter(Adapter):
             ("positionEvent", self._on_position_update),
             ("accountValueEvent", self._on_account_value),
             ("execDetailsEvent", self._on_exec_details),
+            ("commissionReportEvent", self._on_commission_report),
             ("orderStatusEvent", self._on_order_status),
         ):
             try:
@@ -1340,18 +1374,8 @@ class IBKRAdapter(Adapter):
                 # Session and historical sources overlap — keep the first.
                 continue
             seen_fill_ids.add(exec_id)
-            fee_amount: Decimal | None = None
-            fee_currency: str | None = None
-            if commission is not None:
-                try:
-                    fee_amount = Decimal(str(getattr(commission, "commission", 0) or 0))
-                    fee_currency = str(getattr(commission, "currency", "") or "") or None
-                    if fee_amount == 0:
-                        fee_amount = None
-                        fee_currency = None
-                except Exception:
-                    fee_amount = None
-                    fee_currency = None
+            parsed_fee = _parse_commission(commission)
+            fee_amount, fee_currency = parsed_fee if parsed_fee is not None else (None, None)
             # position_id not applicable to IBKR fills — keep None
             reason, entry = _fill_reason_entry(client_order_id)
             try:
@@ -1372,6 +1396,8 @@ class IBKRAdapter(Adapter):
             except Exception as exc:
                 logger.warning("Skipping invalid FillRecord for %r: %s", client_order_id, exc)
                 continue
+            record = self._join_pending_fee(record)
+            self._remember_fill(record)
             grouped.setdefault(client_order_id, []).append(record)
 
         # Sort each client's fills by timestamp for deterministic reconciliation
@@ -1668,18 +1694,8 @@ class IBKRAdapter(Adapter):
                 else exec_time_raw.replace(tzinfo=UTC)
             )
             commission = getattr(fill, "commissionReport", None)
-            fee_amount: Decimal | None = None
-            fee_currency: str | None = None
-            if commission is not None:
-                try:
-                    fee_amount = Decimal(str(getattr(commission, "commission", 0) or 0))
-                    fee_currency = str(getattr(commission, "currency", "") or "") or None
-                    if fee_amount == 0:
-                        fee_amount = None
-                        fee_currency = None
-                except Exception:
-                    fee_amount = None
-                    fee_currency = None
+            parsed_fee = _parse_commission(commission)
+            fee_amount, fee_currency = parsed_fee if parsed_fee is not None else (None, None)
             reason, entry = _fill_reason_entry(client_order_id)
             fill_record = FillRecord(
                 client_order_id=client_order_id,
@@ -1695,6 +1711,8 @@ class IBKRAdapter(Adapter):
                 reason=reason,
                 entry=entry,
             )
+            fill_record = self._join_pending_fee(fill_record)
+            self._remember_fill(fill_record)
             self._publish(
                 FillEvent(
                     event_id=_new_id(),
@@ -1707,6 +1725,65 @@ class IBKRAdapter(Adapter):
             )
         except Exception as exc:
             logger.warning("Skipping execDetailsEvent for %r: %s", fill, exc)
+
+    def _remember_fill(self, record: FillRecord) -> None:
+        """Cache a published/fetched fill for late commission backfill (bounded)."""
+        with self._fill_lock:
+            self._fill_records[record.platform_fill_id] = record
+            while len(self._fill_records) > _FILL_JOIN_CAP:
+                self._fill_records.pop(next(iter(self._fill_records)))
+
+    def _join_pending_fee(self, record: FillRecord) -> FillRecord:
+        """Apply an early-arrived commission to a fresh fill (identity if none)."""
+        with self._fill_lock:
+            pending = self._fill_pending_fees.pop(record.platform_fill_id, None)
+        if pending is None:
+            return record
+        return replace(record, fee_amount=pending[0], fee_currency=pending[1])
+
+    def _on_commission_report(self, trade: Trade, fill: Any, report: Any) -> None:
+        """Backfill a fill's fee from the late ``commissionReportEvent``.
+
+        ``ib_async`` emits ``(trade, fill, report)`` — the fee joins on
+        ``report.execId``. TWS delivers executions and commissions on
+        separate events in either order: a known fill is re-published with
+        the fee attached (the store upserts on ``platform_fill_id``, so the
+        row is updated, never duplicated); an unknown execId waits bounded
+        for its fill. Zero/absent commissions are ignored per the None
+        convention.
+        """
+        commission = report
+        try:
+            exec_id = str(getattr(commission, "execId", "") or "")
+            if not exec_id:
+                return
+            parsed = _parse_commission(commission)
+            with self._fill_lock:
+                record = self._fill_records.get(exec_id)
+                if record is None:
+                    if parsed is not None:
+                        self._fill_pending_fees[exec_id] = parsed
+                        while len(self._fill_pending_fees) > _FILL_JOIN_CAP:
+                            self._fill_pending_fees.pop(next(iter(self._fill_pending_fees)))
+                    return
+                if parsed is None:
+                    return
+                if record.fee_amount == parsed[0] and record.fee_currency == parsed[1]:
+                    return
+                updated = replace(record, fee_amount=parsed[0], fee_currency=parsed[1])
+                self._fill_records[exec_id] = updated
+            self._publish(
+                FillEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=updated.client_order_id,
+                    fill=updated,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping commissionReportEvent for %r: %s", commission, exc)
 
     def _on_order_status(self, trade: Trade) -> None:
         """Translate a live order-status change to ``OrderStatusEvent``.

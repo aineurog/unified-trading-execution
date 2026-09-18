@@ -41,6 +41,7 @@ def mock_ib_async_module():
             "positionEvent",
             "accountValueEvent",
             "execDetailsEvent",
+            "commissionReportEvent",
             "orderStatusEvent",
         ):
             evt = MagicMock()
