@@ -61,6 +61,7 @@ from unified_trading_execution.types.enums import (
     FillEntry,
     FillReason,
     OrderSide,
+    OrderStatus,
     OrderType,
     TimeInForce,
 )
@@ -1466,9 +1467,15 @@ class IBKRAdapter(Adapter):
         that arrive after ``place_order`` has already returned. There is no
         caller to raise to here, so this handler never raises: informational
         codes are debug-logged, everything else is warning-logged with the
-        mapped type and full native context preserved. Rejected orders
-        surface authoritatively on the next ``reconcile()`` pass via their
-        terminal status.
+        mapped type and full native context preserved.
+
+        Codes 201/202 additionally publish the terminal status: TWS reports
+        OCA-driven child cancels (and async rejections) through this channel
+        with no accompanying ``orderStatus`` transition, so without this the
+        mirror row sits live until a reconcile sweep. The status is stamped
+        explicitly (the trade still reads live at error time) and joins the
+        same final-state suppression as the status stream, making repeats
+        and own-cancel echoes idempotent.
         """
         try:
             if error_code in IGNORED_IBKR_CODES:
@@ -1491,8 +1498,67 @@ class IBKRAdapter(Adapter):
                 type(mapped).__name__,
                 error_string,
             )
+            if error_code in (201, 202):
+                self._publish_terminal_from_error(
+                    req_id,
+                    OrderStatus.REJECTED if error_code == 201 else OrderStatus.CANCELLED,
+                )
         except Exception as exc:
             logger.warning("Skipping errorEvent %r: %s", error_code, exc)
+
+    def _publish_terminal_from_error(self, req_id: int, status: OrderStatus) -> None:
+        """Publish a terminal ``OrderStatusEvent`` for a 201/202 rejection.
+
+        Resolves the live trade by numeric order id (``reqId``), translates
+        it with the shared ``_trade_to_record`` mapping, and stamps the
+        terminal status — never translating the trade's own (still live)
+        status. Unknown/absent reqIds and unmappable trades stay log-only;
+        already-final orders are suppressed via the shared final set.
+        Best-effort by design: never raises.
+        """
+        try:
+            if not req_id:
+                return
+            ib = self._ib
+            if ib is None:
+                return
+            try:
+                trades = ib.trades()
+            except Exception:
+                return
+            trade = next(
+                (
+                    t
+                    for t in trades
+                    if getattr(getattr(t, "order", None), "orderId", None) == req_id
+                ),
+                None,
+            )
+            if trade is None:
+                return
+            record = _trade_to_record(trade)
+            if record is None:
+                return
+            cid = record.client_order_id
+            with self._status_lock:
+                if cid in self._status_final_ids:
+                    return
+                self._status_final_ids[cid] = None
+                while len(self._status_final_ids) > _STATUS_FINAL_CAP:
+                    self._status_final_ids.pop(next(iter(self._status_final_ids)))
+            updated = replace(record, status=status, updated_at=_utcnow())
+            self._publish(
+                OrderStatusEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=cid,
+                    order=updated,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Skipping terminal publish for reqId %r: %s", req_id, exc)
 
     def _on_connected(self, *args: Any) -> None:
         """Callback fired by ib_async when connection is established.

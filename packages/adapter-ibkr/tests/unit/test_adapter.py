@@ -1257,3 +1257,90 @@ class TestPositionUpdateEvent:
 
         assert len(captured) == 1
         assert captured[0].position.average_entry_price == Decimal("150")
+
+
+# ---------------------------------------------------------------------------
+# errorEvent 201/202 terminal-status publish
+# ---------------------------------------------------------------------------
+
+
+class TestTerminalFromError:
+    async def test_202_publishes_cancelled(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        trade = _status_trade(order_ref="cid-202", status="Submitted")
+        mock_ib.trades = _MM(return_value=[trade])  # type: ignore[attr-defined]
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_error(42, 202, "Order Canceled - reason:By OCA")
+
+        assert len(captured) == 1
+        assert captured[0].order.client_order_id == "cid-202"
+        # Stamped explicitly — the trade itself still reads live.
+        assert captured[0].order.status is OrderStatus.CANCELLED
+
+        # Repeat 202 for the same order is suppressed (final set).
+        adapter._on_error(42, 202, "Order Canceled - reason:By OCA")
+        assert len(captured) == 1
+
+    async def test_201_publishes_rejected(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        trade = _status_trade(order_ref="cid-201", status="PendingSubmit")
+        mock_ib.trades = _MM(return_value=[trade])  # type: ignore[attr-defined]
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_error(42, 201, "Order rejected - reason:Insufficient funds")
+
+        assert len(captured) == 1
+        assert captured[0].order.status is OrderStatus.REJECTED
+
+    async def test_unknown_req_id_stays_log_only(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.trades = _MM(return_value=[])  # type: ignore[attr-defined]
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_error(999, 202, "Order Canceled - reason:By OCA")
+        adapter._on_error(0, 201, "Order rejected - reason:X")
+
+        assert len(captured) == 0
+
+    async def test_other_codes_publish_nothing(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        trade = _status_trade(order_ref="cid-110", status="Submitted")
+        mock_ib.trades = _MM(return_value=[trade])  # type: ignore[attr-defined]
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        adapter._on_error(42, 110, "The price does not conform to the minimum price variation.")
+
+        assert len(captured) == 0
