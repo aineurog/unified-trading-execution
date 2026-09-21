@@ -22,6 +22,7 @@ import pytest
 
 from unified_trading_execution.errors import (
     InvalidSymbolError,
+    PlatformError,
     PlatformConnectionError,
 )
 from unified_trading_execution.ibkr import IBKRAdapter
@@ -159,54 +160,44 @@ class TestFetchTicker:
         assert ticker is not None
         assert ticker.bid == Decimal("150.25")
 
-    async def test_live_timeout_falls_back_to_delayed(
+    async def test_live_timeout_raises_without_delayed_fallback(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
     ) -> None:
-        """No live feed (TWS 2186) → reqMarketDataType(3) + one delayed retry."""
+        """A live snapshot timeout raises without switching to delayed data."""
         mock_ib = mock_ib_async_module
         _known_contract(mock_ib)
-        mock_ib.reqTickersAsync = AsyncMock(
-            side_effect=[
-                TimeoutError("live needs subscription"),
-                [_snapshot(bid=150.25, ask=150.30, last=150.28)],
-            ]
-        )
+        mock_ib.reqTickersAsync = AsyncMock(side_effect=TimeoutError("live needs subscription"))
 
         await adapter.connect()
-        ticker = await adapter.fetch_ticker(AAPL)
+        with pytest.raises(PlatformConnectionError, match="timed out"):
+            await adapter.fetch_ticker(AAPL)
 
-        assert ticker is not None
-        assert ticker.bid == Decimal("150.25")
-        mock_ib.reqMarketDataType.assert_called_once_with(3)
-        assert mock_ib.reqTickersAsync.await_count == 2
+        mock_ib.reqMarketDataType.assert_not_called()
+        mock_ib.reqTickersAsync.assert_awaited_once()
 
-    async def test_not_subscribed_falls_back_to_delayed(
+    async def test_not_subscribed_raises_without_delayed_fallback(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
     ) -> None:
-        """Live 354 (not subscribed) → reqMarketDataType(3) + one delayed retry."""
+        """Live 354 propagates without switching to delayed data."""
         from unified_trading_execution.ibkr.errors import map_ibkr_error
 
         mock_ib = mock_ib_async_module
         _known_contract(mock_ib)
         mock_ib.reqTickersAsync = AsyncMock(
-            side_effect=[
-                map_ibkr_error(354, "Requested market data is not subscribed"),
-                [_snapshot(bid=150.25, ask=150.30, last=150.28)],
-            ]
+            side_effect=map_ibkr_error(354, "Requested market data is not subscribed")
         )
 
         await adapter.connect()
-        ticker = await adapter.fetch_ticker(AAPL)
+        with pytest.raises(PlatformError, match="not subscribed"):
+            await adapter.fetch_ticker(AAPL)
 
-        assert ticker is not None
-        assert ticker.bid == Decimal("150.25")
-        mock_ib.reqMarketDataType.assert_called_once_with(3)
-        assert mock_ib.reqTickersAsync.await_count == 2
+        mock_ib.reqMarketDataType.assert_not_called()
+        mock_ib.reqTickersAsync.assert_awaited_once()
 
     async def test_snapshot_timeout_raises_connection_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any
     ) -> None:
-        """Live and delayed snapshots both timing out → PlatformConnectionError."""
+        """A live snapshot timeout becomes PlatformConnectionError."""
         mock_ib = mock_ib_async_module
         _known_contract(mock_ib)
         mock_ib.reqTickersAsync = AsyncMock(side_effect=TimeoutError("slow farm"))
@@ -214,7 +205,7 @@ class TestFetchTicker:
         await adapter.connect()
         with pytest.raises(PlatformConnectionError, match="timed out"):
             await adapter.fetch_ticker(AAPL)
-        assert mock_ib.reqTickersAsync.await_count == 2
+        assert mock_ib.reqTickersAsync.await_count == 1
 
     async def test_snapshot_failure_raises_connection_error(
         self, adapter: IBKRAdapter, mock_ib_async_module: Any

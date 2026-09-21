@@ -7,10 +7,9 @@ know. Requires ``IBKR_PORT`` / ``IBKR_ACCOUNT`` (paper gateway).
 Two environment realities are handled by skipping, not failing:
   - Outside market hours (or without a live farm feed) a known contract
     has no quote, and ``fetch_ticker`` returns ``None`` by contract.
-  - Without market-data subscriptions the snapshot request is rejected by
-    TWS; that surfaces as ``PlatformConnectionError`` and the live-quote
-    test skips (the unknown-contract test needs no market data and always
-    asserts).
+    - Without market-data subscriptions the snapshot request is rejected by
+        TWS; that surfaces as a platform error and the live-quote test skips
+        (the unknown-contract test needs no market data and always asserts).
 """
 
 from __future__ import annotations
@@ -19,7 +18,7 @@ import os
 
 import pytest
 
-from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError
+from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError, PlatformError
 from unified_trading_execution.ibkr import IBKRAdapter
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
@@ -35,7 +34,7 @@ async def test_ticker_live_quote(connected_adapter: IBKRAdapter) -> None:
     """A live stock contract returns bid/ask/last with no mark."""
     try:
         ticker = await connected_adapter.fetch_ticker(_stock())
-    except PlatformConnectionError as exc:
+    except (PlatformConnectionError, PlatformError) as exc:
         pytest.skip(f"no market-data snapshot available on this gateway: {exc}")
     if ticker is None:
         pytest.skip(f"no live quote for {_TICKER_SYMBOL} — market closed or unsubscribed")

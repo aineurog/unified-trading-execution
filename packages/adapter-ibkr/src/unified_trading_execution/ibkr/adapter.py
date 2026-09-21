@@ -137,17 +137,6 @@ def _snapshot_price(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
-def _is_not_subscribed(exc: PlatformError) -> bool:
-    """True when *exc* is TWS error 354 (live market data not subscribed).
-
-    354 arrives unmapped as ``PlatformError`` carrying
-    ``platform_error={"ibkr_error_code": 354, ...}`` — the only signal that
-    delayed data should be tried instead of failing outright.
-    """
-    context = getattr(exc, "platform_error", None)
-    return isinstance(context, dict) and context.get("ibkr_error_code") == 354
-
-
 def _balance_from_tags(tags: dict[str, Decimal], currency: str, now: datetime) -> Balance | None:
     """Build a ``Balance`` from accumulated account-value tags (None = unusable).
 
@@ -930,15 +919,10 @@ class IBKRAdapter(Adapter):
         lifecycle is held. ``ib_async`` reports unset prices as ``NaN``;
         each side normalizes to ``None`` via ``_snapshot_price``.
 
-        A live snapshot is tried first; when the gateway has no live feed
-        it answers error 2186 ("requires additional subscription") and the
-        snapshot future never completes, or error 354 ("requested market
-        data is not subscribed") which fails the request outright. On
-        timeout — or on a 354 — the session is switched to delayed data
-        (``reqMarketDataType(3)``) and the snapshot is retried once, so
-        paper logins without a live subscription still get a quote
-        (``marketDataType == 3``) instead of an error. The 354 text itself
-        advertises this: "Delayed market data is available".
+        Only live market data is requested. If the account is not subscribed
+        to the live feed, IBKR's error is propagated and delayed data is not
+        requested implicitly. A request timeout is surfaced as a
+        ``PlatformConnectionError``.
 
         Returns ``None`` when the contract is known but has no live quote
         (market closed, halted, or no market-data subscription). A contract
@@ -975,26 +959,10 @@ class IBKRAdapter(Adapter):
                 ib.reqTickersAsync(qualified),
                 timeout=self._config.timeout_seconds,
             )
-        except TimeoutError:
-            # No live feed (TWS error 2186: live requires a subscription).
-            # Fall back to delayed data and retry once — the mode switch is
-            # session-wide and sticky, which is exactly what we want: every
-            # later snapshot on this connection reuses the working mode.
-            logger.warning(
-                "IBKR live snapshot for %r timed out — retrying with delayed data",
-                instrument.symbol,
-            )
-            tickers = await self._delayed_snapshot_retry(ib, instrument, qualified)
-        except PlatformError as exc:
-            # TWS error 354: live not subscribed for this contract. Same
-            # fallback as the 2186 timeout — delayed is advertised available.
-            if not _is_not_subscribed(exc):
-                raise
-            logger.warning(
-                "IBKR live snapshot for %r not subscribed (354) — retrying with delayed data",
-                instrument.symbol,
-            )
-            tickers = await self._delayed_snapshot_retry(ib, instrument, qualified)
+        except TimeoutError as exc:
+            raise PlatformConnectionError(
+                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
+            ) from exc
         except UteError:
             raise
         except Exception as exc:
@@ -1008,8 +976,7 @@ class IBKRAdapter(Adapter):
 
         # ib_async leaves halt flags as NaN when unset — and bool(nan) is
         # True, so a naive truthiness check treats every live snapshot as
-        # halted. Only a real set flag (1/True/non-zero string) means halted;
-        # delayed feeds report it via delayedHalted instead of halted.
+        # halted. Only a real set flag (1/True/non-zero string) means halted.
         def _is_halted(value: object) -> bool:
             if value is None or value is False:
                 return False
@@ -1022,9 +989,7 @@ class IBKRAdapter(Adapter):
             except (TypeError, ValueError):
                 return bool(value)
 
-        if _is_halted(getattr(snapshot, "halted", None)) or _is_halted(
-            getattr(snapshot, "delayedHalted", None)
-        ):
+        if _is_halted(getattr(snapshot, "halted", None)):
             return None
         bid = _snapshot_price(getattr(snapshot, "bid", None))
         ask = _snapshot_price(getattr(snapshot, "ask", None))
@@ -1032,36 +997,6 @@ class IBKRAdapter(Adapter):
         if bid is None and ask is None and last is None:
             return None
         return Ticker(bid=bid, ask=ask, last=last, mark=None)
-
-    async def _delayed_snapshot_retry(
-        self, ib: IB, instrument: Instrument, qualified: Contract
-    ) -> list[Any]:
-        """Switch the session to delayed data and retry one snapshot.
-
-        The mode switch is session-wide and sticky: every later snapshot on
-        this connection reuses delayed mode without another switch.
-        """
-        try:
-            ib.reqMarketDataType(3)
-        except Exception as exc:
-            raise PlatformConnectionError(
-                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
-            ) from exc
-        try:
-            return await asyncio.wait_for(
-                ib.reqTickersAsync(qualified),
-                timeout=self._config.timeout_seconds,
-            )
-        except UteError:
-            raise
-        except TimeoutError as exc:
-            raise PlatformConnectionError(
-                f"IBKR ticker snapshot for {instrument.symbol!r} timed out"
-            ) from exc
-        except Exception as exc:
-            raise PlatformConnectionError(
-                f"failed to fetch IBKR ticker for {instrument.symbol!r}: {exc}"
-            ) from exc
 
     # ------------------------------------------------------------------
     # Capability reporting
