@@ -1539,24 +1539,8 @@ class IBKRAdapter(Adapter):
             record = _trade_to_record(trade)
             if record is None:
                 return
-            cid = record.client_order_id
-            with self._status_lock:
-                if cid in self._status_final_ids:
-                    return
-                self._status_final_ids[cid] = None
-                while len(self._status_final_ids) > _STATUS_FINAL_CAP:
-                    self._status_final_ids.pop(next(iter(self._status_final_ids)))
             updated = replace(record, status=status, updated_at=_utcnow())
-            self._publish(
-                OrderStatusEvent(
-                    event_id=_new_id(),
-                    timestamp=_utcnow(),
-                    adapter_name=self.platform_name,
-                    account_id=self.account_id,
-                    correlation_id=cid,
-                    order=updated,
-                )
-            )
+            self._publish_status_event(updated)
         except Exception as exc:
             logger.warning("Skipping terminal publish for reqId %r: %s", req_id, exc)
 
@@ -1789,6 +1773,7 @@ class IBKRAdapter(Adapter):
                     fill=fill_record,
                 )
             )
+            self._infer_sibling_cancel(trade, reason)
         except Exception as exc:
             logger.warning("Skipping execDetailsEvent for %r: %s", fill, exc)
 
@@ -1871,26 +1856,89 @@ class IBKRAdapter(Adapter):
             record = _trade_to_record(trade)
             if record is None:
                 return
-            cid = record.client_order_id
-            with self._status_lock:
-                if cid in self._status_final_ids:
-                    return
-                if is_final_order_status(record.status):
-                    self._status_final_ids[cid] = None
-                    while len(self._status_final_ids) > _STATUS_FINAL_CAP:
-                        self._status_final_ids.pop(next(iter(self._status_final_ids)))
-            self._publish(
-                OrderStatusEvent(
-                    event_id=_new_id(),
-                    timestamp=_utcnow(),
-                    adapter_name=self.platform_name,
-                    account_id=self.account_id,
-                    correlation_id=cid,
-                    order=record,
-                )
-            )
+            self._publish_status_event(record)
         except Exception as exc:
             logger.warning("Skipping orderStatusEvent for %r: %s", trade, exc)
+
+    def _publish_status_event(self, record: OrderRecord) -> bool:
+        """Publish an ``OrderStatusEvent``, suppressing repeats of final states.
+
+        Shared by the ``orderStatusEvent`` stream, the 201/202 terminal
+        path, and OCA sibling inference — one suppression rule everywhere.
+        Returns True when published.
+        """
+        cid = record.client_order_id
+        with self._status_lock:
+            if cid in self._status_final_ids:
+                return False
+            if is_final_order_status(record.status):
+                self._status_final_ids[cid] = None
+                while len(self._status_final_ids) > _STATUS_FINAL_CAP:
+                    self._status_final_ids.pop(next(iter(self._status_final_ids)))
+        self._publish(
+            OrderStatusEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=cid,
+                order=record,
+            )
+        )
+        return True
+
+    def _infer_sibling_cancel(self, trade: Trade, reason: FillReason | None) -> None:
+        """Publish CANCELLED for the OCA sibling of a fully-filled child leg.
+
+        OCA guarantees the survivor dies with the fill, but paper TWS sends
+        no message for it — so the fill itself is the terminal evidence.
+        Only fires for fully-filled ``{parent}:tp`` / ``{parent}:sl`` legs
+        with a resolvable live sibling trade; partial fills, single-leg
+        brackets, and unresolvable siblings stay silent (the reconcile
+        sweep remains backstop). Never raises.
+        """
+        try:
+            if reason not in (FillReason.TAKE_PROFIT, FillReason.STOP_LOSS):
+                return
+            status = getattr(trade, "orderStatus", None)
+            order = getattr(trade, "order", None)
+            try:
+                filled = Decimal(str(getattr(status, "filled", 0) or 0))
+                total = Decimal(str(getattr(order, "totalQuantity", 0) or 0))
+            except Exception:
+                return
+            if total <= 0 or filled < total:
+                return
+            cid = str(getattr(order, "orderRef", "") or "")
+            parent, sep, leg = cid.rpartition(":")
+            if not sep or not parent or leg not in ("tp", "sl"):
+                return
+            sibling_ref = f"{parent}:sl" if leg == "tp" else f"{parent}:tp"
+            ib = self._ib
+            if ib is None:
+                return
+            try:
+                trades = list(ib.trades() or [])
+            except Exception:
+                return
+            sibling = next(
+                (
+                    t
+                    for t in trades
+                    if getattr(getattr(t, "order", None), "orderRef", "") == sibling_ref
+                ),
+                None,
+            )
+            if sibling is None:
+                return
+            record = _trade_to_record(sibling)
+            if record is None:
+                return
+            self._publish_status_event(
+                replace(record, status=OrderStatus.CANCELLED, updated_at=_utcnow())
+            )
+        except Exception as exc:
+            logger.warning("Skipping sibling inference for %r: %s", trade, exc)
 
     # ------------------------------------------------------------------
     # Internal helpers

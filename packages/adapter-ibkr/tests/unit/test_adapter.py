@@ -829,6 +829,142 @@ class TestPushEvents:
         assert captured[0].fill.fee_amount is None
         assert "exec-ghost" not in adapter._fill_pending_fees
 
+
+# ---------------------------------------------------------------------------
+# OCA sibling inference on full child fills
+# ---------------------------------------------------------------------------
+
+
+class TestSiblingInference:
+    def _exec(
+        self,
+        adapter: IBKRAdapter,
+        order_ref: str,
+        exec_id: str,
+        shares: float = 10,
+        filled: float = 10,
+        total_qty: float = 10,
+    ) -> None:
+        from datetime import UTC, datetime
+
+        from ib_async.objects import CommissionReport, Execution, Fill
+
+        contract = Contract()
+        contract.symbol = "AAPL"
+        contract.secType = "STK"
+        contract.exchange = "SMART"
+        contract.currency = "USD"
+        contract.conId = 1
+        trade = _trade(
+            order_ref=order_ref, order_id=1, perm_id=1, filled=filled, total_qty=total_qty
+        )
+        execution = Execution(
+            execId=exec_id,
+            time=datetime.now(UTC),
+            orderRef=order_ref,
+            shares=shares,
+            price=100,
+            permId=1,
+        )
+        fill = Fill(
+            contract=contract,
+            execution=execution,
+            commissionReport=CommissionReport(
+                execId=exec_id,
+                commission=0,
+                currency="USD",
+                realizedPNL=0,
+                yield_=0,
+                yieldRedemptionDate=0,
+            ),
+            time=datetime.now(UTC),
+        )
+        adapter._on_exec_details(trade, fill)
+
+    async def test_full_tp_fill_cancels_sibling(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import FillEvent, OrderStatusEvent
+        from unified_trading_execution.types.enums import FillReason
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.trades = _MM(  # type: ignore[attr-defined]
+            return_value=[_status_trade(order_ref="cid-p:sl", status="Submitted")]
+        )
+
+        fills: list[FillEvent] = []
+        statuses: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: fills.append(e))  # type: ignore[arg-type]
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: statuses.append(e))  # type: ignore[arg-type]
+        self._exec(adapter, "cid-p:tp", "exec-1")
+
+        assert len(fills) == 1
+        assert fills[0].fill.reason is FillReason.TAKE_PROFIT
+        assert len(statuses) == 1
+        assert statuses[0].order.client_order_id == "cid-p:sl"
+        assert statuses[0].order.status is OrderStatus.CANCELLED
+
+    async def test_partial_fill_leaves_sibling_live(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import FillEvent, OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.trades = _MM(  # type: ignore[attr-defined]
+            return_value=[_status_trade(order_ref="cid-p:sl", status="Submitted")]
+        )
+
+        statuses: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: None)  # type: ignore[arg-type]
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: statuses.append(e))  # type: ignore[arg-type]
+        self._exec(adapter, "cid-p:tp", "exec-1", shares=4, filled=4, total_qty=10)
+
+        assert len(statuses) == 0
+
+    async def test_absent_sibling_stays_silent(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import FillEvent, OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.trades = _MM(return_value=[])  # type: ignore[attr-defined]
+
+        statuses: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: None)  # type: ignore[arg-type]
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: statuses.append(e))  # type: ignore[arg-type]
+        self._exec(adapter, "cid-p:tp", "exec-1")
+
+        assert len(statuses) == 0
+
+    async def test_plain_fill_infers_nothing(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unittest.mock import MagicMock as _MM
+
+        from unified_trading_execution.events import FillEvent, OrderStatusEvent
+
+        mock_ib = mock_ib_async_module
+        await adapter.connect()
+        mock_ib.trades = _MM(  # type: ignore[attr-defined]
+            return_value=[_status_trade(order_ref="cid-p:sl", status="Submitted")]
+        )
+
+        statuses: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(FillEvent, lambda e: None)  # type: ignore[arg-type]
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: statuses.append(e))  # type: ignore[arg-type]
+        self._exec(adapter, "cid-plain", "exec-1")
+
+        assert len(statuses) == 0
+
     def test_exec_details_skips_zero_qty(self, adapter: IBKRAdapter) -> None:
         from datetime import UTC, datetime
 
