@@ -398,7 +398,17 @@ class SQLiteStateStore(StateStore):
             await self.conn.execute("BEGIN")
             try:
                 await self.conn.execute(
-                    """INSERT OR REPLACE INTO positions
+                    """DELETE FROM positions WHERE symbol=? AND quote_currency IS ?
+                       AND asset_class=? AND position_id=?""",
+                    (
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        position.position_id,
+                    ),
+                )
+                await self.conn.execute(
+                    """INSERT INTO positions
                        (symbol, quote_currency, asset_class, exchange, currency,
                         expiry, strike, option_right, multiplier, platform_symbol,
                         position_id, quantity, average_entry_price, updated_at)
@@ -973,29 +983,49 @@ class SQLiteStateStore(StateStore):
         i = _serialise_instrument(instrument) if instrument is not None else None
         now = datetime.now(tz=UTC).isoformat()
         async with self._write_lock:
-            await self.conn.execute(
-                """INSERT OR REPLACE INTO halts
-                   (scope, symbol, quote_currency, asset_class, exchange, currency,
-                    expiry, strike, option_right, multiplier, platform_symbol,
-                    reason, detail, entered_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    scope,
-                    i["symbol"] if i else "",
-                    i["quote_currency"] if i else "",
-                    i["asset_class"] if i else "",
-                    i["exchange"] if i else None,
-                    i["currency"] if i else None,
-                    i["expiry"] if i else None,
-                    i["strike"] if i else None,
-                    i["option_right"] if i else None,
-                    i["multiplier"] if i else None,
-                    i["platform_symbol"] if i else None,
-                    reason,
-                    detail,
-                    now,
-                ),
-            )
+            await self.conn.execute("BEGIN")
+            try:
+                # DELETE + INSERT instead of INSERT OR REPLACE — same NULL-key
+                # reason as upsert_position: instrument halts on instruments
+                # without a quote currency would otherwise accumulate rows.
+                await self.conn.execute(
+                    """DELETE FROM halts WHERE scope = ? AND symbol = ?
+                       AND quote_currency IS ? AND asset_class = ?""",
+                    (
+                        scope,
+                        i["symbol"] if i else "",
+                        i["quote_currency"] if i else "",
+                        i["asset_class"] if i else "",
+                    ),
+                )
+                await self.conn.execute(
+                    """INSERT INTO halts
+                       (scope, symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, platform_symbol,
+                        reason, detail, entered_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        scope,
+                        i["symbol"] if i else "",
+                        i["quote_currency"] if i else "",
+                        i["asset_class"] if i else "",
+                        i["exchange"] if i else None,
+                        i["currency"] if i else None,
+                        i["expiry"] if i else None,
+                        i["strike"] if i else None,
+                        i["option_right"] if i else None,
+                        i["multiplier"] if i else None,
+                        i["platform_symbol"] if i else None,
+                        reason,
+                        detail,
+                        now,
+                    ),
+                )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def delete_halt(
         self, scope: Literal["instrument", "account"], instrument: Instrument | None

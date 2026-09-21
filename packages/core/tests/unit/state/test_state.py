@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from dataclasses import replace
 from decimal import Decimal
 
@@ -222,6 +222,109 @@ class TestSQLiteStorePositions:
         await store.upsert_position(make_position(qty="0.5", position_id="7"))
         await store.delete_position(make_inst(), "7")
         assert await store.get_positions(make_inst()) == []
+
+    @pytest.mark.asyncio
+    async def test_upsert_position_null_quote_collapses(self, store):
+        """NULL quote_currency must not defeat replacement (dated futures).
+
+        Regression: with INSERT OR REPLACE, SQLite treats NULLs in the
+        (symbol, quote_currency, asset_class, position_id) key as distinct,
+        so every update appended a row. DELETE + INSERT must collapse.
+        """
+        inst = Instrument(
+            symbol="ES",
+            asset_class=AssetClass.FUTURES,
+            quote_currency=None,
+            exchange="CME",
+            currency="USD",
+            expiry=date(2026, 12, 18),
+            multiplier=50,
+        )
+
+        def _pos(qty: str, avg: str):
+            return Position(
+                instrument=inst,
+                quantity=Decimal(qty),
+                average_entry_price=Decimal(avg),
+                updated_at=NOW,
+                position_id="515416632",
+            )
+
+        await store.upsert_position(_pos("1.0", "7664.0"))
+        await store.upsert_position(_pos("1.0", "7664.0448"))
+        await store.upsert_position(_pos("1.0", "7664.0448"))
+
+        legs = await store.get_positions(inst)
+        assert len(legs) == 1
+        assert legs[0].average_entry_price == Decimal("7664.0448")
+
+    @pytest.mark.asyncio
+    async def test_upsert_position_quote_split_preserved(self, store):
+        """The 008 discriminator still holds: USDT vs USD legs never merge."""
+        def _perp(quote: str):
+            return Instrument(
+                symbol="BTC",
+                quote_currency=quote,
+                asset_class=AssetClass.FUTURES,
+                exchange=None,
+                currency=quote,
+                expiry=None,
+                strike=None,
+                option_right=None,
+                multiplier=1,
+            )
+
+        for quote in ("USDT", "USD"):
+            await store.upsert_position(
+                Position(
+                    instrument=_perp(quote),
+                    quantity=Decimal("0.5"),
+                    average_entry_price=Decimal("50000"),
+                    updated_at=NOW,
+                    position_id="0",
+                )
+            )
+
+        assert len(await store.get_positions(_perp("USDT"))) == 1
+        assert len(await store.get_positions(_perp("USD"))) == 1
+        assert len(await store.query_positions(limit=100_000)) == 2
+
+
+# ============================================================
+# SQLiteStateStore — halts (NULL-key DELETE + INSERT)
+# ============================================================
+
+
+class TestSQLiteStoreHalts:
+    @pytest.mark.asyncio
+    async def test_upsert_halt_null_quote_collapses(self, store):
+        """Instrument halts on quote-less instruments must not accumulate rows."""
+        inst = Instrument(
+            symbol="AAPL",
+            asset_class=AssetClass.STOCK,
+            quote_currency=None,
+            exchange="SMART",
+            currency="USD",
+            expiry=None,
+            strike=None,
+            option_right=None,
+            multiplier=None,
+        )
+        await store.upsert_halt("instrument", inst, "test", "d1")
+        await store.upsert_halt("instrument", inst, "test", "d2")
+
+        rows = [r for r in await store.get_active_halts() if r[0] == "instrument"]
+        assert len(rows) == 1
+        assert rows[0][3] == "d2"
+
+    @pytest.mark.asyncio
+    async def test_upsert_account_halt_unaffected(self, store):
+        await store.upsert_halt("account", None, "test", "d1")
+        await store.upsert_halt("account", None, "test", "d2")
+
+        rows = [r for r in await store.get_active_halts() if r[0] == "account"]
+        assert len(rows) == 1
+        assert rows[0][3] == "d2"
 
 
 # ============================================================
