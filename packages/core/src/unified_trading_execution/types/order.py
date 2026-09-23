@@ -166,6 +166,17 @@ class OrderRecord:
     created_at: datetime
     updated_at: datetime
 
+    # GTD expiry (from UnifiedOrder) — persisted so an expired order the
+    # platform drops can reconcile to EXPIRED rather than silently vanish.
+    expire_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        # Unlike UnifiedOrder, a persisted/read-back record may already be past
+        # its expiry, so the value is only required to be timezone-aware when
+        # set — never required to be in the future.
+        if self.expire_at is not None and self.expire_at.tzinfo is None:
+            raise ValueError("expire_at must be timezone-aware (UTC)")
+
 
 @dataclass(frozen=True, slots=True)
 class FillRecord:

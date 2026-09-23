@@ -342,6 +342,33 @@ class TestFetchOpenOrders:
         assert record.price == Decimal("1.16")
         assert record.stop_price == Decimal("1.15")
 
+    async def test_gtd_order_parses_expiration(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A GTD order (ORDER_TIME_SPECIFIED) carries its expiry on the record."""
+        _set_eurusd_symbol_info(mock_mt5_module)
+        expiry_epoch = int(datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC).timestamp())
+        mock_mt5_module.orders_get.return_value = (
+            _order(type_time=2, time_expiration=expiry_epoch),
+        )
+
+        record = next(iter((await adapter.fetch_open_orders()).values()))
+
+        assert record.time_in_force is TimeInForce.GTD
+        assert record.expire_at == datetime(2026, 9, 1, 12, 0, 0, tzinfo=UTC)
+
+    async def test_non_gtd_order_has_no_expiration(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A GTC order never carries an expiry, even if time_expiration is set."""
+        _set_eurusd_symbol_info(mock_mt5_module)
+        mock_mt5_module.orders_get.return_value = (_order(type_time=0, time_expiration=1234567890),)
+
+        record = next(iter((await adapter.fetch_open_orders()).values()))
+
+        assert record.time_in_force is TimeInForce.GTC
+        assert record.expire_at is None
+
     async def test_unknown_ticket_keys_by_platform_id(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:

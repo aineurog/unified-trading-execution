@@ -469,6 +469,10 @@ def build_order_record(
     volume_current = Decimal(str(order_tuple.volume_current))
     price, stop_price = _price_stop_price(order_type, order_tuple)
 
+    expire_at = None
+    if tif == TimeInForce.GTD and order_tuple.time_expiration:
+        expire_at = from_mt5_epoch(order_tuple.time_expiration, server_time_offset)
+
     return OrderRecord(
         instrument=instrument,
         order_type=order_type,
@@ -491,6 +495,7 @@ def build_order_record(
         updated_at=from_mt5_epoch(
             order_tuple.time_done or order_tuple.time_setup, server_time_offset
         ),
+        expire_at=expire_at,
     )
 
 

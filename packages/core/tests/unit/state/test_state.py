@@ -64,7 +64,7 @@ def make_balance(currency="USDT", free="9000", used="1000"):
     )
 
 
-def make_order(client_order_id="abc", status=OrderStatus.OPEN):
+def make_order(client_order_id="abc", status=OrderStatus.OPEN, expire_at=None):
     return OrderRecord(
         instrument=make_inst(),
         order_type=OrderType.LIMIT,
@@ -85,6 +85,7 @@ def make_order(client_order_id="abc", status=OrderStatus.OPEN):
         correlation_id="corr-1",
         created_at=NOW,
         updated_at=NOW,
+        expire_at=expire_at,
     )
 
 
@@ -381,6 +382,21 @@ class TestSQLiteStoreOrders:
     async def test_get_order_nonexistent(self, store):
         got = await store.get_order("nonexistent")
         assert got is None
+
+    @pytest.mark.asyncio
+    async def test_upsert_order_roundtrips_expire_at(self, store):
+        expiry = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
+        await store.upsert_order(make_order(expire_at=expiry))
+        got = await store.get_order("abc")
+        assert got is not None
+        assert got.expire_at == expiry
+
+    @pytest.mark.asyncio
+    async def test_upsert_order_roundtrips_null_expire_at(self, store):
+        await store.upsert_order(make_order())
+        got = await store.get_order("abc")
+        assert got is not None
+        assert got.expire_at is None
 
     @pytest.mark.asyncio
     async def test_upsert_order_updates(self, store):
@@ -1265,3 +1281,24 @@ class TestAdapterConfig:
         await store.set_adapter_config("leverage.BTCUSDT", "10")
         await store.set_adapter_config("margin_mode.BTCUSDT", "cross")
         assert await store.list_adapter_config("leverage.") == {"leverage.BTCUSDT": "10"}
+
+
+# ============================================================
+# SQLiteStateStore — migrations
+# ============================================================
+
+
+class TestMigration009GtdExpireAt:
+    async def _columns(self, store, table):
+        cursor = await store.conn.execute(f"PRAGMA table_info({table})")
+        return {row[1] for row in await cursor.fetchall()}
+
+    @pytest.mark.asyncio
+    async def test_orders_table_gains_expire_at(self):
+        s = SQLiteStateStore(":memory:")
+        await s.initialize()
+        try:
+            assert "expire_at" in await self._columns(s, "orders")
+            assert "expire_at" in await self._columns(s, "order_history")
+        finally:
+            await s.close()

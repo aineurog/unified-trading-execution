@@ -25,6 +25,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.ibkr import IBKRAdapter, IBKRConfig
+from unified_trading_execution.ibkr.adapter import _parse_good_till_date
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -1593,3 +1594,54 @@ class TestTerminalFromError:
         adapter._on_error(42, 110, "The price does not conform to the minimum price variation.")
 
         assert len(captured) == 0
+
+
+# ---------------------------------------------------------------------------
+# GTD goodTillDate parsing
+# ---------------------------------------------------------------------------
+
+
+class TestParseGoodTillDate:
+    def test_valid_utc(self) -> None:
+        dt = _parse_good_till_date("20260801 10:00:00")
+        assert dt is not None
+        assert dt.tzinfo is not None
+        assert dt.year == 2026 and dt.month == 8 and dt.day == 1
+        assert dt.hour == 10 and dt.minute == 0 and dt.second == 0
+
+    def test_empty_returns_none(self) -> None:
+        assert _parse_good_till_date("") is None
+        assert _parse_good_till_date("   ") is None
+
+    def test_malformed_returns_none(self) -> None:
+        assert _parse_good_till_date("2026-08-01") is None
+        assert _parse_good_till_date("garbage") is None
+
+    async def test_trade_record_carries_expire_at(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        trade = _trade(order_ref="cid-gtd", order_id=32, perm_id=778, status="Submitted")
+        trade.contract = Contract(symbol="AAPL", secType="STK", exchange="SMART", currency="USD")
+        trade.order.goodTillDate = "20260901 12:00:00"
+        mock_ib.openTrades.return_value = [trade]  # type: ignore[attr-defined]
+
+        records = await adapter.fetch_open_orders()
+        record = records["cid-gtd"]
+        assert record.expire_at is not None
+        assert record.expire_at.year == 2026
+        assert record.expire_at.month == 9
+        assert record.expire_at.day == 1
+
+    async def test_trade_record_without_good_till_date(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        trade = _trade(order_ref="cid-gtc", order_id=33, perm_id=779, status="Submitted")
+        trade.contract = Contract(symbol="AAPL", secType="STK", exchange="SMART", currency="USD")
+        mock_ib.openTrades.return_value = [trade]  # type: ignore[attr-defined]
+
+        records = await adapter.fetch_open_orders()
+        assert records["cid-gtc"].expire_at is None

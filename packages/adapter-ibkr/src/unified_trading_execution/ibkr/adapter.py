@@ -137,6 +137,23 @@ def _snapshot_price(value: object) -> Decimal | None:
     return Decimal(str(value))
 
 
+def _parse_good_till_date(raw: str) -> datetime | None:
+    """Parse an IBKR ``goodTillDate`` string into a timezone-aware datetime.
+
+    The write path formats GTD expiry as ``"%Y%m%d %H:%M:%S"`` in UTC, so the
+    read-back mirrors that contract.  A missing, empty, or malformed value
+    returns ``None`` rather than raising — a read-back must never fail the
+    whole snapshot on a stray field.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y%m%d %H:%M:%S").replace(tzinfo=UTC)
+    except ValueError:
+        return None
+
+
 def _balance_from_tags(tags: dict[str, Decimal], currency: str, now: datetime) -> Balance | None:
     """Build a ``Balance`` from accumulated account-value tags (None = unusable).
 
@@ -311,7 +328,9 @@ def _trade_to_record(trade: Trade) -> OrderRecord | None:
     if not client_order_id:
         return None
 
-    # GTD expiry not available on wire — keep None
+    # GTD expiry: goodTillDate is written as "%Y%m%d %H:%M:%S" in UTC on the
+    # place path, so parse it back for GTD orders to persist the expiry.
+    expire_at = _parse_good_till_date(str(getattr(order, "goodTillDate", "") or ""))
     try:
         return OrderRecord(
             instrument=instrument,
@@ -333,6 +352,7 @@ def _trade_to_record(trade: Trade) -> OrderRecord | None:
             correlation_id=raw_cid,
             created_at=parsed.created_at,
             updated_at=parsed.updated_at,
+            expire_at=expire_at,
         )
     except Exception as exc:
         logger.warning("Skipping invalid OrderRecord for %r: %s", client_order_id, exc)

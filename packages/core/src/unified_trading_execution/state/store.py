@@ -492,57 +492,7 @@ class SQLiteStateStore(StateStore):
                         take_profit_trigger, take_profit_limit,
                         stop_loss_trigger, stop_loss_limit,
                         platform_order_id, status, filled_quantity, average_fill_price,
-                        correlation_id, created_at, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        order.client_order_id,
-                        i["symbol"],
-                        i["quote_currency"],
-                        i["asset_class"],
-                        i["exchange"],
-                        i["currency"],
-                        i["expiry"],
-                        i["strike"],
-                        i["option_right"],
-                        i["multiplier"],
-                        i["platform_symbol"],
-                        order.order_type.value,
-                        order.side.value,
-                        str(order.quantity),
-                        order.time_in_force.value,
-                        str(order.price) if order.price else None,
-                        str(order.stop_price) if order.stop_price else None,
-                        1 if order.reduce_only else 0,
-                        order.client_tag,
-                        str(order.take_profit.trigger_price) if order.take_profit else None,
-                        str(order.take_profit.limit_price)
-                        if order.take_profit and order.take_profit.limit_price
-                        else None,
-                        str(order.stop_loss.trigger_price) if order.stop_loss else None,
-                        str(order.stop_loss.limit_price)
-                        if order.stop_loss and order.stop_loss.limit_price
-                        else None,
-                        order.platform_order_id,
-                        order.status.value,
-                        str(order.filled_quantity),
-                        str(order.average_fill_price) if order.average_fill_price else None,
-                        order.correlation_id,
-                        order.created_at.isoformat(),
-                        order.updated_at.isoformat(),
-                    ),
-                )
-                # Append-only lifecycle snapshot: preserves terminal transitions
-                # and orders later removed from `orders` by orphan resolution.
-                await self.conn.execute(
-                    """INSERT INTO order_history
-                       (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
-                        expiry, strike, option_right, multiplier, platform_symbol,
-                        order_type, side, quantity, time_in_force, price, stop_price,
-                        reduce_only, client_tag,
-                        take_profit_trigger, take_profit_limit,
-                        stop_loss_trigger, stop_loss_limit,
-                        platform_order_id, status, filled_quantity, average_fill_price,
-                        correlation_id, created_at, updated_at, recorded_at)
+                        correlation_id, created_at, updated_at, expire_at)
                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         order.client_order_id,
@@ -579,7 +529,59 @@ class SQLiteStateStore(StateStore):
                         order.correlation_id,
                         order.created_at.isoformat(),
                         order.updated_at.isoformat(),
+                        order.expire_at.isoformat() if order.expire_at else None,
+                    ),
+                )
+                # Append-only lifecycle snapshot: preserves terminal transitions
+                # and orders later removed from `orders` by orphan resolution.
+                await self.conn.execute(
+                    """INSERT INTO order_history
+                       (client_order_id, symbol, quote_currency, asset_class, exchange, currency,
+                        expiry, strike, option_right, multiplier, platform_symbol,
+                        order_type, side, quantity, time_in_force, price, stop_price,
+                        reduce_only, client_tag,
+                        take_profit_trigger, take_profit_limit,
+                        stop_loss_trigger, stop_loss_limit,
+                        platform_order_id, status, filled_quantity, average_fill_price,
+                        correlation_id, created_at, updated_at, recorded_at, expire_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        order.client_order_id,
+                        i["symbol"],
+                        i["quote_currency"],
+                        i["asset_class"],
+                        i["exchange"],
+                        i["currency"],
+                        i["expiry"],
+                        i["strike"],
+                        i["option_right"],
+                        i["multiplier"],
+                        i["platform_symbol"],
+                        order.order_type.value,
+                        order.side.value,
+                        str(order.quantity),
+                        order.time_in_force.value,
+                        str(order.price) if order.price else None,
+                        str(order.stop_price) if order.stop_price else None,
+                        1 if order.reduce_only else 0,
+                        order.client_tag,
+                        str(order.take_profit.trigger_price) if order.take_profit else None,
+                        str(order.take_profit.limit_price)
+                        if order.take_profit and order.take_profit.limit_price
+                        else None,
+                        str(order.stop_loss.trigger_price) if order.stop_loss else None,
+                        str(order.stop_loss.limit_price)
+                        if order.stop_loss and order.stop_loss.limit_price
+                        else None,
+                        order.platform_order_id,
+                        order.status.value,
+                        str(order.filled_quantity),
+                        str(order.average_fill_price) if order.average_fill_price else None,
+                        order.correlation_id,
+                        order.created_at.isoformat(),
+                        order.updated_at.isoformat(),
                         now,
+                        order.expire_at.isoformat() if order.expire_at else None,
                     ),
                 )
             except BaseException:
@@ -1328,6 +1330,7 @@ class SQLiteStateStore(StateStore):
             correlation_id=row["correlation_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
             updated_at=datetime.fromisoformat(row["updated_at"]),
+            expire_at=datetime.fromisoformat(row["expire_at"]) if row["expire_at"] else None,
         )
 
     def _row_to_fill_record(self, row: aiosqlite.Row) -> FillRecord:

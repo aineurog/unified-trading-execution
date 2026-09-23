@@ -490,6 +490,48 @@ class TestOrderRecord:
         with pytest.raises(Exception):
             r.status = OrderStatus.FILLED  # type: ignore[misc]
 
+    def _make(self, expire_at=None):
+        return OrderRecord(
+            instrument=make_btc(),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.001"),
+            time_in_force=TimeInForce.GTD,
+            client_order_id="abc",
+            price=Decimal("50000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id=None,
+            status=OrderStatus.OPEN,
+            filled_quantity=Decimal("0"),
+            average_fill_price=None,
+            correlation_id=None,
+            created_at=NOW,
+            updated_at=NOW,
+            expire_at=expire_at,
+        )
+
+    def test_expire_at_defaults_to_none(self):
+        assert self._make().expire_at is None
+
+    def test_expire_at_accepts_timezone_aware(self):
+        expiry = datetime(2026, 8, 1, 0, 0, 0, tzinfo=UTC)
+        assert self._make(expire_at=expiry).expire_at == expiry
+
+    def test_expire_at_rejects_naive(self):
+        naive = datetime(2026, 8, 1, 0, 0, 0)
+        with pytest.raises(ValueError, match="expire_at must be timezone-aware"):
+            self._make(expire_at=naive)
+
+    def test_expire_at_may_be_past(self):
+        # Unlike UnifiedOrder, a persisted/read-back record may already be past
+        # its expiry — only tz-awareness is required, not a future date.
+        past = datetime(2020, 1, 1, 0, 0, 0, tzinfo=UTC)
+        assert self._make(expire_at=past).expire_at == past
+
 
 # ============================================================
 # FillRecord (Section 17.11)

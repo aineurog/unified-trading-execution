@@ -1121,6 +1121,102 @@ class TestReconcileMismatchCases:
         # Resolution: the order must be removed from the local mirror
         assert await engine.state_store.get_order("orphan-local") is None
 
+    def _seed_local_order(self, engine, client_order_id, *, time_in_force, expire_at):
+        local_order = OrderRecord(
+            instrument=_instrument(),
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("1"),
+            time_in_force=time_in_force,
+            client_order_id=client_order_id,
+            price=Decimal("50000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id=f"pf-{client_order_id}",
+            status=OrderStatus.OPEN,
+            filled_quantity=Decimal("0"),
+            average_fill_price=None,
+            correlation_id="corr",
+            created_at=_utcnow(),
+            updated_at=_utcnow(),
+            expire_at=expire_at,
+        )
+        return local_order
+
+    async def _seed_empty_platform(self, mock_adapter):
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+
+    async def _history_statuses(self, engine, client_order_id):
+        cursor = await engine.state_store.conn.execute(
+            "SELECT status FROM order_history WHERE client_order_id=? ORDER BY rowid",
+            (client_order_id,),
+        )
+        return [row["status"] for row in await cursor.fetchall()]
+
+    async def test_orphan_gtd_past_expiry_marked_expired(self, engine, mock_adapter):
+        """A past-expiry GTD orphan transitions to EXPIRED before removal."""
+        await engine.state_store.upsert_order(
+            self._seed_local_order(
+                engine,
+                "orphan-gtd",
+                time_in_force=TimeInForce.GTD,
+                expire_at=_utcnow() - timedelta(minutes=1),
+            )
+        )
+        await self._seed_empty_platform(mock_adapter)
+
+        result = await engine.reconcile()
+        assert "orphan-gtd" in result.orphan_orders_in_local
+
+        # Removed from the live mirror…
+        assert await engine.state_store.get_order("orphan-gtd") is None
+        # …but the lifecycle log records the terminal EXPIRED transition.
+        assert "EXPIRED" in await self._history_statuses(engine, "orphan-gtd")
+
+    async def test_orphan_gtd_future_expiry_not_marked_expired(self, engine, mock_adapter):
+        """A GTD orphan still in the future is removed without an EXPIRED row."""
+        await engine.state_store.upsert_order(
+            self._seed_local_order(
+                engine,
+                "orphan-gtd-future",
+                time_in_force=TimeInForce.GTD,
+                expire_at=_utcnow() + timedelta(hours=1),
+            )
+        )
+        await self._seed_empty_platform(mock_adapter)
+
+        await engine.reconcile()
+
+        assert await engine.state_store.get_order("orphan-gtd-future") is None
+        assert "EXPIRED" not in await self._history_statuses(engine, "orphan-gtd-future")
+
+    async def test_orphan_gtc_not_marked_expired(self, engine, mock_adapter):
+        """A non-GTD orphan is removed without an EXPIRED row."""
+        await engine.state_store.upsert_order(
+            self._seed_local_order(
+                engine,
+                "orphan-gtc",
+                time_in_force=TimeInForce.GTC,
+                expire_at=None,
+            )
+        )
+        await self._seed_empty_platform(mock_adapter)
+
+        await engine.reconcile()
+
+        assert await engine.state_store.get_order("orphan-gtc") is None
+        assert "EXPIRED" not in await self._history_statuses(engine, "orphan-gtc")
+
     async def test_partial_fill_discrepancy_detected(self, engine, mock_adapter):
         """Case 5: local and platform fill quantities differ for the same order."""
         # Establish a "clean through" watermark in the past so this pass
