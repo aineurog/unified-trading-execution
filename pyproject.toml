@@ -58,10 +58,12 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 module = [
     "unified_trading_execution.bybit.*",
     "unified_trading_execution.ctrader.*",
+    "unified_trading_execution.hyperliquid.*",
     "uuid_extensions",
     "pybit.*",
     "MetaTrader5",
     "ib_async.*",
+    "hyperliquid.*",
 ]
 ignore_missing_imports = true
 
@@ -83,6 +85,7 @@ forbidden_modules = [
     "unified_trading_execution.ctrader",
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
+    "unified_trading_execution.hyperliquid",
 ]
 
 [[tool.importlinter.contracts]]
@@ -94,6 +97,7 @@ forbidden_modules = [
     "unified_trading_execution.ctrader",
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
+    "unified_trading_execution.hyperliquid",
 ]
 
 [[tool.importlinter.contracts]]
@@ -105,4 +109,5 @@ modules = [
     "unified_trading_execution.ctrader",
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
+    "unified_trading_execution.hyperliquid",
 ]
