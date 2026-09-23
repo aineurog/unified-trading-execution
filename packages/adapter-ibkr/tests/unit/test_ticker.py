@@ -22,8 +22,8 @@ import pytest
 
 from unified_trading_execution.errors import (
     InvalidSymbolError,
-    PlatformError,
     PlatformConnectionError,
+    PlatformError,
 )
 from unified_trading_execution.ibkr import IBKRAdapter
 from unified_trading_execution.types.enums import AssetClass

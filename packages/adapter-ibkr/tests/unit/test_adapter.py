@@ -554,6 +554,119 @@ class TestModifyPositionTpsl:
             )
 
 
+class TestGetPositionTpsl:
+    def _pos(self, con_id: int = 111, qty: float = 10) -> object:
+        from ib_async import Contract
+        from ib_async.objects import Position as IBPos
+
+        c = Contract()
+        c.conId = con_id
+        c.symbol = "AAPL"
+        c.secType = "STK"
+        c.exchange = "NASDAQ"
+        c.currency = "USD"
+        return IBPos(account="DU_TEST", contract=c, position=qty, avgCost=100)
+
+    def _tpsl_trade(
+        self,
+        ref: str,
+        order_type: str,
+        *,
+        lmt: object = None,
+        aux: object = None,
+    ) -> Trade:
+        order = Order(
+            orderId=1,
+            permId=1,
+            orderRef=ref,
+            action="SELL",
+            totalQuantity=10,
+            orderType=order_type,
+        )
+        if lmt is not None:
+            order.lmtPrice = Decimal(str(lmt))
+        if aux is not None:
+            order.auxPrice = Decimal(str(aux))
+        status = IBOrderStatus(
+            orderId=1, status="Submitted", filled=0, remaining=10, avgFillPrice=0, permId=1
+        )
+        return Trade(contract=Contract(), order=order, orderStatus=status)
+
+    async def test_reads_tp_and_sl(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos()]  # type: ignore[attr-defined]
+        mock_ib.openTrades.return_value = [  # type: ignore[attr-defined]
+            self._tpsl_trade("111-tp-ab12cd", "LMT", lmt="150"),
+            self._tpsl_trade("111-sl-ab12cd", "STP", aux="90"),
+        ]
+
+        result = await adapter.get_position_tpsl(AAPL, "111")
+
+        assert result == (TpSlAttachment(Decimal("150")), TpSlAttachment(Decimal("90")))
+
+    async def test_stp_lmt_exposes_limit_price(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos()]  # type: ignore[attr-defined]
+        mock_ib.openTrades.return_value = [  # type: ignore[attr-defined]
+            self._tpsl_trade("111-sl-ab12cd", "STP LMT", lmt="89", aux="90"),
+        ]
+
+        tp, sl = await adapter.get_position_tpsl(AAPL, "111")
+
+        assert tp is None
+        assert sl == TpSlAttachment(Decimal("90"), limit_price=Decimal("89"))
+
+    async def test_no_protective_orders(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos()]  # type: ignore[attr-defined]
+        mock_ib.openTrades.return_value = []  # type: ignore[attr-defined]
+
+        assert await adapter.get_position_tpsl(AAPL, "111") == (None, None)
+
+    async def test_ignores_other_positions_orders(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos()]  # type: ignore[attr-defined]
+        mock_ib.openTrades.return_value = [  # type: ignore[attr-defined]
+            self._tpsl_trade("222-tp-ab12cd", "LMT", lmt="150"),
+        ]
+
+        assert await adapter.get_position_tpsl(AAPL, "111") == (None, None)
+
+    async def test_no_position_returns_none(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = []  # type: ignore[attr-defined]
+
+        assert await adapter.get_position_tpsl(AAPL, "999") is None
+
+    async def test_flat_position_returns_none(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(qty=0)]  # type: ignore[attr-defined]
+
+        assert await adapter.get_position_tpsl(AAPL, "111") is None
+
+    async def test_not_connected(self, adapter: IBKRAdapter) -> None:
+        with pytest.raises(PlatformConnectionError):
+            await adapter.get_position_tpsl(AAPL, "111")
+
+
 # ---------------------------------------------------------------------------
 # Push EventBus — _on_* handlers
 # ---------------------------------------------------------------------------

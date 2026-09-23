@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
-from ib_async import IB, Contract, ExecutionFilter, Order, Trade
+from ib_async import IB, ExecutionFilter, Order, Trade
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
@@ -1119,6 +1119,71 @@ class IBKRAdapter(Adapter):
         orders[-1].transmit = True
         for o in orders:
             ib.placeOrder(order_contract, o)
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open position as ``(take_profit, stop_loss)``.
+
+        Mirrors :meth:`modify_position_tpsl`: ``position_id`` is
+        ``str(conId)`` and globally unique, so *instrument* is accepted for
+        interface uniformity and not used to address the position.  The
+        protective orders are identified by their deterministic ``orderRef``
+        prefixes (``<conId>-tp-`` / ``<conId>-sl-``) among live orders, so
+        they can be read back without retaining placement-time state.
+
+        Returns ``None`` when there is no open (non-flat) position at
+        *position_id*; otherwise each element is ``None`` when that side has
+        no protective order.  The take-profit leg is a plain LMT at its
+        trigger, so ``limit_price`` is always ``None``; the stop-loss leg
+        exposes its limit only when it was placed as ``STP LMT``.
+        """
+        ib = self._require_ib()
+        # Confirm the position leg still exists and is non-flat.
+        for pos in ib.positions():
+            if str(getattr(pos.contract, "conId", "") or "") == position_id:
+                if Decimal(str(pos.position)) == 0:
+                    return None
+                break
+        else:
+            return None
+
+        take_profit: TpSlAttachment | None = None
+        stop_loss: TpSlAttachment | None = None
+        tp_prefix = f"{position_id}-tp-"
+        sl_prefix = f"{position_id}-sl-"
+
+        # ib_async uses the UNSET_DOUBLE sentinel (~1.797e308) for unset price
+        # fields rather than None — treat anything absurdly large as unset.
+        def _price(val: object) -> Decimal | None:
+            try:
+                if val is None:
+                    return None
+                f = float(str(val))
+                if f in (float("inf"), float("-inf")) or abs(f) > 1e12:
+                    return None
+                dec = Decimal(str(val))
+                return None if dec == 0 else dec
+            except Exception:
+                return None
+
+        for trade in ib.openTrades():
+            ref = str(getattr(trade.order, "orderRef", "") or "")
+            if ref.startswith(tp_prefix):
+                trigger = _price(getattr(trade.order, "lmtPrice", None))
+                if trigger is not None:
+                    take_profit = TpSlAttachment(trigger_price=trigger)
+            elif ref.startswith(sl_prefix):
+                trigger = _price(getattr(trade.order, "auxPrice", None))
+                if trigger is None:
+                    continue
+                stop_loss = TpSlAttachment(
+                    trigger_price=trigger,
+                    limit_price=_price(getattr(trade.order, "lmtPrice", None)),
+                )
+        return (take_profit, stop_loss)
 
     # ------------------------------------------------------------------
     # Reconciliation data — proper ib_async usage, covering all cases

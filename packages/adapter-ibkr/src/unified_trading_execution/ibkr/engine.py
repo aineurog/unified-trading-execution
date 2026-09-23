@@ -82,6 +82,14 @@ class IBKREngine(Engine):
             stop_loss=stop_loss,
         )
 
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        """Read the current TP/SL on an open IBKR position as ``(take_profit, stop_loss)``."""
+        return await self._adapter.get_position_tpsl(instrument, position_id)
+
     # ── Snapshots / reads ─────────────────────────────────────────────
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from datetime import UTC, date, datetime
 from dataclasses import replace
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -261,6 +261,7 @@ class TestSQLiteStorePositions:
     @pytest.mark.asyncio
     async def test_upsert_position_quote_split_preserved(self, store):
         """The 008 discriminator still holds: USDT vs USD legs never merge."""
+
         def _perp(quote: str):
             return Instrument(
                 symbol="BTC",
