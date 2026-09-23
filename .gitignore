@@ -35,6 +35,8 @@ Thumbs.db
 *.sqlite
 *.sqlite3
 ute_data/
+*-shm
+*-wal
 
 # MkDocs output
 site/

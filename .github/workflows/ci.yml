@@ -28,6 +28,7 @@ jobs:
           pip install -e packages/adapter-ctrader
           pip install -e packages/adapter-metatrader
           pip install -e packages/adapter-ibkr
+          pip install -e packages/adapter-hyperliquid
 
       - name: Install dev dependencies
         run: pip install ruff mypy pytest pytest-asyncio
@@ -45,6 +46,7 @@ jobs:
           mypy --strict packages/adapter-ctrader/src/
           mypy --strict packages/adapter-metatrader/src/
           mypy --strict packages/adapter-ibkr/src/
+          mypy --strict packages/adapter-hyperliquid/src/
 
   unit-tests:
     needs: lint-and-typecheck
@@ -67,6 +69,7 @@ jobs:
           pip install -e packages/adapter-ctrader
           pip install -e packages/adapter-metatrader
           pip install -e packages/adapter-ibkr
+          pip install -e packages/adapter-hyperliquid
 
       - name: Install dev dependencies
         run: pip install pytest pytest-asyncio
