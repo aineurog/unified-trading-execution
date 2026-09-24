@@ -18,6 +18,7 @@ import pytest
 from unified_trading_execution.errors import (
     InstrumentHaltedError,
     InsufficientBalanceError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -36,8 +37,12 @@ class TestMapMT5Error:
         cases: list[tuple[int, type[UteError]]] = [
             (10004, PlatformConnectionError),  # TRADE_RETCODE_REQUOTE
             (10006, PlatformError),  # TRADE_RETCODE_REJECT
-            (10013, InvalidSymbolError),  # TRADE_RETCODE_INVALID
-            (10015, InvalidSymbolError),  # TRADE_RETCODE_INVALID_PRICE
+            (10013, InvalidOrderError),  # TRADE_RETCODE_INVALID
+            (10014, InvalidOrderError),  # TRADE_RETCODE_INVALID_VOLUME
+            (10015, InvalidOrderError),  # TRADE_RETCODE_INVALID_PRICE
+            (10016, InvalidOrderError),  # TRADE_RETCODE_INVALID_STOPS
+            (10022, InvalidOrderError),  # TRADE_RETCODE_INVALID_EXPIRATION
+            (10034, InvalidOrderError),  # TRADE_RETCODE_LIMIT_VOLUME
             (10017, InstrumentHaltedError),  # TRADE_RETCODE_TRADE_DISABLED
             (10019, InsufficientBalanceError),  # TRADE_RETCODE_NO_MONEY
             (10024, RateLimitError),  # TRADE_RETCODE_TOO_MANY_REQUESTS
@@ -112,7 +117,7 @@ class TestCheckMT5Result:
     def test_none_result_raises(self, mock_mt5_module) -> None:
         """None result triggers last_error check and raises."""
         mock_mt5_module.last_error.return_value = (10015, "invalid price")
-        with pytest.raises(InvalidSymbolError, match="invalid price"):
+        with pytest.raises(InvalidOrderError, match="invalid price"):
             check_mt5_result(None, "order_send")
 
     def test_empty_tuple_result_raises(self, mock_mt5_module) -> None:

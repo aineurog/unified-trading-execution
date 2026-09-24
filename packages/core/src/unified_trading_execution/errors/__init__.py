@@ -44,6 +44,16 @@ class UnsupportedOrderTypeError(UteError):
     """The requested order type is not supported by this adapter."""
 
 
+class InvalidOrderError(UteError):
+    """The platform rejected an order as invalid.
+
+    Validation failures (tick size, min notional, bad trigger price,
+    margin-tier breach, open-interest cap, ...) — the order never rested.
+    Distinct from ``UnsupportedOrderTypeError`` (the adapter cannot express
+    the request at all) and from ``InsufficientBalanceError`` (funding).
+    """
+
+
 class DuplicateOrderIdError(UteError):
     """A user-supplied client_order_id collides with an existing order (active or terminal)."""
 

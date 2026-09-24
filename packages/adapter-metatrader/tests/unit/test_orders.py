@@ -25,6 +25,7 @@ from types import SimpleNamespace
 import pytest
 
 from unified_trading_execution.errors import (
+    InvalidOrderError,
     InvalidSymbolError,
     PlatformConnectionError,
     PlatformError,
@@ -518,7 +519,7 @@ class TestParseMT5Result:
     def test_none_result_raises(self, mock_mt5_module) -> None:
         """None result raises via error mapping."""
         mock_mt5_module.last_error.return_value = (10013, "invalid request")
-        with pytest.raises(InvalidSymbolError):
+        with pytest.raises(InvalidOrderError):
             parse_mt5_result(None, "c1", mt5_module=mock_mt5_module)
 
     def test_rejected_result_raises(self, mock_mt5_module, mt5_constants) -> None:

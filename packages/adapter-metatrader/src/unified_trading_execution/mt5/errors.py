@@ -20,6 +20,7 @@ from typing import Any
 from unified_trading_execution.errors import (
     InstrumentHaltedError,
     InsufficientBalanceError,
+    InvalidOrderError,
     InvalidSymbolError,
     MarketClosedError,
     OrderNotFoundError,
@@ -40,14 +41,15 @@ _TRADE_RETCODE_MAP: dict[int, type[UteError]] = {
     10021: MarketClosedError,  # TRADE_RETCODE_PRICE_OFF — no quotes (market closed)
     10028: PlatformConnectionError,  # TRADE_RETCODE_LOCKED — order locked
     10031: PlatformConnectionError,  # TRADE_RETCODE_CONNECTION — no connection
-    # ---- Invalid symbol / params ----
-    10013: InvalidSymbolError,  # TRADE_RETCODE_INVALID — invalid request
-    10014: InvalidSymbolError,  # TRADE_RETCODE_INVALID_VOLUME
-    10015: InvalidSymbolError,  # TRADE_RETCODE_INVALID_PRICE
-    10016: InvalidSymbolError,  # TRADE_RETCODE_INVALID_STOPS
+    # ---- Invalid order (request validation) ----
+    10013: InvalidOrderError,  # TRADE_RETCODE_INVALID — invalid request
+    10014: InvalidOrderError,  # TRADE_RETCODE_INVALID_VOLUME
+    10015: InvalidOrderError,  # TRADE_RETCODE_INVALID_PRICE
+    10016: InvalidOrderError,  # TRADE_RETCODE_INVALID_STOPS
+    10022: InvalidOrderError,  # TRADE_RETCODE_INVALID_EXPIRATION
+    10034: InvalidOrderError,  # TRADE_RETCODE_LIMIT_VOLUME
+    # ---- Market closed ----
     10018: MarketClosedError,  # TRADE_RETCODE_MARKET_CLOSED
-    10022: InvalidSymbolError,  # TRADE_RETCODE_INVALID_EXPIRATION
-    10034: InvalidSymbolError,  # TRADE_RETCODE_LIMIT_VOLUME
     # ---- Insufficient balance ----
     10019: InsufficientBalanceError,  # TRADE_RETCODE_NO_MONEY
     # ---- Halted / frozen ----
