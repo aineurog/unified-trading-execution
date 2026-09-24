@@ -10,6 +10,8 @@ authors = [
 dependencies = [
     "unified-trading-execution",
     "hyperliquid-python-sdk==0.24.0",
+    "requests>=2.31,<3.0",
+    "websocket-client>=1.5.1,<2.0",
 ]
 
 [project.optional-dependencies]
