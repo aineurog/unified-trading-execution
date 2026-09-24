@@ -621,6 +621,10 @@ receives a raw Bybit error code.
 
 `10029`, `110050`, `170121`, `170221`
 
+**Invalid order** (`InvalidOrderError`):
+
+`10032`, `10033`, `10042`
+
 **Insufficient balance** (`InsufficientBalanceError`):
 
 `110004`, `110006`, `110007`, `110012`, `110044`, `110045`, `110051`,

@@ -23,6 +23,7 @@ from __future__ import annotations
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
     InstrumentHaltedError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -67,10 +68,11 @@ _IBKR_ERROR_CODE_MAP: dict[int, type[UteError]] = {
     103: DuplicateOrderIdError,  # Duplicate order ID.
     # ---- Unsupported / Invalid Parameters ----
     106: UnsupportedOrderTypeError,  # Can't transmit order ID: invalid type/formatting.
-    109: UnsupportedOrderTypeError,  # Price out of range defined by precautionary settings.
-    110: UnsupportedOrderTypeError,  # Price does not conform to the minimum price variation.
     111: UnsupportedOrderTypeError,  # The TIF and the order type are incompatible.
     113: UnsupportedOrderTypeError,  # The TIF option should be set to DAY for MOC and LOC orders.
+    # ---- Invalid Order (price validation) ----
+    109: InvalidOrderError,  # Price out of range defined by precautionary settings.
+    110: InvalidOrderError,  # Price does not conform to the minimum price variation.
     # ---- Invalid Symbol ----
     116: InvalidSymbolError,  # The order cannot be transmitted to a dead exchange.
     124: InvalidSymbolError,  # No market rule for conid: non-tradeable instrument e.g. Index.
