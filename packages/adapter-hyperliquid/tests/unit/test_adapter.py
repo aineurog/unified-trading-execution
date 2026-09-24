@@ -1,10 +1,10 @@
 """Unit tests for HyperliquidAdapter identity and ABC conformance.
 
-Smoke test only: the adapter is a scaffold, so every transport/market
-method is intentionally ``NotImplementedError``.  This module asserts the
-concrete identity surface (which is implemented) and that instantiating the
-adapter satisfies the full ABC — a future change that drops an abstract
-method must fail here, not at the first live use.
+Asserts the concrete identity surface (implemented) and that unimplemented
+transport/market methods still raise ``NotImplementedError`` — a future
+change that drops an abstract method must fail here, not at the first live
+use.  Implemented lifecycle (connect/disconnect) is covered in
+``test_connection.py``.
 """
 
 from __future__ import annotations
@@ -28,8 +28,7 @@ async def test_identity_is_wallet_address(
 
 
 async def test_scaffold_methods_are_stubbed(adapter: HyperliquidAdapter) -> None:
-    """Transport/market methods raise NotImplementedError until implemented."""
+    """Unimplemented market methods raise NotImplementedError until implemented."""
     with pytest.raises(NotImplementedError):
         adapter.supported_order_types()
-    with pytest.raises(NotImplementedError):
-        await adapter.connect()
+    assert adapter.is_connected is False

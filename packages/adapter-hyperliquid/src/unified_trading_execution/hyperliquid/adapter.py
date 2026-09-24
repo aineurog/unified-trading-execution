@@ -1,22 +1,35 @@
 """HyperliquidAdapter — concrete Adapter ABC implementation for Hyperliquid.
 
 Covers Hyperliquid spot and perpetual markets.  One ``Exchange`` instance
-per process (the SDK nonce state is instance-scoped); every blocking SDK
-call goes through ``asyncio.to_thread`` with the configured timeout and is
-never awaited on the loop thread.  Identity is the wallet address itself —
-no separate uid-resolve step.  One-way positions only — no hedge routing.
+per adapter (one account per adapter; the SDK call path is blocking, so
+every call goes through ``asyncio.to_thread`` with the configured request
+timeout and is never awaited on the loop thread).  Identity is the wallet
+address itself — no separate uid-resolve step.  One-way positions only —
+no hedge routing.
 """
 
 from __future__ import annotations
 
-from datetime import datetime
+import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Literal
 
+import requests
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
+from hyperliquid.utils.error import ClientError, ServerError
+from uuid_extensions import uuid7
+
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.events import EventBus
+from unified_trading_execution.errors import PlatformConnectionError, PlatformError
+from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
+from unified_trading_execution.hyperliquid.signing import (
+    assert_user_role_for_signing,
+    build_wallet,
+)
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
 from unified_trading_execution.types.enums import OrderType
@@ -31,6 +44,14 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+
+def _new_id() -> str:
+    return str(uuid7())
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class HyperliquidAdapter(Adapter):
@@ -48,6 +69,8 @@ class HyperliquidAdapter(Adapter):
         self._state_store = state_store
         self._halt_machine: HaltStateMachine | None = None
         self._connected = False
+        self._exchange: Exchange | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
 
     # ---- Identification ----
 
@@ -80,28 +103,102 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Connection lifecycle ----
 
-    async def connect(self) -> None:
-        """Open REST/WS connections and verify signing identity.
+    def _publish(self, event: Event) -> None:
+        """Publish onto the engine's bus, requiring it was wired first."""
+        if self._event_bus is None:
+            raise RuntimeError(
+                "event_bus not wired — construct via Engine or call attach_event_bus() first"
+            )
+        self._event_bus.publish(event)
 
-        Asserts the unified account mode and the key's ``info.userRole``
-        (the ``approveAgent`` one-time setup must have been completed with
-        the main key).  Publishes ``ConnectionStateEvent(connected=True)``
-        on success.
+    def _publish_connection_state(self, connected: bool) -> None:
+        self._publish(
+            ConnectionStateEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                connected=connected,
+            )
+        )
+
+    def _require_exchange(self) -> Exchange:
+        if self._exchange is None:
+            raise PlatformConnectionError("Hyperliquid adapter is not connected")
+        return self._exchange
+
+    async def connect(self) -> None:
+        """Open the transport and verify signing identity.
+
+        Builds the SDK ``Exchange`` (which fetches ``meta``/``spotMeta``
+        over the network at construction, hence off-loop) with the
+        configured timeout, then asserts the signing key's ``userRole``
+        (``approveAgent`` one-time setup) and the account's
+        ``userAbstraction`` (unified only).  Publishes
+        ``ConnectionStateEvent(connected=True)`` on success.  WebSocket
+        subscriptions attach in a later step; this only opens REST.
         """
-        raise NotImplementedError
+        if self._connected:
+            return
+        self._loop = asyncio.get_running_loop()
+        wallet = build_wallet(self._config.private_key)
+        base_url = TESTNET_API_URL if self._config.testnet else MAINNET_API_URL
+        try:
+            exchange = await asyncio.to_thread(
+                Exchange,
+                wallet,
+                base_url,
+                None,
+                None,
+                self._config.wallet_address,
+                None,
+                None,
+                self._config.request_timeout_seconds,
+            )
+        except ClientError as exc:
+            raise PlatformError(f"Hyperliquid transport rejected the connection: {exc}") from exc
+        except (ServerError, requests.exceptions.RequestException) as exc:
+            raise PlatformConnectionError(f"Hyperliquid connection failed: {exc}") from exc
+
+        try:
+            role = await asyncio.to_thread(exchange.info.user_role, wallet.address)
+            assert_user_role_for_signing((role or {}).get("role"))
+            abstraction = await asyncio.to_thread(
+                exchange.info.query_user_abstraction_state, self._config.wallet_address
+            )
+            if abstraction != "unifiedAccount":
+                raise PlatformError(
+                    f"Hyperliquid account abstraction {abstraction!r} is not supported — "
+                    "unified account only"
+                )
+        except (PlatformError, PlatformConnectionError):
+            raise
+        except ClientError as exc:
+            raise PlatformError(f"Hyperliquid identity check rejected: {exc}") from exc
+        except (ServerError, requests.exceptions.RequestException) as exc:
+            raise PlatformConnectionError(f"Hyperliquid identity check failed: {exc}") from exc
+
+        self._exchange = exchange
+        self._connected = True
+        self._publish_connection_state(True)
 
     async def disconnect(self) -> None:
-        """Close all connections gracefully.
+        """Close the transport gracefully.
 
-        Publishes ``ConnectionStateEvent(connected=False)``; cancels
-        in-flight posts; leaves no dangling nonce gaps.
+        Publishes ``ConnectionStateEvent(connected=False)``.  WebSocket
+        teardown joins here when subscriptions land.
         """
-        raise NotImplementedError
+        if self._exchange is None and not self._connected:
+            return
+        self._exchange = None
+        self._connected = False
+        self._publish_connection_state(False)
 
     @property
     def is_connected(self) -> bool:
-        """Return True if connections are currently established."""
-        raise NotImplementedError
+        """Return True if the transport is currently established."""
+        return self._connected
 
     # ---- Order operations ----
 
