@@ -13,26 +13,51 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 import requests
 from hyperliquid.exchange import Exchange
 from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
 from hyperliquid.utils.error import ClientError, ServerError
+from hyperliquid.utils.types import Cloid
 from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import Adapter, RateLimits
-from unified_trading_execution.errors import PlatformConnectionError, PlatformError
+from unified_trading_execution.errors import (
+    InvalidOrderError,
+    InvalidSymbolError,
+    OrderNotFoundError,
+    PlatformConnectionError,
+    PlatformError,
+)
 from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
+from unified_trading_execution.hyperliquid.errors import map_hyperliquid_error
+from unified_trading_execution.hyperliquid.orders import (
+    build_cancel_action,
+    build_modify_action,
+    build_place_order_action,
+    client_order_id_to_cloid,
+    max_limit_notional,
+    max_market_notional,
+    parse_order_result,
+    quantize_price,
+    round_price_to_tick,
+    validate_size,
+)
 from unified_trading_execution.hyperliquid.signing import (
     assert_user_role_for_signing,
     build_wallet,
 )
+from unified_trading_execution.hyperliquid.streams import translate_order_entry
+from unified_trading_execution.hyperliquid.symbols import (
+    from_hyperliquid_coin,
+    to_hyperliquid_coin,
+)
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
-from unified_trading_execution.types.enums import OrderType
+from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
@@ -71,6 +96,10 @@ class HyperliquidAdapter(Adapter):
         self._connected = False
         self._exchange: Exchange | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
+        # client_order_id -> (coin, is_spot), populated at place time so
+        # modify/cancel can address orders without a venue scan.  Unknown
+        # ids fall back to scanning open orders for the cloid.
+        self._client_coins: dict[str, tuple[str, bool]] = {}
 
     # ---- Identification ----
 
@@ -193,6 +222,7 @@ class HyperliquidAdapter(Adapter):
             return
         self._exchange = None
         self._connected = False
+        self._client_coins.clear()
         self._publish_connection_state(False)
 
     @property
@@ -200,34 +230,349 @@ class HyperliquidAdapter(Adapter):
         """Return True if the transport is currently established."""
         return self._connected
 
+    # ---- Transport helper ----
+
+    async def _run_exchange(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+        """Run a blocking SDK call off-loop with unified error mapping.
+
+        Transport failures (HTTP 5xx, timeouts, drops) become
+        ``PlatformConnectionError``; client errors (4xx) become
+        ``PlatformError``.  Venue ``{"status": "err"}`` envelopes do NOT
+        raise here — the caller extracts and maps them via
+        :meth:`_check_action_ok`, since only the caller knows the context.
+        """
+        self._require_exchange()
+        try:
+            return await asyncio.to_thread(func, *args, **kwargs)
+        except ClientError as exc:
+            raise PlatformError(f"Hyperliquid request rejected: {exc}") from exc
+        except (ServerError, requests.exceptions.RequestException) as exc:
+            raise PlatformConnectionError(f"Hyperliquid request failed: {exc}") from exc
+
+    @staticmethod
+    def _check_action_ok(response: Any, *, context: str) -> Any:
+        """Unwrap an action response or raise its mapped error.
+
+        A top-level ``{"status": "err", "response": "<string>"}`` envelope
+        (observed live on cancels and auth failures) maps through the error
+        table; anything not shaped like a response raises generic
+        ``PlatformError`` with context.
+        """
+        if not isinstance(response, dict):
+            raise PlatformError(f"Unexpected Hyperliquid response {response!r} ({context})")
+        if response.get("status") == "err":
+            data = response.get("response")
+            message = data if isinstance(data, str) else context
+            raise map_hyperliquid_error(message=message)
+        return response
+
+    @staticmethod
+    def _is_spot_coin(coin: str) -> bool:
+        """Classify a coin by name encoding (aliases/pairs are spot, bare names perps).
+
+        Biconditional with the SDK's own ``asset >= 10_000`` rule for every
+        in-scope coin (verified across listings); used where the coin is
+        known but the id is not yet resolved.
+        """
+        return coin.startswith("@") or "/" in coin
+
+    def _reverse_pair_coins(self) -> dict[str, str]:
+        """Pair table for alias decoding, viewed off the SDK index.
+
+        A per-call copy rather than a stored second registry — nothing to
+        sync, test, or diverge, since the SDK builds its index once.
+        """
+        exchange = self._require_exchange()
+        return dict(exchange.info.name_to_coin)
+
     # ---- Order operations ----
+
+    async def _find_open_entry(
+        self, client_order_id: str
+    ) -> tuple[dict[str, Any], str, bool] | None:
+        """Find the newest open entry carrying the cloid, with its coin.
+
+        Timestamp-max over matches so echo duplicates resolve to the live
+        leg, never first-match.  Returns ``(entry, coin, is_spot)`` or None.
+        """
+        want = client_order_id_to_cloid(client_order_id)
+        best: dict[str, Any] | None = None
+        best_timestamp = -1
+        for entry in await self._open_order_entries():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("cloid") or "") != want:
+                continue
+            coin = str(entry.get("coin") or "")
+            if not coin:
+                continue
+            try:
+                timestamp = int(str(entry.get("timestamp") or "0"))
+            except ValueError:
+                timestamp = 0
+            if timestamp >= best_timestamp:
+                best, best_timestamp = entry, timestamp
+        if best is None:
+            return None
+        coin = str(best.get("coin") or "")
+        return best, coin, self._is_spot_coin(coin)
+
+    async def _resolve_coin(self, client_order_id: str) -> tuple[str, bool]:
+        """Resolve the ``(coin, is_spot)`` for a client order id.
+
+        Placement cache first; otherwise scan open orders for the cloid
+        (covers restarts and orders placed outside this session).
+        """
+        cached = self._client_coins.get(client_order_id)
+        if cached is not None:
+            return cached
+        found = await self._find_open_entry(client_order_id)
+        if found is None:
+            raise OrderNotFoundError(f"Order {client_order_id} not found")
+        _, coin, is_spot = found
+        resolved = (coin, is_spot)
+        self._client_coins[client_order_id] = resolved
+        return resolved
+
+    async def _open_order_entries(self) -> list[Any]:
+        """Fetch raw open-order entries across both order shapes."""
+        exchange = self._require_exchange()
+        address = self._config.wallet_address
+        basic = await self._run_exchange(exchange.info.open_orders, address)
+        frontend = await self._run_exchange(exchange.info.frontend_open_orders, address)
+        entries: list[Any] = []
+        if isinstance(basic, list):
+            entries.extend(basic)
+        if isinstance(frontend, list):
+            entries.extend(frontend)
+        return entries
+
+    async def _current_order_record(self, client_order_id: str) -> OrderRecord:
+        """Fetch the live ``OrderRecord`` for modify-merge; missing becomes not-found."""
+        found = await self._find_open_entry(client_order_id)
+        if found is None:
+            raise OrderNotFoundError(f"Order {client_order_id} is not open")
+        entry, coin, is_spot = found
+        instrument = from_hyperliquid_coin(
+            coin, is_spot=is_spot, spot_pair_coins=self._reverse_pair_coins()
+        )
+        return translate_order_entry(entry, instrument=instrument)
+
+    async def _market_band_price(
+        self, coin: str, side: OrderSide, *, is_spot: bool, sz_decimals: int
+    ) -> Decimal:
+        """Touch-derived aggressive price for MARKET orders (up buys, down sells)."""
+        exchange = self._require_exchange()
+        book = await self._run_exchange(exchange.info.l2_snapshot, coin)
+        try:
+            levels = book["levels"]
+            touch = levels[1][0] if side == OrderSide.BUY else levels[0][0]
+            touch_px = Decimal(str(touch["px"]))
+        except (KeyError, IndexError, TypeError) as exc:
+            raise map_hyperliquid_error(message="No liquidity available for market order.") from exc
+        band = touch_px * (Decimal("1.01") if side == OrderSide.BUY else Decimal("0.99"))
+        return round_price_to_tick(
+            band,
+            sz_decimals,
+            is_spot=is_spot,
+            direction="up" if side == OrderSide.BUY else "down",
+        )
+
+    async def _max_leverage_for(self, coin: str) -> int:
+        """Read the live universe ``maxLeverage`` for tier-cap checks.
+
+        One ``meta`` call per order for now; repoint at cached
+        ``InstrumentSpec.max_leverage`` once spec caching exists.
+        """
+        exchange = self._require_exchange()
+        meta = await self._run_exchange(exchange.info.meta)
+        for entry in meta.get("universe") or []:
+            if isinstance(entry, dict) and entry.get("name") == coin:
+                try:
+                    return int(entry.get("maxLeverage") or 1)
+                except (TypeError, ValueError):
+                    return 1
+        raise InvalidSymbolError(f"Unknown coin {coin!r} in meta")
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
         """Translate and submit a fully-validated order.
 
         Receives a ``UnifiedOrder`` that has already passed all risk checks.
-        ``cloid``-addressed end-to-end for idempotent retry.
+        Sizes/prices validate against live ``szDecimals`` (strict — never
+        reshaped); MARKET pricing is touch-derived automatically; notionals
+        check against the live max-leverage tier.  Returns the parent
+        result; TP/SL legs ride the same action.  ``cloid``-addressed
+        end-to-end for idempotent retry.
         """
-        raise NotImplementedError
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(order.instrument)
+        is_spot = order.instrument.asset_class == AssetClass.SPOT
+        try:
+            asset = exchange.info.name_to_asset(coin)
+            sz_decimals = int(exchange.info.asset_to_sz_decimals[asset])
+        except KeyError as exc:
+            raise InvalidSymbolError(f"Unknown coin {coin!r} on Hyperliquid") from exc
+
+        client_order_id = order.client_order_id or _new_id()
+        validate_size(order.quantity, sz_decimals)
+        if order.price is not None:
+            quantize_price(order.price, sz_decimals, is_spot=is_spot)
+        if order.stop_price is not None:
+            quantize_price(order.stop_price, sz_decimals, is_spot=is_spot)
+        for attachment in (order.take_profit, order.stop_loss):
+            if attachment is None:
+                continue
+            quantize_price(attachment.trigger_price, sz_decimals, is_spot=is_spot)
+            if attachment.limit_price is not None:
+                quantize_price(attachment.limit_price, sz_decimals, is_spot=is_spot)
+
+        market_limit_price: Decimal | None = None
+        if order.order_type == OrderType.MARKET:
+            market_limit_price = await self._market_band_price(
+                coin, order.side, is_spot=is_spot, sz_decimals=sz_decimals
+            )
+            if not is_spot:
+                cap = max_market_notional(await self._max_leverage_for(coin))
+                if market_limit_price * order.quantity > cap:
+                    raise InvalidOrderError(f"Market notional exceeds tier cap {cap} for {coin}")
+        elif order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and not is_spot:
+            assert order.price is not None
+            cap = max_limit_notional(await self._max_leverage_for(coin))
+            if order.price * order.quantity > cap:
+                raise InvalidOrderError(f"Limit notional exceeds tier cap {cap} for {coin}")
+
+        requests, grouping = build_place_order_action(
+            order,
+            coin=coin,
+            client_order_id=client_order_id,
+            market_limit_price=market_limit_price,
+        )
+        for request in requests:
+            request["cloid"] = Cloid(request["cloid"])
+        response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
+        data = self._check_action_ok(response, context=f"placing order {client_order_id}")
+        try:
+            statuses = data["response"]["data"]["statuses"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(
+                f"Unexpected order response shape {data!r} for {client_order_id}"
+            ) from exc
+        if not isinstance(statuses, list) or not statuses:
+            raise PlatformError(f"Empty order statuses for {client_order_id}")
+        parent = parse_order_result(statuses[0], client_order_id, requested_quantity=order.quantity)
+        self._client_coins[client_order_id] = (coin, is_spot)
+        return parent
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
-        """Translate and submit an order modification, preferring cloid."""
-        raise NotImplementedError
+        """Translate and submit an order modification, preferring cloid.
+
+        Merges over the live record, submits ``modify_order`` by cloid,
+        then re-queries ``orderStatus`` for the authoritative result.
+        """
+        exchange = self._require_exchange()
+        current = await self._current_order_record(modification.client_order_id)
+        coin, _ = await self._resolve_coin(modification.client_order_id)
+        kwargs = build_modify_action(modification, coin=coin, current=current)
+        kwargs["oid"] = Cloid(kwargs["oid"])
+        kwargs["cloid"] = Cloid(kwargs["cloid"])
+        response = await self._run_exchange(exchange.modify_order, **kwargs)
+        self._check_action_ok(response, context=f"amending order {modification.client_order_id}")
+        result = await self.get_order_by_client_id(modification.client_order_id)
+        if result is None:
+            raise OrderNotFoundError(
+                f"Order {modification.client_order_id} was amended but could not be re-queried"
+            )
+        return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel an existing order via ``cancelByCloid``.
 
         Raises ``OrderNotFoundError`` if the venue reports the order was
-        never placed.
+        never placed.  A cancel that removes the order from the book reads
+        back as ``unknownOid`` — reported as CANCELLED, since absence after
+        a cancel ack means gone.
         """
-        raise NotImplementedError
+        exchange = self._require_exchange()
+        coin, _ = await self._resolve_coin(client_order_id)
+        cancel_coin, raw_cloid = build_cancel_action(client_order_id, coin=coin)
+        response = await self._run_exchange(exchange.cancel_by_cloid, cancel_coin, Cloid(raw_cloid))
+        self._check_action_ok(response, context=f"cancelling order {client_order_id}")
+        result = await self.get_order_by_client_id(client_order_id)
+        if result is None:
+            now = _utcnow()
+            return OrderResult(
+                client_order_id=client_order_id,
+                platform_order_id=None,
+                status=OrderStatus.CANCELLED,
+                filled_quantity=Decimal("0"),
+                average_fill_price=None,
+                created_at=now,
+                updated_at=now,
+            )
+        return result
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
-        """Query order status by cloid via the cloid index and ``orderStatus``.
+        """Query order status by cloid: open scan first, ``orderStatus`` second.
 
-        Returns None if not found.
+        Open orders are the live truth — ``orderStatus``-by-cloid resolves
+        to the *original* leg after a modify (observed live: replacement
+        live under a new oid while the query returns the cancelled
+        original), so it is consulted only when no open entry carries the
+        cloid.  Returns None on ``unknownOid``.  Average fill price is not
+        reported by either endpoint and reads back as None — fills carry
+        prices via fill events.
         """
-        raise NotImplementedError
+        want = client_order_id_to_cloid(client_order_id)
+        try:
+            record = await self._current_order_record(client_order_id)
+        except OrderNotFoundError:
+            record = None
+        if record is not None:
+            return OrderResult(
+                client_order_id=client_order_id,
+                platform_order_id=record.platform_order_id,
+                status=record.status,
+                filled_quantity=record.filled_quantity,
+                average_fill_price=record.average_fill_price,
+                created_at=record.created_at,
+                updated_at=record.updated_at,
+            )
+        exchange = self._require_exchange()
+        response = await self._run_exchange(
+            exchange.info.query_order_by_cloid, self._config.wallet_address, Cloid(want)
+        )
+        if not isinstance(response, dict):
+            raise PlatformError(f"Unexpected orderStatus shape {response!r}")
+        if response.get("status") == "unknownOid":
+            return None
+        try:
+            payload = response["order"]
+            order_object = payload["order"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
+        coin = str(order_object.get("coin") or "")
+        if not coin:
+            raise PlatformError(f"orderStatus entry is missing coin: {response!r}")
+        instrument = from_hyperliquid_coin(
+            coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
+        )
+        record = translate_order_entry(
+            {
+                **order_object,
+                "status": payload.get("status"),
+                "statusTimestamp": payload.get("statusTimestamp"),
+            },
+            instrument=instrument,
+        )
+        return OrderResult(
+            client_order_id=client_order_id,
+            platform_order_id=record.platform_order_id,
+            status=record.status,
+            filled_quantity=record.filled_quantity,
+            average_fill_price=record.average_fill_price,
+            created_at=record.created_at,
+            updated_at=record.updated_at,
+        )
 
     # ---- Instrument metadata ----
 
@@ -242,7 +587,14 @@ class HyperliquidAdapter(Adapter):
 
     def supported_order_types(self) -> frozenset[OrderType]:
         """Return the supported order types — all four guaranteed types."""
-        raise NotImplementedError
+        return frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
+        )
 
     # ---- Rate limits ----
 
