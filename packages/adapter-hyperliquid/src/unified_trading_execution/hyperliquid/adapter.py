@@ -11,6 +11,8 @@ no hedge routing.
 from __future__ import annotations
 
 import asyncio
+import logging
+import time
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -35,6 +37,10 @@ from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
 from unified_trading_execution.hyperliquid.errors import map_hyperliquid_error
 from unified_trading_execution.hyperliquid.orders import (
+    MAX_DECIMALS_PERPS,
+    MAX_DECIMALS_SPOT,
+    SL_CLOID_SUFFIX,
+    TP_CLOID_SUFFIX,
     build_cancel_action,
     build_modify_action,
     build_place_order_action,
@@ -51,14 +57,27 @@ from unified_trading_execution.hyperliquid.signing import (
     assert_user_role_for_signing,
     build_wallet,
 )
-from unified_trading_execution.hyperliquid.streams import translate_order_entry
+from unified_trading_execution.hyperliquid.streams import (
+    translate_balance,
+    translate_fill,
+    translate_order_entry,
+    translate_position,
+    translate_ticker,
+)
 from unified_trading_execution.hyperliquid.symbols import (
     from_hyperliquid_coin,
     to_hyperliquid_coin,
 )
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
-from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderStatus, OrderType
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import (
@@ -70,6 +89,8 @@ from unified_trading_execution.types.order import (
     UnifiedOrder,
 )
 from unified_trading_execution.types.position import Balance, Position
+
+logger = logging.getLogger(__name__)
 
 
 def _new_id() -> str:
@@ -101,6 +122,13 @@ class HyperliquidAdapter(Adapter):
         # modify/cancel can address orders without a venue scan.  Unknown
         # ids fall back to scanning open orders for the cloid.
         self._client_coins: dict[str, tuple[str, bool]] = {}
+        # platform oid -> (client_order_id, reason, entry) for fill
+        # attribution; child-cloid raw -> (parent id, reason, entry).
+        self._oid_clients: dict[str, tuple[str, FillReason | None, FillEntry | None]] = {}
+        self._child_parents: dict[str, tuple[str, FillReason, FillEntry]] = {}
+        # InstrumentSpec cache with monotonic fetch times (TTL-governed).
+        self._instrument_specs: dict[Instrument, tuple[InstrumentSpec, float]] = {}
+        self._spec_ttl: float | None = config.instrument_spec_cache_ttl
 
     # ---- Identification ----
 
@@ -224,6 +252,8 @@ class HyperliquidAdapter(Adapter):
         self._exchange = None
         self._connected = False
         self._client_coins.clear()
+        self._oid_clients.clear()
+        self._child_parents.clear()
         self._publish_connection_state(False)
 
     @property
@@ -379,21 +409,28 @@ class HyperliquidAdapter(Adapter):
             direction="up" if side == OrderSide.BUY else "down",
         )
 
-    async def _max_leverage_for(self, coin: str) -> int:
-        """Read the live universe ``maxLeverage`` for tier-cap checks.
+    async def _refresh_oid_index(self) -> None:
+        """Rebuild oid→client attribution from open orders carrying our cloids.
 
-        One ``meta`` call per order for now; repoint at cached
-        ``InstrumentSpec.max_leverage`` once spec caching exists.
+        Covers legs whose oids were never acked (``waitingForTrigger``
+        children) and sessions restarted after placement.  Unknown oids
+        stay unattributed — fetch_fills keys those by raw oid.
         """
-        exchange = self._require_exchange()
-        meta = await self._run_exchange(exchange.info.meta)
-        for entry in meta.get("universe") or []:
-            if isinstance(entry, dict) and entry.get("name") == coin:
-                try:
-                    return int(entry.get("maxLeverage") or 1)
-                except (TypeError, ValueError):
-                    return 1
-        raise InvalidSymbolError(f"Unknown coin {coin!r} in meta")
+        for entry in await self._open_order_entries():
+            if not isinstance(entry, dict):
+                continue
+            raw = str(entry.get("cloid") or "")
+            oid = entry.get("oid")
+            if not raw or oid is None or oid == "":
+                continue
+            if raw in self._child_parents:
+                parent, reason, entry_side = self._child_parents[raw]
+                self._oid_clients[str(oid)] = (parent, reason, entry_side)
+                continue
+            for client_order_id in list(self._client_coins):
+                if raw == client_order_id_to_cloid(client_order_id):
+                    self._oid_clients[str(oid)] = (client_order_id, None, None)
+                    break
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
         """Translate and submit a fully-validated order.
@@ -408,11 +445,11 @@ class HyperliquidAdapter(Adapter):
         exchange = self._require_exchange()
         coin = to_hyperliquid_coin(order.instrument)
         is_spot = order.instrument.asset_class == AssetClass.SPOT
-        try:
-            asset = exchange.info.name_to_asset(coin)
-            sz_decimals = int(exchange.info.asset_to_sz_decimals[asset])
-        except KeyError as exc:
-            raise InvalidSymbolError(f"Unknown coin {coin!r} on Hyperliquid") from exc
+        spec = await self.fetch_instrument_spec(order.instrument)
+        lot_exponent = spec.lot_size.as_tuple().exponent
+        if not isinstance(lot_exponent, int):
+            raise PlatformError(f"InstrumentSpec has no usable lot_size for {coin}")
+        sz_decimals = -lot_exponent
 
         client_order_id = order.client_order_id or _new_id()
         validate_size(order.quantity, sz_decimals)
@@ -432,13 +469,17 @@ class HyperliquidAdapter(Adapter):
             market_limit_price = await self._market_band_price(
                 coin, order.side, is_spot=is_spot, sz_decimals=sz_decimals
             )
-            if not is_spot:
-                cap = max_market_notional(await self._max_leverage_for(coin))
+            if not is_spot and spec.max_leverage is not None:
+                cap = max_market_notional(int(spec.max_leverage))
                 if market_limit_price * order.quantity > cap:
                     raise InvalidOrderError(f"Market notional exceeds tier cap {cap} for {coin}")
-        elif order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) and not is_spot:
+        elif (
+            order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT)
+            and not is_spot
+            and spec.max_leverage is not None
+        ):
             assert order.price is not None
-            cap = max_limit_notional(await self._max_leverage_for(coin))
+            cap = max_limit_notional(int(spec.max_leverage))
             if order.price * order.quantity > cap:
                 raise InvalidOrderError(f"Limit notional exceeds tier cap {cap} for {coin}")
 
@@ -463,6 +504,23 @@ class HyperliquidAdapter(Adapter):
         raise_on_status_errors(statuses)
         parent = parse_order_result(statuses[0], client_order_id, requested_quantity=order.quantity)
         self._client_coins[client_order_id] = (coin, is_spot)
+        for status in statuses:
+            if not isinstance(status, dict):
+                continue
+            detail = status.get("resting") or status.get("filled") or {}
+            oid = detail.get("oid") if isinstance(detail, dict) else None
+            if oid is None or oid == "":
+                continue
+            self._oid_clients[str(oid)] = (client_order_id, None, None)
+        for suffix, reason in (
+            (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+            (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+        ):
+            self._child_parents[client_order_id_to_cloid(f"{client_order_id}:{suffix}")] = (
+                client_order_id,
+                reason,
+                FillEntry.OUT,
+            )
         return parent
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
@@ -484,6 +542,12 @@ class HyperliquidAdapter(Adapter):
             raise OrderNotFoundError(
                 f"Order {modification.client_order_id} was amended but could not be re-queried"
             )
+        if result.platform_order_id is not None:
+            self._oid_clients[result.platform_order_id] = (
+                modification.client_order_id,
+                None,
+                None,
+            )
         return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
@@ -492,7 +556,9 @@ class HyperliquidAdapter(Adapter):
         Raises ``OrderNotFoundError`` if the venue reports the order was
         never placed.  A cancel that removes the order from the book reads
         back as ``unknownOid`` — reported as CANCELLED, since absence after
-        a cancel ack means gone.
+        a cancel ack means gone.  Cloids are not venue-unique: a reused
+        client id leaves sibling orders working, and the re-query then
+        truthfully reports the remainder as OPEN.
         """
         exchange = self._require_exchange()
         coin, _ = await self._resolve_coin(client_order_id)
@@ -578,12 +644,88 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Instrument metadata ----
 
-    async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
-        """Fetch trading rules for an instrument from ``meta``/``spotMeta``.
+    def _cached_spec(self, instrument: Instrument) -> InstrumentSpec | None:
+        """Return the cached spec when fresh, else None (TTL-governed)."""
+        cached = self._instrument_specs.get(instrument)
+        if cached is None:
+            return None
+        spec, fetched_at = cached
+        ttl = self._spec_ttl
+        if ttl is None or time.monotonic() - fetched_at < ttl:
+            return spec
+        self._instrument_specs.pop(instrument, None)
+        return None
 
-        Raises ``InvalidSymbolError`` if the instrument is not tradable.
+    async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
+        """Fetch (or return a cached) ``InstrumentSpec`` for ``instrument``.
+
+        Perps read ``meta.universe`` (``szDecimals``/``maxLeverage``);
+        spot reads ``spotMeta`` (base-token ``szDecimals``).  Tick is
+        ``10^-(MAX_DECIMALS - szDecimals)`` with the 5-sig-fig rule enforced
+        at placement, not here; lot is ``10^-szDecimals``; minimums are the
+        venue $10 floors; maximum quantity is the tier-implied non-binding
+        upper bound (real caps enforce at placement); delisted entries
+        raise ``InvalidSymbolError``.
         """
-        raise NotImplementedError
+        cached = self._cached_spec(instrument)
+        if cached is not None:
+            return cached
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        is_spot = instrument.asset_class == AssetClass.SPOT
+        if not is_spot:
+            meta = await self._run_exchange(exchange.info.meta)
+            entry = next(
+                (
+                    e
+                    for e in meta.get("universe") or []
+                    if isinstance(e, dict) and e.get("name") == coin
+                ),
+                None,
+            )
+            if entry is None or entry.get("isDelisted"):
+                raise InvalidSymbolError(f"Instrument {coin!r} is not tradable on Hyperliquid")
+            sz_decimals = int(entry.get("szDecimals", 0))
+            max_leverage = entry.get("maxLeverage")
+            decimals_cap = MAX_DECIMALS_PERPS
+        else:
+            spot_meta = await self._run_exchange(exchange.info.spot_meta)
+            alias = exchange.info.name_to_coin.get(coin, coin)
+            entry = next(
+                (
+                    e
+                    for e in spot_meta.get("universe") or []
+                    if isinstance(e, dict) and e.get("name") == alias
+                ),
+                None,
+            )
+            if entry is None:
+                raise InvalidSymbolError(f"Instrument {coin!r} is not tradable on Hyperliquid")
+            token_ids = entry.get("tokens") or []
+            token_rows = {
+                t.get("index"): t for t in spot_meta.get("tokens") or [] if isinstance(t, dict)
+            }
+            base_row = token_rows.get(token_ids[0]) if len(token_ids) == 2 else None
+            if base_row is None or base_row.get("szDecimals") is None:
+                raise InvalidSymbolError(f"Spot pair {coin!r} has no usable token metadata")
+            sz_decimals = int(base_row["szDecimals"])
+            max_leverage = None
+            decimals_cap = MAX_DECIMALS_SPOT
+        tick_size = Decimal(1).scaleb(-(decimals_cap - sz_decimals))
+        lot_size = Decimal(1).scaleb(-sz_decimals)
+        tier = max_limit_notional(int(max_leverage) if max_leverage is not None else 1)
+        spec = InstrumentSpec(
+            tick_size=tick_size,
+            lot_size=lot_size,
+            min_qty=lot_size,
+            max_qty=tier / tick_size,
+            min_notional=Decimal("10"),
+            price_precision=decimals_cap - sz_decimals,
+            qty_precision=sz_decimals,
+            max_leverage=Decimal(str(max_leverage)) if max_leverage is not None else None,
+        )
+        self._instrument_specs[instrument] = (spec, time.monotonic())
+        return spec
 
     # ---- Capability reporting ----
 
@@ -607,11 +749,50 @@ class HyperliquidAdapter(Adapter):
     # ---- Market data ----
 
     async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
-        """Snapshot bid/ask/mid via ``allMids`` + ``l2Book``.
+        """Snapshot best bid/ask via ``l2Book`` plus mark from asset ctx.
 
-        Weight-2 info calls, ~1s cache.  Returns None when the book is empty.
+        Returns None when the book is empty (no live quote); a malformed
+        book raises.  ``last`` is not reported by these endpoints and stays
+        None — mid derives via ``Ticker.mid``.
         """
-        raise NotImplementedError
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        is_spot = instrument.asset_class == AssetClass.SPOT
+        book = await self._run_exchange(exchange.info.l2_snapshot, coin)
+        try:
+            levels = book["levels"]
+            bids, asks = levels[0], levels[1]
+            if not bids or not asks:
+                return None
+            best_bid = str(bids[0]["px"])
+            best_ask = str(asks[0]["px"])
+        except (KeyError, IndexError, TypeError) as exc:
+            raise PlatformError(f"Unexpected l2Book shape for {coin}") from exc
+        mark: str | None = None
+        if not is_spot:
+            meta_ctx = await self._run_exchange(exchange.info.meta_and_asset_ctxs)
+            try:
+                universe, ctxs = meta_ctx[0]["universe"], meta_ctx[1]
+                index = next(
+                    i
+                    for i, e in enumerate(universe)
+                    if isinstance(e, dict) and e.get("name") == coin
+                )
+                mark = str(ctxs[index].get("markPx"))
+            except (StopIteration, KeyError, IndexError, TypeError) as exc:
+                raise PlatformError(f"Unexpected asset ctx shape for {coin}") from exc
+        else:
+            # Spot ctxs key by the venue alias (``@107``), not the pair
+            # spelling the canonical instrument carries.
+            alias = exchange.info.name_to_coin.get(coin, coin)
+            spot_ctx = await self._run_exchange(exchange.info.spot_meta_and_asset_ctxs)
+            try:
+                ctxs = spot_ctx[1]
+                ctx = next(c for c in ctxs if isinstance(c, dict) and c.get("coin") == alias)
+                mark = str(ctx.get("markPx"))
+            except (StopIteration, KeyError, IndexError, TypeError) as exc:
+                raise PlatformError(f"Unexpected spot ctx shape for {coin}") from exc
+        return translate_ticker(None, best_bid=best_bid, best_ask=best_ask, mark=mark)
 
     # ---- Position TP/SL modification ----
 
@@ -636,21 +817,165 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Reconciliation data ----
 
+    @staticmethod
+    def _state_time(state: Any, field: str = "time") -> datetime:
+        """Decode a state millisecond timestamp, defaulting to now."""
+        try:
+            ms = int(str(state.get(field)))
+        except (AttributeError, TypeError, ValueError):
+            return _utcnow()
+        seconds, millis = divmod(ms, 1000)
+        return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
+
     async def fetch_positions(self) -> list[Position]:
-        """Fetch open legs from ``clearinghouseState``."""
-        raise NotImplementedError
+        """Fetch open legs from ``clearinghouseState`` (spot has no legs).
+
+        Flat (zero-size) legs are skipped; malformed legs are logged and
+        skipped, never aborting the snapshot.
+        """
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        timestamp = self._state_time(state)
+        result: list[Position] = []
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        for leg in legs or []:
+            try:
+                coin = str((leg.get("position") or {}).get("coin") or "")
+                instrument = from_hyperliquid_coin(coin, is_spot=False)
+                position = translate_position(leg, instrument=instrument, timestamp=timestamp)
+            except Exception:
+                logger.exception("Skipping malformed position leg: %s", leg)
+                continue
+            if position.quantity != 0:
+                result.append(position)
+        return result
 
     async def fetch_balances(self) -> dict[str, Balance]:
         """Fetch per-currency balances from ``spotClearinghouseState``."""
-        raise NotImplementedError
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.spot_user_state, self._config.wallet_address)
+        timestamp = _utcnow()
+        result: dict[str, Balance] = {}
+        rows = state.get("balances") if isinstance(state, dict) else None
+        for row in rows or []:
+            try:
+                currency = str(row.get("coin") or "")
+                if not currency:
+                    continue
+                result[currency] = translate_balance(row, currency=currency, timestamp=timestamp)
+            except Exception:
+                logger.exception("Skipping malformed balance row: %s", row)
+                continue
+        return result
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
-        """Fetch open orders (``openOrders`` + ``frontendOpenOrders``) keyed by cloid."""
-        raise NotImplementedError
+        """Fetch every open order, keyed by client order id.
+
+        Derived TP/SL child legs are attachments of their parent in the
+        unified model, not orders of their own, so they are excluded — the
+        parent is reported, keyed by client id.  Venue-created legs we never
+        minted a cloid for key by platform oid; entries with neither id are
+        skipped, never collapsed onto an empty key.
+        """
+        result: dict[str, OrderRecord] = {}
+        cloid_to_client: dict[str, str] = {}
+        child_cloids: set[str] = set()
+        for client_order_id in list(self._client_coins):
+            cloid_to_client[client_order_id_to_cloid(client_order_id)] = client_order_id
+            child_cloids.update(
+                client_order_id_to_cloid(f"{client_order_id}:{suffix}")
+                for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+            )
+        child_cloids.update(self._child_parents)
+        for entry in await self._open_order_entries():
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("cloid") or "") in child_cloids:
+                continue
+            try:
+                coin = str(entry.get("coin") or "")
+                instrument = from_hyperliquid_coin(
+                    coin,
+                    is_spot=self._is_spot_coin(coin),
+                    spot_pair_coins=self._reverse_pair_coins(),
+                )
+                order = translate_order_entry(entry, instrument=instrument)
+            except Exception:
+                logger.exception("Skipping malformed open order entry: %s", entry)
+                continue
+            key: str | None = cloid_to_client.get(order.client_order_id, order.client_order_id)
+            if not key:
+                key = order.platform_order_id
+            if not key:
+                logger.error("Open order entry has no order id: %s", entry)
+                continue
+            result[key] = order
+        return result
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
-        """Fetch recent fills (``userFills`` + ``userFillsByTime`` merged and deduped)."""
-        raise NotImplementedError
+        """Fetch recent fills, grouped by client order id.
+
+        Without ``since`` reads the recent window (``userFills``, ≤2000);
+        with ``since`` reads ``userFillsByTime`` from that bound (server
+        filters; a client-side guard holds the boundary).  Entries dedupe
+        on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
+        children by parent with their reason), unknown oids key by raw oid.
+        """
+        await self._refresh_oid_index()
+        exchange = self._require_exchange()
+        if since is not None:
+            if since.tzinfo is None:
+                raise ValueError("since must be timezone-aware (UTC)")
+            entries = await self._run_exchange(
+                exchange.info.user_fills_by_time,
+                self._config.wallet_address,
+                int(since.timestamp() * 1000),
+            )
+        else:
+            entries = await self._run_exchange(
+                exchange.info.user_fills, self._config.wallet_address
+            )
+        if not isinstance(entries, list):
+            raise PlatformError(f"Unexpected fills shape {entries!r}")
+        result: dict[str, list[FillRecord]] = {}
+        seen: set[tuple[str, str]] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            raw_hash, raw_tid = entry.get("hash"), entry.get("tid")
+            if raw_hash in (None, "") or raw_tid in (None, ""):
+                continue
+            key = (str(raw_hash), str(raw_tid))
+            if key in seen:
+                continue
+            seen.add(key)
+            oid = str(entry.get("oid") or "")
+            attributed = self._oid_clients.get(oid)
+            if attributed is not None:
+                client_order_id, reason, entry_side = attributed
+            else:
+                client_order_id, reason, entry_side = (oid or key[0]), None, None
+            try:
+                coin = str(entry.get("coin") or "")
+                instrument = from_hyperliquid_coin(
+                    coin,
+                    is_spot=self._is_spot_coin(coin),
+                    spot_pair_coins=self._reverse_pair_coins(),
+                )
+                fill = translate_fill(
+                    entry,
+                    instrument=instrument,
+                    client_order_id=client_order_id,
+                    reason=reason,
+                    fill_entry=entry_side,
+                )
+            except Exception:
+                logger.exception("Skipping malformed fill entry: %s", entry)
+                continue
+            if since is not None and fill.fill_timestamp < since:
+                continue
+            result.setdefault(client_order_id, []).append(fill)
+        return result
 
     # ---- Leverage + margin intent ----
 

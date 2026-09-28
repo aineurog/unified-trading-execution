@@ -95,7 +95,12 @@ def _parse_ms(raw: object, field: str) -> datetime:
 
 
 def translate_fill(
-    entry: dict[str, Any], *, instrument: Instrument, client_order_id: str
+    entry: dict[str, Any],
+    *,
+    instrument: Instrument,
+    client_order_id: str,
+    reason: FillReason | None = None,
+    fill_entry: FillEntry | None = None,
 ) -> FillRecord:
     """Build a ``FillRecord`` from one fill entry (WS or REST shape, shared).
 
@@ -103,24 +108,22 @@ def translate_fill(
     unique per fill (one transaction can carry several), while ``tid``
     needs its block/coin context; the pair is unique.  ``fee`` keeps its
     sign (negative = maker rebate); zero-vs-missing stays distinct.
-    ``dir`` maps to entry/reason (``Open *`` → IN, ``Close *`` → OUT, spot
-    ``Buy`` → IN / ``Sell`` → OUT, all with no reason unless TP/SL
-    attribution is known — venue ``normalTpsl`` children keyed
-    ``hl-tpsl-<oid>`` arrive with TAKE_PROFIT/STOP_LOSS + OUT from the
-    caller).  Unrecognized ``dir`` values yield no entry/reason rather than
-    a guess; ``closedPnl`` has no core field and is dropped.
+    Missing ``reason``/``entry`` derive from ``dir`` (``Open *`` → IN,
+    ``Close *`` → OUT, spot ``Buy`` → IN / ``Sell`` → OUT); an explicit
+    caller attribution (our TP/SL child legs) wins over the derivation.
+    Unrecognized ``dir`` values yield no entry/reason rather than a guess;
+    ``closedPnl`` has no core field and is dropped.
     """
     direction = entry.get("dir")
-    entry_side: FillEntry | None = None
-    reason: FillReason | None = None
-    if direction in ("Open Long", "Open Short"):
-        entry_side = FillEntry.IN
-    elif direction in ("Close Long", "Close Short"):
-        entry_side = FillEntry.OUT
-    elif direction == "Buy":
-        entry_side = FillEntry.IN
-    elif direction == "Sell":
-        entry_side = FillEntry.OUT
+    if fill_entry is None:
+        if direction in ("Open Long", "Open Short"):
+            fill_entry = FillEntry.IN
+        elif direction in ("Close Long", "Close Short"):
+            fill_entry = FillEntry.OUT
+        elif direction == "Buy":
+            fill_entry = FillEntry.IN
+        elif direction == "Sell":
+            fill_entry = FillEntry.OUT
     return FillRecord(
         client_order_id=client_order_id,
         platform_fill_id=f"{_required_string(entry, 'hash')}:{_required_string(entry, 'tid')}",
@@ -133,7 +136,7 @@ def translate_fill(
         correlation_id=client_order_id,
         position_id=None,
         reason=reason,
-        entry=entry_side,
+        entry=fill_entry,
     )
 
 

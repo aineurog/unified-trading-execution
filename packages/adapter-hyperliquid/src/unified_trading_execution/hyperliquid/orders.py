@@ -56,6 +56,11 @@ MAX_DECIMALS_PERPS = 6
 MAX_DECIMALS_SPOT = 8
 MAX_PRICE_SIGNIFICANT_FIGURES = 5
 
+# Child-cloid derivation suffixes (``f"{parent_client_id}:{suffix}"``).
+# Shared with the adapter so fill attribution recomputes the same ids.
+TP_CLOID_SUFFIX = "take_profit"
+SL_CLOID_SUFFIX = "stop_loss"
+
 _HEX_32_RE = re.compile(r"^[0-9a-f]{32}$")
 
 _TIF_WIRE: dict[TimeInForce, str] = {
@@ -321,8 +326,8 @@ def _tpsl_children(
     """
     children: list[dict[str, Any]] = []
     attachments = (
-        (order.take_profit, "tp", "take_profit"),
-        (order.stop_loss, "sl", "stop_loss"),
+        (order.take_profit, "tp", TP_CLOID_SUFFIX),
+        (order.stop_loss, "sl", SL_CLOID_SUFFIX),
     )
     for attachment, tpsl, suffix in attachments:
         if attachment is None:

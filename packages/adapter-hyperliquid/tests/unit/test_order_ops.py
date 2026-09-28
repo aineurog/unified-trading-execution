@@ -60,7 +60,9 @@ def _connected(adapter: HyperliquidAdapter) -> MagicMock:
     exchange.info.name_to_asset.side_effect = lambda coin: {"BTC": 0}[coin]
     exchange.info.asset_to_sz_decimals = {0: 5}
     exchange.info.name_to_coin = {}
-    exchange.info.meta.return_value = {"universe": [{"name": "BTC", "maxLeverage": 40}]}
+    exchange.info.meta.return_value = {
+        "universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]
+    }
     adapter._exchange = exchange
     adapter._connected = True
     return exchange
@@ -128,7 +130,9 @@ async def test_place_market_band_is_tick_rounded(adapter: HyperliquidAdapter) ->
     exchange.info.l2_snapshot.return_value = {
         "levels": [[{"px": "100", "sz": "1", "n": 1}], [{"px": "101", "sz": "1", "n": 1}]]
     }
-    exchange.info.meta.return_value = {"universe": [{"name": "BTC", "maxLeverage": 40}]}
+    exchange.info.meta.return_value = {
+        "universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]
+    }
     exchange.bulk_orders.return_value = _ok_statuses([{"resting": {"oid": 1}}])
     await adapter.place_order(_order(order_type=OrderType.MARKET, price=None))
     (requests,), _ = exchange.bulk_orders.call_args
