@@ -258,6 +258,20 @@ async def test_intent_requires_store() -> None:
     adapter._connected = True
     with pytest.raises(PlatformError, match="state_store"):
         await adapter.set_leverage(_perp(), leverage=2)
+    adapter._exchange.update_leverage.assert_not_called()
+
+
+async def test_margin_mode_requires_store_without_mutating() -> None:
+    """Without a store the venue must not be mutated before the raise."""
+    from unified_trading_execution.events import EventBus
+
+    config = HyperliquidConfig(wallet_address=_TEST_ADDRESS, private_key=_TEST_KEY, testnet=True)
+    adapter = HyperliquidAdapter(config, event_bus=EventBus())
+    adapter._exchange = _exchange_mock()
+    adapter._connected = True
+    with pytest.raises(PlatformError, match="state_store"):
+        await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
+    adapter._exchange.update_leverage.assert_not_called()
 
 
 async def test_connect_reapplies_auto_apply() -> None:

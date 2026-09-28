@@ -1096,8 +1096,8 @@ class HyperliquidAdapter(Adapter):
         Owns the leverage number only — the mode resolves stored intent,
         else venue, else default.  Above the tier cap raises
         ``InvalidOrderError`` (never clamped); spot raises
-        ``InvalidSymbolError``.  Intent persists only after the venue
-        accepts.
+        ``InvalidSymbolError``.  The store is required up front so the venue
+        is never mutated when intent cannot be persisted.
         """
         raw_leverage: Any = leverage
         if isinstance(raw_leverage, bool) or not isinstance(raw_leverage, int) or raw_leverage < 1:
@@ -1107,11 +1107,11 @@ class HyperliquidAdapter(Adapter):
         if instrument.asset_class == AssetClass.SPOT:
             raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no leverage")
         coin = to_hyperliquid_coin(instrument)
+        store = await self._require_store()
         cap = await self._tier_max_leverage(coin)
         if leverage > cap:
             raise InvalidOrderError(f"Leverage {leverage} exceeds max {cap} for {coin}")
         await self._submit_leverage(coin, leverage, await self._resolved_is_cross(coin))
-        store = await self._require_store()
         await store.set_adapter_config(f"leverage:{coin}", str(leverage))
         await store.set_adapter_config(f"leverage.on_drift:{coin}", on_drift)
         await store.set_adapter_config(
@@ -1161,6 +1161,8 @@ class HyperliquidAdapter(Adapter):
 
         Owns the mode only — leverage is preserved (stored, else venue,
         else default).  ``mode`` is the enum or ``"cross"``/``"isolated"``.
+        The store is required up front so the venue is never mutated when
+        intent cannot be persisted.
         """
         try:
             resolved = MarginMode(mode)
@@ -1173,10 +1175,10 @@ class HyperliquidAdapter(Adapter):
         if instrument.asset_class == AssetClass.SPOT:
             raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no margin mode")
         coin = to_hyperliquid_coin(instrument)
+        store = await self._require_store()
         await self._submit_leverage(
             coin, await self._resolved_leverage(coin), resolved is MarginMode.CROSS
         )
-        store = await self._require_store()
         await store.set_adapter_config(f"margin_mode:{coin}", resolved.value)
         await store.set_adapter_config(f"margin_mode.on_drift:{coin}", on_drift)
         await store.set_adapter_config(
