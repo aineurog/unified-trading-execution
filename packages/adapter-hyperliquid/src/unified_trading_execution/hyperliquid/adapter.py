@@ -239,6 +239,7 @@ class HyperliquidAdapter(Adapter):
 
         self._exchange = exchange
         self._connected = True
+        await self._reapply_stored_intent()
         self._publish_connection_state(True)
 
     async def disconnect(self) -> None:
@@ -979,6 +980,109 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Leverage + margin intent ----
 
+    async def _require_store(self) -> StateStore:
+        if self._state_store is None:
+            raise PlatformError(
+                "HyperliquidAdapter was constructed without a state_store — "
+                "leverage/margin intent persistence is unavailable"
+            )
+        return self._state_store
+
+    async def _venue_leverage(self, coin: str) -> tuple[int, bool] | None:
+        """Read live ``(leverage, is_cross)`` for a coin; None with no open leg."""
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or position.get("coin") != coin:
+                continue
+            leverage = position.get("leverage") or {}
+            try:
+                return int(leverage.get("value", 1)), leverage.get("type") == "cross"
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    async def _tier_max_leverage(self, coin: str) -> int:
+        """Effective max leverage: universe max capped by the zero-position tier."""
+        exchange = self._require_exchange()
+        meta = await self._run_exchange(exchange.info.meta)
+        universe = meta.get("universe") if isinstance(meta, dict) else None
+        entry = next(
+            (e for e in universe or [] if isinstance(e, dict) and e.get("name") == coin),
+            None,
+        )
+        if entry is None:
+            raise InvalidSymbolError(f"Unknown coin {coin!r} on Hyperliquid")
+        try:
+            universe_max = int(entry.get("maxLeverage") or 1)
+        except (TypeError, ValueError):
+            universe_max = 1
+        tables = meta.get("marginTables") if isinstance(meta, dict) else None
+        if isinstance(tables, list):
+            for table in tables:
+                if (
+                    not isinstance(table, list)
+                    or len(table) != 2
+                    or table[0] != entry.get("marginTableId")
+                ):
+                    continue
+                tiers = table[1].get("marginTiers") if isinstance(table[1], dict) else None
+                for tier in tiers or []:
+                    if not isinstance(tier, dict):
+                        continue
+                    try:
+                        if Decimal(str(tier.get("lowerBound", "0"))) != 0:
+                            continue
+                        return min(universe_max, int(tier.get("maxLeverage") or universe_max))
+                    except (TypeError, ValueError):
+                        continue
+        return universe_max
+
+    async def _stored_leverage(self, coin: str) -> int | None:
+        if self._state_store is None:
+            return None
+        raw = await self._state_store.get_adapter_config(f"leverage:{coin}")
+        try:
+            return int(raw) if raw is not None else None
+        except ValueError:
+            return None
+
+    async def _stored_margin_mode(self, coin: str) -> MarginMode | None:
+        if self._state_store is None:
+            return None
+        raw = await self._state_store.get_adapter_config(f"margin_mode:{coin}")
+        try:
+            return MarginMode(raw) if raw is not None else None
+        except ValueError:
+            return None
+
+    async def _resolved_is_cross(self, coin: str) -> bool:
+        """Mode for an ``updateLeverage`` call: stored intent, else venue, else default."""
+        stored = await self._stored_margin_mode(coin)
+        if stored is not None:
+            return stored is MarginMode.CROSS
+        venue = await self._venue_leverage(coin)
+        if venue is not None:
+            return venue[1]
+        return self._config.default_margin_mode is MarginMode.CROSS
+
+    async def _resolved_leverage(self, coin: str) -> int:
+        """Leverage for an ``updateLeverage`` call: stored intent, else venue, else default."""
+        stored = await self._stored_leverage(coin)
+        if stored is not None:
+            return stored
+        venue = await self._venue_leverage(coin)
+        if venue is not None:
+            return venue[0]
+        return self._config.default_leverage
+
+    async def _submit_leverage(self, coin: str, leverage: int, is_cross: bool) -> None:
+        exchange = self._require_exchange()
+        response = await self._run_exchange(exchange.update_leverage, leverage, coin, is_cross)
+        self._check_action_ok(response, context=f"setting leverage for {coin}")
+
     async def set_leverage(
         self,
         instrument: Instrument,
@@ -989,30 +1093,61 @@ class HyperliquidAdapter(Adapter):
     ) -> None:
         """Set per-asset leverage via ``updateLeverage`` and persist intent.
 
-        Owns the leverage number only — the margin mode comes from the
-        separate margin-mode intent (stored intent, else live venue value,
-        else the configured default), so each field has exactly one writer.
-        Max is checked against both ``universe.maxLeverage`` and the
-        ``marginTables`` tiers — block with ``InvalidOrderError``, never
-        silently clamp.
+        Owns the leverage number only — the mode resolves stored intent,
+        else venue, else default.  Above the tier cap raises
+        ``InvalidOrderError`` (never clamped); spot raises
+        ``InvalidSymbolError``.  Intent persists only after the venue
+        accepts.
         """
-        raise NotImplementedError
+        raw_leverage: Any = leverage
+        if isinstance(raw_leverage, bool) or not isinstance(raw_leverage, int) or raw_leverage < 1:
+            raise InvalidOrderError(f"leverage must be an integer >= 1, got {leverage}")
+        if on_drift not in ("reapply", "notify", "halt"):
+            raise ValueError(f"on_drift must be reapply/notify/halt, got {on_drift}")
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no leverage")
+        coin = to_hyperliquid_coin(instrument)
+        cap = await self._tier_max_leverage(coin)
+        if leverage > cap:
+            raise InvalidOrderError(f"Leverage {leverage} exceeds max {cap} for {coin}")
+        await self._submit_leverage(coin, leverage, await self._resolved_is_cross(coin))
+        store = await self._require_store()
+        await store.set_adapter_config(f"leverage:{coin}", str(leverage))
+        await store.set_adapter_config(f"leverage.on_drift:{coin}", on_drift)
+        await store.set_adapter_config(
+            f"leverage.auto_apply:{coin}", "1" if auto_apply_on_connect else "0"
+        )
 
     async def get_leverage(self, instrument: Instrument) -> tuple[int, bool] | None:
-        """Query per-asset ``(leverage, is_cross)`` from the venue."""
-        raise NotImplementedError
+        """Query per-asset ``(leverage, is_cross)``; None with no open leg."""
+        if instrument.asset_class == AssetClass.SPOT:
+            return None
+        return await self._venue_leverage(to_hyperliquid_coin(instrument))
 
     async def remove_leverage(self, instrument: Instrument) -> None:
         """Drop stored per-asset leverage intent (venue untouched)."""
-        raise NotImplementedError
+        store = await self._require_store()
+        coin = to_hyperliquid_coin(instrument)
+        await store.delete_adapter_config(f"leverage:{coin}")
+        await store.delete_adapter_config(f"leverage.on_drift:{coin}")
+        await store.delete_adapter_config(f"leverage.auto_apply:{coin}")
 
     async def top_up_isolated_margin(self, instrument: Instrument, *, amount_usdc: Decimal) -> None:
-        """Top up isolated margin via ``updateIsolatedMargin`` semantics.
+        """Add (positive) or remove (negative) isolated margin by delta.
 
-        ``isBuy`` is passed as ``true`` — a documented venue no-op until
-        Hyperliquid hedge mode exists.
+        Goes through ``update_isolated_margin`` — the SDK wraps no
+        leverage-targeted top-up, so targeting a leverage number is out of
+        scope; strict-isolated removal refusals surface as mapped venue
+        errors.  ``isBuy`` is sent ``true``: a documented venue no-op.
         """
-        raise NotImplementedError
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no isolated margin")
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        response = await self._run_exchange(
+            exchange.update_isolated_margin, float(amount_usdc), coin
+        )
+        self._check_action_ok(response, context=f"topping up isolated margin for {coin}")
 
     async def set_margin_mode(
         self,
@@ -1024,26 +1159,177 @@ class HyperliquidAdapter(Adapter):
     ) -> None:
         """Set per-asset margin mode via ``updateLeverage`` and persist intent.
 
-        Owns the mode only — leverage is preserved (stored leverage intent,
-        else live venue value, else the configured default).  ``mode`` is
-        the ``MarginMode`` enum or the raw strings ``"cross"`` /
-        ``"isolated"``.  Each intent carries its own drift policy, so mode
-        drift and leverage drift are managed independently.
+        Owns the mode only — leverage is preserved (stored, else venue,
+        else default).  ``mode`` is the enum or ``"cross"``/``"isolated"``.
         """
-        raise NotImplementedError
+        try:
+            resolved = MarginMode(mode)
+        except ValueError:
+            raise ValueError(
+                f"mode must be one of {[m.value for m in MarginMode]}, got {mode!r}"
+            ) from None
+        if on_drift not in ("reapply", "notify", "halt"):
+            raise ValueError(f"on_drift must be reapply/notify/halt, got {on_drift}")
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no margin mode")
+        coin = to_hyperliquid_coin(instrument)
+        await self._submit_leverage(
+            coin, await self._resolved_leverage(coin), resolved is MarginMode.CROSS
+        )
+        store = await self._require_store()
+        await store.set_adapter_config(f"margin_mode:{coin}", resolved.value)
+        await store.set_adapter_config(f"margin_mode.on_drift:{coin}", on_drift)
+        await store.set_adapter_config(
+            f"margin_mode.auto_apply:{coin}", "1" if auto_apply_on_connect else "0"
+        )
 
     async def get_margin_mode(self, instrument: Instrument) -> MarginMode | None:
-        """Query the per-asset margin mode from the venue for an instrument."""
-        raise NotImplementedError
+        """Query the per-asset margin mode; None with no open leg (or spot)."""
+        if instrument.asset_class == AssetClass.SPOT:
+            return None
+        venue = await self._venue_leverage(to_hyperliquid_coin(instrument))
+        if venue is None:
+            return None
+        return MarginMode.CROSS if venue[1] else MarginMode.ISOLATED
 
     async def remove_margin_mode(self, instrument: Instrument) -> None:
         """Drop stored per-asset margin-mode intent (venue untouched)."""
-        raise NotImplementedError
+        store = await self._require_store()
+        coin = to_hyperliquid_coin(instrument)
+        await store.delete_adapter_config(f"margin_mode:{coin}")
+        await store.delete_adapter_config(f"margin_mode.on_drift:{coin}")
+        await store.delete_adapter_config(f"margin_mode.auto_apply:{coin}")
+
+    def _decode_lev_intent_key(self, key: str) -> str | None:
+        """Extract the coin from a stored ``leverage:{coin}`` key (None for policy rows)."""
+        if not key.startswith("leverage:") or "." in key:
+            return None
+        return key.removeprefix("leverage:")
+
+    def _decode_mode_intent_key(self, key: str) -> str | None:
+        """Extract the coin from a stored ``margin_mode:{coin}`` key (None for policy rows)."""
+        if not key.startswith("margin_mode:") or "." in key:
+            return None
+        return key.removeprefix("margin_mode:")
+
+    async def _halt_for_drift(self, coin: str, *, reason: str, detail: str) -> None:
+        """Enter an instrument halt for drift, degrading to a log without setup."""
+        if self._halt_machine is None:
+            logger.warning("Cannot enter %s halt for %s — no halt machine attached", reason, coin)
+            return
+        try:
+            instrument = from_hyperliquid_coin(
+                coin,
+                is_spot=self._is_spot_coin(coin),
+                spot_pair_coins=self._reverse_pair_coins(),
+            )
+        except Exception:
+            logger.exception("Cannot resolve instrument for %s halt on %s", reason, coin)
+            return
+        self._halt_machine.enter_halt(
+            scope="instrument", instrument=instrument, reason=reason, detail=detail
+        )
+
+    async def _reconcile_leverage_row(self, coin: str, stored: int) -> None:
+        venue = await self._venue_leverage(coin)
+        if venue is None:
+            return
+        if venue[0] == stored:
+            return
+        policy = None
+        if self._state_store is not None:
+            policy = await self._state_store.get_adapter_config(f"leverage.on_drift:{coin}")
+        on_drift = policy or "reapply"
+        detail = f"stored={stored} venue={venue[0]}"
+        if on_drift == "reapply":
+            await self._submit_leverage(coin, stored, await self._resolved_is_cross(coin))
+        elif on_drift == "notify":
+            logger.warning("Leverage drift on %s: %s", coin, detail)
+        else:
+            await self._halt_for_drift(coin, reason="leverage_drift", detail=detail)
+
+    async def _reconcile_margin_row(self, coin: str, stored: MarginMode) -> None:
+        venue = await self._venue_leverage(coin)
+        if venue is None:
+            return
+        if (venue[1] and stored is MarginMode.CROSS) or (
+            not venue[1] and stored is MarginMode.ISOLATED
+        ):
+            return
+        policy = None
+        if self._state_store is not None:
+            policy = await self._state_store.get_adapter_config(f"margin_mode.on_drift:{coin}")
+        on_drift = policy or "reapply"
+        detail = f"stored={stored.value} venue={'cross' if venue[1] else 'isolated'}"
+        if on_drift == "reapply":
+            await self._submit_leverage(
+                coin, await self._resolved_leverage(coin), stored is MarginMode.CROSS
+            )
+        elif on_drift == "notify":
+            logger.warning("Margin mode drift on %s: %s", coin, detail)
+        else:
+            await self._halt_for_drift(coin, reason="margin_mode_drift", detail=detail)
 
     async def reconcile_user_intent(self) -> None:
         """Reconcile stored per-asset leverage/mode intent with the venue.
 
-        Re-applies drifted leverage/mode per the stored on-drift policy.
-        No position-mode reconciliation — one-way is asserted, not managed.
+        Each drifted coin executes its own stored policy; failures are
+        logged per coin without aborting the pass.  No position-mode
+        reconciliation — one-way is asserted, not managed.
         """
-        raise NotImplementedError
+        if self._state_store is None:
+            return
+        for key, value in (await self._state_store.list_adapter_config("leverage:")).items():
+            coin = self._decode_lev_intent_key(key)
+            if coin is None:
+                continue
+            try:
+                stored = int(value)
+            except ValueError:
+                continue
+            try:
+                await self._reconcile_leverage_row(coin, stored)
+            except Exception:
+                logger.exception("Leverage reconcile failed for %s", coin)
+        for key, value in (await self._state_store.list_adapter_config("margin_mode:")).items():
+            coin = self._decode_mode_intent_key(key)
+            if coin is None:
+                continue
+            try:
+                stored_mode = MarginMode(value)
+            except ValueError:
+                continue
+            try:
+                await self._reconcile_margin_row(coin, stored_mode)
+            except Exception:
+                logger.exception("Margin mode reconcile failed for %s", coin)
+
+    async def _reapply_stored_intent(self) -> None:
+        """Impose auto-apply stored intent after connect; failures never break connect."""
+        if self._state_store is None:
+            return
+        for key, value in (await self._state_store.list_adapter_config("leverage:")).items():
+            coin = self._decode_lev_intent_key(key)
+            if coin is None:
+                continue
+            try:
+                if await self._state_store.get_adapter_config(f"leverage.auto_apply:{coin}") == "0":
+                    continue
+                await self._submit_leverage(coin, int(value), await self._resolved_is_cross(coin))
+            except Exception:
+                logger.exception("Leverage reapply failed for %s on connect", coin)
+        for key, value in (await self._state_store.list_adapter_config("margin_mode:")).items():
+            coin = self._decode_mode_intent_key(key)
+            if coin is None:
+                continue
+            try:
+                if (
+                    await self._state_store.get_adapter_config(f"margin_mode.auto_apply:{coin}")
+                    == "0"
+                ):
+                    continue
+                await self._submit_leverage(
+                    coin, await self._resolved_leverage(coin), MarginMode(value) is MarginMode.CROSS
+                )
+            except Exception:
+                logger.exception("Margin mode reapply failed for %s on connect", coin)
