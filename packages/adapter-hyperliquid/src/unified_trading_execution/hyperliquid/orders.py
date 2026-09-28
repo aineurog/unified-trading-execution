@@ -514,6 +514,23 @@ def map_order_status(status: str) -> OrderStatus:
     return mapped
 
 
+def raise_on_status_errors(statuses: list[Any]) -> None:
+    """Raise the mapped exception for the first error in a batch of statuses.
+
+    ``bulk_orders`` returns one status per request (the parent followed by
+    any TP/SL child legs), so a rejected child must surface rather than be
+    dropped behind a resting parent — otherwise a bracket whose TP/SL leg
+    the venue refused reads back as a plain resting order.  Benign cancel
+    outcomes (post-only match, IOC no-match) are results, not failures, and
+    pass through to ``parse_order_result``.
+    """
+    for entry in statuses:
+        if isinstance(entry, dict) and "error" in entry:
+            message = str(entry["error"] or "")
+            if not is_cancelled_outcome(message=message):
+                raise map_hyperliquid_error(message=message)
+
+
 def parse_order_result(
     status_entry: dict[str, Any] | str,
     client_order_id: str,
