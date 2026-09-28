@@ -43,6 +43,7 @@ from unified_trading_execution.hyperliquid.orders import (
     max_market_notional,
     parse_order_result,
     quantize_price,
+    raise_on_status_errors,
     round_price_to_tick,
     validate_size,
 )
@@ -459,6 +460,7 @@ class HyperliquidAdapter(Adapter):
             ) from exc
         if not isinstance(statuses, list) or not statuses:
             raise PlatformError(f"Empty order statuses for {client_order_id}")
+        raise_on_status_errors(statuses)
         parent = parse_order_result(statuses[0], client_order_id, requested_quantity=order.quantity)
         self._client_coins[client_order_id] = (coin, is_spot)
         return parent

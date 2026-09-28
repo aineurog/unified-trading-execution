@@ -23,7 +23,11 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
-from unified_trading_execution.types.order import OrderModification, UnifiedOrder
+from unified_trading_execution.types.order import (
+    OrderModification,
+    TpSlAttachment,
+    UnifiedOrder,
+)
 
 _CLOID = "0x" + "ab" * 16
 
@@ -144,6 +148,21 @@ async def test_place_market_tier_breach_rejects(adapter: HyperliquidAdapter) -> 
             _order(order_type=OrderType.MARKET, price=None, quantity=Decimal("10000"))
         )
     exchange.bulk_orders.assert_not_called()
+
+
+async def test_place_rejects_error_in_bracket_child(adapter: HyperliquidAdapter) -> None:
+    """A rejected TP/SL child must surface, not hide behind a resting parent."""
+    exchange = _connected(adapter)
+    exchange.bulk_orders.return_value = _ok_statuses(
+        [{"resting": {"oid": 11}}, {"error": "Invalid TP/SL price."}]
+    )
+    with pytest.raises(InvalidOrderError):
+        await adapter.place_order(
+            _order(
+                take_profit=TpSlAttachment(trigger_price=Decimal("60000")),
+                client_order_id=_CLOID,
+            )
+        )
 
 
 def _open_entry(**kwargs: Any) -> dict[str, Any]:
