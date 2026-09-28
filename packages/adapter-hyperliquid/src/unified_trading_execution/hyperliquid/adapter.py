@@ -782,12 +782,15 @@ class HyperliquidAdapter(Adapter):
             except (StopIteration, KeyError, IndexError, TypeError) as exc:
                 raise PlatformError(f"Unexpected asset ctx shape for {coin}") from exc
         else:
+            # Spot ctxs key by the venue alias (``@107``), not the pair
+            # spelling the canonical instrument carries.
+            alias = exchange.info.name_to_coin.get(coin, coin)
             spot_ctx = await self._run_exchange(exchange.info.spot_meta_and_asset_ctxs)
             try:
                 ctxs = spot_ctx[1]
-                ctx = next(c for c in ctxs if isinstance(c, dict) and c.get("coin") == coin)
+                ctx = next(c for c in ctxs if isinstance(c, dict) and c.get("coin") == alias)
                 mark = str(ctx.get("markPx"))
-            except (StopIteration, KeyError, TypeError) as exc:
+            except (StopIteration, KeyError, IndexError, TypeError) as exc:
                 raise PlatformError(f"Unexpected spot ctx shape for {coin}") from exc
         return translate_ticker(None, best_bid=best_bid, best_ask=best_ask, mark=mark)
 
@@ -932,8 +935,11 @@ class HyperliquidAdapter(Adapter):
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
-            key = (str(entry.get("hash") or ""), str(entry.get("tid") or ""))
-            if not all(key) or key in seen:
+            raw_hash, raw_tid = entry.get("hash"), entry.get("tid")
+            if raw_hash in (None, "") or raw_tid in (None, ""):
+                continue
+            key = (str(raw_hash), str(raw_tid))
+            if key in seen:
                 continue
             seen.add(key)
             oid = str(entry.get("oid") or "")

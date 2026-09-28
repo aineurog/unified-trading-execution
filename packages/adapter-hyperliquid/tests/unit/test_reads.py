@@ -93,6 +93,26 @@ async def test_fetch_ticker_empty_book(adapter: HyperliquidAdapter) -> None:
     assert await adapter.fetch_ticker(_perp()) is None
 
 
+async def test_fetch_ticker_spot_resolves_alias(adapter: HyperliquidAdapter) -> None:
+    """Spot ctxs key by venue alias (@107), not the pair spelling."""
+    exchange = _connected(adapter)
+    exchange.info.name_to_coin = {"HYPE/USDC": "@107", "@107": "@107"}
+    exchange.info.l2_snapshot.return_value = {
+        "levels": [[{"px": "88.9", "sz": "1", "n": 1}], [{"px": "89.1", "sz": "1", "n": 1}]]
+    }
+    exchange.info.spot_meta_and_asset_ctxs.return_value = (
+        {"universe": [{"name": "@107", "index": 107, "tokens": [150, 0]}], "tokens": []},
+        [{"coin": "@107", "markPx": "89.0"}],
+    )
+    ticker = await adapter.fetch_ticker(_spot())
+    assert ticker is not None
+    assert (ticker.bid, ticker.ask, ticker.mark) == (
+        Decimal("88.9"),
+        Decimal("89.1"),
+        Decimal("89.0"),
+    )
+
+
 async def test_fetch_positions_skips_flat(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     exchange.info.user_state.return_value = {
@@ -175,6 +195,28 @@ async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) ->
     exchange.info.user_fills_by_time.assert_called_once()
     args, _ = exchange.info.user_fills_by_time.call_args
     assert args[1] == 2000
+
+
+async def test_fetch_fills_keeps_zero_tid(adapter: HyperliquidAdapter) -> None:
+    """tid == 0 is a real id, not a missing one — the fill must survive."""
+    exchange = _connected(adapter)
+    exchange.info.name_to_coin = {}
+    dust = {
+        "coin": "BTC",
+        "px": "100",
+        "sz": "0.01",
+        "side": "B",
+        "time": 2000,
+        "dir": "Spot Dust Conversion",
+        "hash": "0x" + "0" * 64,
+        "oid": 7,
+        "fee": "0",
+        "feeToken": "USDC",
+        "tid": 0,
+    }
+    exchange.info.user_fills.return_value = [dust]
+    fills = await adapter.fetch_fills()
+    assert sum(len(v) for v in fills.values()) == 1
 
 
 async def test_spec_cache_ttl_expiry(adapter: HyperliquidAdapter) -> None:
