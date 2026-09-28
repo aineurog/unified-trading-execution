@@ -165,6 +165,57 @@ async def test_fetch_open_orders_keys(adapter: HyperliquidAdapter) -> None:
     assert set(orders) == {"0x" + "ab" * 16, "2"}
 
 
+async def test_fetch_open_orders_excludes_bracket_children(adapter: HyperliquidAdapter) -> None:
+    """A bracket's TP/SL children must not mask its parent entry order."""
+    from unified_trading_execution.hyperliquid.orders import (
+        SL_CLOID_SUFFIX,
+        TP_CLOID_SUFFIX,
+        client_order_id_to_cloid,
+    )
+
+    exchange = _connected(adapter)
+    exchange.info.name_to_coin = {}
+    client_id = "0x" + "ab" * 16
+    adapter._client_coins[client_id] = ("BTC", False)
+
+    def entry(oid: int, cloid: str, price: int, order_type: str) -> dict[str, object]:
+        return {
+            "coin": "BTC",
+            "side": "B",
+            "limitPx": str(price),
+            "sz": "0.01",
+            "oid": oid,
+            "timestamp": oid,
+            "origSz": "0.01",
+            "cloid": cloid,
+            "orderType": order_type,
+        }
+
+    bracket = [
+        entry(11, client_order_id_to_cloid(client_id), 50000, "Limit"),
+        entry(
+            12,
+            client_order_id_to_cloid(f"{client_id}:{TP_CLOID_SUFFIX}"),
+            60000,
+            "Take Profit Market",
+        ),
+        entry(
+            13,
+            client_order_id_to_cloid(f"{client_id}:{SL_CLOID_SUFFIX}"),
+            40000,
+            "Stop Market",
+        ),
+    ]
+    exchange.info.open_orders.return_value = bracket
+    exchange.info.frontend_open_orders.return_value = bracket
+    result = await adapter.fetch_open_orders()
+    assert set(result) == {client_id}
+    assert (result[client_id].platform_order_id, result[client_id].price) == (
+        "11",
+        Decimal("50000"),
+    )
+
+
 async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     exchange.info.name_to_coin = {}

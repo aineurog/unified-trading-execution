@@ -871,19 +871,26 @@ class HyperliquidAdapter(Adapter):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch every open order, keyed by client order id.
 
-        Entries carrying our cloid key by client id (derived children
-        included — they are real working orders); venue-created legs
-        without one key by platform oid; entries with neither id are
+        Derived TP/SL child legs are attachments of their parent in the
+        unified model, not orders of their own, so they are excluded — the
+        parent is reported, keyed by client id.  Venue-created legs we never
+        minted a cloid for key by platform oid; entries with neither id are
         skipped, never collapsed onto an empty key.
         """
         result: dict[str, OrderRecord] = {}
         cloid_to_client: dict[str, str] = {}
+        child_cloids: set[str] = set()
         for client_order_id in list(self._client_coins):
             cloid_to_client[client_order_id_to_cloid(client_order_id)] = client_order_id
-        for child_raw, (parent, _, _) in self._child_parents.items():
-            cloid_to_client[child_raw] = parent
+            child_cloids.update(
+                client_order_id_to_cloid(f"{client_order_id}:{suffix}")
+                for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+            )
+        child_cloids.update(self._child_parents)
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
+                continue
+            if str(entry.get("cloid") or "") in child_cloids:
                 continue
             try:
                 coin = str(entry.get("coin") or "")
