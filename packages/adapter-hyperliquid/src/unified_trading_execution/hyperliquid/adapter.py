@@ -57,7 +57,9 @@ from unified_trading_execution.hyperliquid.orders import (
     build_cancel_action,
     build_modify_action,
     build_place_order_action,
+    build_position_tpsl_action,
     client_order_id_to_cloid,
+    position_tpsl_cloid,
     max_limit_notional,
     max_market_notional,
     parse_order_result,
@@ -857,6 +859,29 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Position TP/SL modification ----
 
+    async def _open_leg(self, instrument: Instrument, position_id: str) -> Position | None:
+        """Return the open leg for ``position_id`` on ``instrument``'s coin, else None."""
+        coin = to_hyperliquid_coin(instrument)
+        for position in await self.fetch_positions():
+            if position.position_id == position_id and position.instrument.symbol == coin:
+                return position
+        return None
+
+    async def _position_tpsl_entries(self, position_id: str) -> dict[str, dict[str, Any]]:
+        """Open entries carrying our position cloids, keyed ``take_profit``/``stop_loss``."""
+        want = {
+            position_tpsl_cloid(position_id, TP_CLOID_SUFFIX): "take_profit",
+            position_tpsl_cloid(position_id, SL_CLOID_SUFFIX): "stop_loss",
+        }
+        found: dict[str, dict[str, Any]] = {}
+        for entry in await self._open_order_entries():
+            if not isinstance(entry, dict):
+                continue
+            side = want.get(str(entry.get("cloid") or ""))
+            if side is not None:
+                found[side] = entry
+        return found
+
     async def modify_position_tpsl(
         self,
         instrument: Instrument,
@@ -865,16 +890,138 @@ class HyperliquidAdapter(Adapter):
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
-        """Modify TP/SL on an open position via the ``positionTpsl`` grouping."""
-        raise NotImplementedError
+        """Attach or replace TP/SL on an open position via ``positionTpsl``.
+
+        Merge semantics: only mentioned sides are touched, unmentioned legs
+        stay working.  Legs are full-size at attach time (fixed-size — the
+        venue does not auto-resize API-placed legs, verified live), so
+        re-attach after resizing the leg.  Detach one side by cancelling its
+        leg (visible in ``fetch_open_orders`` keyed by cloid); both None
+        raises ``ValueError`` per the ABC contract.  No open leg reads back
+        as ``OrderNotFoundError``; spot raises ``InvalidSymbolError``.
+        """
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss must be provided")
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no position TP/SL")
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        leg = await self._open_leg(instrument, position_id)
+        if leg is None or leg.quantity == 0:
+            raise OrderNotFoundError(f"No open position {position_id!r} for {coin}")
+        spec = await self.fetch_instrument_spec(instrument)
+        lot_exponent = spec.lot_size.as_tuple().exponent
+        if not isinstance(lot_exponent, int):
+            raise PlatformError(f"InstrumentSpec has no usable lot_size for {coin}")
+        sz_decimals = -lot_exponent
+        for attachment in (take_profit, stop_loss):
+            if attachment is None:
+                continue
+            quantize_price(attachment.trigger_price, sz_decimals, is_spot=False)
+            if attachment.limit_price is not None:
+                quantize_price(attachment.limit_price, sz_decimals, is_spot=False)
+        existing = await self._position_tpsl_entries(position_id)
+        for side, attachment in (("take_profit", take_profit), ("stop_loss", stop_loss)):
+            entry = existing.get(side)
+            if entry is None or attachment is None:
+                continue
+            oid = entry.get("oid")
+            if oid is None or oid == "":
+                continue
+            try:
+                response = await self._run_exchange(exchange.cancel, coin, int(oid))
+                self._check_action_ok(response, context=f"replacing position {side} for {coin}")
+            except OrderNotFoundError:
+                continue  # leg vanished concurrently — the replace below still applies
+        requests, grouping = build_position_tpsl_action(
+            coin=coin,
+            position_id=position_id,
+            close_buy=leg.quantity < 0,
+            quantity=abs(leg.quantity),
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        for request in requests:
+            request["cloid"] = Cloid(request["cloid"])
+        response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
+        data = self._check_action_ok(response, context=f"setting position TP/SL for {coin}")
+        try:
+            statuses = data["response"]["data"]["statuses"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(
+                f"Unexpected order response shape {data!r} for position {position_id}"
+            ) from exc
+        if not isinstance(statuses, list) or not statuses:
+            raise PlatformError(f"Empty order statuses for position {position_id}")
+        raise_on_status_errors(statuses)
+        reasons = {"take_profit": FillReason.TAKE_PROFIT, "stop_loss": FillReason.STOP_LOSS}
+        for suffix, status in zip((TP_CLOID_SUFFIX, SL_CLOID_SUFFIX), statuses):
+            if not isinstance(status, dict):
+                continue
+            detail = status.get("resting") or status.get("filled") or {}
+            oid = detail.get("oid") if isinstance(detail, dict) else None
+            if oid is None or oid == "":
+                continue
+            self._oid_clients[str(oid)] = (
+                position_tpsl_cloid(position_id, suffix),
+                reasons[suffix],
+                FillEntry.OUT,
+            )
 
     async def get_position_tpsl(
         self,
         instrument: Instrument,
         position_id: str,
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
-        """Read the current TP/SL on an open position."""
-        raise NotImplementedError
+        """Read the current TP/SL on an open position via ``orderStatus``-by-cloid.
+
+        Returns ``(take_profit, stop_loss)`` with None per missing side, or
+        None when no leg is open at ``position_id``.  Reads are authoritative
+        per-leg queries (not the open-orders scan), so terminal legs read
+        back as missing rather than stale.
+        """
+        if instrument.asset_class == AssetClass.SPOT:
+            return None
+        if await self._open_leg(instrument, position_id) is None:
+            return None
+        exchange = self._require_exchange()
+        found: dict[str, TpSlAttachment] = {}
+        for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX):
+            raw = position_tpsl_cloid(position_id, suffix)
+            response = await self._run_exchange(
+                exchange.info.query_order_by_cloid, self._config.wallet_address, Cloid(raw)
+            )
+            if not isinstance(response, dict):
+                raise PlatformError(f"Unexpected orderStatus shape {response!r}")
+            if response.get("status") == "unknownOid":
+                continue
+            try:
+                payload = response["order"]
+                order_object = payload["order"]
+                status = payload.get("status")
+            except (KeyError, TypeError) as exc:
+                raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
+            if status in ("filled", "canceled"):
+                continue
+            try:
+                order_type = order_object.get("orderType")
+                if isinstance(order_type, dict):
+                    # Open-order entry shape: trigger descriptor is nested.
+                    trigger = order_type.get("trigger") or {}
+                    trigger_raw = trigger.get("triggerPx", order_object.get("triggerPx"))
+                    is_market = bool(trigger.get("isMarket", True))
+                else:
+                    # orderStatus shape: flat fields, market-ness in the
+                    # display string ("Take Profit Market", "Stop Limit", ...).
+                    trigger_raw = order_object.get("triggerPx")
+                    is_market = "Market" in str(order_type or "")
+                trigger_price = Decimal(str(trigger_raw))
+                limit_price = None if is_market else Decimal(str(order_object.get("limitPx")))
+            except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                raise PlatformError(f"orderStatus leg is not a trigger: {response!r}") from exc
+            side = "take_profit" if suffix == TP_CLOID_SUFFIX else "stop_loss"
+            found[side] = TpSlAttachment(trigger_price=trigger_price, limit_price=limit_price)
+        return found.get("take_profit"), found.get("stop_loss")
 
     # ---- Reconciliation data ----
 
