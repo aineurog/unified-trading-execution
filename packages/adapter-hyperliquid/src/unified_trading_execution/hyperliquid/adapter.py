@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
@@ -31,6 +31,7 @@ from unified_trading_execution.errors import (
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
+    RateLimitError,
 )
 from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
@@ -47,6 +48,15 @@ from unified_trading_execution.hyperliquid.events import (
     MarginModeApplyFailedEvent,
     MarginModeChangedEvent,
     MarginModeDriftEvent,
+)
+from unified_trading_execution.hyperliquid.rates import (
+    CONNECT_WEIGHT,
+    IP_WEIGHT_BUDGET_PER_MINUTE,
+    IP_WEIGHT_WINDOW_SECONDS,
+    RateBudget,
+    describe_call,
+    request_weight,
+    surcharge_weight,
 )
 from unified_trading_execution.hyperliquid.orders import (
     MAX_DECIMALS_PERPS,
@@ -146,6 +156,9 @@ class HyperliquidAdapter(Adapter):
         # InstrumentSpec cache with monotonic fetch times (TTL-governed).
         self._instrument_specs: dict[Instrument, tuple[InstrumentSpec, float]] = {}
         self._spec_ttl: float | None = config.instrument_spec_cache_ttl
+        # Local IP weight accounting (see ``rates``) — every SDK call flows
+        # through ``_run_exchange``; ``connect`` records construction directly.
+        self._rate_budget = RateBudget()
 
     # ---- Identification ----
 
@@ -247,6 +260,7 @@ class HyperliquidAdapter(Adapter):
                     f"Hyperliquid account abstraction {abstraction!r} is not supported — "
                     "unified account only"
                 )
+            self._rate_budget.record(CONNECT_WEIGHT)
         except (PlatformError, PlatformConnectionError):
             raise
         except ClientError as exc:
@@ -286,17 +300,29 @@ class HyperliquidAdapter(Adapter):
 
         Transport failures (HTTP 5xx, timeouts, drops) become
         ``PlatformConnectionError``; client errors (4xx) become
-        ``PlatformError``.  Venue ``{"status": "err"}`` envelopes do NOT
+        ``PlatformError`` — except HTTP 429, which becomes
+        ``RateLimitError``.  Venue ``{"status": "err"}`` envelopes do NOT
         raise here — the caller extracts and maps them via
         :meth:`_check_action_ok`, since only the caller knows the context.
+
+        Every completed or venue-rejected call records its IP weight
+        (base upfront, response surcharge after); requests that never
+        reached the venue (timeouts, drops) record nothing.
         """
         self._require_exchange()
+        name, batch_length = describe_call(func, args)
+        base = request_weight(name, batch_length=batch_length)
         try:
-            return await asyncio.to_thread(func, *args, **kwargs)
+            result = await asyncio.to_thread(func, *args, **kwargs)
         except ClientError as exc:
+            self._rate_budget.record(base)
+            if getattr(exc, "status_code", None) == 429:
+                raise RateLimitError(f"Hyperliquid rate limit exceeded: {exc}") from exc
             raise PlatformError(f"Hyperliquid request rejected: {exc}") from exc
         except (ServerError, requests.exceptions.RequestException) as exc:
             raise PlatformConnectionError(f"Hyperliquid request failed: {exc}") from exc
+        self._rate_budget.record(base + surcharge_weight(name, result))
+        return result
 
     @staticmethod
     def _check_action_ok(response: Any, *, context: str) -> Any:
@@ -764,8 +790,18 @@ class HyperliquidAdapter(Adapter):
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
-        """Return the live weight-budget state, not constants."""
-        raise NotImplementedError
+        """Return the live IP weight-budget state (locally tracked, no venue call).
+
+        WebSocket and address-action budgets are separate limiter regimes
+        this does not cover — see ``rates``.
+        """
+        now = _utcnow()
+        return RateLimits(
+            requests_per_interval=IP_WEIGHT_BUDGET_PER_MINUTE,
+            interval_seconds=IP_WEIGHT_WINDOW_SECONDS,
+            remaining=self._rate_budget.remaining(),
+            reset_at=now + timedelta(seconds=self._rate_budget.resets_in()),
+        )
 
     # ---- Market data ----
 
@@ -941,6 +977,8 @@ class HyperliquidAdapter(Adapter):
         filters; a client-side guard holds the boundary).  Entries dedupe
         on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
         children by parent with their reason), unknown oids key by raw oid.
+        Costs one open-orders scan (both shapes) for oid attribution plus
+        the fills call itself.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
