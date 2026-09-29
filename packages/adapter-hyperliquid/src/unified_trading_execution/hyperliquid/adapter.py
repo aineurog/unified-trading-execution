@@ -49,15 +49,6 @@ from unified_trading_execution.hyperliquid.events import (
     MarginModeChangedEvent,
     MarginModeDriftEvent,
 )
-from unified_trading_execution.hyperliquid.rates import (
-    CONNECT_WEIGHT,
-    IP_WEIGHT_BUDGET_PER_MINUTE,
-    IP_WEIGHT_WINDOW_SECONDS,
-    RateBudget,
-    describe_call,
-    request_weight,
-    surcharge_weight,
-)
 from unified_trading_execution.hyperliquid.orders import (
     MAX_DECIMALS_PERPS,
     MAX_DECIMALS_SPOT,
@@ -74,6 +65,15 @@ from unified_trading_execution.hyperliquid.orders import (
     raise_on_status_errors,
     round_price_to_tick,
     validate_size,
+)
+from unified_trading_execution.hyperliquid.rates import (
+    CONNECT_WEIGHT,
+    IP_WEIGHT_BUDGET_PER_MINUTE,
+    IP_WEIGHT_WINDOW_SECONDS,
+    RateBudget,
+    describe_call,
+    request_weight,
+    surcharge_weight,
 )
 from unified_trading_execution.hyperliquid.signing import (
     assert_user_role_for_signing,
@@ -306,8 +306,9 @@ class HyperliquidAdapter(Adapter):
         :meth:`_check_action_ok`, since only the caller knows the context.
 
         Every completed or venue-rejected call records its IP weight
-        (base upfront, response surcharge after); requests that never
-        reached the venue (timeouts, drops) record nothing.
+        (base upfront, response surcharge after) — a 5xx is a venue
+        response and bills too; only requests that never reached the venue
+        (timeouts, drops) record nothing.
         """
         self._require_exchange()
         name, batch_length = describe_call(func, args)
@@ -319,7 +320,10 @@ class HyperliquidAdapter(Adapter):
             if getattr(exc, "status_code", None) == 429:
                 raise RateLimitError(f"Hyperliquid rate limit exceeded: {exc}") from exc
             raise PlatformError(f"Hyperliquid request rejected: {exc}") from exc
-        except (ServerError, requests.exceptions.RequestException) as exc:
+        except ServerError as exc:
+            self._rate_budget.record(base)
+            raise PlatformConnectionError(f"Hyperliquid request failed: {exc}") from exc
+        except requests.exceptions.RequestException as exc:
             raise PlatformConnectionError(f"Hyperliquid request failed: {exc}") from exc
         self._rate_budget.record(base + surcharge_weight(name, result))
         return result

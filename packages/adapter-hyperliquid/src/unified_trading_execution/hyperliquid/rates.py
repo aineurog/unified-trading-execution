@@ -146,7 +146,11 @@ class RateBudget:
         return max(0, self._budget - self.spent())
 
     def resets_in(self) -> float:
-        """Seconds until the window fully clears (0 when nothing tracked)."""
+        """Seconds until the oldest recorded spend ages out (0 when nothing tracked).
+
+        With a sliding window there is no single reset instant: this is when
+        the budget first starts recovering, not when it returns to full.
+        """
         with self._lock:
             now = self._time_fn()
             self._prune(now)

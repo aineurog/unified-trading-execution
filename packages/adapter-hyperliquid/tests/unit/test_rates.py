@@ -7,10 +7,14 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+import requests
+from hyperliquid.utils.error import ClientError, ServerError
 
-from hyperliquid.utils.error import ClientError
-
-from unified_trading_execution.errors import PlatformError, RateLimitError
+from unified_trading_execution.errors import (
+    PlatformConnectionError,
+    PlatformError,
+    RateLimitError,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.hyperliquid.rates import (
@@ -180,6 +184,22 @@ async def test_run_exchange_429_maps_to_rate_limit() -> None:
     with pytest.raises(RateLimitError, match="rate limit"):
         await adapter._run_exchange(adapter._exchange.info.user_state, _TEST_ADDRESS)
     assert adapter._rate_budget.spent() == 2  # rejected calls still spent budget
+
+
+async def test_run_exchange_5xx_records_base_weight() -> None:
+    """A 5xx is a venue response — it reached the venue, so it bills."""
+    adapter = _adapter_with(_FakeInfo(error=ServerError(500, "internal error")))
+    with pytest.raises(PlatformConnectionError):
+        await adapter._run_exchange(adapter._exchange.info.user_state, _TEST_ADDRESS)
+    assert adapter._rate_budget.spent() == 2
+
+
+async def test_run_exchange_transport_failure_records_nothing() -> None:
+    """A dropped request never reached the venue — it must not bill."""
+    adapter = _adapter_with(_FakeInfo(error=requests.exceptions.ConnectionError("drop")))
+    with pytest.raises(PlatformConnectionError):
+        await adapter._run_exchange(adapter._exchange.info.user_state, _TEST_ADDRESS)
+    assert adapter._rate_budget.spent() == 0
 
 
 async def test_run_exchange_other_4xx_stays_platform_error() -> None:
