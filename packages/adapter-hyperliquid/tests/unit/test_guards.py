@@ -12,6 +12,7 @@ from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.events import Event, EventBus
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
+from unified_trading_execution.hyperliquid.errors import LeverageDriftError
 from unified_trading_execution.hyperliquid.events import LeverageDriftEvent
 from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument
@@ -206,7 +207,7 @@ async def test_strict_notify_rejects_order() -> None:
     adapter, _, seen = _adapter(
         {"leverage:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
     )
-    with pytest.raises(PlatformError, match="differs from intent"):
+    with pytest.raises(LeverageDriftError, match="differs from intent"):
         await adapter._strict_check_leverage(_perp())
     _exchange_of(adapter).update_leverage.assert_not_called()
     (drift,) = [e for e in seen if isinstance(e, LeverageDriftEvent)]
@@ -220,7 +221,7 @@ async def test_strict_halt_rejects_and_halts() -> None:
     )
     halt = MagicMock()
     adapter.attach_halt_machine(halt)
-    with pytest.raises(PlatformError, match="differs from intent"):
+    with pytest.raises(LeverageDriftError, match="differs from intent"):
         await adapter._strict_check_leverage(_perp())
     halt.enter_halt.assert_called_once()
     (drift,) = [e for e in seen if isinstance(e, LeverageDriftEvent)]
@@ -249,6 +250,6 @@ async def test_place_order_hook_rejects_on_unrepaired_drift() -> None:
         time_in_force=TimeInForce.GTC,
         client_order_id="strict-hook-1",
     )
-    with pytest.raises(PlatformError, match="differs from intent"):
+    with pytest.raises(LeverageDriftError, match="differs from intent"):
         await adapter.place_order(order)
     _exchange_of(adapter).bulk_orders.assert_not_called()

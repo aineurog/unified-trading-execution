@@ -35,7 +35,11 @@ from unified_trading_execution.errors import (
 from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
-from unified_trading_execution.hyperliquid.errors import map_hyperliquid_error
+from unified_trading_execution.hyperliquid.errors import (
+    LeverageDriftError,
+    LeverageExceedsMaxError,
+    map_hyperliquid_error,
+)
 from unified_trading_execution.hyperliquid.events import (
     LeverageAppliedEvent,
     LeverageApplyFailedEvent,
@@ -1133,7 +1137,7 @@ class HyperliquidAdapter(Adapter):
 
         Owns the leverage number only — the mode resolves stored intent,
         else venue, else default.  Above the tier cap raises
-        ``InvalidOrderError`` (never clamped); spot raises
+        ``LeverageExceedsMaxError`` (never clamped); spot raises
         ``InvalidSymbolError``.  The store is required up front so the venue
         is never mutated when intent cannot be persisted.  With the default
         ``block_on_open_position`` an open leg refuses the change (the venue
@@ -1155,7 +1159,7 @@ class HyperliquidAdapter(Adapter):
             )
         cap = await self._tier_max_leverage(coin)
         if leverage > cap:
-            raise InvalidOrderError(f"Leverage {leverage} exceeds max {cap} for {coin}")
+            raise LeverageExceedsMaxError(f"Leverage {leverage} exceeds max {cap} for {coin}")
         await self._submit_leverage(coin, leverage, await self._resolved_is_cross(coin))
         await store.set_adapter_config(f"leverage:{coin}", str(leverage))
         await store.set_adapter_config(f"leverage.on_drift:{coin}", on_drift)
@@ -1507,7 +1511,7 @@ class HyperliquidAdapter(Adapter):
         passes, since nothing contradicts intent and the submit ack is the
         verification.  On drift the coin's ``on_drift`` policy executes
         exactly as reconcile does; anything but reapply rejects the order
-        with ``PlatformError``.
+        with ``LeverageDriftError``.
         """
         coin = to_hyperliquid_coin(instrument)
         raw = await self._policy_knob("leverage", _POLICY_KNOB_STRICT_CHECK, coin)
@@ -1521,7 +1525,7 @@ class HyperliquidAdapter(Adapter):
         legs = {coin: venue} if venue is not None else {}
         action = await self._reconcile_leverage_row(coin, intent, legs=legs)
         if action is not None and action != "reapplied":
-            raise PlatformError(
+            raise LeverageDriftError(
                 f"Platform leverage differs from intent {intent} for {coin}"
             )
 
