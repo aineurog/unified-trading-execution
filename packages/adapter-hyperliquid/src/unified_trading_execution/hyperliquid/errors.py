@@ -42,6 +42,25 @@ class OpenInterestCapError(InvalidOrderError):
     """
 
 
+class LeverageExceedsMaxError(InvalidOrderError):
+    """Leverage above the venue tier cap (the doc-named error).
+
+    Subtypes core ``InvalidOrderError`` rather than deriving ``UteError``
+    directly as Bybit's same-named type does, so existing ``except
+    InvalidOrderError`` handlers keep catching it; the distinct name lets
+    callers separate "over the cap" from other invalid orders.
+    """
+
+
+class LeverageDriftError(UteError):
+    """Platform leverage differs from stored intent and the order is rejected.
+
+    Raised by the pre-order strict check under the notify/halt policies.
+    Mirrors Bybit's type exactly (``UteError``-direct): it is neither an
+    invalid order nor a platform failure, so callers match it by name.
+    """
+
+
 # Cancel-path message; the venue appends " asset=<id>" (observed live —
 # the reference shows the bare sentence), so this matches by prefix.
 _MISSING_ORDER_PREFIX = "Order was never placed, already canceled, or filled."

@@ -15,6 +15,7 @@ from unified_trading_execution.errors import (
 )
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
+from unified_trading_execution.hyperliquid.errors import LeverageExceedsMaxError
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
 
@@ -85,6 +86,20 @@ def _leg(coin: str = "BTC", value: int = 20, kind: str = "isolated") -> dict[str
     }
 
 
+def _exchange_of(adapter: HyperliquidAdapter) -> MagicMock:
+    """Narrow the mocked exchange — fails loudly if no mock is attached."""
+    exchange = adapter._exchange
+    assert isinstance(exchange, MagicMock)
+    return exchange
+
+
+def _store_of(adapter: HyperliquidAdapter) -> MagicMock:
+    """Narrow the mocked store — fails loudly if no mock is attached."""
+    store = adapter._state_store
+    assert isinstance(store, MagicMock)
+    return store
+
+
 def _adapter(store_data: dict[str, str] | None = None, **kwargs: Any) -> HyperliquidAdapter:
     from unified_trading_execution.events import EventBus
 
@@ -99,17 +114,17 @@ def _adapter(store_data: dict[str, str] | None = None, **kwargs: Any) -> Hyperli
 async def test_set_leverage_submits_and_persists() -> None:
     adapter = _adapter()
     await adapter.set_leverage(_perp(), leverage=10)
-    _, args, kwargs = adapter._exchange.update_leverage.mock_calls[0]
+    _, args, kwargs = _exchange_of(adapter).update_leverage.mock_calls[0]
     assert (args[0], args[2] if len(args) > 2 else kwargs.get("is_cross")) == (10, True)
-    backing = adapter._state_store.backing
-    assert backing["leverage:BTC"] == "10"
+    backing = _store_of(adapter).backing
+    assert backing["leverage.value:BTC"] == "10"
     assert backing["leverage.on_drift:BTC"] == "reapply"
 
 
 async def test_set_leverage_preserves_stored_isolated_mode() -> None:
-    adapter = _adapter({"margin_mode:BTC": "isolated"})
+    adapter = _adapter({"margin.mode:BTC": "isolated"})
     await adapter.set_leverage(_perp(), leverage=5)
-    _, args, kwargs = adapter._exchange.update_leverage.mock_calls[0]
+    _, args, kwargs = _exchange_of(adapter).update_leverage.mock_calls[0]
     is_cross = args[2] if len(args) > 2 else kwargs.get("is_cross")
     assert is_cross is False
 
@@ -119,14 +134,14 @@ async def test_set_leverage_rejects_bad_values(leverage: Any) -> None:
     adapter = _adapter()
     with pytest.raises(InvalidOrderError):
         await adapter.set_leverage(_perp(), leverage=leverage)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_set_leverage_rejects_above_tier_cap() -> None:
     adapter = _adapter()
-    with pytest.raises(InvalidOrderError, match="exceeds max"):
+    with pytest.raises(LeverageExceedsMaxError, match="exceeds max"):
         await adapter.set_leverage(_perp(), leverage=41)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_set_leverage_rejects_spot() -> None:
@@ -153,29 +168,29 @@ async def test_get_leverage_none_without_leg_or_spot() -> None:
 
 
 async def test_remove_leverage() -> None:
-    adapter = _adapter({"leverage:BTC": "5", "leverage.on_drift:BTC": "halt"})
+    adapter = _adapter({"leverage.value:BTC": "5", "leverage.on_drift:BTC": "halt"})
     await adapter.remove_leverage(_perp())
-    assert adapter._state_store.backing == {}
-    adapter._exchange.update_leverage.assert_not_called()
+    assert _store_of(adapter).backing == {}
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_top_up_submits_delta() -> None:
     adapter = _adapter()
     await adapter.top_up_isolated_margin(_perp(), amount_usdc=Decimal("25.5"))
-    _, args, _ = adapter._exchange.update_isolated_margin.mock_calls[0]
+    _, args, _ = _exchange_of(adapter).update_isolated_margin.mock_calls[0]
     assert args[0] == 25.5
     with pytest.raises(InvalidSymbolError):
         await adapter.top_up_isolated_margin(_spot(), amount_usdc=Decimal("1"))
 
 
 async def test_set_margin_mode_preserves_leverage() -> None:
-    adapter = _adapter({"leverage:BTC": "7"})
+    adapter = _adapter({"leverage.value:BTC": "7"})
     await adapter.set_margin_mode(_perp(), "isolated")
-    _, args, kwargs = adapter._exchange.update_leverage.mock_calls[0]
+    _, args, kwargs = _exchange_of(adapter).update_leverage.mock_calls[0]
     assert args[0] == 7
     is_cross = args[2] if len(args) > 2 else kwargs.get("is_cross")
     assert is_cross is False
-    assert adapter._state_store.backing["margin_mode:BTC"] == "isolated"
+    assert _store_of(adapter).backing["margin.mode:BTC"] == "isolated"
 
 
 async def test_set_margin_mode_rejects() -> None:
@@ -184,46 +199,46 @@ async def test_set_margin_mode_rejects() -> None:
         await adapter.set_margin_mode(_perp(), "portfolio")  # type: ignore[arg-type]
     with pytest.raises(InvalidSymbolError):
         await adapter.set_margin_mode(_spot(), MarginMode.CROSS)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_get_remove_margin_mode() -> None:
     adapter = _adapter(legs=[_leg(kind="cross", value=3)])
     assert await adapter.get_margin_mode(_perp()) is MarginMode.CROSS
     await adapter.remove_margin_mode(_perp())
-    assert adapter._state_store.backing == {}
+    assert _store_of(adapter).backing == {}
     empty = _adapter()
     assert await empty.get_margin_mode(_perp()) is None
 
 
 async def test_reconcile_reapplies_drift() -> None:
     adapter = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "reapply"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "reapply"}, legs=[_leg(value=5)]
     )
     await adapter.reconcile_user_intent()
-    _, args, _ = adapter._exchange.update_leverage.mock_calls[0]
+    _, args, _ = _exchange_of(adapter).update_leverage.mock_calls[0]
     assert args[0] == 10
 
 
 async def test_reconcile_notify_does_not_submit() -> None:
     adapter = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
     )
     await adapter.reconcile_user_intent()
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_reconcile_halt_without_machine_logs() -> None:
     adapter = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
     )
     await adapter.reconcile_user_intent()  # no halt machine: logs, no submit, no raise
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_reconcile_halt_enters_halt() -> None:
     adapter = _adapter(
-        {"margin_mode:BTC": "cross", "margin_mode.on_drift:BTC": "halt"},
+        {"margin.mode:BTC": "cross", "margin.mode.on_drift:BTC": "halt"},
         legs=[_leg(kind="isolated")],
     )
     halt = MagicMock()
@@ -232,13 +247,35 @@ async def test_reconcile_halt_enters_halt() -> None:
     await adapter.reconcile_user_intent()
     halt.enter_halt.assert_called_once()
     assert halt.enter_halt.call_args[1]["reason"] == "margin_mode_drift"
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_reconcile_matching_does_nothing() -> None:
-    adapter = _adapter({"leverage:BTC": "20"}, legs=[_leg(value=20, kind="cross")])
+    adapter = _adapter({"leverage.value:BTC": "20"}, legs=[_leg(value=20, kind="cross")])
     await adapter.reconcile_user_intent()
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
+
+
+async def test_reconcile_fetches_venue_state_once_per_pass() -> None:
+    """Three drifted coins share two user_state fetches, not six."""
+    adapter = _adapter(
+        {
+            "leverage.value:BTC": "10",
+            "leverage.value:ETH": "10",
+            "leverage.value:SOL": "10",
+            "margin.mode:BTC": "cross",
+            "margin.mode:ETH": "cross",
+            "margin.mode:SOL": "cross",
+        },
+        legs=[
+            _leg(coin="BTC", value=5, kind="isolated"),
+            _leg(coin="ETH", value=5, kind="isolated"),
+            _leg(coin="SOL", value=5, kind="isolated"),
+        ],
+    )
+    await adapter.reconcile_user_intent()
+    assert _exchange_of(adapter).info.user_state.call_count == 2
+    assert _exchange_of(adapter).update_leverage.call_count == 6
 
 
 async def test_reconcile_without_store_returns() -> None:
@@ -258,7 +295,7 @@ async def test_intent_requires_store() -> None:
     adapter._connected = True
     with pytest.raises(PlatformError, match="state_store"):
         await adapter.set_leverage(_perp(), leverage=2)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_margin_mode_requires_store_without_mutating() -> None:
@@ -271,7 +308,7 @@ async def test_margin_mode_requires_store_without_mutating() -> None:
     adapter._connected = True
     with pytest.raises(PlatformError, match="state_store"):
         await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_connect_reapplies_auto_apply() -> None:
@@ -282,7 +319,7 @@ async def test_connect_reapplies_auto_apply() -> None:
     config = HyperliquidConfig(wallet_address=_TEST_ADDRESS, private_key=_TEST_KEY, testnet=True)
     event_bus = EventBus()
     adapter = HyperliquidAdapter(config, event_bus=event_bus)
-    adapter.attach_state_store(_store_mock({"leverage:BTC": "9", "margin_mode:BTC": "cross"}))
+    adapter.attach_state_store(_store_mock({"leverage.value:BTC": "9", "margin.mode:BTC": "cross"}))
     exchange = _exchange_mock(legs=[_leg(value=9, kind="cross")])
     with patch("unified_trading_execution.hyperliquid.adapter.Exchange", return_value=exchange):
         exchange.info.user_role.return_value = {"role": "agent"}
