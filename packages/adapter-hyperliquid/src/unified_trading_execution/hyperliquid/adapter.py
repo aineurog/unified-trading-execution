@@ -988,21 +988,29 @@ class HyperliquidAdapter(Adapter):
             )
         return self._state_store
 
-    async def _venue_leverage(self, coin: str) -> tuple[int, bool] | None:
-        """Read live ``(leverage, is_cross)`` for a coin; None with no open leg."""
+    async def _venue_leverage_map(self) -> dict[str, tuple[int, bool]]:
+        """Read live ``{coin: (leverage, is_cross)}`` for every open leg in one fetch."""
         exchange = self._require_exchange()
         state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
         legs = state.get("assetPositions") if isinstance(state, dict) else None
+        result: dict[str, tuple[int, bool]] = {}
         for leg in legs or []:
             position = leg.get("position") if isinstance(leg, dict) else None
-            if not isinstance(position, dict) or position.get("coin") != coin:
+            if not isinstance(position, dict):
+                continue
+            coin = position.get("coin")
+            if not coin:
                 continue
             leverage = position.get("leverage") or {}
             try:
-                return int(leverage.get("value", 1)), leverage.get("type") == "cross"
+                result[str(coin)] = int(leverage.get("value", 1)), leverage.get("type") == "cross"
             except (TypeError, ValueError):
-                return None
-        return None
+                continue
+        return result
+
+    async def _venue_leverage(self, coin: str) -> tuple[int, bool] | None:
+        """Read live ``(leverage, is_cross)`` for a coin; None with no open leg."""
+        return (await self._venue_leverage_map()).get(coin)
 
     async def _tier_max_leverage(self, coin: str) -> int:
         """Effective max leverage: universe max capped by the zero-position tier."""
@@ -1058,22 +1066,34 @@ class HyperliquidAdapter(Adapter):
         except ValueError:
             return None
 
-    async def _resolved_is_cross(self, coin: str) -> bool:
-        """Mode for an ``updateLeverage`` call: stored intent, else venue, else default."""
+    async def _resolved_is_cross(
+        self, coin: str, *, legs: dict[str, tuple[int, bool]] | None = None
+    ) -> bool:
+        """Mode for an ``updateLeverage`` call: stored intent, else venue, else default.
+
+        ``legs`` is a pre-fetched :meth:`_venue_leverage_map` snapshot, sparing
+        one ``userState`` call per coin on multi-coin passes.
+        """
         stored = await self._stored_margin_mode(coin)
         if stored is not None:
             return stored is MarginMode.CROSS
-        venue = await self._venue_leverage(coin)
+        venue = legs.get(coin) if legs is not None else await self._venue_leverage(coin)
         if venue is not None:
             return venue[1]
         return self._config.default_margin_mode is MarginMode.CROSS
 
-    async def _resolved_leverage(self, coin: str) -> int:
-        """Leverage for an ``updateLeverage`` call: stored intent, else venue, else default."""
+    async def _resolved_leverage(
+        self, coin: str, *, legs: dict[str, tuple[int, bool]] | None = None
+    ) -> int:
+        """Leverage for an ``updateLeverage`` call: stored intent, else venue, else default.
+
+        ``legs`` is a pre-fetched :meth:`_venue_leverage_map` snapshot, sparing
+        one ``userState`` call per coin on multi-coin passes.
+        """
         stored = await self._stored_leverage(coin)
         if stored is not None:
             return stored
-        venue = await self._venue_leverage(coin)
+        venue = legs.get(coin) if legs is not None else await self._venue_leverage(coin)
         if venue is not None:
             return venue[0]
         return self._config.default_leverage
@@ -1232,8 +1252,10 @@ class HyperliquidAdapter(Adapter):
             scope="instrument", instrument=instrument, reason=reason, detail=detail
         )
 
-    async def _reconcile_leverage_row(self, coin: str, stored: int) -> None:
-        venue = await self._venue_leverage(coin)
+    async def _reconcile_leverage_row(
+        self, coin: str, stored: int, *, legs: dict[str, tuple[int, bool]]
+    ) -> None:
+        venue = legs.get(coin)
         if venue is None:
             return
         if venue[0] == stored:
@@ -1244,14 +1266,16 @@ class HyperliquidAdapter(Adapter):
         on_drift = policy or "reapply"
         detail = f"stored={stored} venue={venue[0]}"
         if on_drift == "reapply":
-            await self._submit_leverage(coin, stored, await self._resolved_is_cross(coin))
+            await self._submit_leverage(coin, stored, await self._resolved_is_cross(coin, legs=legs))
         elif on_drift == "notify":
             logger.warning("Leverage drift on %s: %s", coin, detail)
         else:
             await self._halt_for_drift(coin, reason="leverage_drift", detail=detail)
 
-    async def _reconcile_margin_row(self, coin: str, stored: MarginMode) -> None:
-        venue = await self._venue_leverage(coin)
+    async def _reconcile_margin_row(
+        self, coin: str, stored: MarginMode, *, legs: dict[str, tuple[int, bool]]
+    ) -> None:
+        venue = legs.get(coin)
         if venue is None:
             return
         if (venue[1] and stored is MarginMode.CROSS) or (
@@ -1265,7 +1289,7 @@ class HyperliquidAdapter(Adapter):
         detail = f"stored={stored.value} venue={'cross' if venue[1] else 'isolated'}"
         if on_drift == "reapply":
             await self._submit_leverage(
-                coin, await self._resolved_leverage(coin), stored is MarginMode.CROSS
+                coin, await self._resolved_leverage(coin, legs=legs), stored is MarginMode.CROSS
             )
         elif on_drift == "notify":
             logger.warning("Margin mode drift on %s: %s", coin, detail)
@@ -1281,6 +1305,9 @@ class HyperliquidAdapter(Adapter):
         """
         if self._state_store is None:
             return
+        # One userState fetch per pass — a row never changes another coin's
+        # venue state, so a pass snapshot reads exactly what per-row fetches did.
+        legs = await self._venue_leverage_map()
         for key, value in (await self._state_store.list_adapter_config("leverage:")).items():
             coin = self._decode_lev_intent_key(key)
             if coin is None:
@@ -1290,9 +1317,10 @@ class HyperliquidAdapter(Adapter):
             except ValueError:
                 continue
             try:
-                await self._reconcile_leverage_row(coin, stored)
+                await self._reconcile_leverage_row(coin, stored, legs=legs)
             except Exception:
                 logger.exception("Leverage reconcile failed for %s", coin)
+        legs = await self._venue_leverage_map()
         for key, value in (await self._state_store.list_adapter_config("margin_mode:")).items():
             coin = self._decode_mode_intent_key(key)
             if coin is None:
@@ -1302,7 +1330,7 @@ class HyperliquidAdapter(Adapter):
             except ValueError:
                 continue
             try:
-                await self._reconcile_margin_row(coin, stored_mode)
+                await self._reconcile_margin_row(coin, stored_mode, legs=legs)
             except Exception:
                 logger.exception("Margin mode reconcile failed for %s", coin)
 
@@ -1310,6 +1338,7 @@ class HyperliquidAdapter(Adapter):
         """Impose auto-apply stored intent after connect; failures never break connect."""
         if self._state_store is None:
             return
+        legs = await self._venue_leverage_map()
         for key, value in (await self._state_store.list_adapter_config("leverage:")).items():
             coin = self._decode_lev_intent_key(key)
             if coin is None:
@@ -1317,9 +1346,12 @@ class HyperliquidAdapter(Adapter):
             try:
                 if await self._state_store.get_adapter_config(f"leverage.auto_apply:{coin}") == "0":
                     continue
-                await self._submit_leverage(coin, int(value), await self._resolved_is_cross(coin))
+                await self._submit_leverage(
+                    coin, int(value), await self._resolved_is_cross(coin, legs=legs)
+                )
             except Exception:
                 logger.exception("Leverage reapply failed for %s on connect", coin)
+        legs = await self._venue_leverage_map()
         for key, value in (await self._state_store.list_adapter_config("margin_mode:")).items():
             coin = self._decode_mode_intent_key(key)
             if coin is None:
@@ -1331,7 +1363,9 @@ class HyperliquidAdapter(Adapter):
                 ):
                     continue
                 await self._submit_leverage(
-                    coin, await self._resolved_leverage(coin), MarginMode(value) is MarginMode.CROSS
+                    coin,
+                    await self._resolved_leverage(coin, legs=legs),
+                    MarginMode(value) is MarginMode.CROSS,
                 )
             except Exception:
                 logger.exception("Margin mode reapply failed for %s on connect", coin)
