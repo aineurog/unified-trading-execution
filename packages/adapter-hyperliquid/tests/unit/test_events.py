@@ -133,7 +133,7 @@ def _assert_identity(event: Event) -> None:
 
 
 async def test_set_margin_mode_emits_changed_with_stored_previous() -> None:
-    adapter, _, seen = _adapter({"margin_mode:BTC": "cross"})
+    adapter, _, seen = _adapter({"margin.mode:BTC": "cross"})
     await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
     (changed,) = _of_type(seen, MarginModeChangedEvent)
     assert isinstance(changed, MarginModeChangedEvent)
@@ -164,7 +164,7 @@ async def test_set_margin_mode_emits_changed_with_none_previous() -> None:
 
 
 async def test_set_margin_mode_no_event_when_unchanged() -> None:
-    adapter, _, seen = _adapter({"margin_mode:BTC": "isolated"})
+    adapter, _, seen = _adapter({"margin.mode:BTC": "isolated"})
     await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
     assert _of_type(seen, MarginModeChangedEvent) == []
 
@@ -187,7 +187,7 @@ def _exchange_of_update(adapter: HyperliquidAdapter) -> Any:
 
 async def test_reconcile_lev_reapply_emits_drift_only() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "reapply"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "reapply"}, legs=[_leg(value=5)]
     )
     await adapter.reconcile_user_intent()
     (drift,) = _of_type(seen, LeverageDriftEvent)
@@ -200,7 +200,7 @@ async def test_reconcile_lev_reapply_emits_drift_only() -> None:
 
 async def test_reconcile_lev_notify_emits_drift_without_submit() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
     )
     await adapter.reconcile_user_intent()
     (drift,) = _of_type(seen, LeverageDriftEvent)
@@ -213,7 +213,7 @@ async def test_reconcile_lev_notify_emits_drift_without_submit() -> None:
 
 async def test_reconcile_lev_halt_emits_drift_then_halts() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
     )
     halt = MagicMock()
     adapter.attach_halt_machine(halt)
@@ -226,7 +226,7 @@ async def test_reconcile_lev_halt_emits_drift_then_halts() -> None:
 
 async def test_reconcile_lev_submit_failure_emits_failed() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "reapply"},
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "reapply"},
         legs=[_leg(value=5)],
         fail_submit=True,
     )
@@ -241,7 +241,7 @@ async def test_reconcile_lev_submit_failure_emits_failed() -> None:
 
 async def test_reconcile_mode_reapply_emits_drift() -> None:
     adapter, _, seen = _adapter(
-        {"margin_mode:BTC": "cross", "margin_mode.on_drift:BTC": "reapply"},
+        {"margin.mode:BTC": "cross", "margin.mode.on_drift:BTC": "reapply"},
         legs=[_leg(value=10, kind="isolated")],
     )
     await adapter.reconcile_user_intent()
@@ -255,7 +255,7 @@ async def test_reconcile_mode_reapply_emits_drift() -> None:
 
 async def test_reconcile_mode_notify_and_halt() -> None:
     adapter, _, seen = _adapter(
-        {"margin_mode:BTC": "cross", "margin_mode.on_drift:BTC": "notify"},
+        {"margin.mode:BTC": "cross", "margin.mode.on_drift:BTC": "notify"},
         legs=[_leg(value=10, kind="isolated")],
     )
     await adapter.reconcile_user_intent()
@@ -264,7 +264,7 @@ async def test_reconcile_mode_notify_and_halt() -> None:
     assert drift.action_taken == "notified"
 
     adapter2, _, seen2 = _adapter(
-        {"margin_mode:BTC": "cross", "margin_mode.on_drift:BTC": "halt"},
+        {"margin.mode:BTC": "cross", "margin.mode.on_drift:BTC": "halt"},
         legs=[_leg(value=10, kind="isolated")],
     )
     halt = MagicMock()
@@ -278,7 +278,7 @@ async def test_reconcile_mode_notify_and_halt() -> None:
 
 async def test_reconcile_mode_submit_failure_emits_failed() -> None:
     adapter, _, seen = _adapter(
-        {"margin_mode:BTC": "cross", "margin_mode.on_drift:BTC": "reapply"},
+        {"margin.mode:BTC": "cross", "margin.mode.on_drift:BTC": "reapply"},
         legs=[_leg(value=10, kind="isolated")],
         fail_submit=True,
     )
@@ -292,7 +292,7 @@ async def test_reconcile_mode_submit_failure_emits_failed() -> None:
 
 async def test_reconcile_spot_child_resolves_through_pair_table() -> None:
     adapter, _, seen = _adapter(
-        {"margin_mode:@107": "cross", "margin_mode.on_drift:@107": "reapply"},
+        {"margin.mode:@107": "cross", "margin.mode.on_drift:@107": "reapply"},
         legs=[_leg(coin="@107", value=10, kind="isolated")],
         pair_coins={"HYPE/USDC": "@107"},
     )
@@ -304,7 +304,7 @@ async def test_reconcile_spot_child_resolves_through_pair_table() -> None:
 
 async def test_reconcile_skips_unresolvable_coin_without_submit() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BAD:COIN": "10"},
+        {"leverage.value:BAD:COIN": "10"},
         legs=[_leg(coin="BAD:COIN", value=5)],
     )
     await adapter.reconcile_user_intent()
@@ -316,7 +316,7 @@ async def test_reconcile_skips_unresolvable_coin_without_submit() -> None:
 
 async def test_reapply_on_connect_emits_applied() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "9", "leverage.auto_apply:BTC": "1"}, legs=[_leg(value=9)]
+        {"leverage.value:BTC": "9", "leverage.auto_apply:BTC": "1"}, legs=[_leg(value=9)]
     )
     await adapter._reapply_stored_intent()
     (applied,) = _of_type(seen, LeverageAppliedEvent)
@@ -327,7 +327,7 @@ async def test_reapply_on_connect_emits_applied() -> None:
 
 async def test_reapply_on_connect_emits_failed() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "9", "leverage.auto_apply:BTC": "1"},
+        {"leverage.value:BTC": "9", "leverage.auto_apply:BTC": "1"},
         legs=[_leg(value=5)],
         fail_submit=True,
     )
@@ -340,7 +340,7 @@ async def test_reapply_on_connect_emits_failed() -> None:
 
 async def test_reapply_mode_emits_changed_only_on_change() -> None:
     adapter, _, seen = _adapter(
-        {"margin_mode:BTC": "cross"}, legs=[_leg(value=10, kind="isolated")]
+        {"margin.mode:BTC": "cross"}, legs=[_leg(value=10, kind="isolated")]
     )
     await adapter._reapply_stored_intent()
     (changed,) = _of_type(seen, MarginModeChangedEvent)
@@ -349,7 +349,7 @@ async def test_reapply_mode_emits_changed_only_on_change() -> None:
     assert changed.current is MarginMode.CROSS
 
     adapter2, _, seen2 = _adapter(
-        {"margin_mode:BTC": "cross"}, legs=[_leg(value=10, kind="cross")]
+        {"margin.mode:BTC": "cross"}, legs=[_leg(value=10, kind="cross")]
     )
     await adapter2._reapply_stored_intent()
     assert _of_type(seen2, MarginModeChangedEvent) == []

@@ -117,7 +117,7 @@ async def test_set_leverage_blocked_with_open_leg() -> None:
     with pytest.raises(PlatformError, match="open position"):
         await adapter.set_leverage(_perp(), leverage=10)
     _exchange_of(adapter).update_leverage.assert_not_called()
-    assert _store_of(adapter).backing.get("leverage:BTC") is None
+    assert _store_of(adapter).backing.get("leverage.value:BTC") is None
     assert seen == []
 
 
@@ -183,19 +183,19 @@ async def test_strict_disabled_makes_no_venue_call() -> None:
 
 
 async def test_strict_passes_when_flat() -> None:
-    adapter, _, _ = _adapter({"leverage:BTC": "10"})
+    adapter, _, _ = _adapter({"leverage.value:BTC": "10"})
     await adapter._strict_check_leverage(_perp())  # no leg: nothing contradicts intent
     _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_strict_passes_when_matching() -> None:
-    adapter, _, _ = _adapter({"leverage:BTC": "10"}, legs=[_leg(value=10, kind="cross")])
+    adapter, _, _ = _adapter({"leverage.value:BTC": "10"}, legs=[_leg(value=10, kind="cross")])
     await adapter._strict_check_leverage(_perp())
     _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_strict_reapplies_drift_and_proceeds() -> None:
-    adapter, _, seen = _adapter({"leverage:BTC": "10"}, legs=[_leg(value=5)])
+    adapter, _, seen = _adapter({"leverage.value:BTC": "10"}, legs=[_leg(value=5)])
     await adapter._strict_check_leverage(_perp())  # reapply policy: no raise
     _exchange_of(adapter).update_leverage.assert_called_once()
     (drift,) = [e for e in seen if isinstance(e, LeverageDriftEvent)]
@@ -205,7 +205,7 @@ async def test_strict_reapplies_drift_and_proceeds() -> None:
 
 async def test_strict_notify_rejects_order() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
     )
     with pytest.raises(LeverageDriftError, match="differs from intent"):
         await adapter._strict_check_leverage(_perp())
@@ -217,7 +217,7 @@ async def test_strict_notify_rejects_order() -> None:
 
 async def test_strict_halt_rejects_and_halts() -> None:
     adapter, _, seen = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "halt"}, legs=[_leg(value=5)]
     )
     halt = MagicMock()
     adapter.attach_halt_machine(halt)
@@ -239,7 +239,7 @@ async def test_strict_unconfigured_coin_enforces_default() -> None:
 
 async def test_place_order_hook_rejects_on_unrepaired_drift() -> None:
     adapter, _, _ = _adapter(
-        {"leverage:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
+        {"leverage.value:BTC": "10", "leverage.on_drift:BTC": "notify"}, legs=[_leg(value=5)]
     )
     order = UnifiedOrder(
         instrument=_perp(),
