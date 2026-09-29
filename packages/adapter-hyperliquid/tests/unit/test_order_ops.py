@@ -316,3 +316,25 @@ async def test_resolve_coin_scans_open_orders(adapter: HyperliquidAdapter) -> No
     exchange.info.frontend_open_orders.return_value = []
     assert await adapter._resolve_coin(_CLOID) == ("BTC", False)
     assert adapter._client_coins[_CLOID] == ("BTC", False)
+
+
+async def test_resolve_coin_falls_back_to_order_status(adapter: HyperliquidAdapter) -> None:
+    """Empty scan (post-churn propagation lag) resolves via orderStatus."""
+    exchange = _connected(adapter)
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.query_order_by_cloid.return_value = {
+        "status": "order",
+        "order": {"order": {"coin": "BTC"}, "status": "open"},
+    }
+    assert await adapter._resolve_coin(_CLOID) == ("BTC", False)
+    assert adapter._client_coins[_CLOID] == ("BTC", False)
+
+
+async def test_resolve_coin_unknown_everywhere(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+    with pytest.raises(OrderNotFoundError):
+        await adapter._resolve_coin(_CLOID)

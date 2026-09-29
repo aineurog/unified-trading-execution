@@ -48,6 +48,7 @@ from unified_trading_execution.types.order import (
     OrderModification,
     OrderRecord,
     OrderResult,
+    TpSlAttachment,
     UnifiedOrder,
 )
 
@@ -348,6 +349,59 @@ def _tpsl_children(
             )
         )
     return children
+
+
+def position_tpsl_cloid(position_id: str, side: str) -> str:
+    """Raw cloid for a position TP/SL leg (``side`` is ``"take_profit"``/``"stop_loss"``).
+
+    Namespaced under ``"position:"`` so these never collide with bracket
+    child cloids (``f"{client_id}:{suffix}"``) — client ids are uuid/hex
+    and never carry the prefix.
+    """
+    return client_order_id_to_cloid(f"position:{position_id}:{side}")
+
+
+def build_position_tpsl_action(
+    *,
+    coin: str,
+    position_id: str,
+    close_buy: bool,
+    quantity: Decimal,
+    take_profit: TpSlAttachment | None,
+    stop_loss: TpSlAttachment | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Build reduce-only trigger legs closing a position, batched as ``positionTpsl``.
+
+    One leg per non-None attachment, sized to the full leg quantity at
+    attach time (fixed-size — the venue does not auto-resize API-placed
+    legs, verified live).  Direction and trigger validity are venue-checked
+    (``Invalid TP/SL price`` maps to ``InvalidOrderError``); only tick
+    shaping is validated upstream.  Returns ``(requests, grouping)`` for
+    ``bulk_orders``.
+    """
+    requests: list[dict[str, Any]] = []
+    for attachment, tpsl, suffix in (
+        (take_profit, "tp", TP_CLOID_SUFFIX),
+        (stop_loss, "sl", SL_CLOID_SUFFIX),
+    ):
+        if attachment is None:
+            continue
+        requests.append(
+            _trigger_request(
+                coin=coin,
+                is_buy=close_buy,
+                quantity=quantity,
+                price=attachment.limit_price
+                if attachment.limit_price is not None
+                else attachment.trigger_price,
+                trigger_px=attachment.trigger_price,
+                is_market=attachment.limit_price is None,
+                tpsl=tpsl,
+                reduce_only=True,
+                cloid=position_tpsl_cloid(position_id, suffix),
+            )
+        )
+    return requests, "positionTpsl"
 
 
 def build_place_order_action(

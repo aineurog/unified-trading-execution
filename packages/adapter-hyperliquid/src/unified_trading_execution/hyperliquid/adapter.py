@@ -57,10 +57,13 @@ from unified_trading_execution.hyperliquid.orders import (
     build_cancel_action,
     build_modify_action,
     build_place_order_action,
+    build_position_tpsl_action,
     client_order_id_to_cloid,
+    map_order_status,
     max_limit_notional,
     max_market_notional,
     parse_order_result,
+    position_tpsl_cloid,
     quantize_price,
     raise_on_status_errors,
     round_price_to_tick,
@@ -399,19 +402,37 @@ class HyperliquidAdapter(Adapter):
     async def _resolve_coin(self, client_order_id: str) -> tuple[str, bool]:
         """Resolve the ``(coin, is_spot)`` for a client order id.
 
-        Placement cache first; otherwise scan open orders for the cloid
-        (covers restarts and orders placed outside this session).
+        Placement cache first, then the open-orders scan (covers restarts
+        and orders placed outside this session), then ``orderStatus``-by-
+        cloid as a last resort: the scan is eventually consistent and can
+        miss a leg briefly after cancel/replace churn while ``orderStatus``
+        stays strongly consistent.  Truly unknown cloids still raise.
         """
         cached = self._client_coins.get(client_order_id)
         if cached is not None:
             return cached
         found = await self._find_open_entry(client_order_id)
-        if found is None:
-            raise OrderNotFoundError(f"Order {client_order_id} not found")
-        _, coin, is_spot = found
-        resolved = (coin, is_spot)
-        self._client_coins[client_order_id] = resolved
-        return resolved
+        if found is not None:
+            _, coin, is_spot = found
+            resolved = (coin, is_spot)
+            self._client_coins[client_order_id] = resolved
+            return resolved
+        exchange = self._require_exchange()
+        response = await self._run_exchange(
+            exchange.info.query_order_by_cloid,
+            self._config.wallet_address,
+            Cloid(client_order_id_to_cloid(client_order_id)),
+        )
+        if isinstance(response, dict) and response.get("status") != "unknownOid":
+            try:
+                coin = str(response["order"]["order"].get("coin") or "")
+            except (KeyError, TypeError):
+                coin = ""
+            if coin:
+                resolved = (coin, self._is_spot_coin(coin))
+                self._client_coins[client_order_id] = resolved
+                return resolved
+        raise OrderNotFoundError(f"Order {client_order_id} not found")
 
     async def _open_order_entries(self) -> list[Any]:
         """Fetch raw open-order entries across both order shapes."""
@@ -461,9 +482,28 @@ class HyperliquidAdapter(Adapter):
         """Rebuild oid→client attribution from open orders carrying our cloids.
 
         Covers legs whose oids were never acked (``waitingForTrigger``
-        children) and sessions restarted after placement.  Unknown oids
-        stay unattributed — fetch_fills keys those by raw oid.
+        children) and sessions restarted after placement.  Position TP/SL
+        legs recover too: their cloids derive deterministically from the
+        position id, so open positions re-anchor them with no stored state.
+        Unknown oids stay unattributed — fetch_fills keys those by raw oid.
+        Costs one ``userState`` read plus the open-orders scan.
         """
+        position_cloids: dict[str, tuple[str, FillReason | None, FillEntry | None]] = {}
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or not position.get("coin"):
+                continue
+            # Same id convention as ``translate_position``: f"{coin}:oneWay".
+            position_id = f"{position['coin']}:oneWay"
+            for suffix, reason in (
+                (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+                (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+            ):
+                raw = position_tpsl_cloid(position_id, suffix)
+                position_cloids[raw] = (raw, reason, FillEntry.OUT)
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
@@ -474,6 +514,9 @@ class HyperliquidAdapter(Adapter):
             if raw in self._child_parents:
                 parent, reason, entry_side = self._child_parents[raw]
                 self._oid_clients[str(oid)] = (parent, reason, entry_side)
+                continue
+            if raw in position_cloids:
+                self._oid_clients[str(oid)] = position_cloids[raw]
                 continue
             for client_order_id in list(self._client_coins):
                 if raw == client_order_id_to_cloid(client_order_id):
@@ -857,6 +900,34 @@ class HyperliquidAdapter(Adapter):
 
     # ---- Position TP/SL modification ----
 
+    async def _open_leg(self, instrument: Instrument, position_id: str) -> Position | None:
+        """Return the open leg for ``position_id`` on ``instrument``'s coin, else None."""
+        coin = to_hyperliquid_coin(instrument)
+        for position in await self.fetch_positions():
+            if position.position_id == position_id and position.instrument.symbol == coin:
+                return position
+        return None
+
+    async def _position_tpsl_entries(self, position_id: str) -> dict[str, list[dict[str, Any]]]:
+        """Open entries carrying our position cloids, keyed ``take_profit``/``stop_loss``.
+
+        Lists, not single entries: the venue allows duplicate cloids, so a
+        cloid can address several live legs (prior replaces, cross-run
+        reuse).  Callers cancel every oid — cancelling one leaves siblings.
+        """
+        want = {
+            position_tpsl_cloid(position_id, TP_CLOID_SUFFIX): "take_profit",
+            position_tpsl_cloid(position_id, SL_CLOID_SUFFIX): "stop_loss",
+        }
+        found: dict[str, list[dict[str, Any]]] = {}
+        for entry in await self._open_order_entries():
+            if not isinstance(entry, dict):
+                continue
+            side = want.get(str(entry.get("cloid") or ""))
+            if side is not None:
+                found.setdefault(side, []).append(entry)
+        return found
+
     async def modify_position_tpsl(
         self,
         instrument: Instrument,
@@ -865,16 +936,169 @@ class HyperliquidAdapter(Adapter):
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
-        """Modify TP/SL on an open position via the ``positionTpsl`` grouping."""
-        raise NotImplementedError
+        """Attach or replace TP/SL on an open position via ``positionTpsl``.
+
+        Merge semantics: only mentioned sides are touched, unmentioned legs
+        stay working.  Legs are full-size at attach time (fixed-size — the
+        venue does not auto-resize API-placed legs, verified live), so
+        re-attach after resizing the leg.  Detach one side by cancelling its
+        leg (visible in ``fetch_open_orders`` keyed by cloid); both None
+        raises ``ValueError`` per the ABC contract.  No open leg reads back
+        as ``OrderNotFoundError``; spot raises ``InvalidSymbolError``.
+        """
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss must be provided")
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no position TP/SL")
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        leg = await self._open_leg(instrument, position_id)
+        if leg is None or leg.quantity == 0:
+            raise OrderNotFoundError(f"No open position {position_id!r} for {coin}")
+        spec = await self.fetch_instrument_spec(instrument)
+        lot_exponent = spec.lot_size.as_tuple().exponent
+        if not isinstance(lot_exponent, int):
+            raise PlatformError(f"InstrumentSpec has no usable lot_size for {coin}")
+        sz_decimals = -lot_exponent
+        for attachment in (take_profit, stop_loss):
+            if attachment is None:
+                continue
+            quantize_price(attachment.trigger_price, sz_decimals, is_spot=False)
+            if attachment.limit_price is not None:
+                quantize_price(attachment.limit_price, sz_decimals, is_spot=False)
+        existing = await self._position_tpsl_entries(position_id)
+        for side, attachment in (("take_profit", take_profit), ("stop_loss", stop_loss)):
+            if attachment is None:
+                continue
+            cancelled: list[str] = []
+            for entry in existing.get(side, []):
+                oid = entry.get("oid")
+                if oid is None or oid == "":
+                    continue
+                try:
+                    response = await self._run_exchange(exchange.cancel, coin, int(oid))
+                    self._check_action_ok(response, context=f"replacing position {side} for {coin}")
+                except OrderNotFoundError:
+                    continue  # leg vanished concurrently — the replace below still applies
+                cancelled.append(str(oid))
+            # Serialize on disappearance: the replacement reuses the same
+            # cloid, and cancel_by_cloid only retires one leg per call, so
+            # every cancelled oid must be gone before placing or siblings
+            # survive under the shared cloid (observed live).  Bounded wait;
+            # the replace proceeds regardless so a stuck listing can't wedge
+            # the modify.
+            for _ in range(5):
+                if not cancelled:
+                    break
+                live = await self._open_order_entries()
+                live_oids = {str(e.get("oid") or "") for e in live if isinstance(e, dict)}
+                if not any(oid in live_oids for oid in cancelled):
+                    break
+                await asyncio.sleep(2)
+        requests, grouping = build_position_tpsl_action(
+            coin=coin,
+            position_id=position_id,
+            close_buy=leg.quantity < 0,
+            quantity=abs(leg.quantity),
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        for request in requests:
+            request["cloid"] = Cloid(request["cloid"])
+        response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
+        data = self._check_action_ok(response, context=f"setting position TP/SL for {coin}")
+        try:
+            statuses = data["response"]["data"]["statuses"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(
+                f"Unexpected order response shape {data!r} for position {position_id}"
+            ) from exc
+        if not isinstance(statuses, list) or not statuses:
+            raise PlatformError(f"Empty order statuses for position {position_id}")
+        raise_on_status_errors(statuses)
+        # Attribute each acked oid by the cloid it was actually sent with, not a
+        # fixed side order: a merge that replaces only one side sends one request
+        # and gets one status, so zipping a (TP, SL) tuple would tag an SL leg as
+        # TAKE_PROFIT (and key its fills under the TP cloid).
+        reason_for_cloid = {
+            position_tpsl_cloid(position_id, TP_CLOID_SUFFIX): FillReason.TAKE_PROFIT,
+            position_tpsl_cloid(position_id, SL_CLOID_SUFFIX): FillReason.STOP_LOSS,
+        }
+        for request, status in zip(requests, statuses, strict=False):
+            if not isinstance(status, dict):
+                continue
+            raw = request["cloid"].to_raw()
+            reason = reason_for_cloid.get(raw)
+            if reason is None:
+                continue
+            detail = status.get("resting") or status.get("filled") or {}
+            oid = detail.get("oid") if isinstance(detail, dict) else None
+            if oid is None or oid == "":
+                continue
+            self._oid_clients[str(oid)] = (raw, reason, FillEntry.OUT)
 
     async def get_position_tpsl(
         self,
         instrument: Instrument,
         position_id: str,
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
-        """Read the current TP/SL on an open position."""
-        raise NotImplementedError
+        """Read the current TP/SL on an open position via ``orderStatus``-by-cloid.
+
+        Returns ``(take_profit, stop_loss)`` with None per missing side, or
+        None when no leg is open at ``position_id``.  Reads are authoritative
+        per-leg queries (not the open-orders scan), so terminal legs read
+        back as missing rather than stale.
+        """
+        if instrument.asset_class == AssetClass.SPOT:
+            return None
+        if await self._open_leg(instrument, position_id) is None:
+            return None
+        exchange = self._require_exchange()
+        found: dict[str, TpSlAttachment] = {}
+        for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX):
+            raw = position_tpsl_cloid(position_id, suffix)
+            response = await self._run_exchange(
+                exchange.info.query_order_by_cloid, self._config.wallet_address, Cloid(raw)
+            )
+            if not isinstance(response, dict):
+                raise PlatformError(f"Unexpected orderStatus shape {response!r}")
+            if response.get("status") == "unknownOid":
+                continue
+            try:
+                payload = response["order"]
+                order_object = payload["order"]
+                status = payload.get("status")
+            except (KeyError, TypeError) as exc:
+                raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
+            if not isinstance(status, str) or map_order_status(status) != OrderStatus.OPEN:
+                # Only a working leg can be a live stop.  Every terminal status
+                # must read back as missing — not just filled/canceled but the
+                # whole cancel family (a TP/SL is OCO, so when one side fills
+                # the other reports ``siblingFilledCanceled``) and every
+                # ``*Rejected`` variant.  Reporting a dead leg as live would
+                # tell the caller a position is protected when it is not.
+                continue
+            try:
+                order_type = order_object.get("orderType")
+                if isinstance(order_type, dict):
+                    # Open-order entry shape: trigger descriptor is nested.
+                    trigger = order_type.get("trigger") or {}
+                    trigger_raw = trigger.get("triggerPx", order_object.get("triggerPx"))
+                    is_market = bool(trigger.get("isMarket", True))
+                else:
+                    # orderStatus shape: flat fields, market-ness in the display
+                    # string.  "Limit" is the discriminator, matching
+                    # ``_translate_order_type``: a bare "Stop"/"Take Profit" is
+                    # market-on-trigger (its ``limitPx`` carries the trigger).
+                    trigger_raw = order_object.get("triggerPx")
+                    is_market = not str(order_type or "").endswith("Limit")
+                trigger_price = Decimal(str(trigger_raw))
+                limit_price = None if is_market else Decimal(str(order_object.get("limitPx")))
+            except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+                raise PlatformError(f"orderStatus leg is not a trigger: {response!r}") from exc
+            side = "take_profit" if suffix == TP_CLOID_SUFFIX else "stop_loss"
+            found[side] = TpSlAttachment(trigger_price=trigger_price, limit_price=limit_price)
+        return found.get("take_profit"), found.get("stop_loss")
 
     # ---- Reconciliation data ----
 
@@ -981,8 +1205,8 @@ class HyperliquidAdapter(Adapter):
         filters; a client-side guard holds the boundary).  Entries dedupe
         on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
         children by parent with their reason), unknown oids key by raw oid.
-        Costs one open-orders scan (both shapes) for oid attribution plus
-        the fills call itself.
+        Costs one open-orders scan (both shapes) plus one ``userState`` read
+        for oid attribution, plus the fills call itself.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
