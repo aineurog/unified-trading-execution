@@ -72,7 +72,9 @@ def _exchange_mock(*, legs: list[dict[str, Any]] | None = None) -> MagicMock:
     return exchange
 
 
-def _leg(coin: str = "BTC", value: int = 20, kind: str = "isolated", szi: str = "1") -> dict[str, Any]:
+def _leg(
+    coin: str = "BTC", value: int = 20, kind: str = "isolated", szi: str = "1"
+) -> dict[str, Any]:
     return {
         "type": "oneWay",
         "position": {
@@ -111,6 +113,7 @@ def _store_of(adapter: HyperliquidAdapter) -> MagicMock:
 
 
 # ---- block_on_open_position ----
+
 
 async def test_set_leverage_blocked_with_open_leg() -> None:
     adapter, _, seen = _adapter(legs=[_leg(value=5)])
@@ -154,6 +157,26 @@ async def test_set_margin_mode_block_disabled() -> None:
     _exchange_of(adapter).update_leverage.assert_called_once()
 
 
+async def test_margin_block_knob_persists_under_family_prefix() -> None:
+    """The guard must read the same key the margin family writes."""
+    adapter, _, _ = _adapter()
+    await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED, block_on_open_position=False)
+    backing = _store_of(adapter).backing
+    assert backing["margin.mode.block_on_open:BTC"] == "0"
+    assert await adapter._policy_knob("margin.mode", "block_on_open", "BTC") == "0"
+
+
+async def test_margin_block_knob_honoured_on_later_call() -> None:
+    """A stored unblocked intent lets a later mode change through the guard."""
+    adapter, _, _ = _adapter()
+    await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED, block_on_open_position=False)
+    _exchange_of(adapter).info.user_state.return_value = {
+        "assetPositions": [_leg(value=10, kind="isolated")]
+    }
+    await adapter.set_margin_mode(_perp(), MarginMode.CROSS)
+    assert _exchange_of(adapter).update_leverage.call_count == 2
+
+
 async def test_block_never_applies_to_spot() -> None:
     adapter, _, _ = _adapter()
     await adapter._block_on_open_position(_spot(), action="change leverage", kind="leverage")
@@ -175,6 +198,7 @@ async def test_remove_clears_knob_rows() -> None:
 
 
 # ---- strict_check ----
+
 
 async def test_strict_disabled_makes_no_venue_call() -> None:
     adapter, _, _ = _adapter({"leverage.strict_check:BTC": "0"}, legs=[_leg(value=5)])
@@ -229,6 +253,14 @@ async def test_strict_halt_rejects_and_halts() -> None:
     assert drift.action_taken == "halted"
 
 
+async def test_strict_failed_reapply_rejects_order() -> None:
+    """A reapply that itself raises leaves drift unrepaired — reject the order."""
+    adapter, _, _ = _adapter({"leverage.value:BTC": "10"}, legs=[_leg(value=5)])
+    _exchange_of(adapter).update_leverage.side_effect = PlatformError("venue down")
+    with pytest.raises(LeverageDriftError, match="differs from intent"):
+        await adapter._strict_check_leverage(_perp())
+
+
 async def test_strict_unconfigured_coin_enforces_default() -> None:
     """Never-configured coins verify against default 1x (Bybit parity)."""
     adapter, _, _ = _adapter(legs=[_leg(value=5)])
@@ -249,6 +281,24 @@ async def test_place_order_hook_rejects_on_unrepaired_drift() -> None:
         price=Decimal("50000"),
         time_in_force=TimeInForce.GTC,
         client_order_id="strict-hook-1",
+    )
+    with pytest.raises(LeverageDriftError, match="differs from intent"):
+        await adapter.place_order(order)
+    _exchange_of(adapter).bulk_orders.assert_not_called()
+
+
+async def test_place_order_hook_rejects_when_reapply_fails() -> None:
+    """End to end: a failed strict reapply must keep the order off the venue."""
+    adapter, _, _ = _adapter({"leverage.value:BTC": "10"}, legs=[_leg(value=5)])
+    _exchange_of(adapter).update_leverage.side_effect = PlatformError("venue down")
+    order = UnifiedOrder(
+        instrument=_perp(),
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.001"),
+        price=Decimal("50000"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="strict-hook-2",
     )
     with pytest.raises(LeverageDriftError, match="differs from intent"):
         await adapter.place_order(order)

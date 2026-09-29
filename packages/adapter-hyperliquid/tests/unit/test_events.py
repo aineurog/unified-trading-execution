@@ -14,7 +14,6 @@ from unified_trading_execution.events import Event, EventBus
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
 from unified_trading_execution.hyperliquid.events import (
-
     LeverageAppliedEvent,
     LeverageApplyFailedEvent,
     LeverageDriftEvent,
@@ -348,9 +347,7 @@ async def test_reapply_mode_emits_changed_only_on_change() -> None:
     assert changed.previous is MarginMode.ISOLATED
     assert changed.current is MarginMode.CROSS
 
-    adapter2, _, seen2 = _adapter(
-        {"margin.mode:BTC": "cross"}, legs=[_leg(value=10, kind="cross")]
-    )
+    adapter2, _, seen2 = _adapter({"margin.mode:BTC": "cross"}, legs=[_leg(value=10, kind="cross")])
     await adapter2._reapply_stored_intent()
     assert _of_type(seen2, MarginModeChangedEvent) == []
 
