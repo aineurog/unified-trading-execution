@@ -282,6 +282,41 @@ async def test_modify_indexes_acked_oids() -> None:
     assert adapter._oid_clients["102"] == (sl_id, FillReason.STOP_LOSS, FillEntry.OUT)
 
 
+async def test_replace_waits_for_oid_disappearance() -> None:
+    """Replace serializes on the cancelled oid vanishing before placing."""
+    tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
+    exchange = _exchange_mock(entries=[_trigger_entry(cloid=tp_cloid, oid=11)])
+    adapter = _adapter(exchange)
+    seen: list[bool] = []
+    real_entries = adapter._open_order_entries
+
+    async def _entries() -> list[Any]:
+        if not seen:
+            seen.append(True)
+            return [_trigger_entry(cloid=tp_cloid, oid=11)]
+        return []
+
+    adapter._open_order_entries = _entries  # type: ignore[method-assign]
+    await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp())
+    assert seen, "replace must re-scan before placing"
+    exchange.bulk_orders.assert_called_once()
+    await real_entries()  # restore not needed; keeps linters honest about the name
+
+
+async def test_replace_cancels_every_duplicate_cloid() -> None:
+    """Two live legs sharing one cloid (prior replace residue): both cancelled."""
+    tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
+    exchange = _exchange_mock(entries=[
+        _trigger_entry(cloid=tp_cloid, oid=11),
+        _trigger_entry(cloid=tp_cloid, oid=12),
+    ])
+    adapter = _adapter(exchange)
+    await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp())
+    cancelled = sorted(call[1][1] for call in exchange.cancel.mock_calls)
+    assert cancelled == [11, 12]
+    exchange.bulk_orders.assert_called_once()
+
+
 async def test_short_leg_closes_with_buy() -> None:
     exchange = _exchange_mock(legs=[{**_leg(), "position": {**_leg()["position"], "szi": "-0.5"}}])
     adapter = _adapter(exchange)
@@ -369,6 +404,17 @@ async def test_get_parses_order_status_string_shape() -> None:
     tp, sl = await adapter.get_position_tpsl(_perp(), _POSITION_ID) or (None, None)
     assert tp is not None and tp.trigger_price == Decimal("126650.0") and tp.limit_price is None
     assert sl is None
+
+
+async def test_get_canceled_string_reads_missing() -> None:
+    """Payload status 'canceled' (live spelling) reads back as missing."""
+    exchange = _exchange_mock()
+    exchange.info.query_order_by_cloid.side_effect = [
+        _status_response(status="canceled"),
+        {"status": "unknownOid"},
+    ]
+    adapter = _adapter(exchange)
+    assert await adapter.get_position_tpsl(_perp(), _POSITION_ID) == (None, None)
 
 
 async def test_get_terminal_leg_reads_missing() -> None:

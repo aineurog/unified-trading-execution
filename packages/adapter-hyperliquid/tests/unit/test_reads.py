@@ -248,6 +248,40 @@ async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) ->
     assert args[1] == 2000
 
 
+async def test_fetch_fills_recovers_position_legs_after_restart(
+    adapter: HyperliquidAdapter,
+) -> None:
+    """Fresh maps (post-restart): open position legs re-anchor fills with reason."""
+    from unified_trading_execution.hyperliquid.orders import position_tpsl_cloid
+    from unified_trading_execution.types.enums import FillReason
+
+    exchange = _connected(adapter)
+    assert adapter._oid_clients == {} and adapter._child_parents == {}
+    tp_raw = position_tpsl_cloid("BTC:oneWay", "take_profit")
+    exchange.info.user_state.return_value = {"assetPositions": [{"position": {"coin": "BTC"}}]}
+    exchange.info.open_orders.return_value = [{"cloid": tp_raw, "oid": 77}]
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [
+        {
+            "coin": "BTC",
+            "px": "100",
+            "sz": "0.01",
+            "side": "A",
+            "time": 2000,
+            "dir": "Close Long",
+            "hash": "0xh",
+            "oid": 77,
+            "fee": "0.01",
+            "feeToken": "USDC",
+            "tid": 9,
+        }
+    ]
+    fills = await adapter.fetch_fills()
+    assert set(fills) == {tp_raw}
+    (record,) = fills[tp_raw]
+    assert record.reason == FillReason.TAKE_PROFIT
+
+
 async def test_fetch_fills_keeps_zero_tid(adapter: HyperliquidAdapter) -> None:
     """tid == 0 is a real id, not a missing one — the fill must survive."""
     exchange = _connected(adapter)

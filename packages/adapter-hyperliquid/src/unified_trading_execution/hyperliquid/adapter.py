@@ -401,19 +401,37 @@ class HyperliquidAdapter(Adapter):
     async def _resolve_coin(self, client_order_id: str) -> tuple[str, bool]:
         """Resolve the ``(coin, is_spot)`` for a client order id.
 
-        Placement cache first; otherwise scan open orders for the cloid
-        (covers restarts and orders placed outside this session).
+        Placement cache first, then the open-orders scan (covers restarts
+        and orders placed outside this session), then ``orderStatus``-by-
+        cloid as a last resort: the scan is eventually consistent and can
+        miss a leg briefly after cancel/replace churn while ``orderStatus``
+        stays strongly consistent.  Truly unknown cloids still raise.
         """
         cached = self._client_coins.get(client_order_id)
         if cached is not None:
             return cached
         found = await self._find_open_entry(client_order_id)
-        if found is None:
-            raise OrderNotFoundError(f"Order {client_order_id} not found")
-        _, coin, is_spot = found
-        resolved = (coin, is_spot)
-        self._client_coins[client_order_id] = resolved
-        return resolved
+        if found is not None:
+            _, coin, is_spot = found
+            resolved = (coin, is_spot)
+            self._client_coins[client_order_id] = resolved
+            return resolved
+        exchange = self._require_exchange()
+        response = await self._run_exchange(
+            exchange.info.query_order_by_cloid,
+            self._config.wallet_address,
+            Cloid(client_order_id_to_cloid(client_order_id)),
+        )
+        if isinstance(response, dict) and response.get("status") != "unknownOid":
+            try:
+                coin = str(response["order"]["order"].get("coin") or "")
+            except (KeyError, TypeError):
+                coin = ""
+            if coin:
+                resolved = (coin, self._is_spot_coin(coin))
+                self._client_coins[client_order_id] = resolved
+                return resolved
+        raise OrderNotFoundError(f"Order {client_order_id} not found")
 
     async def _open_order_entries(self) -> list[Any]:
         """Fetch raw open-order entries across both order shapes."""
@@ -463,9 +481,28 @@ class HyperliquidAdapter(Adapter):
         """Rebuild oid→client attribution from open orders carrying our cloids.
 
         Covers legs whose oids were never acked (``waitingForTrigger``
-        children) and sessions restarted after placement.  Unknown oids
-        stay unattributed — fetch_fills keys those by raw oid.
+        children) and sessions restarted after placement.  Position TP/SL
+        legs recover too: their cloids derive deterministically from the
+        position id, so open positions re-anchor them with no stored state.
+        Unknown oids stay unattributed — fetch_fills keys those by raw oid.
+        Costs one ``userState`` read plus the open-orders scan.
         """
+        position_cloids: dict[str, tuple[str, FillReason | None, FillEntry | None]] = {}
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or not position.get("coin"):
+                continue
+            # Same id convention as ``translate_position``: f"{coin}:oneWay".
+            position_id = f"{position['coin']}:oneWay"
+            for suffix, reason in (
+                (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+                (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+            ):
+                raw = position_tpsl_cloid(position_id, suffix)
+                position_cloids[raw] = (raw, reason, FillEntry.OUT)
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
@@ -476,6 +513,9 @@ class HyperliquidAdapter(Adapter):
             if raw in self._child_parents:
                 parent, reason, entry_side = self._child_parents[raw]
                 self._oid_clients[str(oid)] = (parent, reason, entry_side)
+                continue
+            if raw in position_cloids:
+                self._oid_clients[str(oid)] = position_cloids[raw]
                 continue
             for client_order_id in list(self._client_coins):
                 if raw == client_order_id_to_cloid(client_order_id):
@@ -867,19 +907,26 @@ class HyperliquidAdapter(Adapter):
                 return position
         return None
 
-    async def _position_tpsl_entries(self, position_id: str) -> dict[str, dict[str, Any]]:
-        """Open entries carrying our position cloids, keyed ``take_profit``/``stop_loss``."""
+    async def _position_tpsl_entries(
+        self, position_id: str
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Open entries carrying our position cloids, keyed ``take_profit``/``stop_loss``.
+
+        Lists, not single entries: the venue allows duplicate cloids, so a
+        cloid can address several live legs (prior replaces, cross-run
+        reuse).  Callers cancel every oid — cancelling one leaves siblings.
+        """
         want = {
             position_tpsl_cloid(position_id, TP_CLOID_SUFFIX): "take_profit",
             position_tpsl_cloid(position_id, SL_CLOID_SUFFIX): "stop_loss",
         }
-        found: dict[str, dict[str, Any]] = {}
+        found: dict[str, list[dict[str, Any]]] = {}
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
             side = want.get(str(entry.get("cloid") or ""))
             if side is not None:
-                found[side] = entry
+                found.setdefault(side, []).append(entry)
         return found
 
     async def modify_position_tpsl(
@@ -922,17 +969,37 @@ class HyperliquidAdapter(Adapter):
                 quantize_price(attachment.limit_price, sz_decimals, is_spot=False)
         existing = await self._position_tpsl_entries(position_id)
         for side, attachment in (("take_profit", take_profit), ("stop_loss", stop_loss)):
-            entry = existing.get(side)
-            if entry is None or attachment is None:
+            if attachment is None:
                 continue
-            oid = entry.get("oid")
-            if oid is None or oid == "":
-                continue
-            try:
-                response = await self._run_exchange(exchange.cancel, coin, int(oid))
-                self._check_action_ok(response, context=f"replacing position {side} for {coin}")
-            except OrderNotFoundError:
-                continue  # leg vanished concurrently — the replace below still applies
+            cancelled: list[str] = []
+            for entry in existing.get(side, []):
+                oid = entry.get("oid")
+                if oid is None or oid == "":
+                    continue
+                try:
+                    response = await self._run_exchange(exchange.cancel, coin, int(oid))
+                    self._check_action_ok(
+                        response, context=f"replacing position {side} for {coin}"
+                    )
+                except OrderNotFoundError:
+                    continue  # leg vanished concurrently — the replace below still applies
+                cancelled.append(str(oid))
+            # Serialize on disappearance: the replacement reuses the same
+            # cloid, and cancel_by_cloid only retires one leg per call, so
+            # every cancelled oid must be gone before placing or siblings
+            # survive under the shared cloid (observed live).  Bounded wait;
+            # the replace proceeds regardless so a stuck listing can't wedge
+            # the modify.
+            for _ in range(5):
+                if not cancelled:
+                    break
+                live = await self._open_order_entries()
+                live_oids = {
+                    str(e.get("oid") or "") for e in live if isinstance(e, dict)
+                }
+                if not any(oid in live_oids for oid in cancelled):
+                    break
+                await asyncio.sleep(2)
         requests, grouping = build_position_tpsl_action(
             coin=coin,
             position_id=position_id,
@@ -1128,8 +1195,8 @@ class HyperliquidAdapter(Adapter):
         filters; a client-side guard holds the boundary).  Entries dedupe
         on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
         children by parent with their reason), unknown oids key by raw oid.
-        Costs one open-orders scan (both shapes) for oid attribution plus
-        the fills call itself.
+        Costs one open-orders scan (both shapes) plus one ``userState`` read
+        for oid attribution, plus the fills call itself.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
