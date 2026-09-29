@@ -1265,3 +1265,18 @@ class TestAdapterConfig:
         await store.set_adapter_config("leverage.BTCUSDT", "10")
         await store.set_adapter_config("margin_mode.BTCUSDT", "cross")
         assert await store.list_adapter_config("leverage.") == {"leverage.BTCUSDT": "10"}
+
+    @pytest.mark.asyncio
+    async def test_list_treats_prefix_literally(self, store):
+        """LIKE wildcards in the prefix must not widen the match.
+
+        Dotted policy rows never match a colon prefix either (":" vs "."),
+        so value-row enumeration is exact.
+        """
+        await store.set_adapter_config("margin_mode:BTC", "cross")
+        await store.set_adapter_config("marginXmode:BTC", "cross")
+        await store.set_adapter_config("margin mode:BTC", "cross")
+        await store.set_adapter_config("margin%mode:BTC", "cross")
+        await store.set_adapter_config("margin_mode.on_drift:BTC", "reapply")
+        assert await store.list_adapter_config("margin_mode:") == {"margin_mode:BTC": "cross"}
+        assert await store.list_adapter_config("margin%mode:") == {"margin%mode:BTC": "cross"}
