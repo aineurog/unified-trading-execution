@@ -152,7 +152,7 @@ async def test_set_leverage_rejects_spot() -> None:
 async def test_set_leverage_rejects_bad_policy() -> None:
     adapter = _adapter()
     with pytest.raises(ValueError, match="on_drift"):
-        await adapter.set_leverage(_perp(), leverage=2, on_drift="explode")
+        await adapter.set_leverage(_perp(), leverage=2, on_drift="explode")  # type: ignore[arg-type]
 
 
 async def test_get_leverage_reads_leg() -> None:
@@ -195,7 +195,7 @@ async def test_set_margin_mode_preserves_leverage() -> None:
 async def test_set_margin_mode_rejects() -> None:
     adapter = _adapter()
     with pytest.raises(ValueError, match="mode"):
-        await adapter.set_margin_mode(_perp(), "portfolio")
+        await adapter.set_margin_mode(_perp(), "portfolio")  # type: ignore[arg-type]
     with pytest.raises(InvalidSymbolError):
         await adapter.set_margin_mode(_spot(), MarginMode.CROSS)
     _exchange_of(adapter).update_leverage.assert_not_called()
@@ -294,7 +294,7 @@ async def test_intent_requires_store() -> None:
     adapter._connected = True
     with pytest.raises(PlatformError, match="state_store"):
         await adapter.set_leverage(_perp(), leverage=2)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_margin_mode_requires_store_without_mutating() -> None:
@@ -307,7 +307,7 @@ async def test_margin_mode_requires_store_without_mutating() -> None:
     adapter._connected = True
     with pytest.raises(PlatformError, match="state_store"):
         await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
-    adapter._exchange.update_leverage.assert_not_called()
+    _exchange_of(adapter).update_leverage.assert_not_called()
 
 
 async def test_connect_reapplies_auto_apply() -> None:
