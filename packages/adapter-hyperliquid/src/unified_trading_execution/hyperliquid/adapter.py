@@ -59,10 +59,11 @@ from unified_trading_execution.hyperliquid.orders import (
     build_place_order_action,
     build_position_tpsl_action,
     client_order_id_to_cloid,
-    position_tpsl_cloid,
+    map_order_status,
     max_limit_notional,
     max_market_notional,
     parse_order_result,
+    position_tpsl_cloid,
     quantize_price,
     raise_on_status_errors,
     round_price_to_tick,
@@ -907,9 +908,7 @@ class HyperliquidAdapter(Adapter):
                 return position
         return None
 
-    async def _position_tpsl_entries(
-        self, position_id: str
-    ) -> dict[str, list[dict[str, Any]]]:
+    async def _position_tpsl_entries(self, position_id: str) -> dict[str, list[dict[str, Any]]]:
         """Open entries carrying our position cloids, keyed ``take_profit``/``stop_loss``.
 
         Lists, not single entries: the venue allows duplicate cloids, so a
@@ -978,9 +977,7 @@ class HyperliquidAdapter(Adapter):
                     continue
                 try:
                     response = await self._run_exchange(exchange.cancel, coin, int(oid))
-                    self._check_action_ok(
-                        response, context=f"replacing position {side} for {coin}"
-                    )
+                    self._check_action_ok(response, context=f"replacing position {side} for {coin}")
                 except OrderNotFoundError:
                     continue  # leg vanished concurrently — the replace below still applies
                 cancelled.append(str(oid))
@@ -994,9 +991,7 @@ class HyperliquidAdapter(Adapter):
                 if not cancelled:
                     break
                 live = await self._open_order_entries()
-                live_oids = {
-                    str(e.get("oid") or "") for e in live if isinstance(e, dict)
-                }
+                live_oids = {str(e.get("oid") or "") for e in live if isinstance(e, dict)}
                 if not any(oid in live_oids for oid in cancelled):
                     break
                 await asyncio.sleep(2)
@@ -1021,19 +1016,26 @@ class HyperliquidAdapter(Adapter):
         if not isinstance(statuses, list) or not statuses:
             raise PlatformError(f"Empty order statuses for position {position_id}")
         raise_on_status_errors(statuses)
-        reasons = {"take_profit": FillReason.TAKE_PROFIT, "stop_loss": FillReason.STOP_LOSS}
-        for suffix, status in zip((TP_CLOID_SUFFIX, SL_CLOID_SUFFIX), statuses):
+        # Attribute each acked oid by the cloid it was actually sent with, not a
+        # fixed side order: a merge that replaces only one side sends one request
+        # and gets one status, so zipping a (TP, SL) tuple would tag an SL leg as
+        # TAKE_PROFIT (and key its fills under the TP cloid).
+        reason_for_cloid = {
+            position_tpsl_cloid(position_id, TP_CLOID_SUFFIX): FillReason.TAKE_PROFIT,
+            position_tpsl_cloid(position_id, SL_CLOID_SUFFIX): FillReason.STOP_LOSS,
+        }
+        for request, status in zip(requests, statuses, strict=False):
             if not isinstance(status, dict):
+                continue
+            raw = request["cloid"].to_raw()
+            reason = reason_for_cloid.get(raw)
+            if reason is None:
                 continue
             detail = status.get("resting") or status.get("filled") or {}
             oid = detail.get("oid") if isinstance(detail, dict) else None
             if oid is None or oid == "":
                 continue
-            self._oid_clients[str(oid)] = (
-                position_tpsl_cloid(position_id, suffix),
-                reasons[suffix],
-                FillEntry.OUT,
-            )
+            self._oid_clients[str(oid)] = (raw, reason, FillEntry.OUT)
 
     async def get_position_tpsl(
         self,
@@ -1068,7 +1070,13 @@ class HyperliquidAdapter(Adapter):
                 status = payload.get("status")
             except (KeyError, TypeError) as exc:
                 raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
-            if status in ("filled", "canceled"):
+            if not isinstance(status, str) or map_order_status(status) != OrderStatus.OPEN:
+                # Only a working leg can be a live stop.  Every terminal status
+                # must read back as missing — not just filled/canceled but the
+                # whole cancel family (a TP/SL is OCO, so when one side fills
+                # the other reports ``siblingFilledCanceled``) and every
+                # ``*Rejected`` variant.  Reporting a dead leg as live would
+                # tell the caller a position is protected when it is not.
                 continue
             try:
                 order_type = order_object.get("orderType")
@@ -1078,10 +1086,12 @@ class HyperliquidAdapter(Adapter):
                     trigger_raw = trigger.get("triggerPx", order_object.get("triggerPx"))
                     is_market = bool(trigger.get("isMarket", True))
                 else:
-                    # orderStatus shape: flat fields, market-ness in the
-                    # display string ("Take Profit Market", "Stop Limit", ...).
+                    # orderStatus shape: flat fields, market-ness in the display
+                    # string.  "Limit" is the discriminator, matching
+                    # ``_translate_order_type``: a bare "Stop"/"Take Profit" is
+                    # market-on-trigger (its ``limitPx`` carries the trigger).
                     trigger_raw = order_object.get("triggerPx")
-                    is_market = "Market" in str(order_type or "")
+                    is_market = not str(order_type or "").endswith("Limit")
                 trigger_price = Decimal(str(trigger_raw))
                 limit_price = None if is_market else Decimal(str(order_object.get("limitPx")))
             except (KeyError, TypeError, ValueError, InvalidOperation) as exc:

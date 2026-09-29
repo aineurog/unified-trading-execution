@@ -8,10 +8,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from unified_trading_execution.errors import InvalidOrderError, InvalidSymbolError, OrderNotFoundError
+from unified_trading_execution.errors import (
+    InvalidOrderError,
+    InvalidSymbolError,
+    OrderNotFoundError,
+    PlatformError,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
-from unified_trading_execution.hyperliquid.enums import MarginMode
 from unified_trading_execution.hyperliquid.orders import (
     SL_CLOID_SUFFIX,
     TP_CLOID_SUFFIX,
@@ -135,6 +139,7 @@ def _sl(price: str = "40000") -> TpSlAttachment:
 
 # ---- builder ----
 
+
 def test_builder_grouping_and_cloids() -> None:
     requests, grouping = build_position_tpsl_action(
         coin="BTC",
@@ -150,7 +155,9 @@ def test_builder_grouping_and_cloids() -> None:
     assert tp_request["reduce_only"] is True and sl_request["reduce_only"] is True
     assert tp_request["is_buy"] is False and sl_request["is_buy"] is False
     assert tp_request["sz"] == sl_request["sz"] == 0.5
-    assert tp_request["order_type"] == {"trigger": {"isMarket": True, "triggerPx": 60000.0, "tpsl": "tp"}}
+    assert tp_request["order_type"] == {
+        "trigger": {"isMarket": True, "triggerPx": 60000.0, "tpsl": "tp"}
+    }
     assert tp_request["cloid"] == position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
     assert sl_request["cloid"] == position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX)
 
@@ -167,10 +174,13 @@ def test_builder_single_side_and_limit() -> None:
     )
     assert grouping == "positionTpsl"
     assert request["is_buy"] is True
-    assert request["order_type"] == {"trigger": {"isMarket": False, "triggerPx": 60000.0, "tpsl": "tp"}}
+    assert request["order_type"] == {
+        "trigger": {"isMarket": False, "triggerPx": 60000.0, "tpsl": "tp"}
+    }
 
 
 # ---- modify validation ----
+
 
 async def test_modify_rejects_empty() -> None:
     adapter = _adapter(_exchange_mock())
@@ -200,12 +210,16 @@ async def test_modify_wrong_position_id() -> None:
 
 # ---- modify attach/replace ----
 
+
 async def test_modify_attaches_both_without_cancels() -> None:
     exchange = _exchange_mock()
     adapter = _adapter(exchange)
     await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp(), stop_loss=_sl())
     exchange.cancel.assert_not_called()
-    (requests,), kwargs = exchange.bulk_orders.mock_calls[0][1], exchange.bulk_orders.mock_calls[0][2]
+    (requests,), kwargs = (
+        exchange.bulk_orders.mock_calls[0][1],
+        exchange.bulk_orders.mock_calls[0][2],
+    )
     assert kwargs.get("grouping") == "positionTpsl"
     assert len(requests) == 2
 
@@ -226,10 +240,12 @@ async def test_modify_replaces_mentioned_side_only() -> None:
     """An existing SL leg is cancelled and replaced when SL is mentioned; TP untouched."""
     sl_cloid = position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX)
     tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
-    exchange = _exchange_mock(entries=[
-        _trigger_entry(cloid=tp_cloid, oid=11),
-        _trigger_entry(cloid=sl_cloid, oid=12),
-    ])
+    exchange = _exchange_mock(
+        entries=[
+            _trigger_entry(cloid=tp_cloid, oid=11),
+            _trigger_entry(cloid=sl_cloid, oid=12),
+        ]
+    )
     adapter = _adapter(exchange)
     await adapter.modify_position_tpsl(_perp(), _POSITION_ID, stop_loss=_sl())
     exchange.cancel.assert_called_once()
@@ -271,15 +287,39 @@ async def test_modify_rejects_bad_trigger() -> None:
 
 
 async def test_modify_indexes_acked_oids() -> None:
-    exchange = _exchange_mock(
-        bulk_statuses=[{"resting": {"oid": 101}}, {"resting": {"oid": 102}}]
-    )
+    exchange = _exchange_mock(bulk_statuses=[{"resting": {"oid": 101}}, {"resting": {"oid": 102}}])
     adapter = _adapter(exchange)
     await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp(), stop_loss=_sl())
     tp_id = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
     sl_id = position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX)
     assert adapter._oid_clients["101"] == (tp_id, FillReason.TAKE_PROFIT, FillEntry.OUT)
     assert adapter._oid_clients["102"] == (sl_id, FillReason.STOP_LOSS, FillEntry.OUT)
+
+
+@pytest.mark.parametrize(
+    ("attachment", "suffix", "reason"),
+    [
+        ({"take_profit": _tp()}, TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+        ({"stop_loss": _sl()}, SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+    ],
+)
+async def test_modify_single_side_attributes_its_own_cloid(
+    attachment: dict[str, TpSlAttachment], suffix: str, reason: FillReason
+) -> None:
+    """A one-sided merge acks one oid; it must carry *that* side's cloid and reason.
+
+    Zipping a fixed (TP, SL) suffix tuple against the response would tag a
+    lone stop-loss leg with the take-profit cloid and TAKE_PROFIT reason,
+    mislabelling every subsequent fill of that stop.
+    """
+    exchange = _exchange_mock(bulk_statuses=[{"resting": {"oid": 101}}])
+    adapter = _adapter(exchange)
+    await adapter.modify_position_tpsl(_perp(), _POSITION_ID, **attachment)
+    assert adapter._oid_clients["101"] == (
+        position_tpsl_cloid(_POSITION_ID, suffix),
+        reason,
+        FillEntry.OUT,
+    )
 
 
 async def test_replace_waits_for_oid_disappearance() -> None:
@@ -306,10 +346,12 @@ async def test_replace_waits_for_oid_disappearance() -> None:
 async def test_replace_cancels_every_duplicate_cloid() -> None:
     """Two live legs sharing one cloid (prior replace residue): both cancelled."""
     tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
-    exchange = _exchange_mock(entries=[
-        _trigger_entry(cloid=tp_cloid, oid=11),
-        _trigger_entry(cloid=tp_cloid, oid=12),
-    ])
+    exchange = _exchange_mock(
+        entries=[
+            _trigger_entry(cloid=tp_cloid, oid=11),
+            _trigger_entry(cloid=tp_cloid, oid=12),
+        ]
+    )
     adapter = _adapter(exchange)
     await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp())
     cancelled = sorted(call[1][1] for call in exchange.cancel.mock_calls)
@@ -327,15 +369,23 @@ async def test_short_leg_closes_with_buy() -> None:
 
 # ---- get ----
 
-def _status_response(*, status: str = "open", trigger_px: str = "60000",
-                     limit_px: str = "60000", is_market: bool = True) -> dict[str, Any]:
+
+def _status_response(
+    *,
+    status: str = "open",
+    trigger_px: str = "60000",
+    limit_px: str = "60000",
+    is_market: bool = True,
+) -> dict[str, Any]:
     return {
         "status": "order" if status == "open" else status,
         "order": {
             "order": {
                 "coin": "BTC",
                 "limitPx": limit_px,
-                "orderType": {"trigger": {"triggerPx": trigger_px, "isMarket": is_market, "tpsl": "tp"}},
+                "orderType": {
+                    "trigger": {"triggerPx": trigger_px, "isMarket": is_market, "tpsl": "tp"}
+                },
             },
             "status": status,
         },
@@ -427,7 +477,91 @@ async def test_get_terminal_leg_reads_missing() -> None:
     assert await adapter.get_position_tpsl(_perp(), _POSITION_ID) == (None, None)
 
 
+async def test_get_unknown_status_raises() -> None:
+    """An unrecognised status is never silently reported as a live stop."""
+    exchange = _exchange_mock()
+    exchange.info.query_order_by_cloid.side_effect = [
+        _status_response(status="somethingNewCanceled"),
+        {"status": "unknownOid"},
+    ]
+    adapter = _adapter(exchange)
+    with pytest.raises(PlatformError, match="Unknown order status"):
+        await adapter.get_position_tpsl(_perp(), _POSITION_ID)
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        "filled",
+        "canceled",
+        "siblingFilledCanceled",
+        "reduceOnlyCanceled",
+        "liquidatedCanceled",
+        "oracleRejected",
+        "minTradeNtlRejected",
+    ],
+)
+async def test_get_non_working_status_reads_missing(status: str) -> None:
+    """Every terminal status reads back as missing, not just filled/canceled.
+
+    The legs are OCO, so when one side fills the other reports
+    ``siblingFilledCanceled`` — reading that as a live stop would claim the
+    position is protected when it is not.
+    """
+    exchange = _exchange_mock()
+    exchange.info.query_order_by_cloid.side_effect = [
+        _status_response(status=status),
+        {"status": "unknownOid"},
+    ]
+    adapter = _adapter(exchange)
+    assert await adapter.get_position_tpsl(_perp(), _POSITION_ID) == (None, None)
+
+
+@pytest.mark.parametrize(
+    ("order_type", "expected_limit"),
+    [
+        ("Stop", None),
+        ("Stop Market", None),
+        ("Take Profit Market", None),
+        ("Stop Limit", Decimal("59000")),
+        ("Take Profit Limit", Decimal("59000")),
+    ],
+)
+async def test_get_market_ness_from_order_type_suffix(
+    order_type: str, expected_limit: Decimal | None
+) -> None:
+    """A bare ``Stop``/``Take Profit`` is market-on-trigger, so it carries no limit.
+
+    Matches ``_translate_order_type``: "Limit" is the discriminator, and a
+    market trigger's ``limitPx`` merely echoes the trigger price.
+    """
+    exchange = _exchange_mock()
+    exchange.info.query_order_by_cloid.side_effect = [
+        {
+            "status": "order",
+            "order": {
+                "order": {
+                    "coin": "BTC",
+                    "limitPx": "59000",
+                    "triggerPx": "60000",
+                    "isTrigger": True,
+                    "orderType": order_type,
+                    "reduceOnly": True,
+                },
+                "status": "open",
+            },
+        },
+        {"status": "unknownOid"},
+    ]
+    adapter = _adapter(exchange)
+    tp, _ = await adapter.get_position_tpsl(_perp(), _POSITION_ID) or (None, None)
+    assert tp is not None
+    assert tp.trigger_price == Decimal("60000")
+    assert tp.limit_price == expected_limit
+
+
 # ---- snapshot inclusion ----
+
 
 async def test_fetch_open_orders_includes_position_legs_by_cloid() -> None:
     tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
