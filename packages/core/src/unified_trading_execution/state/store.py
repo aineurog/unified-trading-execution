@@ -931,10 +931,16 @@ class SQLiteStateStore(StateStore):
             await self.conn.execute("DELETE FROM adapter_config WHERE key=?", (key,))
 
     async def list_adapter_config(self, prefix: str) -> dict[str, str]:
+        # The prefix is caller data, not a pattern: escape LIKE wildcards so
+        # only literal-prefix rows match (e.g. "margin_mode:" must not match
+        # "marginXmode:").  Stored keys are untouched — only the filter narrows.
+        escaped = "".join(
+            f"\\{char}" if char in ("\\", "%", "_") else char for char in prefix
+        )
         async with self._write_lock:
             cursor = await self.conn.execute(
-                "SELECT key, value FROM adapter_config WHERE key LIKE ?",
-                (prefix + "%",),
+                "SELECT key, value FROM adapter_config WHERE key LIKE ? ESCAPE '\\'",
+                (escaped + "%",),
             )
             rows = await cursor.fetchall()
             return {str(row["key"]): str(row["value"]) for row in rows}
