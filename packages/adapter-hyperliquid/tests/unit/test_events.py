@@ -145,7 +145,7 @@ async def test_set_margin_mode_emits_changed_with_stored_previous() -> None:
 
 async def test_set_margin_mode_emits_changed_with_venue_previous() -> None:
     adapter, _, seen = _adapter(legs=[_leg(value=10, kind="cross")])
-    await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED)
+    await adapter.set_margin_mode(_perp(), MarginMode.ISOLATED, block_on_open_position=False)
     (changed,) = _of_type(seen, MarginModeChangedEvent)
     assert isinstance(changed, MarginModeChangedEvent)
     assert changed.previous is MarginMode.CROSS

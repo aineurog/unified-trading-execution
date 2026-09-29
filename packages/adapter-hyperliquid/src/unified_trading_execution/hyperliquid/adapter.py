@@ -14,7 +14,7 @@ import asyncio
 import logging
 import time
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 import requests
@@ -99,6 +99,11 @@ from unified_trading_execution.types.order import (
 from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
+
+_POLICY_KNOB_STRICT_CHECK = "strict_check"
+_POLICY_KNOB_BLOCK_ON_OPEN = "block_on_open"
+DEFAULT_STRICT_CHECK = True
+DEFAULT_BLOCK_ON_OPEN_POSITION = True
 
 
 def _new_id() -> str:
@@ -449,8 +454,11 @@ class HyperliquidAdapter(Adapter):
         reshaped); MARKET pricing is touch-derived automatically; notionals
         check against the live max-leverage tier.  Returns the parent
         result; TP/SL legs ride the same action.  ``cloid``-addressed
-        end-to-end for idempotent retry.
+        end-to-end for idempotent retry.  The coin's ``strict_check`` knob
+        (default on) verifies leverage against intent first, rejecting the
+        order on unrepaired drift.
         """
+        await self._strict_check_leverage(order.instrument)
         exchange = self._require_exchange()
         coin = to_hyperliquid_coin(order.instrument)
         is_spot = order.instrument.asset_class == AssetClass.SPOT
@@ -1117,6 +1125,8 @@ class HyperliquidAdapter(Adapter):
         *,
         leverage: int = 1,
         on_drift: Literal["reapply", "notify", "halt"] = "reapply",
+        strict_check: bool = True,
+        block_on_open_position: bool = True,
         auto_apply_on_connect: bool = True,
     ) -> None:
         """Set per-asset leverage via ``updateLeverage`` and persist intent.
@@ -1125,7 +1135,10 @@ class HyperliquidAdapter(Adapter):
         else venue, else default.  Above the tier cap raises
         ``InvalidOrderError`` (never clamped); spot raises
         ``InvalidSymbolError``.  The store is required up front so the venue
-        is never mutated when intent cannot be persisted.
+        is never mutated when intent cannot be persisted.  With the default
+        ``block_on_open_position`` an open leg refuses the change (the venue
+        would recut live margin); ``strict_check`` arms pre-order
+        verification for the coin.  Both knobs persist per coin.
         """
         raw_leverage: Any = leverage
         if isinstance(raw_leverage, bool) or not isinstance(raw_leverage, int) or raw_leverage < 1:
@@ -1136,12 +1149,22 @@ class HyperliquidAdapter(Adapter):
             raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no leverage")
         coin = to_hyperliquid_coin(instrument)
         store = await self._require_store()
+        if block_on_open_position:
+            await self._block_on_open_position(
+                instrument, action="change leverage", kind="leverage"
+            )
         cap = await self._tier_max_leverage(coin)
         if leverage > cap:
             raise InvalidOrderError(f"Leverage {leverage} exceeds max {cap} for {coin}")
         await self._submit_leverage(coin, leverage, await self._resolved_is_cross(coin))
         await store.set_adapter_config(f"leverage:{coin}", str(leverage))
         await store.set_adapter_config(f"leverage.on_drift:{coin}", on_drift)
+        await store.set_adapter_config(
+            f"leverage.strict_check:{coin}", "1" if strict_check else "0"
+        )
+        await store.set_adapter_config(
+            f"leverage.block_on_open:{coin}", "1" if block_on_open_position else "0"
+        )
         await store.set_adapter_config(
             f"leverage.auto_apply:{coin}", "1" if auto_apply_on_connect else "0"
         )
@@ -1153,11 +1176,13 @@ class HyperliquidAdapter(Adapter):
         return await self._venue_leverage(to_hyperliquid_coin(instrument))
 
     async def remove_leverage(self, instrument: Instrument) -> None:
-        """Drop stored per-asset leverage intent (venue untouched)."""
+        """Drop stored per-asset leverage intent and its knobs (venue untouched)."""
         store = await self._require_store()
         coin = to_hyperliquid_coin(instrument)
         await store.delete_adapter_config(f"leverage:{coin}")
         await store.delete_adapter_config(f"leverage.on_drift:{coin}")
+        await store.delete_adapter_config(f"leverage.strict_check:{coin}")
+        await store.delete_adapter_config(f"leverage.block_on_open:{coin}")
         await store.delete_adapter_config(f"leverage.auto_apply:{coin}")
 
     async def top_up_isolated_margin(self, instrument: Instrument, *, amount_usdc: Decimal) -> None:
@@ -1183,6 +1208,7 @@ class HyperliquidAdapter(Adapter):
         mode: MarginMode | str,
         *,
         on_drift: Literal["reapply", "notify", "halt"] = "reapply",
+        block_on_open_position: bool = True,
         auto_apply_on_connect: bool = True,
     ) -> None:
         """Set per-asset margin mode via ``updateLeverage`` and persist intent.
@@ -1190,7 +1216,8 @@ class HyperliquidAdapter(Adapter):
         Owns the mode only — leverage is preserved (stored, else venue,
         else default, which the venue then enforces).  ``mode`` is the enum
         or ``"cross"``/``"isolated"``.  The store is required up front so the
-        venue is never mutated when intent cannot be persisted.  A
+        venue is never mutated when intent cannot be persisted.  With the
+        default ``block_on_open_position`` an open leg refuses the change.  A
         ``MarginModeChangedEvent`` publishes when the mode actually changes.
         """
         try:
@@ -1205,6 +1232,10 @@ class HyperliquidAdapter(Adapter):
             raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no margin mode")
         coin = to_hyperliquid_coin(instrument)
         store = await self._require_store()
+        if block_on_open_position:
+            await self._block_on_open_position(
+                instrument, action="change margin mode", kind="margin_mode"
+            )
         legs = await self._venue_leverage_map()
         stored_mode = await self._stored_margin_mode(coin)
         venue = legs.get(coin)
@@ -1216,6 +1247,9 @@ class HyperliquidAdapter(Adapter):
         )
         await store.set_adapter_config(f"margin_mode:{coin}", resolved.value)
         await store.set_adapter_config(f"margin_mode.on_drift:{coin}", on_drift)
+        await store.set_adapter_config(
+            f"margin_mode.block_on_open:{coin}", "1" if block_on_open_position else "0"
+        )
         await store.set_adapter_config(
             f"margin_mode.auto_apply:{coin}", "1" if auto_apply_on_connect else "0"
         )
@@ -1243,12 +1277,54 @@ class HyperliquidAdapter(Adapter):
         return MarginMode.CROSS if venue[1] else MarginMode.ISOLATED
 
     async def remove_margin_mode(self, instrument: Instrument) -> None:
-        """Drop stored per-asset margin-mode intent (venue untouched)."""
+        """Drop stored per-asset margin-mode intent and its knobs (venue untouched)."""
         store = await self._require_store()
         coin = to_hyperliquid_coin(instrument)
         await store.delete_adapter_config(f"margin_mode:{coin}")
         await store.delete_adapter_config(f"margin_mode.on_drift:{coin}")
+        await store.delete_adapter_config(f"margin_mode.block_on_open:{coin}")
         await store.delete_adapter_config(f"margin_mode.auto_apply:{coin}")
+
+    async def _policy_knob(self, kind: str, knob: str, coin: str) -> str | None:
+        """Read one persisted behavior knob (None if unset or storeless)."""
+        if self._state_store is None:
+            return None
+        return await self._state_store.get_adapter_config(f"{kind}.{knob}:{coin}")
+
+    async def _has_open_position(self, coin: str) -> bool:
+        """True when the coin carries a nonzero-size leg."""
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or position.get("coin") != coin:
+                continue
+            try:
+                return Decimal(str(position.get("szi") or "0")) != 0
+            except InvalidOperation:
+                continue
+        return False
+
+    async def _block_on_open_position(
+        self, instrument: Instrument, *, action: str, kind: Literal["leverage", "margin_mode"]
+    ) -> None:
+        """Raise if the instrument has an open leg and the guard is enabled.
+
+        The guard reads the family's persisted ``block_on_open`` knob;
+        unconfigured coins default to blocked.  An open leg recalculates
+        margin immediately on ``updateLeverage``, so the default refuses.
+        Spot has no legs and never blocks.
+        """
+        if instrument.asset_class == AssetClass.SPOT:
+            return
+        coin = to_hyperliquid_coin(instrument)
+        raw = await self._policy_knob(kind, _POLICY_KNOB_BLOCK_ON_OPEN, coin)
+        enabled = DEFAULT_BLOCK_ON_OPEN_POSITION if raw is None else raw == "1"
+        if not enabled:
+            return
+        if await self._has_open_position(coin):
+            raise PlatformError(f"Cannot {action} with open position for {coin}")
 
     def _coin_instrument(self, coin: str) -> Instrument | None:
         """Resolve a stored coin to its instrument; None (logged) when unresolvable."""
@@ -1295,16 +1371,19 @@ class HyperliquidAdapter(Adapter):
 
     async def _reconcile_leverage_row(
         self, coin: str, stored: int, *, legs: dict[str, tuple[int, bool]]
-    ) -> None:
-        """Reconcile one coin's leverage intent, publishing drift/failure events."""
+    ) -> Literal["reapplied", "notified", "halted"] | None:
+        """Reconcile one coin's leverage intent, publishing drift/failure events.
+
+        Returns the action taken, or None when venue already matches intent.
+        """
         venue = legs.get(coin)
         if venue is None:
-            return
+            return None
         if venue[0] == stored:
-            return
+            return None
         instrument = self._coin_instrument(coin)
         if instrument is None:
-            return
+            return None
         policy = None
         if self._state_store is not None:
             policy = await self._state_store.get_adapter_config(f"leverage.on_drift:{coin}")
@@ -1330,7 +1409,7 @@ class HyperliquidAdapter(Adapter):
                         reason=str(exc),
                     )
                 )
-                return
+                return None
             action = "reapplied"
         elif on_drift == "notify":
             logger.warning("Leverage drift on %s: %s", coin, detail)
@@ -1352,20 +1431,24 @@ class HyperliquidAdapter(Adapter):
         )
         if on_drift == "halt":
             await self._halt_for_drift(coin, reason="leverage_drift", detail=detail)
+        return action
 
     async def _reconcile_margin_row(
         self, coin: str, stored: MarginMode, *, legs: dict[str, tuple[int, bool]]
-    ) -> None:
-        """Reconcile one coin's margin-mode intent, publishing drift/failure events."""
+    ) -> Literal["reapplied", "notified", "halted"] | None:
+        """Reconcile one coin's margin-mode intent, publishing drift/failure events.
+
+        Returns the action taken, or None when venue already matches intent.
+        """
         venue = legs.get(coin)
         if venue is None:
-            return
+            return None
         platform = MarginMode.CROSS if venue[1] else MarginMode.ISOLATED
         if platform is stored:
-            return
+            return None
         instrument = self._coin_instrument(coin)
         if instrument is None:
-            return
+            return None
         policy = None
         if self._state_store is not None:
             policy = await self._state_store.get_adapter_config(f"margin_mode.on_drift:{coin}")
@@ -1391,7 +1474,7 @@ class HyperliquidAdapter(Adapter):
                         reason=str(exc),
                     )
                 )
-                return
+                return None
             action = "reapplied"
         elif on_drift == "notify":
             logger.warning("Margin mode drift on %s: %s", coin, detail)
@@ -1413,6 +1496,34 @@ class HyperliquidAdapter(Adapter):
         )
         if on_drift == "halt":
             await self._halt_for_drift(coin, reason="margin_mode_drift", detail=detail)
+        return action
+
+    async def _strict_check_leverage(self, instrument: Instrument) -> None:
+        """Pre-order leverage verification.
+
+        The coin's persisted ``strict_check`` knob decides whether the check
+        runs at all (default on; ``"0"`` disables).  Intent is stored
+        leverage, else the configured default — a flat venue (no leg) always
+        passes, since nothing contradicts intent and the submit ack is the
+        verification.  On drift the coin's ``on_drift`` policy executes
+        exactly as reconcile does; anything but reapply rejects the order
+        with ``PlatformError``.
+        """
+        coin = to_hyperliquid_coin(instrument)
+        raw = await self._policy_knob("leverage", _POLICY_KNOB_STRICT_CHECK, coin)
+        if raw == "0":
+            return
+        if raw is None and not DEFAULT_STRICT_CHECK:
+            return
+        stored = await self._stored_leverage(coin)
+        intent = stored if stored is not None else self._config.default_leverage
+        venue = await self._venue_leverage(coin)
+        legs = {coin: venue} if venue is not None else {}
+        action = await self._reconcile_leverage_row(coin, intent, legs=legs)
+        if action is not None and action != "reapplied":
+            raise PlatformError(
+                f"Platform leverage differs from intent {intent} for {coin}"
+            )
 
     async def reconcile_user_intent(self) -> None:
         """Reconcile stored per-asset leverage/mode intent with the venue.
