@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -33,7 +34,14 @@ from unified_trading_execution.errors import (
     PlatformError,
     RateLimitError,
 )
-from unified_trading_execution.events import ConnectionStateEvent, Event, EventBus
+from unified_trading_execution.events import (
+    ConnectionStateEvent,
+    Event,
+    EventBus,
+    FillEvent,
+    OrderCancelledEvent,
+    OrderStatusEvent,
+)
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
 from unified_trading_execution.hyperliquid.errors import (
@@ -89,6 +97,7 @@ from unified_trading_execution.hyperliquid.streams import (
     translate_position,
     translate_ticker,
 )
+from unified_trading_execution.hyperliquid.websocket import HyperliquidWebSocket
 from unified_trading_execution.hyperliquid.symbols import (
     from_hyperliquid_coin,
     to_hyperliquid_coin,
@@ -121,6 +130,11 @@ _POLICY_KNOB_STRICT_CHECK = "strict_check"
 _POLICY_KNOB_BLOCK_ON_OPEN = "block_on_open"
 DEFAULT_STRICT_CHECK = True
 DEFAULT_BLOCK_ON_OPEN_POSITION = True
+
+#: Seconds between push-channel liveness polls (see ``_monitor_streams``).
+_WS_MONITOR_INTERVAL_SECONDS = 15.0
+#: Fill ids remembered for stream dedupe (matches the venue recent window).
+_WS_SEEN_FILL_IDS = 10000
 
 
 def _new_id() -> str:
@@ -162,6 +176,17 @@ class HyperliquidAdapter(Adapter):
         # Local IP weight accounting (see ``rates``) — every SDK call flows
         # through ``_run_exchange``; ``connect`` records construction directly.
         self._rate_budget = RateBudget()
+        # Push-channel state (see "WebSocket event streams" below).  The
+        # socket is owned here but started explicitly via ``start_streams``.
+        self._ws: HyperliquidWebSocket | None = None
+        self._ws_task: asyncio.Task[None] | None = None
+        self._ws_pending: set[asyncio.Task[Any]] = set()
+        # Fill ids ("<hash>:<tid>", the ``platform_fill_id`` shape) already
+        # reported — shared by both fill channels so dual-subscribed fills
+        # publish exactly once.  Bounded: matches the venue recent window.
+        self._seen_fill_ids: deque[str] = deque(maxlen=_WS_SEEN_FILL_IDS)
+        # Push-channel link state.  ``_ws_task`` polls it (see below).
+        self._streams_up = False
 
     # ---- Identification ----
 
@@ -279,9 +304,10 @@ class HyperliquidAdapter(Adapter):
     async def disconnect(self) -> None:
         """Close the transport gracefully.
 
-        Publishes ``ConnectionStateEvent(connected=False)``.  WebSocket
-        teardown joins here when subscriptions land.
+        Stops push streams first, then drops REST.  Publishes
+        ``ConnectionStateEvent(connected=False)``.
         """
+        await self.stop_streams()
         if self._exchange is None and not self._connected:
             return
         self._exchange = None
@@ -295,6 +321,368 @@ class HyperliquidAdapter(Adapter):
     def is_connected(self) -> bool:
         """Return True if the transport is currently established."""
         return self._connected
+
+    @property
+    def streams_connected(self) -> bool:
+        """Return True if the push channel is currently established."""
+        socket = self._ws
+        return socket is not None and socket.is_connected()
+
+    # ---- WebSocket event streams ----
+
+    async def start_streams(self) -> None:
+        """Open the push channel and subscribe the account streams.
+
+        Subscribes ``userEvents``, ``orderUpdates``, and ``userFills``,
+        then seeds the fill seen-set from a REST read so pre-subscription
+        history is never re-published (REST owns the past; the streams own
+        everything after).  Idempotent while the socket lives.  Requires a
+        connected exchange and a wired event bus.
+        """
+        self._require_exchange()
+        if self._ws is not None and self._ws.is_connected():
+            return
+        await self.stop_streams()
+        socket = await asyncio.to_thread(self._build_connected_socket)
+        self._ws = socket
+        try:
+            socket.subscribe_user_events(self._on_ws_message)
+            socket.subscribe_order_updates(self._on_ws_message)
+            socket.subscribe_user_fills(self._on_ws_message)
+        except Exception:
+            await asyncio.to_thread(socket.disconnect)
+            self._ws = None
+            raise
+        await self._seed_seen_fills()
+        self._streams_up = True
+        self._ws_task = asyncio.ensure_future(self._monitor_streams())
+
+    def _build_connected_socket(self) -> HyperliquidWebSocket:
+        """Construct and connect one socket (blocking — always called off-loop)."""
+        socket = HyperliquidWebSocket(self._config)
+        socket.connect()
+        return socket
+
+    async def stop_streams(self) -> None:
+        """Stop the monitor and tear the socket down (idempotent, never raises)."""
+        self._streams_up = False
+        task, self._ws_task = self._ws_task, None
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Hyperliquid streams monitor failed on stop")
+        socket, self._ws = self._ws, None
+        if socket is not None:
+            try:
+                await asyncio.to_thread(socket.disconnect)
+            except Exception:
+                logger.exception("Hyperliquid streams disconnect failed")
+
+    def _on_ws_message(self, message: dict[str, Any]) -> None:
+        """Hand a manager-thread message to the event loop (never raises).
+
+        No staleness gate: callbacks execute synchronously on the manager
+        thread, so a dead manager cannot deliver — rebuilds and stops only
+        ever silence live threads, never resurrect dead ones.
+        """
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _schedule() -> None:
+            try:
+                task = asyncio.ensure_future(self._dispatch_ws_message(message))
+            except Exception:
+                logger.exception("Hyperliquid WS message dropped before dispatch")
+                return
+            self._ws_pending.add(task)
+            task.add_done_callback(self._ws_task_done)
+
+        try:
+            loop.call_soon_threadsafe(_schedule)
+        except RuntimeError:
+            logger.exception("Hyperliquid WS message dropped — loop closed")
+
+    def _ws_task_done(self, task: asyncio.Task[Any]) -> None:
+        """Retire a dispatch task, surfacing failures without warnings."""
+        self._ws_pending.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.exception("Hyperliquid WS dispatch failed: %r", exc)
+
+    async def _dispatch_ws_message(self, message: dict[str, Any]) -> None:
+        """Route one push message to its channel handler (never raises)."""
+        try:
+            if not isinstance(message, dict):
+                raise PlatformError(f"Unexpected WS message shape {message!r}")
+            channel = message.get("channel")
+            data = message.get("data")
+            if channel == "userFills":
+                await self._handle_user_fills_message(data)
+            elif channel == "user":
+                await self._handle_user_message(data)
+            elif channel == "orderUpdates":
+                await self._handle_order_updates_message(data)
+            else:
+                logger.warning("Ignoring WS message on unknown channel %r", channel)
+        except Exception:
+            logger.exception("Hyperliquid WS message handling failed")
+
+    @staticmethod
+    def _fill_key(entry: dict[str, Any]) -> str | None:
+        """The dedupe key for a fill entry (None when the entry has no id)."""
+        raw_hash, raw_tid = entry.get("hash"), entry.get("tid")
+        if raw_hash in (None, "") or raw_tid in (None, ""):
+            return None
+        return f"{raw_hash}:{raw_tid}"
+
+    def _fill_seen(self, entry: dict[str, Any]) -> bool:
+        """True when this fill id already reported (records it when new).
+
+        Id-less entries always report False — they still translate (or skip
+        loudly) downstream; dedupe needs an id to key on.
+        """
+        key = self._fill_key(entry)
+        if key is None:
+            return False
+        if key in self._seen_fill_ids:
+            return True
+        self._seen_fill_ids.append(key)
+        return False
+
+    def _publish_fill_record(self, record: FillRecord) -> None:
+        """Publish one fill record on the bus."""
+        self._publish(
+            FillEvent(
+                event_id=_new_id(),
+                timestamp=_utcnow(),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                fill=record,
+            )
+        )
+
+    async def _absorb_fills(self, *, publish_unseen: bool) -> None:
+        """Fold a REST fills snapshot into the seen-set.
+
+        With ``publish_unseen=False`` (startup seed) history is only marked —
+        REST owns the past.  With True (post-reconnect gap cover) unseen
+        fills publish — the live channel missed them.
+        """
+        for records in (await self.fetch_fills()).values():
+            for record in records:
+                key = record.platform_fill_id
+                if key in self._seen_fill_ids:
+                    continue
+                self._seen_fill_ids.append(key)
+                if publish_unseen:
+                    self._publish_fill_record(record)
+
+    async def _seed_seen_fills(self) -> None:
+        """Mark current REST history seen so streams never re-publish the past."""
+        await self._absorb_fills(publish_unseen=False)
+
+    async def _handle_user_fills_message(self, data: Any) -> None:
+        """Publish streaming fills; snapshots only seed the seen-set."""
+        if not isinstance(data, dict):
+            raise PlatformError(f"Unexpected userFills shape {data!r}")
+        self._require_user(data)
+        for entry in data.get("fills") or []:
+            if not isinstance(entry, dict):
+                logger.warning("Skipping malformed userFills entry: %r", entry)
+                continue
+            if data.get("isSnapshot"):
+                self._fill_seen(entry)
+                continue
+            await self._publish_fill_entry(entry)
+
+    async def _handle_user_message(self, data: Any) -> None:
+        """Dispatch a ``user``-channel event (fills publish; rest is logged)."""
+        if not isinstance(data, dict):
+            raise PlatformError(f"Unexpected user-channel shape {data!r}")
+        if "fills" in data:
+            for entry in data.get("fills") or []:
+                if not isinstance(entry, dict):
+                    logger.warning("Skipping malformed user fill entry: %r", entry)
+                    continue
+                await self._publish_fill_entry(entry)
+            return
+        if "funding" in data:
+            logger.debug("Hyperliquid funding update: %r", data.get("funding"))
+            return
+        if "liquidation" in data:
+            logger.warning("Hyperliquid liquidation update: %r", data.get("liquidation"))
+            return
+        if "nonUserCancel" in data:
+            logger.debug("Hyperliquid non-user cancels: %r", data.get("nonUserCancel"))
+            return
+        logger.warning("Ignoring unknown user-channel update: %r", sorted(data))
+
+    async def _handle_order_updates_message(self, data: Any) -> None:
+        """Publish an ``OrderStatusEvent`` per order update (+ cancel on terminal)."""
+        entries = data if isinstance(data, list) else [data]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                logger.warning("Skipping malformed order update: %r", entry)
+                continue
+            try:
+                record = await self._translate_order_update(entry)
+            except Exception:
+                logger.exception("Skipping untranslatable order update: %r", entry)
+                continue
+            self._publish(
+                OrderStatusEvent(
+                    event_id=_new_id(),
+                    timestamp=_utcnow(),
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    order=record,
+                )
+            )
+            if record.status is OrderStatus.CANCELLED:
+                self._publish(
+                    OrderCancelledEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        client_order_id=record.client_order_id,
+                        instrument=record.instrument,
+                    )
+                )
+
+    async def _translate_order_update(self, entry: dict[str, Any]) -> OrderRecord:
+        """Translate one ``WsOrder`` update (order object + status override)."""
+        payload = entry.get("order")
+        if not isinstance(payload, dict):
+            raise PlatformError(f"Order update is missing its order object: {entry!r}")
+        coin = str(payload.get("coin") or "")
+        if not coin:
+            raise PlatformError(f"Order update is missing coin: {entry!r}")
+        instrument = from_hyperliquid_coin(
+            coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
+        )
+        status = entry.get("status")
+        return translate_order_entry(
+            {**payload, "status": status} if status is not None else payload,
+            instrument=instrument,
+        )
+
+    async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
+        """Translate one fill and publish it unless already seen (never raises)."""
+        try:
+            if self._fill_seen(entry):
+                return
+            coin = str(entry.get("coin") or "")
+            if not coin:
+                raise PlatformError(f"Fill entry is missing coin: {entry!r}")
+            instrument = from_hyperliquid_coin(
+                coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
+            )
+            oid = str(entry.get("oid") or "")
+            attributed = self._oid_clients.get(oid)
+            if attributed is not None:
+                client_order_id, reason, fill_entry = attributed
+            else:
+                client_order_id, reason, fill_entry = (oid or "unknown"), None, None
+            record = translate_fill(
+                entry,
+                instrument=instrument,
+                client_order_id=client_order_id,
+                reason=reason,
+                fill_entry=fill_entry,
+            )
+            self._publish_fill_record(record)
+        except Exception:
+            logger.exception("Skipping untranslatable fill entry: %r", entry)
+
+    def _require_user(self, data: dict[str, Any]) -> None:
+        """Drop messages routed to a different user than configured."""
+        user = data.get("user")
+        if user is not None and str(user).lower() != self._config.wallet_address.lower():
+            raise PlatformError(f"WS message for unexpected user {user!r}")
+
+    async def _monitor_streams(self) -> None:
+        """Own the push channel: rebuild drops, gap-fill, announce (never raises).
+
+        The SDK manager dies silently on drop (no reconnect, no callback),
+        so each tick compares socket liveness against ``_streams_up``.  On a
+        drop the state flips and waiters are told; on rebuild the fresh
+        socket resubscribes, unseen gap fills publish, and the state flips
+        back.  A failed rebuild only logs — the next tick retries.
+        """
+        while True:
+            try:
+                await asyncio.sleep(_WS_MONITOR_INTERVAL_SECONDS)
+                socket = self._ws
+                if socket is None:
+                    return
+                try:
+                    alive = socket.is_connected()
+                except Exception:
+                    logger.exception("Hyperliquid streams liveness check failed")
+                    alive = False
+                if alive:
+                    if not self._streams_up:
+                        self._streams_up = True
+                        self._publish_connection_state(True)
+                    continue
+                if self._streams_up:
+                    self._streams_up = False
+                    self._publish_connection_state(False)
+                await self._rebuild_streams(socket)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Hyperliquid streams monitor tick failed")
+
+    async def _rebuild_streams(self, dead: HyperliquidWebSocket) -> None:
+        """Swap a dead socket for a fresh subscribed one and cover the gap.
+
+        Only replaces ``self._ws`` when the dead instance is still current
+        (a concurrent ``stop_streams`` wins the race by clearing first).
+        Gap fills missed between drop and resubscribe publish when unseen;
+        the resubscribe snapshot itself only seeds.
+        """
+        try:
+            replacement = await asyncio.to_thread(self._build_connected_socket)
+        except Exception:
+            logger.exception("Hyperliquid streams rebuild failed — retrying next tick")
+            return
+        if self._ws is not dead:
+            try:
+                await asyncio.to_thread(replacement.disconnect)
+            except Exception:
+                logger.exception("Hyperliquid replacement socket teardown failed")
+            return
+        self._ws = replacement
+        try:
+            await asyncio.to_thread(dead.disconnect)
+        except Exception:
+            logger.exception("Hyperliquid dead socket teardown failed")
+        try:
+            replacement.subscribe_user_events(self._on_ws_message)
+            replacement.subscribe_order_updates(self._on_ws_message)
+            replacement.subscribe_user_fills(self._on_ws_message)
+        except Exception:
+            logger.exception("Hyperliquid resubscribe after reconnect failed")
+            return
+        try:
+            await self._absorb_fills(publish_unseen=True)
+        except Exception:
+            logger.exception("Hyperliquid gap re-query after reconnect failed")
+            return
+        self._streams_up = True
+        self._publish_connection_state(True)
 
     # ---- Transport helper ----
 
@@ -1036,6 +1424,24 @@ class HyperliquidAdapter(Adapter):
             if oid is None or oid == "":
                 continue
             self._oid_clients[str(oid)] = (raw, reason, FillEntry.OUT)
+        # ``positionTpsl`` acks usually carry no oid (bare
+        # ``waitingForTrigger`` strings), so re-read the rested legs and
+        # index those too — otherwise their fills key by raw oid with no
+        # reason until a fills refresh happens to rebuild them.
+        placed = {request["cloid"].to_raw() for request in requests}
+        for side, suffix in (("take_profit", TP_CLOID_SUFFIX), ("stop_loss", SL_CLOID_SUFFIX)):
+            raw = position_tpsl_cloid(position_id, suffix)
+            if raw not in placed:
+                continue
+            for entry in (await self._position_tpsl_entries(position_id)).get(side, []):
+                oid = entry.get("oid")
+                if oid is None or oid == "":
+                    continue
+                self._oid_clients[str(oid)] = (
+                    raw,
+                    FillReason.TAKE_PROFIT if side == "take_profit" else FillReason.STOP_LOSS,
+                    FillEntry.OUT,
+                )
 
     async def get_position_tpsl(
         self,

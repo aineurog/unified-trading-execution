@@ -359,6 +359,20 @@ async def test_replace_cancels_every_duplicate_cloid() -> None:
     exchange.bulk_orders.assert_called_once()
 
 
+async def test_place_indexes_rested_oids_missing_from_ack() -> None:
+    """Bare waitingForTrigger acks carry no oid — rested legs are indexed via re-scan."""
+    tp_raw = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
+    sl_raw = position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX)
+    exchange = _exchange_mock(entries=[
+        _trigger_entry(cloid=tp_raw, oid=101),
+        _trigger_entry(cloid=sl_raw, oid=102),
+    ])
+    adapter = _adapter(exchange)
+    await adapter.modify_position_tpsl(_perp(), _POSITION_ID, take_profit=_tp(), stop_loss=_sl())
+    assert adapter._oid_clients["101"] == (tp_raw, FillReason.TAKE_PROFIT, FillEntry.OUT)
+    assert adapter._oid_clients["102"] == (sl_raw, FillReason.STOP_LOSS, FillEntry.OUT)
+
+
 async def test_short_leg_closes_with_buy() -> None:
     exchange = _exchange_mock(legs=[{**_leg(), "position": {**_leg()["position"], "szi": "-0.5"}}])
     adapter = _adapter(exchange)

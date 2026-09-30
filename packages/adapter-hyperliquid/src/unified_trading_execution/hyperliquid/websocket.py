@@ -81,11 +81,12 @@ class HyperliquidWebSocket:
         subscriptions, self._subscriptions = self._subscriptions, []
         if manager is None:
             return
-        for subscription, subscription_id in subscriptions:
-            try:
-                manager.unsubscribe(_as_subscription(subscription), subscription_id)
-            except Exception:
-                logger.exception("Hyperliquid WS unsubscribe failed for %s", subscription)
+        if manager.is_alive():
+            for subscription, subscription_id in subscriptions:
+                try:
+                    manager.unsubscribe(_as_subscription(subscription), subscription_id)
+                except Exception:
+                    logger.exception("Hyperliquid WS unsubscribe failed for %s", subscription)
         manager.stop()
 
     def is_connected(self) -> bool:
