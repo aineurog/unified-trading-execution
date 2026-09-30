@@ -97,11 +97,11 @@ from unified_trading_execution.hyperliquid.streams import (
     translate_position,
     translate_ticker,
 )
-from unified_trading_execution.hyperliquid.websocket import HyperliquidWebSocket
 from unified_trading_execution.hyperliquid.symbols import (
     from_hyperliquid_coin,
     to_hyperliquid_coin,
 )
+from unified_trading_execution.hyperliquid.websocket import HyperliquidWebSocket
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
 from unified_trading_execution.types.enums import (
@@ -561,7 +561,12 @@ class HyperliquidAdapter(Adapter):
                 )
 
     async def _translate_order_update(self, entry: dict[str, Any]) -> OrderRecord:
-        """Translate one ``WsOrder`` update (order object + status override)."""
+        """Translate one ``WsOrder`` update.
+
+        ``status`` and ``statusTimestamp`` are siblings of the ``order``
+        object on the wire, so both are folded in — without the timestamp
+        the record's ``updated_at`` would silently fall back to creation.
+        """
         payload = entry.get("order")
         if not isinstance(payload, dict):
             raise PlatformError(f"Order update is missing its order object: {entry!r}")
@@ -571,11 +576,11 @@ class HyperliquidAdapter(Adapter):
         instrument = from_hyperliquid_coin(
             coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
         )
-        status = entry.get("status")
-        return translate_order_entry(
-            {**payload, "status": status} if status is not None else payload,
-            instrument=instrument,
-        )
+        merged = dict(payload)
+        for key in ("status", "statusTimestamp"):
+            if entry.get(key) is not None:
+                merged[key] = entry[key]
+        return translate_order_entry(merged, instrument=instrument)
 
     async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
         """Translate one fill and publish it unless already seen (never raises)."""
@@ -593,7 +598,13 @@ class HyperliquidAdapter(Adapter):
             if attributed is not None:
                 client_order_id, reason, fill_entry = attributed
             else:
-                client_order_id, reason, fill_entry = (oid or "unknown"), None, None
+                # Match ``fetch_fills``: an unattributed fill keys by its L1
+                # hash.  A constant placeholder would collide across fills.
+                client_order_id, reason, fill_entry = (
+                    (oid or str(entry.get("hash") or "")),
+                    None,
+                    None,
+                )
             record = translate_fill(
                 entry,
                 instrument=instrument,
@@ -674,7 +685,14 @@ class HyperliquidAdapter(Adapter):
             replacement.subscribe_order_updates(self._on_ws_message)
             replacement.subscribe_user_fills(self._on_ws_message)
         except Exception:
+            # A connected-but-unsubscribed socket would look alive to the
+            # monitor and never be rebuilt — tear it down so the next tick
+            # retries instead of silently declaring the streams up.
             logger.exception("Hyperliquid resubscribe after reconnect failed")
+            try:
+                await asyncio.to_thread(replacement.disconnect)
+            except Exception:
+                logger.exception("Hyperliquid unsubscribed replacement teardown failed")
             return
         try:
             await self._absorb_fills(publish_unseen=True)
@@ -1429,19 +1447,21 @@ class HyperliquidAdapter(Adapter):
         # index those too — otherwise their fills key by raw oid with no
         # reason until a fills refresh happens to rebuild them.
         placed = {request["cloid"].to_raw() for request in requests}
-        for side, suffix in (("take_profit", TP_CLOID_SUFFIX), ("stop_loss", SL_CLOID_SUFFIX)):
-            raw = position_tpsl_cloid(position_id, suffix)
-            if raw not in placed:
-                continue
-            for entry in (await self._position_tpsl_entries(position_id)).get(side, []):
-                oid = entry.get("oid")
-                if oid is None or oid == "":
+        wanted = [
+            ("take_profit", TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+            ("stop_loss", SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+        ]
+        if any(position_tpsl_cloid(position_id, suffix) in placed for _, suffix, _ in wanted):
+            entries = await self._position_tpsl_entries(position_id)
+            for side, suffix, reason in wanted:
+                raw = position_tpsl_cloid(position_id, suffix)
+                if raw not in placed:
                     continue
-                self._oid_clients[str(oid)] = (
-                    raw,
-                    FillReason.TAKE_PROFIT if side == "take_profit" else FillReason.STOP_LOSS,
-                    FillEntry.OUT,
-                )
+                for entry in entries.get(side, []):
+                    oid = entry.get("oid")
+                    if oid is None or oid == "":
+                        continue
+                    self._oid_clients[str(oid)] = (raw, reason, FillEntry.OUT)
 
     async def get_position_tpsl(
         self,

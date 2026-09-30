@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock, patch
 
-from unified_trading_execution.events import Event, EventBus, FillEvent, OrderCancelledEvent, OrderStatusEvent
+import pytest
+
+from unified_trading_execution.events import (
+    Event,
+    EventBus,
+    FillEvent,
+    OrderCancelledEvent,
+    OrderStatusEvent,
+)
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
-from unified_trading_execution.types.enums import AssetClass, OrderStatus
-from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.enums import OrderStatus
 
 _TEST_ADDRESS = "0x0000000000000000000000000000000000000001"
 _TEST_KEY = "0x" + "11" * 32
@@ -75,23 +83,28 @@ def _of(seen: list[Event], kind: type[Event]) -> list[Event]:
 
 # ---- userFills channel ----
 
+
 async def test_user_fills_snapshot_seeds_without_publishing() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "isSnapshot": True,
-                                          "fills": [_fill()]}}
+        {
+            "channel": "userFills",
+            "data": {"user": _TEST_ADDRESS, "isSnapshot": True, "fills": [_fill()]},
+        }
     )
     assert seen == []
     # Same fill arriving live afterwards is a duplicate — still nothing.
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
+    )
     assert seen == []
 
 
 async def test_user_fills_streaming_publishes() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
+    )
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert (event.fill.fill_quantity, event.fill.fill_price) == (Decimal("0.01"), Decimal("100"))
@@ -103,8 +116,11 @@ async def test_user_fills_streaming_publishes() -> None:
 async def test_user_fills_wrong_user_dropped() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "userFills",
-         "data": {"user": "0x0000000000000000000000000000000000000002", "fills": [_fill()]}})
+        {
+            "channel": "userFills",
+            "data": {"user": "0x0000000000000000000000000000000000000002", "fills": [_fill()]},
+        }
+    )
     assert seen == []
 
 
@@ -112,15 +128,16 @@ async def test_user_fills_malformed_entry_skips_rest_processes() -> None:
     adapter, _, seen = _adapter()
     bad = {"coin": "BTC"}  # no px/sz/hash — untranslatable
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [bad, _fill(tid=10)]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [bad, _fill(tid=10)]}}
+    )
     assert len(_of(seen, FillEvent)) == 1
 
 
 async def test_user_fills_unknown_coin_skips() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "userFills",
-         "data": {"user": _TEST_ADDRESS, "fills": [_fill(coin="dex:XYZ")]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill(coin="dex:XYZ")]}}
+    )
     assert seen == []
 
 
@@ -128,13 +145,26 @@ async def test_fill_attribution_uses_oid_index() -> None:
     adapter, _, seen = _adapter()
     adapter._oid_clients["5"] = ("parent-1", None, None)
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
+    )
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert event.fill.client_order_id == "parent-1"
 
 
+async def test_fill_without_oid_falls_back_to_hash() -> None:
+    """An unattributed, oid-less fill keys by its L1 hash — as ``fetch_fills`` does."""
+    adapter, _, seen = _adapter()
+    await adapter._dispatch_ws_message(
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill(oid="")]}}
+    )
+    (event,) = _of(seen, FillEvent)
+    assert isinstance(event, FillEvent)
+    assert event.fill.client_order_id == "0xh"
+
+
 # ---- user channel ----
+
 
 async def test_user_channel_fills_share_seen_set() -> None:
     """Dual-subscribed fills (user + userFills) publish exactly once."""
@@ -142,15 +172,15 @@ async def test_user_channel_fills_share_seen_set() -> None:
     message = {"channel": "user", "data": {"fills": [_fill()]}}
     await adapter._dispatch_ws_message(message)
     await adapter._dispatch_ws_message(
-        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}})
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
+    )
     assert len(_of(seen, FillEvent)) == 1
 
 
 async def test_user_channel_non_fill_variants_logged_only() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message({"channel": "user", "data": {"funding": {"coin": "BTC"}}})
-    await adapter._dispatch_ws_message(
-        {"channel": "user", "data": {"liquidation": {"lid": 1}}})
+    await adapter._dispatch_ws_message({"channel": "user", "data": {"liquidation": {"lid": 1}}})
     await adapter._dispatch_ws_message({"channel": "user", "data": {"nonUserCancel": []}})
     await adapter._dispatch_ws_message({"channel": "user", "data": {"somethingNew": 1}})
     assert seen == []
@@ -165,6 +195,7 @@ async def test_unknown_channel_ignored() -> None:
 
 # ---- orderUpdates channel ----
 
+
 async def test_order_updates_publish_status() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
@@ -178,7 +209,8 @@ async def test_order_updates_publish_status() -> None:
 async def test_order_updates_cancelled_publishes_both() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "orderUpdates", "data": [_order_update(status="canceled")]})
+        {"channel": "orderUpdates", "data": [_order_update(status="canceled")]}
+    )
     (status_event,) = _of(seen, OrderStatusEvent)
     (cancelled,) = _of(seen, OrderCancelledEvent)
     assert isinstance(status_event, OrderStatusEvent)
@@ -190,7 +222,8 @@ async def test_order_updates_cancelled_publishes_both() -> None:
 async def test_order_updates_malformed_entry_skips_rest() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
-        {"channel": "orderUpdates", "data": [{"no": "order"}, _order_update(oid=8)]})
+        {"channel": "orderUpdates", "data": [{"no": "order"}, _order_update(oid=8)]}
+    )
     (event,) = _of(seen, OrderStatusEvent)
     assert isinstance(event, OrderStatusEvent)
     assert event.order.platform_order_id == "8"
@@ -205,18 +238,37 @@ async def test_order_updates_unknown_coin_skips() -> None:
     assert seen == []
 
 
+async def test_order_updates_carry_status_timestamp() -> None:
+    """``updated_at`` tracks the sibling ``statusTimestamp``, not creation.
+
+    ``statusTimestamp`` sits on the update next to ``order`` (not inside it);
+    dropping it would leave ``updated_at`` pinned to the order's ``timestamp``.
+    """
+    adapter, _, seen = _adapter()
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(status="filled")]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.created_at == datetime.fromtimestamp(1700000000, tz=UTC)
+    assert event.order.updated_at == datetime.fromtimestamp(1700000001, tz=UTC)
+
+
 # ---- thread marshalling ----
+
 
 async def test_on_ws_message_schedules() -> None:
     adapter, _, seen = _adapter()
-    adapter._on_ws_message({"channel": "userFills",
-                            "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}})
+    adapter._on_ws_message(
+        {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
+    )
     await asyncio.sleep(0.05)
     assert len(_of(seen, FillEvent)) == 1
     assert adapter._ws_pending == set()
 
 
 # ---- lifecycle ----
+
 
 def _socket_mock() -> MagicMock:
     socket = MagicMock()
@@ -225,7 +277,7 @@ def _socket_mock() -> MagicMock:
 
 
 async def test_start_stop_lifecycle() -> None:
-    adapter, _, seen = _adapter()
+    adapter, _, _ = _adapter()
     with patch(
         "unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"
     ) as socket_class:
@@ -298,6 +350,52 @@ async def test_rebuild_loses_race_to_stop() -> None:
         assert seen == []
 
 
+async def test_rebuild_resubscribe_failure_tears_down_replacement() -> None:
+    """A failed resubscribe must not leave a live-looking socket behind.
+
+    A connected-but-unsubscribed replacement satisfies ``is_connected``, so
+    the monitor would announce the streams up and never rebuild again.
+    """
+
+    class _FakeSocket:
+        def __init__(self) -> None:
+            self.connected = True
+            self.disconnects = 0
+
+        def is_connected(self) -> bool:
+            return self.connected
+
+        def connect(self) -> None:
+            self.connected = True
+
+        def subscribe_user_events(self, callback: object) -> None:
+            raise RuntimeError("denied")
+
+        def subscribe_order_updates(self, callback: object) -> None:
+            pass
+
+        def subscribe_user_fills(self, callback: object) -> None:
+            pass
+
+        def disconnect(self) -> None:
+            self.connected = False
+            self.disconnects += 1
+
+    adapter, _, seen = _adapter()
+    dead = _socket_mock()
+    adapter._ws = dead
+    with patch(
+        "unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"
+    ) as socket_class:
+        fresh = _FakeSocket()
+        socket_class.return_value = fresh
+        await adapter._rebuild_streams(dead)
+    assert adapter._streams_up is False
+    assert fresh.disconnects == 1
+    assert adapter._ws is fresh and not adapter._ws.is_connected()
+    assert seen == []
+
+
 async def test_monitor_rebuilds_dead_socket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -342,8 +440,6 @@ async def test_gap_fill_skips_seen() -> None:
     exchange = adapter._exchange
     assert isinstance(exchange, MagicMock)
     exchange.info.user_fills.return_value = [_fill(), _fill(tid=10)]
-    with patch(
-        "unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"
-    ):
+    with patch("unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"):
         await adapter._rebuild_streams(dead)
         assert len(_of(seen, FillEvent)) == 1
