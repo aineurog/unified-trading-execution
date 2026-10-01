@@ -11,6 +11,7 @@ no hedge routing.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import time
 from collections import deque
@@ -305,9 +306,12 @@ class HyperliquidAdapter(Adapter):
         """Close the transport gracefully.
 
         Stops push streams first, then drops REST.  Publishes
-        ``ConnectionStateEvent(connected=False)``.
+        ``ConnectionStateEvent(connected=False)``.  Clears the loop handle
+        so manager-thread stragglers drop silently instead of scheduling
+        onto a possibly closed loop.
         """
         await self.stop_streams()
+        self._loop = None
         if self._exchange is None and not self._connected:
             return
         self._exchange = None
@@ -364,7 +368,14 @@ class HyperliquidAdapter(Adapter):
         return socket
 
     async def stop_streams(self) -> None:
-        """Stop the monitor and tear the socket down (idempotent, never raises)."""
+        """Stop the monitor and tear the socket down (idempotent, never raises).
+
+        The socket teardown is time-bounded: ``unsubscribe`` sends on a
+        potentially wedged connection, and an unbounded teardown hangs the
+        caller the same way a dropped socket hangs a reader. On timeout the
+        reference is dropped and the (daemonized) worker is left to finish —
+        teardown completeness is best-effort by contract.
+        """
         self._streams_up = False
         task, self._ws_task = self._ws_task, None
         if task is not None:
@@ -375,10 +386,23 @@ class HyperliquidAdapter(Adapter):
                 pass
             except Exception:
                 logger.exception("Hyperliquid streams monitor failed on stop")
+        pending, self._ws_pending = set(self._ws_pending), set()
+        for dispatch in pending:
+            dispatch.cancel()
+        if pending:
+            try:
+                await asyncio.gather(*pending, return_exceptions=True)
+            except Exception:
+                logger.exception("Hyperliquid streams dispatch drain failed on stop")
         socket, self._ws = self._ws, None
         if socket is not None:
             try:
-                await asyncio.to_thread(socket.disconnect)
+                await asyncio.wait_for(
+                    asyncio.to_thread(socket.disconnect),
+                    timeout=self._config.request_timeout_seconds,
+                )
+            except TimeoutError:
+                logger.warning("Hyperliquid streams disconnect timed out — reference dropped")
             except Exception:
                 logger.exception("Hyperliquid streams disconnect failed")
 
@@ -560,12 +584,29 @@ class HyperliquidAdapter(Adapter):
                     )
                 )
 
+    def _known_client_id(self, raw_cloid: str) -> str | None:
+        """Map a venue cloid back to the caller client id, if placed this session.
+
+        Same derivation as ``fetch_open_orders``: non-hex cids hash on the
+        wire, so the venue echo never matches. Session-scoped by construction —
+        the map only holds cids placed since connect, so cloids from prior
+        sessions stay unknown and pass through untouched.
+        """
+        if not raw_cloid:
+            return None
+        for client_order_id in list(self._client_coins):
+            if raw_cloid == client_order_id_to_cloid(client_order_id):
+                return client_order_id
+        return None
+
     async def _translate_order_update(self, entry: dict[str, Any]) -> OrderRecord:
         """Translate one ``WsOrder`` update.
 
         ``status`` and ``statusTimestamp`` are siblings of the ``order``
         object on the wire, so both are folded in — without the timestamp
         the record's ``updated_at`` would silently fall back to creation.
+        The record's client id is restored to the caller id (same rule as
+        ``fetch_open_orders``) — consumers match on values, not dict keys.
         """
         payload = entry.get("order")
         if not isinstance(payload, dict):
@@ -580,7 +621,11 @@ class HyperliquidAdapter(Adapter):
         for key in ("status", "statusTimestamp"):
             if entry.get(key) is not None:
                 merged[key] = entry[key]
-        return translate_order_entry(merged, instrument=instrument)
+        record = translate_order_entry(merged, instrument=instrument)
+        resolved = self._known_client_id(record.client_order_id)
+        if resolved is not None and resolved != record.client_order_id:
+            record = dataclasses.replace(record, client_order_id=resolved)
+        return record
 
     async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
         """Translate one fill and publish it unless already seen (never raises)."""
@@ -983,6 +1028,20 @@ class HyperliquidAdapter(Adapter):
             if order.price * order.quantity > cap:
                 raise InvalidOrderError(f"Limit notional exceeds tier cap {cap} for {coin}")
 
+        # Record the cid→coin and child-cloid maps BEFORE submitting: the
+        # venue's WS push routinely beats the REST ack back, and any push
+        # dispatched in between must already resolve (a rejected order leaves
+        # a harmless entry — its cloid can never produce pushes).
+        self._client_coins[client_order_id] = (coin, is_spot)
+        for suffix, reason in (
+            (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+            (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+        ):
+            self._child_parents[client_order_id_to_cloid(f"{client_order_id}:{suffix}")] = (
+                client_order_id,
+                reason,
+                FillEntry.OUT,
+            )
         requests, grouping = build_place_order_action(
             order,
             coin=coin,
@@ -1003,7 +1062,6 @@ class HyperliquidAdapter(Adapter):
             raise PlatformError(f"Empty order statuses for {client_order_id}")
         raise_on_status_errors(statuses)
         parent = parse_order_result(statuses[0], client_order_id, requested_quantity=order.quantity)
-        self._client_coins[client_order_id] = (coin, is_spot)
         for status in statuses:
             if not isinstance(status, dict):
                 continue
@@ -1012,15 +1070,6 @@ class HyperliquidAdapter(Adapter):
             if oid is None or oid == "":
                 continue
             self._oid_clients[str(oid)] = (client_order_id, None, None)
-        for suffix, reason in (
-            (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
-            (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
-        ):
-            self._child_parents[client_order_id_to_cloid(f"{client_order_id}:{suffix}")] = (
-                client_order_id,
-                reason,
-                FillEntry.OUT,
-            )
         return parent
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
@@ -1614,12 +1663,19 @@ class HyperliquidAdapter(Adapter):
             except Exception:
                 logger.exception("Skipping malformed open order entry: %s", entry)
                 continue
-            key: str | None = cloid_to_client.get(order.client_order_id, order.client_order_id)
+            resolved = cloid_to_client.get(order.client_order_id)
+            key: str | None = resolved or order.client_order_id
             if not key:
                 key = order.platform_order_id
             if not key:
                 logger.error("Open order entry has no order id: %s", entry)
                 continue
+            if resolved is not None and resolved != order.client_order_id:
+                # The venue echoes our hashed cloid, not the original id —
+                # restore it so the record agrees with its key (consumers
+                # read values, not keys; a hex cloid there breaks orphan
+                # matching against caller-held client ids).
+                order = dataclasses.replace(order, client_order_id=resolved)
             result[key] = order
         return result
 

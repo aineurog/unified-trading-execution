@@ -114,3 +114,12 @@ def test_disconnect_unsubscribes_and_stops() -> None:
     manager.unsubscribe.assert_called_once()
     manager.stop.assert_called_once()
     ws.disconnect()  # second call is quiet
+
+
+def test_connect_daemonizes_manager_thread() -> None:
+    """A wedged socket must never block process exit — graceful stop first,
+    daemon bit as the backstop."""
+    ws = HyperliquidWebSocket(_config())
+    manager = _manager_mock()
+    _connect_recorded(ws, manager)
+    assert manager.daemon is True
