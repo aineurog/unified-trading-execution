@@ -206,6 +206,23 @@ async def test_order_updates_publish_status() -> None:
     assert _of(seen, OrderCancelledEvent) == []
 
 
+async def test_order_updates_restore_hashed_client_id() -> None:
+    """A push update for a hashed-cloid order carries the caller id, not venue hex."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter, _, seen = _adapter()
+    client_id = "my-order-123"
+    adapter._client_coins[client_id] = ("BTC", False)
+    hashed = client_order_id_to_cloid(client_id)
+    assert hashed != client_id
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=hashed)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.client_order_id == client_id
+
+
 async def test_order_updates_cancelled_publishes_both() -> None:
     adapter, _, seen = _adapter()
     await adapter._dispatch_ws_message(
@@ -294,6 +311,36 @@ async def test_start_stop_lifecycle() -> None:
         assert adapter._ws is None and adapter._ws_task is None
         socket.disconnect.assert_called_once()
         await adapter.stop_streams()  # idempotent no-op
+
+
+async def test_stop_streams_drops_wedged_socket_within_timeout() -> None:
+    """Teardown is time-bounded: a socket wedged in disconnect must not hang stop."""
+    import threading
+    import time
+
+    from unified_trading_execution.hyperliquid import HyperliquidConfig
+
+    bus = EventBus()
+    config = HyperliquidConfig(
+        wallet_address=_TEST_ADDRESS,
+        private_key=_TEST_KEY,
+        testnet=True,
+        request_timeout_seconds=0.2,
+    )
+    adapter = HyperliquidAdapter(config, event_bus=bus)
+    release = threading.Event()
+
+    def _wedged() -> None:
+        assert not release.wait(timeout=30)
+
+    socket = MagicMock()
+    socket.disconnect.side_effect = _wedged
+    adapter._ws = socket
+    started = time.monotonic()
+    await adapter.stop_streams()
+    assert time.monotonic() - started < 5
+    assert adapter._ws is None
+    release.set()
 
 
 async def test_start_subscribe_failure_tears_down() -> None:

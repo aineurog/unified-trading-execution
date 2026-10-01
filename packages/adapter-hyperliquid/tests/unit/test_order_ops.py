@@ -118,6 +118,34 @@ async def test_place_maps_venue_error(adapter: HyperliquidAdapter) -> None:
         await adapter.place_order(_order())
 
 
+async def test_place_venue_error_keeps_client_coin_for_late_pushes(
+    adapter: HyperliquidAdapter,
+) -> None:
+    """The cid→coin map is recorded pre-submit: a reject after the venue may
+    already have accepted still leaves pushes resolvable (harmless otherwise —
+    an unaccepted cloid can never produce pushes)."""
+    exchange = _connected(adapter)
+    exchange.bulk_orders.return_value = {
+        "status": "ok",
+        "response": {"type": "order", "data": {"statuses": [{"error": "Invalid TP/SL price."}]}},
+    }
+    with pytest.raises(InvalidOrderError):
+        await adapter.place_order(_order(client_order_id="doomed-1"))
+    assert adapter._client_coins["doomed-1"] == ("BTC", False)
+
+
+async def test_place_validation_reject_records_nothing(adapter: HyperliquidAdapter) -> None:
+    """Client-side validation fires before recording — a never-submitted cid
+    must not pollute the map (contrast the test above)."""
+    exchange = _connected(adapter)
+    with pytest.raises(InvalidOrderError):
+        await adapter.place_order(
+            _order(quantity=Decimal("0.0100001"), client_order_id="never-sent")
+        )
+    exchange.bulk_orders.assert_not_called()
+    assert "never-sent" not in adapter._client_coins
+
+
 async def test_place_rejects_top_level_err(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     exchange.bulk_orders.return_value = {"status": "err", "response": "Multi-sig required"}

@@ -60,6 +60,9 @@ class HyperliquidWebSocket:
             return
         try:
             manager = WebsocketManager(self._base_url)
+            # Daemon: graceful stop is always attempted first (disconnect),
+            # but a wedged socket must never block process exit.
+            manager.daemon = True
             manager.start()
         except websocket.WebSocketException as exc:
             raise PlatformConnectionError(f"Hyperliquid WebSocket failed to start: {exc}") from exc

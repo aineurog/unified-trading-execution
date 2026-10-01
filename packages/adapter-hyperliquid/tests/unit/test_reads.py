@@ -163,6 +163,9 @@ async def test_fetch_open_orders_keys(adapter: HyperliquidAdapter) -> None:
     ]
     orders = await adapter.fetch_open_orders()
     assert set(orders) == {"0x" + "ab" * 16, "2"}
+    # Unmapped cloids keep their raw id in the record — the rewrite fires
+    # only on map resolution (contrast the hashed-cid test below).
+    assert orders["0x" + "ab" * 16].client_order_id == "0x" + "ab" * 16
 
 
 async def test_fetch_open_orders_excludes_bracket_children(adapter: HyperliquidAdapter) -> None:
@@ -214,6 +217,36 @@ async def test_fetch_open_orders_excludes_bracket_children(adapter: HyperliquidA
         "11",
         Decimal("50000"),
     )
+
+
+async def test_fetch_open_orders_restores_hashed_client_id(adapter: HyperliquidAdapter) -> None:
+    """A non-hex client id hashes to a venue cloid — the record must carry the
+    original id back, agreeing with its dict key, not the venue hex."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    exchange = _connected(adapter)
+    exchange.info.name_to_coin = {}
+    client_id = "my-order-123"
+    adapter._client_coins[client_id] = ("BTC", False)
+    hashed = client_order_id_to_cloid(client_id)
+    assert hashed != client_id  # non-hex ids hash — the case under test
+    exchange.info.open_orders.return_value = [
+        {
+            "coin": "BTC",
+            "side": "B",
+            "limitPx": "50000",
+            "sz": "0.01",
+            "oid": 7,
+            "timestamp": 7,
+            "origSz": "0.01",
+            "cloid": hashed,
+            "orderType": "Limit",
+        }
+    ]
+    exchange.info.frontend_open_orders.return_value = []
+    result = await adapter.fetch_open_orders()
+    assert set(result) == {client_id}
+    assert result[client_id].client_order_id == client_id
 
 
 async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) -> None:
