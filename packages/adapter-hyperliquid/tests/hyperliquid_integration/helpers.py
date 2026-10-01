@@ -223,14 +223,15 @@ async def wait_for_flat(
         await asyncio.sleep(0.5)
 
 
-async def flatten_all(adapter: HyperliquidAdapter, instrument: Instrument) -> None:
-    """Best-effort full cleanup: cancel every open, close every leg on the coin.
+async def flatten_all(adapter: HyperliquidAdapter) -> None:
+    """Best-effort full cleanup: cancel every open, close every leg.
 
     Detaches position TP/SL first (resting trigger legs block nothing but pollute
     the book), then cancels plain opens, then market-closes each nonzero leg.
+    Each leg is closed on its OWN coin — a leg must never be closed with another
+    instrument's symbol, which would size the close against the wrong market.
     Silent-tolerant — teardown must never fail the test it protects.
     """
-    coin = instrument.symbol
     # Position TP/SL legs surface in fetch_open_orders keyed by raw cloid,
     # so the cancel sweep below detaches them — no separate detach call.
     with contextlib.suppress(Exception):
@@ -244,10 +245,13 @@ async def flatten_all(adapter: HyperliquidAdapter, instrument: Instrument) -> No
             qty = abs(leg.quantity)
             if qty <= 0:
                 continue
+            coin = (leg.position_id or "").split(":", 1)[0]
+            if not coin:
+                continue
             with contextlib.suppress(Exception):
                 await adapter.place_order(
                     UnifiedOrder(
-                        instrument=instrument,
+                        instrument=make_perp(coin),
                         order_type=OrderType.MARKET,
                         side=OrderSide.SELL if leg.quantity > 0 else OrderSide.BUY,
                         quantity=qty,
@@ -269,7 +273,7 @@ async def restore_defaults(
     """
     from unified_trading_execution.hyperliquid import MarginMode
 
-    await flatten_all(adapter, instrument)
+    await flatten_all(adapter)
     await wait_for_flat(adapter)
     with contextlib.suppress(Exception):
         await adapter.set_margin_mode(instrument, MarginMode.CROSS)

@@ -56,7 +56,7 @@ async def test_engine_roundtrip(
     limits = await engine.get_rate_limits()
     assert limits.remaining > 0
 
-    await flatten_all(adapter, btc_perp)
+    await flatten_all(adapter)
     assert await engine.fetch_positions() == []
 
     # --- LIMIT lifecycle ---
@@ -120,7 +120,7 @@ async def test_engine_roundtrip(
 
     # --- reconcile (no drift → no-op) + restore flat + defaults ---
     await engine.reconcile_user_intent()
-    await flatten_all(adapter, btc_perp)
+    await flatten_all(adapter)
     await restore_defaults(adapter, btc_perp)
     assert await engine.fetch_positions() == []
     assert await engine.fetch_open_orders() == {}

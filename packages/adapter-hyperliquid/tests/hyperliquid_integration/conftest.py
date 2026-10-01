@@ -205,9 +205,9 @@ async def flattened_book(
     """
     from .helpers import flatten_all
 
-    await flatten_all(connected_adapter, btc_perp)
+    await flatten_all(connected_adapter)
     yield
-    await flatten_all(connected_adapter, btc_perp)
+    await flatten_all(connected_adapter)
 
 
 _TEvent = TypeVar("_TEvent", bound=Event)

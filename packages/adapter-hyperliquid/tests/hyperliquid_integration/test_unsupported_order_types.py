@@ -1,7 +1,10 @@
-"""Integration: unsupported order shapes raise named errors, never KeyErrors.
+"""Integration: unsupported time-in-force values raise named errors, never KeyErrors.
 
-Gate: every GTD/DAY/FOK/PostOnly-type/chase/scale/TWAP/trailing attempt raises
-``UnsupportedOrderTypeError`` with its own name (PLAN §0 non-goal guard).
+Gate: every non-GTC/IOC time-in-force the core can express (DAY/GTD/FOK) raises
+``UnsupportedOrderTypeError`` (PLAN §0 non-goal guard).  Platform-only shapes
+(post-only, chase, scale, TWAP, trailing) have no core representation, so they
+cannot be constructed into a request — they are unreachable by design, not
+silently accepted.
 """
 
 from __future__ import annotations
