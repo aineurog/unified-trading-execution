@@ -658,3 +658,38 @@ async def test_stop_clears_account_baselines() -> None:
     await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
     await adapter._dispatch_ws_message(_spot([_row("USDC", "1.0")]))
     assert seen == []
+
+
+async def test_clearinghouse_missing_legs_does_not_falsely_close() -> None:
+    """A dict push lacking ``assetPositions`` must not read as an empty book."""
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))  # seed a live leg
+    seen.clear()
+
+    malformed = {
+        "channel": "clearinghouseState",
+        "data": {"user": _TEST_ADDRESS, "clearinghouseState": {"marginSummary": {}}},
+    }
+    await adapter._dispatch_ws_message(malformed)
+    assert [e for e in seen if isinstance(e, PositionUpdateEvent)] == []
+
+    # Baseline survives: a genuine flat push still emits the close signal.
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    closed = [e for e in seen if isinstance(e, PositionUpdateEvent)]
+    assert len(closed) == 1
+    assert closed[0].position.position_id == "BTC:oneWay"
+    assert closed[0].position.quantity == 0
+
+
+async def test_spot_non_list_balances_does_not_falsely_zero() -> None:
+    """A present-but-non-list ``balances`` must not read as an empty book."""
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_spot([_row("USDC", "895.05")]))
+    seen.clear()
+
+    malformed = {
+        "channel": "spotState",
+        "data": {"user": _TEST_ADDRESS, "spotState": {"balances": {"coin": "USDC"}}},
+    }
+    await adapter._dispatch_ws_message(malformed)
+    assert [e for e in seen if isinstance(e, BalanceUpdateEvent)] == []

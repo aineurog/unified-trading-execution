@@ -704,9 +704,15 @@ class HyperliquidAdapter(Adapter):
             inner = data.get("clearinghouseState")
             if not isinstance(inner, dict):
                 raise PlatformError(f"Unexpected clearinghouseState shape {data!r}")
+            # Require the leg list to be present and list-typed: treating a
+            # missing/malformed field as "no positions" would diff every
+            # baselined leg into a spurious zero-quantity close signal.
+            leg_entries = inner.get("assetPositions")
+            if not isinstance(leg_entries, list):
+                raise PlatformError(f"Unexpected clearinghouseState shape {data!r}")
             timestamp = _utcnow()
             current: dict[str, Position] = {}
-            for entry in inner.get("assetPositions") or []:
+            for entry in leg_entries:
                 if not isinstance(entry, dict):
                     continue
                 try:
@@ -783,7 +789,9 @@ class HyperliquidAdapter(Adapter):
                 if isinstance(data.get("spotState"), dict)
                 else None
             )
-            if rows is None:
+            # List-typed, not just present: iterating a non-list would yield
+            # no rows and diff every baselined currency into a spurious zero.
+            if not isinstance(rows, list):
                 raise PlatformError(f"Unexpected spotState shape {data!r}")
             timestamp = _utcnow()
             current: dict[str, Balance] = {}
