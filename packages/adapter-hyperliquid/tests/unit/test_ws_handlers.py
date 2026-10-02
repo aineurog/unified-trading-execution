@@ -5,17 +5,20 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from unified_trading_execution.events import (
+    BalanceUpdateEvent,
+    ConnectionStateEvent,
     Event,
     EventBus,
     FillEvent,
     OrderCancelledEvent,
     OrderStatusEvent,
+    PositionUpdateEvent,
 )
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.types.enums import OrderStatus
@@ -24,7 +27,7 @@ _TEST_ADDRESS = "0x0000000000000000000000000000000000000001"
 _TEST_KEY = "0x" + "11" * 32
 
 
-def _fill(oid: int = 5, tid: int = 9, coin: str = "BTC", **over: Any) -> dict[str, Any]:
+def _fill(oid: int | str = 5, tid: int = 9, coin: str = "BTC", **over: Any) -> dict[str, Any]:
     entry = {
         "coin": coin,
         "px": "100",
@@ -300,7 +303,7 @@ async def test_start_stop_lifecycle() -> None:
     ) as socket_class:
         socket_class.return_value = _socket_mock()
         await adapter.start_streams()
-        socket = adapter._ws
+        socket = cast(MagicMock, adapter._ws)
         assert socket is not None and adapter._ws_task is not None
         assert socket.subscribe_user_events.call_count == 1
         assert socket.subscribe_order_updates.call_count == 1
@@ -451,8 +454,6 @@ async def test_monitor_rebuilds_dead_socket(
 
     monkeypatch.setattr(adapter_module, "_WS_MONITOR_INTERVAL_SECONDS", 0.05)
     adapter, bus, seen = _adapter()
-    from unified_trading_execution.events import ConnectionStateEvent
-
     bus.subscribe(ConnectionStateEvent, seen.append)
     dead = _socket_mock()
     dead.is_connected.return_value = False
@@ -475,7 +476,7 @@ async def test_monitor_rebuilds_dead_socket(
     finally:
         adapter._rebuild_streams = real_rebuild
     assert calls, "monitor must attempt rebuild while the socket is dead"
-    states = [e.connected for e in seen if type(e).__name__ == "ConnectionStateEvent"]
+    states = [e.connected for e in seen if isinstance(e, ConnectionStateEvent)]
     assert states == [False]
 
 
@@ -490,3 +491,205 @@ async def test_gap_fill_skips_seen() -> None:
     with patch("unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"):
         await adapter._rebuild_streams(dead)
         assert len(_of(seen, FillEvent)) == 1
+
+
+# ---- account-state channels (clearinghouseState / spotState) ----
+
+
+def _clearinghouse(legs: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "channel": "clearinghouseState",
+        "data": {
+            "dex": "",
+            "user": _TEST_ADDRESS,
+            "clearinghouseState": {
+                "marginSummary": {
+                    "accountValue": "85.0",
+                    "totalNtlPos": "85.0",
+                    "totalRawUsd": "0.0",
+                    "totalMarginUsed": "85.0",
+                },
+                "crossMarginSummary": {
+                    "accountValue": "85.0",
+                    "totalNtlPos": "85.0",
+                    "totalRawUsd": "0.0",
+                    "totalMarginUsed": "85.0",
+                },
+                "crossMaintenanceMarginUsed": "1.0",
+                "withdrawable": "0.0",
+                "assetPositions": legs,
+                "time": 1700000000000,
+            },
+        },
+    }
+
+
+def _leg(
+    coin: str = "BTC", szi: str = "0.001", entry_px: str = "85454.0", upl: str = "-0.02"
+) -> dict[str, Any]:
+    return {
+        "type": "oneWay",
+        "position": {
+            "coin": coin,
+            "szi": szi,
+            "leverage": {"type": "cross", "value": 1},
+            "entryPx": entry_px,
+            "positionValue": "85.4",
+            "unrealizedPnl": upl,
+            "returnOnEquity": "0.0",
+            "liquidationPx": None,
+            "marginUsed": "85.4",
+            "maxLeverage": 40,
+            "cumFunding": {"allTime": "0.0", "sinceOpen": "0.0", "sinceChange": "0.0"},
+        },
+    }
+
+
+def _spot(balances: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "channel": "spotState",
+        "data": {"user": _TEST_ADDRESS, "spotState": {"balances": balances}},
+    }
+
+
+def _row(coin: str, total: str, hold: str = "0.0") -> dict[str, Any]:
+    return {"coin": coin, "token": 0, "total": total, "hold": hold, "entryNtl": "0.0"}
+
+
+def _account_adapter() -> tuple[HyperliquidAdapter, EventBus, list[Event]]:
+    adapter, bus, seen = _adapter()
+    bus.subscribe(PositionUpdateEvent, seen.append)
+    bus.subscribe(BalanceUpdateEvent, seen.append)
+    return adapter, bus, seen
+
+
+async def test_clearinghouse_first_push_seeds_silently() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    assert [e for e in seen if type(e).__name__ == "PositionUpdateEvent"] == []
+
+
+async def test_clearinghouse_appearance_publishes_once() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    (event,) = [e for e in seen if type(e).__name__ == "PositionUpdateEvent"]
+    assert isinstance(event, PositionUpdateEvent)
+    assert event.position.position_id == "BTC:oneWay"
+    assert event.position.quantity == Decimal("0.001")
+    assert event.position.average_entry_price == Decimal("85454.0")
+
+
+async def test_clearinghouse_heartbeat_swallowed() -> None:
+    """Same qty/entry, moved upl — heartbeat, never news."""
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg(upl="-0.09")]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg(upl="-0.01")]))
+    assert len([e for e in seen if type(e).__name__ == "PositionUpdateEvent"]) == 1
+
+
+async def test_clearinghouse_qty_change_publishes() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg(szi="0.002")]))
+    updates = [e for e in seen if type(e).__name__ == "PositionUpdateEvent"]
+    assert len(updates) == 2
+    assert isinstance(updates[1], PositionUpdateEvent)
+    assert updates[1].position.quantity == Decimal("0.002")
+
+
+async def test_clearinghouse_disappearance_deletes() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    updates = [e for e in seen if type(e).__name__ == "PositionUpdateEvent"]
+    assert len(updates) == 2
+    assert isinstance(updates[1], PositionUpdateEvent)
+    assert updates[1].position.quantity == 0
+    assert updates[1].position.position_id == "BTC:oneWay"
+    # Baseline dropped: another flat push stays silent.
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    assert len([e for e in seen if type(e).__name__ == "PositionUpdateEvent"]) == 2
+
+
+async def test_clearinghouse_malformed_safe() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message({"channel": "clearinghouseState", "data": {"nope": True}})
+    await adapter._dispatch_ws_message({"channel": "clearinghouseState", "data": None})
+    assert [e for e in seen if type(e).__name__ == "PositionUpdateEvent"] == []
+
+
+async def test_spot_seed_change_and_new_coin() -> None:
+    adapter, _, seen = _account_adapter()
+    rows = [_row("USDC", "895.05"), _row("HYPE", "0.0")]
+    await adapter._dispatch_ws_message(_spot(rows))
+    await adapter._dispatch_ws_message(_spot(rows))
+    assert [e for e in seen if type(e).__name__ == "BalanceUpdateEvent"] == []
+    await adapter._dispatch_ws_message(_spot([_row("USDC", "894.00"), _row("HYPE", "0.0")]))
+    balances = [e for e in seen if type(e).__name__ == "BalanceUpdateEvent"]
+    assert len(balances) == 1
+    assert isinstance(balances[0], BalanceUpdateEvent)
+    assert balances[0].balance.currency == "USDC"
+    assert balances[0].balance.total == Decimal("894.00")
+    await adapter._dispatch_ws_message(
+        _spot([_row("USDC", "894.00"), _row("HYPE", "0.0"), _row("PURR", "3.9")])
+    )
+    balances = [e for e in seen if type(e).__name__ == "BalanceUpdateEvent"]
+    assert len(balances) == 2
+    assert isinstance(balances[1], BalanceUpdateEvent)
+    assert balances[1].balance.currency == "PURR"
+
+
+async def test_stop_clears_account_baselines() -> None:
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_spot([_row("USDC", "1.0")]))
+    assert adapter._position_baseline and adapter._balance_baseline
+    await adapter.stop_streams()
+    assert adapter._position_baseline == {}
+    assert adapter._balance_baseline == {}
+    assert adapter._account_seeded == set()
+    # Next pushes re-seed instead of bursting against stale truth.
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))
+    await adapter._dispatch_ws_message(_spot([_row("USDC", "1.0")]))
+    assert seen == []
+
+
+async def test_clearinghouse_missing_legs_does_not_falsely_close() -> None:
+    """A dict push lacking ``assetPositions`` must not read as an empty book."""
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_clearinghouse([_leg()]))  # seed a live leg
+    seen.clear()
+
+    malformed = {
+        "channel": "clearinghouseState",
+        "data": {"user": _TEST_ADDRESS, "clearinghouseState": {"marginSummary": {}}},
+    }
+    await adapter._dispatch_ws_message(malformed)
+    assert [e for e in seen if isinstance(e, PositionUpdateEvent)] == []
+
+    # Baseline survives: a genuine flat push still emits the close signal.
+    await adapter._dispatch_ws_message(_clearinghouse([]))
+    closed = [e for e in seen if isinstance(e, PositionUpdateEvent)]
+    assert len(closed) == 1
+    assert closed[0].position.position_id == "BTC:oneWay"
+    assert closed[0].position.quantity == 0
+
+
+async def test_spot_non_list_balances_does_not_falsely_zero() -> None:
+    """A present-but-non-list ``balances`` must not read as an empty book."""
+    adapter, _, seen = _account_adapter()
+    await adapter._dispatch_ws_message(_spot([_row("USDC", "895.05")]))
+    seen.clear()
+
+    malformed = {
+        "channel": "spotState",
+        "data": {"user": _TEST_ADDRESS, "spotState": {"balances": {"coin": "USDC"}}},
+    }
+    await adapter._dispatch_ws_message(malformed)
+    assert [e for e in seen if isinstance(e, BalanceUpdateEvent)] == []

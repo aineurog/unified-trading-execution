@@ -36,12 +36,14 @@ from unified_trading_execution.errors import (
     RateLimitError,
 )
 from unified_trading_execution.events import (
+    BalanceUpdateEvent,
     ConnectionStateEvent,
     Event,
     EventBus,
     FillEvent,
     OrderCancelledEvent,
     OrderStatusEvent,
+    PositionUpdateEvent,
 )
 from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 from unified_trading_execution.hyperliquid.enums import MarginMode
@@ -188,6 +190,17 @@ class HyperliquidAdapter(Adapter):
         self._seen_fill_ids: deque[str] = deque(maxlen=_WS_SEEN_FILL_IDS)
         # Push-channel link state.  ``_ws_task`` polls it (see below).
         self._streams_up = False
+        # Account-state baselines for the ``clearinghouseState`` / ``spotState``
+        # diff (see handlers below).  Keyed by position id / currency; the
+        # venue pushes full snapshots on a heartbeat, so publishing requires
+        # a last-published value to compare against.
+        self._position_baseline: dict[str, Position] = {}
+        self._balance_baseline: dict[str, Balance] = {}
+        # Channels whose first push has been swallowed as the baseline seed.
+        # Seeding happens once per baseline lifetime (fresh adapter or after
+        # ``stop_streams`` clears); reconnects keep baselines and diff across
+        # the outage instead of re-seeding.
+        self._account_seeded: set[str] = set()
 
     # ---- Identification ----
 
@@ -337,11 +350,13 @@ class HyperliquidAdapter(Adapter):
     async def start_streams(self) -> None:
         """Open the push channel and subscribe the account streams.
 
-        Subscribes ``userEvents``, ``orderUpdates``, and ``userFills``,
-        then seeds the fill seen-set from a REST read so pre-subscription
-        history is never re-published (REST owns the past; the streams own
-        everything after).  Idempotent while the socket lives.  Requires a
-        connected exchange and a wired event bus.
+        Subscribes ``userEvents``, ``orderUpdates``, ``userFills``,
+        ``clearinghouseState`` and ``spotState``, then seeds the fill
+        seen-set from a REST read so pre-subscription history is never
+        re-published (REST owns the past; the streams own everything
+        after).  Position/balance baselines start empty, so each channel's
+        first push only seeds (no connect burst).  Idempotent while the
+        socket lives.  Requires a connected exchange and a wired event bus.
         """
         self._require_exchange()
         if self._ws is not None and self._ws.is_connected():
@@ -353,6 +368,8 @@ class HyperliquidAdapter(Adapter):
             socket.subscribe_user_events(self._on_ws_message)
             socket.subscribe_order_updates(self._on_ws_message)
             socket.subscribe_user_fills(self._on_ws_message)
+            socket.subscribe_clearinghouse_state(self._on_ws_message)
+            socket.subscribe_spot_state(self._on_ws_message)
         except Exception:
             await asyncio.to_thread(socket.disconnect)
             self._ws = None
@@ -377,6 +394,12 @@ class HyperliquidAdapter(Adapter):
         teardown completeness is best-effort by contract.
         """
         self._streams_up = False
+        # Baselines die with the streams: the next start re-seeds instead of
+        # diffing against stale pre-stop truth (which would burst-publish).
+        # Reconnects deliberately keep baselines (see _rebuild_streams).
+        self._position_baseline = {}
+        self._balance_baseline = {}
+        self._account_seeded = set()
         task, self._ws_task = self._ws_task, None
         if task is not None:
             task.cancel()
@@ -453,6 +476,10 @@ class HyperliquidAdapter(Adapter):
                 await self._handle_user_message(data)
             elif channel == "orderUpdates":
                 await self._handle_order_updates_message(data)
+            elif channel == "clearinghouseState":
+                await self._handle_clearinghouse_message(data)
+            elif channel == "spotState":
+                await self._handle_spot_message(data)
             else:
                 logger.warning("Ignoring WS message on unknown channel %r", channel)
         except Exception:
@@ -661,6 +688,173 @@ class HyperliquidAdapter(Adapter):
         except Exception:
             logger.exception("Skipping untranslatable fill entry: %r", entry)
 
+    async def _handle_clearinghouse_message(self, data: Any) -> None:
+        """Diff a ``clearinghouseState`` push into ``PositionUpdateEvent``s (never raises).
+
+        The venue pushes full snapshots on a ~5s heartbeat regardless of
+        activity, so only transitions publish: new legs, legs whose quantity
+        or entry price moved, and disappearances (a zero-quantity update
+        carrying the position id — the core close signal). Mark-driven
+        floats (``unrealizedPnl``, ``positionValue``) are heartbeat, never
+        news. The first push per baseline lifetime only seeds the baseline.
+        """
+        try:
+            if not isinstance(data, dict):
+                raise PlatformError(f"Unexpected clearinghouseState shape {data!r}")
+            inner = data.get("clearinghouseState")
+            if not isinstance(inner, dict):
+                raise PlatformError(f"Unexpected clearinghouseState shape {data!r}")
+            # Require the leg list to be present and list-typed: treating a
+            # missing/malformed field as "no positions" would diff every
+            # baselined leg into a spurious zero-quantity close signal.
+            leg_entries = inner.get("assetPositions")
+            if not isinstance(leg_entries, list):
+                raise PlatformError(f"Unexpected clearinghouseState shape {data!r}")
+            timestamp = _utcnow()
+            current: dict[str, Position] = {}
+            for entry in leg_entries:
+                if not isinstance(entry, dict):
+                    continue
+                try:
+                    coin = str((entry.get("position") or {}).get("coin") or "")
+                    if not coin:
+                        continue
+                    position = translate_position(
+                        entry,
+                        instrument=from_hyperliquid_coin(coin, is_spot=False),
+                        timestamp=timestamp,
+                    )
+                except Exception:
+                    logger.exception("Skipping malformed position leg: %s", entry)
+                    continue
+                if position.position_id is None or position.quantity == 0:
+                    continue
+                current[position.position_id] = position
+            if "clearinghouseState" not in self._account_seeded:
+                self._position_baseline = current
+                self._account_seeded.add("clearinghouseState")
+                return
+            for position_id, position in current.items():
+                baseline = self._position_baseline.get(position_id)
+                if (
+                    baseline is None
+                    or baseline.quantity != position.quantity
+                    or baseline.average_entry_price != position.average_entry_price
+                ):
+                    self._publish(
+                        PositionUpdateEvent(
+                            event_id=_new_id(),
+                            timestamp=_utcnow(),
+                            adapter_name=self.platform_name,
+                            account_id=self.account_id,
+                            correlation_id=None,
+                            position=position,
+                        )
+                    )
+                    self._position_baseline[position_id] = position
+            for position_id in set(self._position_baseline) - set(current):
+                baseline = self._position_baseline.pop(position_id)
+                self._publish(
+                    PositionUpdateEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        position=dataclasses.replace(
+                            baseline, quantity=Decimal("0"), updated_at=timestamp
+                        ),
+                    )
+                )
+        except Exception:
+            logger.exception("Hyperliquid clearinghouseState handling failed")
+
+    async def _handle_spot_message(self, data: Any) -> None:
+        """Diff a ``spotState`` push into ``BalanceUpdateEvent``s (never raises).
+
+        Same heartbeat discipline as positions: new coins and rows whose
+        total/free/used moved publish; zero-total dust slots are excluded
+        from the baseline and never publish, except a baselined coin
+        transitioning to zero publishes its final zero row once (so the
+        DB mirror clears) then goes silent. Vanished rows otherwise are
+        ignored (token slots persist — a disappearance is not a balance
+        event). ``tokenToAvailableAfterMaintenance`` is ignored: ``free``
+        already derives as ``total - hold`` in ``translate_balance``.
+        """
+        try:
+            if not isinstance(data, dict):
+                raise PlatformError(f"Unexpected spotState shape {data!r}")
+            rows = (
+                (data.get("spotState") or {}).get("balances")
+                if isinstance(data.get("spotState"), dict)
+                else None
+            )
+            # List-typed, not just present: iterating a non-list would yield
+            # no rows and diff every baselined currency into a spurious zero.
+            if not isinstance(rows, list):
+                raise PlatformError(f"Unexpected spotState shape {data!r}")
+            timestamp = _utcnow()
+            current: dict[str, Balance] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    currency = str(row.get("coin") or "")
+                    if not currency:
+                        continue
+                    balance = translate_balance(row, currency=currency, timestamp=timestamp)
+                    if balance.total == 0:
+                        continue
+                    current[currency] = balance
+                except Exception:
+                    logger.exception("Skipping malformed balance row: %s", row)
+                    continue
+            if "spotState" not in self._account_seeded:
+                self._balance_baseline = current
+                self._account_seeded.add("spotState")
+                return
+            for currency, balance in current.items():
+                baseline = self._balance_baseline.get(currency)
+                if (
+                    baseline is None
+                    or baseline.total != balance.total
+                    or baseline.free != balance.free
+                    or baseline.used != balance.used
+                ):
+                    self._publish(
+                        BalanceUpdateEvent(
+                            event_id=_new_id(),
+                            timestamp=_utcnow(),
+                            adapter_name=self.platform_name,
+                            account_id=self.account_id,
+                            correlation_id=None,
+                            balance=balance,
+                        )
+                    )
+                    self._balance_baseline[currency] = balance
+            for currency in set(self._balance_baseline) - set(current):
+                baseline = self._balance_baseline.pop(currency)
+                if baseline.total == 0:
+                    continue
+                self._publish(
+                    BalanceUpdateEvent(
+                        event_id=_new_id(),
+                        timestamp=_utcnow(),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        balance=dataclasses.replace(
+                            baseline,
+                            total=Decimal("0"),
+                            free=Decimal("0"),
+                            used=Decimal("0"),
+                            updated_at=timestamp,
+                        ),
+                    )
+                )
+        except Exception:
+            logger.exception("Hyperliquid spotState handling failed")
+
     def _require_user(self, data: dict[str, Any]) -> None:
         """Drop messages routed to a different user than configured."""
         user = data.get("user")
@@ -729,6 +923,8 @@ class HyperliquidAdapter(Adapter):
             replacement.subscribe_user_events(self._on_ws_message)
             replacement.subscribe_order_updates(self._on_ws_message)
             replacement.subscribe_user_fills(self._on_ws_message)
+            replacement.subscribe_clearinghouse_state(self._on_ws_message)
+            replacement.subscribe_spot_state(self._on_ws_message)
         except Exception:
             # A connected-but-unsubscribed socket would look alive to the
             # monitor and never be rebuilt — tear it down so the next tick
@@ -1611,7 +1807,13 @@ class HyperliquidAdapter(Adapter):
         return result
 
     async def fetch_balances(self) -> dict[str, Balance]:
-        """Fetch per-currency balances from ``spotClearinghouseState``."""
+        """Fetch per-currency balances from ``spotClearinghouseState``.
+
+        Zero-total dust slots (the venue returns every token slot for the
+        address) are excluded — only coins with a non-zero total seed the
+        DB mirror on ``Engine.connect`` and reconcile. ``free`` derives as
+        ``total - hold`` (see ``translate_balance``).
+        """
         exchange = self._require_exchange()
         state = await self._run_exchange(exchange.info.spot_user_state, self._config.wallet_address)
         timestamp = _utcnow()
@@ -1622,7 +1824,10 @@ class HyperliquidAdapter(Adapter):
                 currency = str(row.get("coin") or "")
                 if not currency:
                     continue
-                result[currency] = translate_balance(row, currency=currency, timestamp=timestamp)
+                balance = translate_balance(row, currency=currency, timestamp=timestamp)
+                if balance.total == 0:
+                    continue
+                result[currency] = balance
             except Exception:
                 logger.exception("Skipping malformed balance row: %s", row)
                 continue

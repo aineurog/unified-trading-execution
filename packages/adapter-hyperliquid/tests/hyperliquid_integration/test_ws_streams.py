@@ -1,30 +1,41 @@
 """Integration: push-channel receipt against live testnet.
 
-Gate: order/fill lifecycle arrives on the bus via WS; position/balance push
-assertions are pre-written but skipped until the P5 account-state push lands
-(see not_push/hyperliquid/WS_ACCOUNT_PUSH_PLAN.md).
+Gate: order/fill lifecycle plus account-state (positions, balances) arrives
+on the bus via WS, with heartbeat snapshots swallowed by the adapter diff.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import Callable
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
-import pytest
-
 from unified_trading_execution.events import (
+    BalanceUpdateEvent,
     FillEvent,
     OrderCancelledEvent,
     OrderStatusEvent,
+    PositionUpdateEvent,
 )
 from unified_trading_execution.hyperliquid import HyperliquidAdapter
-from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType
+from unified_trading_execution.types.enums import (
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
 from unified_trading_execution.types.instrument import Instrument
 
-from .helpers import build_unified_order, valid_qty_from_spec, venue_price
+from .helpers import (
+    build_unified_order,
+    flatten_all,
+    valid_qty_from_spec,
+    venue_price,
+    wait_for_position,
+)
 
 if TYPE_CHECKING:
     from .conftest import EventCollector
@@ -82,10 +93,11 @@ def _install_debug_tap(adapter: HyperliquidAdapter, collect_events: EventCollect
     orig = adapter._dispatch_ws_message
 
     async def spy(message: object) -> None:
-        channel: object = None
-        data: object = None
-        if isinstance(message, dict):
-            channel, data = message.get("channel"), message.get("data")
+        if not isinstance(message, dict):
+            await orig(message)
+            return
+        channel: object = message.get("channel")
+        data: object = message.get("data")
         print(f"\n[ws-raw] channel={channel} {_summarize_raw(channel, data)}", flush=True)
         if os.getenv("HLIT_WS_DEBUG") == "1":
             print(f"[ws-full] {json.dumps(message)[:3000]}", flush=True)
@@ -176,8 +188,6 @@ async def test_fill_push(
     collect_events: EventCollector,
     flattened_book: None,
 ) -> None:
-    from unified_trading_execution.types.enums import TimeInForce
-
     await _ensure_streams(connected_adapter, collect_events)
     spec = await connected_adapter.fetch_instrument_spec(btc_perp)
     qty = valid_qty_from_spec(spec, reference_price)
@@ -196,11 +206,75 @@ async def test_fill_push(
     assert any(e.fill.client_order_id == cid for e in events)
 
 
-@pytest.mark.skip(reason="P5 account-state push not implemented — see WS_ACCOUNT_PUSH_PLAN.md")
-async def test_position_update_push() -> None:
-    raise NotImplementedError("push-branch gate: dust leg open → one PositionUpdateEvent")
+async def test_position_update_push(
+    connected_adapter: HyperliquidAdapter,
+    btc_perp: Instrument,
+    reference_price: Decimal,
+    unique_cid: Callable[[str], str],
+    funded_account: Decimal,
+    collect_events: EventCollector,
+    flattened_book: None,
+) -> None:
+    await _ensure_streams(connected_adapter, collect_events)
+    # Let the seed land first: a leg opened before the first push would be
+    # swallowed into the baseline. Heartbeat is ~5s, so 8s is ample.
+    await asyncio.sleep(8)
+    collect_events.drain()
+
+    spec = await connected_adapter.fetch_instrument_spec(btc_perp)
+    qty = valid_qty_from_spec(spec, reference_price)
+    await connected_adapter.place_order(
+        build_unified_order(
+            btc_perp,
+            OrderType.MARKET,
+            OrderSide.BUY,
+            qty,
+            client_order_id=unique_cid("ws-pos"),
+            time_in_force=TimeInForce.IOC,
+        )
+    )
+    await wait_for_position(connected_adapter, "BTC")
+    events = await collect_events.wait_for(PositionUpdateEvent, timeout=30.0)
+    opened = [
+        e for e in events if e.position.position_id == "BTC:oneWay" and e.position.quantity != 0
+    ]
+    assert opened, "leg appearance must publish exactly one PositionUpdateEvent"
+    assert opened[0].position.quantity == qty
+
+    await flatten_all(connected_adapter)
+    deleted = await collect_events.wait_for(PositionUpdateEvent, timeout=30.0)
+    gone = [
+        e for e in deleted if e.position.position_id == "BTC:oneWay" and e.position.quantity == 0
+    ]
+    assert gone, "leg disappearance must publish the zero-quantity close signal"
 
 
-@pytest.mark.skip(reason="P5 account-state push not implemented — see WS_ACCOUNT_PUSH_PLAN.md")
-async def test_balance_update_push() -> None:
-    raise NotImplementedError("push-branch gate: balance touch → BalanceUpdateEvent")
+async def test_balance_update_push(
+    connected_adapter: HyperliquidAdapter,
+    btc_perp: Instrument,
+    reference_price: Decimal,
+    unique_cid: Callable[[str], str],
+    funded_account: Decimal,
+    collect_events: EventCollector,
+    flattened_book: None,
+) -> None:
+    await _ensure_streams(connected_adapter, collect_events)
+    await asyncio.sleep(8)
+    collect_events.drain()
+
+    # A taker fill pays a fee, moving the USDC total — the one deterministic
+    # balance touch available without touching other currencies.
+    spec = await connected_adapter.fetch_instrument_spec(btc_perp)
+    qty = valid_qty_from_spec(spec, reference_price)
+    await connected_adapter.place_order(
+        build_unified_order(
+            btc_perp,
+            OrderType.MARKET,
+            OrderSide.BUY,
+            qty,
+            client_order_id=unique_cid("ws-bal"),
+            time_in_force=TimeInForce.IOC,
+        )
+    )
+    events = await collect_events.wait_for(BalanceUpdateEvent, timeout=30.0)
+    assert any(e.balance.currency == "USDC" for e in events)
