@@ -1748,6 +1748,12 @@ class HyperliquidAdapter(Adapter):
         )
         for request in requests:
             request["cloid"] = Cloid(request["cloid"])
+        # Warm the exclusion cache before submitting: pushes beat the ack,
+        # and these cloids derive from the position id alone — no read needed.
+        self._position_leg_cloids.update(
+            position_tpsl_cloid(position_id, suffix)
+            for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+        )
         response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
         data = self._check_action_ok(response, context=f"setting position TP/SL for {coin}")
         try:
@@ -1784,12 +1790,6 @@ class HyperliquidAdapter(Adapter):
         # index those too — otherwise their fills key by raw oid with no
         # reason until a fills refresh happens to rebuild them.
         placed = {request["cloid"].to_raw() for request in requests}
-        # Warm the WS exclusion cache with the legs just minted — pushes for
-        # them must already be skippable before any refresh runs.
-        self._position_leg_cloids.update(
-            position_tpsl_cloid(position_id, suffix)
-            for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
-        )
         wanted = [
             ("take_profit", TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
             ("stop_loss", SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
