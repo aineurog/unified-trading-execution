@@ -498,6 +498,12 @@ class HyperliquidAdapter(Adapter):
 
         Id-less entries always report False — they still translate (or skip
         loudly) downstream; dedupe needs an id to key on.
+
+        Snapshot-seeding only: the id is recorded up front because there is
+        no translation to fail. The live path (``_publish_fill_entry``) and
+        the gap path (``_absorb_fills``) peek at the seen-set and record
+        only after a successful publish, so a poison entry never burns
+        its id (issue 12).
         """
         key = self._fill_key(entry)
         if key is None:
@@ -532,9 +538,9 @@ class HyperliquidAdapter(Adapter):
                 key = record.platform_fill_id
                 if key in self._seen_fill_ids:
                     continue
-                self._seen_fill_ids.append(key)
                 if publish_unseen:
                     self._publish_fill_record(record)
+                self._seen_fill_ids.append(key)
 
     async def _seed_seen_fills(self) -> None:
         """Mark current REST history seen so streams never re-publish the past."""
@@ -655,9 +661,15 @@ class HyperliquidAdapter(Adapter):
         return record
 
     async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
-        """Translate one fill and publish it unless already seen (never raises)."""
+        """Translate one fill and publish it unless already seen (never raises).
+
+        The seen-set is peeked — not recorded — up front; the id is marked
+        only after a successful publish, so a poison (untranslatable) entry
+        never burns its id and its redelivery still publishes (issue 12).
+        """
         try:
-            if self._fill_seen(entry):
+            key = self._fill_key(entry)
+            if key is not None and key in self._seen_fill_ids:
                 return
             coin = str(entry.get("coin") or "")
             if not coin:
@@ -685,6 +697,8 @@ class HyperliquidAdapter(Adapter):
                 fill_entry=fill_entry,
             )
             self._publish_fill_record(record)
+            if key is not None:
+                self._seen_fill_ids.append(key)
         except Exception:
             logger.exception("Skipping untranslatable fill entry: %r", entry)
 

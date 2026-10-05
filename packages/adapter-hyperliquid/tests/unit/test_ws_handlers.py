@@ -693,3 +693,18 @@ async def test_spot_non_list_balances_does_not_falsely_zero() -> None:
     }
     await adapter._dispatch_ws_message(malformed)
     assert [e for e in seen if isinstance(e, BalanceUpdateEvent)] == []
+
+
+async def test_poison_fill_does_not_burn_seen_id() -> None:
+    """Issue 12: a poison entry must not block its own redelivery."""
+    adapter, _, seen = _adapter()
+    poison = _fill(coin="")
+    await adapter._publish_fill_entry(poison)
+    assert _of(seen, FillEvent) == []
+    await adapter._publish_fill_entry(_fill())
+    (event,) = _of(seen, FillEvent)
+    assert isinstance(event, FillEvent)
+    assert event.fill.platform_fill_id == "0xh:9"
+    # Genuine duplicates are still swallowed.
+    await adapter._publish_fill_entry(_fill())
+    assert len(_of(seen, FillEvent)) == 1
