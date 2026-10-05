@@ -258,6 +258,50 @@ async def test_order_updates_unknown_coin_skips() -> None:
     assert seen == []
 
 
+async def test_order_updates_skip_position_legs() -> None:
+    """Position TP/SL legs are attachments: no status, no cancel, no history."""
+    from unified_trading_execution.hyperliquid.orders import (
+        TP_CLOID_SUFFIX,
+        position_tpsl_cloid,
+    )
+
+    adapter, _, seen = _adapter()
+    leg = position_tpsl_cloid("BTC:oneWay", TP_CLOID_SUFFIX)
+    adapter._position_leg_cloids.add(leg)
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=leg), _order_update(oid=8)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.platform_order_id == "8"
+    assert _of(seen, OrderCancelledEvent) == []
+    # A terminal leg update is swallowed too — never mirrored, never cancelled.
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=leg, status="canceled")]}
+    )
+    assert len(_of(seen, OrderStatusEvent)) == 1
+    assert _of(seen, OrderCancelledEvent) == []
+
+
+async def test_order_updates_skip_bracket_children() -> None:
+    """Placement-time TP/SL legs (same-batch children) never mirror either."""
+    from unified_trading_execution.hyperliquid.orders import (
+        TP_CLOID_SUFFIX,
+        client_order_id_to_cloid,
+    )
+
+    adapter, _, seen = _adapter()
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    child = client_order_id_to_cloid(f"my-order-123:{TP_CLOID_SUFFIX}")
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=child), _order_update(oid=8)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.platform_order_id == "8"
+    assert _of(seen, OrderCancelledEvent) == []
+
+
 async def test_order_updates_carry_status_timestamp() -> None:
     """``updated_at`` tracks the sibling ``statusTimestamp``, not creation.
 

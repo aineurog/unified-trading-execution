@@ -232,8 +232,20 @@ async def flatten_all(adapter: HyperliquidAdapter) -> None:
     instrument's symbol, which would size the close against the wrong market.
     Silent-tolerant — teardown must never fail the test it protects.
     """
-    # Position TP/SL legs surface in fetch_open_orders keyed by raw cloid,
-    # so the cancel sweep below detaches them — no separate detach call.
+    # Position TP/SL legs are excluded from fetch_open_orders (attachments,
+    # not orders), so detach them explicitly by deterministic cloid before
+    # the cancel sweep — the sweep only sees plain opens.
+    with contextlib.suppress(Exception):
+        from unified_trading_execution.hyperliquid.orders import position_tpsl_cloid
+
+        legs = await adapter.fetch_positions()
+        for leg in legs:
+            position_id = leg.position_id or ""
+            if not position_id:
+                continue
+            for suffix in ("take_profit", "stop_loss"):
+                with contextlib.suppress(Exception):
+                    await adapter.cancel_order(position_tpsl_cloid(position_id, suffix))
     with contextlib.suppress(Exception):
         opens = await adapter.fetch_open_orders()
         for client_order_id in list(opens):

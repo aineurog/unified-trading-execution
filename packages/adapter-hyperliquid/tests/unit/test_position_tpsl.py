@@ -576,12 +576,37 @@ async def test_get_market_ness_from_order_type_suffix(
     assert tp.limit_price == expected_limit
 
 
-# ---- snapshot inclusion ----
+# ---- snapshot exclusion (attachments, not orders) ----
 
 
-async def test_fetch_open_orders_includes_position_legs_by_cloid() -> None:
+async def test_fetch_open_orders_excludes_position_legs() -> None:
+    tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
+    sl_cloid = position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX)
+    parent_cloid = "0x" + "ab" * 16
+    exchange = _exchange_mock(
+        entries=[
+            _trigger_entry(cloid=tp_cloid, oid=11),
+            _trigger_entry(cloid=sl_cloid, oid=12),
+            _trigger_entry(cloid=parent_cloid, oid=13),
+        ]
+    )
+    adapter = _adapter(exchange)
+    snapshot = await adapter.fetch_open_orders()
+    assert tp_cloid not in snapshot and sl_cloid not in snapshot
+    # The parent survives; legs stay reachable via the entries scan.
+    assert parent_cloid in snapshot
+    entries = await adapter._position_tpsl_entries(_POSITION_ID)
+    assert set(entries) == {"take_profit", "stop_loss"}
+
+
+async def test_position_leg_exclusion_is_stateless() -> None:
+    """No session maps needed: the set derives from venue legs alone."""
     tp_cloid = position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX)
     exchange = _exchange_mock(entries=[_trigger_entry(cloid=tp_cloid, oid=11)])
     adapter = _adapter(exchange)
-    snapshot = await adapter.fetch_open_orders()
-    assert tp_cloid in snapshot
+    assert adapter._client_coins == {} and adapter._child_parents == {}
+    assert await adapter.fetch_open_orders() == {}
+    assert adapter._position_leg_cloids == {
+        position_tpsl_cloid(_POSITION_ID, TP_CLOID_SUFFIX),
+        position_tpsl_cloid(_POSITION_ID, SL_CLOID_SUFFIX),
+    }

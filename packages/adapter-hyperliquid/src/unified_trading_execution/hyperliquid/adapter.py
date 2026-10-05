@@ -201,7 +201,12 @@ class HyperliquidAdapter(Adapter):
         # ``stop_streams`` clears); reconnects keep baselines and diff across
         # the outage instead of re-seeding.
         self._account_seeded: set[str] = set()
-
+        # Raw cloids of working position TP/SL legs.  Legs are position
+        # attachments, not orders, so ``fetch_open_orders`` and the
+        # ``orderUpdates`` handler both skip them.  Warmed wherever venue
+        # legs are in hand; read-only on the WS path (never a read per
+        # message).  Cold-cache leaks self-heal via reconcile.
+        self._position_leg_cloids: set[str] = set()
     # ---- Identification ----
 
     @property
@@ -332,6 +337,7 @@ class HyperliquidAdapter(Adapter):
         self._client_coins.clear()
         self._oid_clients.clear()
         self._child_parents.clear()
+        self._position_leg_cloids.clear()
         self._publish_connection_state(False)
 
     @property
@@ -582,12 +588,46 @@ class HyperliquidAdapter(Adapter):
             return
         logger.warning("Ignoring unknown user-channel update: %r", sorted(data))
 
+    def _bracket_child_cloids(self) -> set[str]:
+        """Raw cloids of bracket TP/SL children minted this session (pure, sync).
+
+        Same derivation as ``fetch_open_orders``: per placed cid the
+        ``{cid}:tp`` / ``{cid}:sl`` hashes, plus every ``_child_parents``
+        raw.  No network — safe to call per WS message.
+        """
+        found: set[str] = set()
+        for client_order_id in list(self._client_coins):
+            found.update(
+                client_order_id_to_cloid(f"{client_order_id}:{suffix}")
+                for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+            )
+        found.update(self._child_parents)
+        return found
+
     async def _handle_order_updates_message(self, data: Any) -> None:
-        """Publish an ``OrderStatusEvent`` per order update (+ cancel on terminal)."""
+        """Publish an ``OrderStatusEvent`` per order update (+ cancel on terminal).
+
+        TP/SL legs — bracket children and position legs alike — are
+        attachments, not orders: their updates are skipped before
+        translating (same exclusion as ``fetch_open_orders``, Bybit
+        ``createType`` parity), so legs never reach the mirror or the
+        history via this path.  Leg activity stays auditable through
+        fills, which carry the parent id plus reason.  The exclusion
+        consults in-memory sets only (position cache + session child
+        derivation — no network read per message); a cold position cache
+        only lets a leg through until the first refresh, and reconcile
+        deletes the strays.
+        """
         entries = data if isinstance(data, list) else [data]
+        bracket = self._bracket_child_cloids()
         for entry in entries:
             if not isinstance(entry, dict):
                 logger.warning("Skipping malformed order update: %r", entry)
+                continue
+            payload = entry.get("order")
+            raw = str(payload.get("cloid") or "") if isinstance(payload, dict) else ""
+            if raw and (raw in self._position_leg_cloids or raw in bracket):
+                logger.debug("Skipping TP/SL leg update (attachment): %r", raw)
                 continue
             try:
                 record = await self._translate_order_update(entry)
@@ -1139,6 +1179,39 @@ class HyperliquidAdapter(Adapter):
             direction="up" if side == OrderSide.BUY else "down",
         )
 
+    @staticmethod
+    def _position_leg_cloids_from_legs(legs: Any) -> set[str]:
+        """Raw cloids of position TP/SL legs for open venue legs (pure).
+
+        Same derivation as ``_refresh_oid_index`` and ``modify_position_tpsl``:
+        per leg, ``position_tpsl_cloid(f"{coin}:oneWay", suffix)`` for both
+        suffixes.  Stateless — position ids come from venue truth, so the
+        set survives restarts with no stored state.
+        """
+        found: set[str] = set()
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or not position.get("coin"):
+                continue
+            position_id = f"{position['coin']}:oneWay"
+            found.add(position_tpsl_cloid(position_id, TP_CLOID_SUFFIX))
+            found.add(position_tpsl_cloid(position_id, SL_CLOID_SUFFIX))
+        return found
+
+    async def _refresh_position_leg_cloids(self) -> set[str]:
+        """Rebuild the position-leg exclusion cache from venue legs.
+
+        One ``userState`` read; stores into ``_position_leg_cloids`` and
+        returns the set.  ``fetch_open_orders`` calls this every time so
+        its exclusion is never stale; the WS push path consults the cache
+        read-only instead.
+        """
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        self._position_leg_cloids = self._position_leg_cloids_from_legs(legs)
+        return set(self._position_leg_cloids)
+
     async def _refresh_oid_index(self) -> None:
         """Rebuild oid→client attribution from open orders carrying our cloids.
 
@@ -1165,6 +1238,9 @@ class HyperliquidAdapter(Adapter):
             ):
                 raw = position_tpsl_cloid(position_id, suffix)
                 position_cloids[raw] = (raw, reason, FillEntry.OUT)
+        # Warm the WS exclusion cache with the same derivation — fills reads
+        # already paid for the venue legs, so the push path stays warm free.
+        self._position_leg_cloids.update(position_cloids)
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
@@ -1607,7 +1683,9 @@ class HyperliquidAdapter(Adapter):
         stay working.  Legs are full-size at attach time (fixed-size — the
         venue does not auto-resize API-placed legs, verified live), so
         re-attach after resizing the leg.  Detach one side by cancelling its
-        leg (visible in ``fetch_open_orders`` keyed by cloid); both None
+        leg by position cloid (legs are attachments: excluded from
+        ``fetch_open_orders`` and the order push stream, never mirrored —
+        use ``_position_tpsl_entries`` to address them); both None
         raises ``ValueError`` per the ABC contract.  No open leg reads back
         as ``OrderNotFoundError``; spot raises ``InvalidSymbolError``.
         """
@@ -1706,6 +1784,12 @@ class HyperliquidAdapter(Adapter):
         # index those too — otherwise their fills key by raw oid with no
         # reason until a fills refresh happens to rebuild them.
         placed = {request["cloid"].to_raw() for request in requests}
+        # Warm the WS exclusion cache with the legs just minted — pushes for
+        # them must already be skippable before any refresh runs.
+        self._position_leg_cloids.update(
+            position_tpsl_cloid(position_id, suffix)
+            for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+        )
         wanted = [
             ("take_profit", TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
             ("stop_loss", SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
@@ -1852,9 +1936,14 @@ class HyperliquidAdapter(Adapter):
 
         Derived TP/SL child legs are attachments of their parent in the
         unified model, not orders of their own, so they are excluded — the
-        parent is reported, keyed by client id.  Venue-created legs we never
-        minted a cloid for key by platform oid; entries with neither id are
-        skipped, never collapsed onto an empty key.
+        parent is reported, keyed by client id.  Position TP/SL legs are
+        attachments of the position and excluded the same way (Bybit
+        ``createType`` parity): their cloids derive statelessly from open
+        venue legs, so the exclusion survives restarts with no stored
+        state.  Costs one ``userState`` read for the exclusion set, plus
+        the open-orders scan.  Venue-created legs we never minted a cloid
+        for key by platform oid; entries with neither id are skipped, never
+        collapsed onto an empty key.
         """
         result: dict[str, OrderRecord] = {}
         cloid_to_client: dict[str, str] = {}
@@ -1866,6 +1955,7 @@ class HyperliquidAdapter(Adapter):
                 for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
             )
         child_cloids.update(self._child_parents)
+        child_cloids.update(await self._refresh_position_leg_cloids())
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
