@@ -116,6 +116,7 @@ async def test_user_fills_streaming_publishes() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
+    adapter._flush_all_parked()  # unattributed fills park until the hold expires
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert (event.fill.fill_quantity, event.fill.fill_price) == (Decimal("0.01"), Decimal("100"))
@@ -141,6 +142,7 @@ async def test_user_fills_malformed_entry_skips_rest_processes() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [bad, _fill(tid=10)]}}
     )
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
 
 
@@ -169,6 +171,7 @@ async def test_fill_without_oid_falls_back_to_hash() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill(oid="")]}}
     )
+    adapter._flush_all_parked()
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert event.fill.client_order_id == "0xh"
@@ -185,6 +188,7 @@ async def test_user_channel_fills_share_seen_set() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
 
 
@@ -507,6 +511,7 @@ async def test_on_ws_message_schedules() -> None:
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
     await asyncio.sleep(0.05)
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
     assert adapter._ws_pending == set()
 
@@ -926,9 +931,68 @@ async def test_poison_fill_does_not_burn_seen_id() -> None:
     await adapter._publish_fill_entry(poison)
     assert _of(seen, FillEvent) == []
     await adapter._publish_fill_entry(_fill())
+    adapter._flush_all_parked()  # hold expiry: now valid, still unattributed → raw
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert event.fill.platform_fill_id == "0xh:9"
     # Genuine duplicates are still swallowed.
     await adapter._publish_fill_entry(_fill())
+    adapter._flush_all_parked()
+    assert len(_of(seen, FillEvent)) == 1
+
+
+async def test_parked_fill_resolves_on_ack() -> None:
+    """Issue 16: a fill parked pre-ack publishes with the uuid once indexed."""
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    assert _of(seen, FillEvent) == []  # parked, not published
+    adapter._oid_clients["5"] = ("parent-1", None, None)  # the ack lands
+    adapter._flush_all_parked()
+    (event,) = _of(seen, FillEvent)
+    assert isinstance(event, FillEvent)
+    assert event.fill.client_order_id == "parent-1"
+
+
+async def test_parked_duplicate_dropped_and_seed_wins() -> None:
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await adapter._publish_fill_entry(_fill())  # duplicate while parked
+    adapter._seen_fill_ids.append("0xh:9")  # snapshot seeds meanwhile
+    adapter._flush_all_parked()
+    assert _of(seen, FillEvent) == []
+
+
+async def test_stop_streams_flushes_parked() -> None:
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    assert _of(seen, FillEvent) == []
+    await adapter.stop_streams()
+    assert len(_of(seen, FillEvent)) == 1
+    assert adapter._pending_fills == {}
+
+
+async def test_park_cap_overflow_publishes_oldest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import unified_trading_execution.hyperliquid.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_PENDING_FILL_CAP", 1)
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await adapter._publish_fill_entry(_fill(tid=10))  # evicts the first, publishes it
+    assert len(_of(seen, FillEvent)) == 1
+    adapter._flush_all_parked()
+    assert len(_of(seen, FillEvent)) == 2
+
+
+async def test_park_deadline_fires_with_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timer path itself: expiry publishes without an explicit flush."""
+    import unified_trading_execution.hyperliquid.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_FILL_ATTRIBUTION_HOLD_SECONDS", 0.01)
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await asyncio.sleep(0.05)
     assert len(_of(seen, FillEvent)) == 1

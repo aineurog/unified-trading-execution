@@ -138,6 +138,13 @@ DEFAULT_BLOCK_ON_OPEN_POSITION = True
 _WS_MONITOR_INTERVAL_SECONDS = 15.0
 #: Fill ids remembered for stream dedupe (matches the venue recent window).
 _WS_SEEN_FILL_IDS = 10000
+#: Seconds an unattributed fill waits for its ack before publishing raw.
+#: Acks land in hundreds of ms; the hold only ever delays fills the
+#: adapter could not yet attribute (issue 16) — attributed fills publish
+#: instantly, statuses never wait.
+_FILL_ATTRIBUTION_HOLD_SECONDS = 2.0
+#: Parked-fill bound: overflow publishes oldest immediately, never drops.
+_PENDING_FILL_CAP = 1000
 
 
 def _new_id() -> str:
@@ -188,6 +195,15 @@ class HyperliquidAdapter(Adapter):
         # reported — shared by both fill channels so dual-subscribed fills
         # publish exactly once.  Bounded: matches the venue recent window.
         self._seen_fill_ids: deque[str] = deque(maxlen=_WS_SEEN_FILL_IDS)
+        # Fills parked awaiting attribution (issue 16): key → raw entry for
+        # fills whose oid was unknown when the push arrived.  A deadline task
+        # publishes each with the best resolution then available; shutdown
+        # flushes them synchronously instead of dropping.  Oids that fail
+        # REST resolution are remembered in ``_oid_unresolvable`` so
+        # ``fetch_fills`` never re-pays them.
+        self._pending_fills: dict[str, dict[str, Any]] = {}
+        self._pending_fill_tasks: set[asyncio.Task[None]] = set()
+        self._oid_unresolvable: set[str] = set()
         # Push-channel link state.  ``_ws_task`` polls it (see below).
         self._streams_up = False
         # Account-state baselines for the ``clearinghouseState`` / ``spotState``
@@ -338,6 +354,8 @@ class HyperliquidAdapter(Adapter):
         self._oid_clients.clear()
         self._child_parents.clear()
         self._position_leg_cloids.clear()
+        self._pending_fills.clear()
+        self._oid_unresolvable.clear()
         self._publish_connection_state(False)
 
     @property
@@ -423,6 +441,9 @@ class HyperliquidAdapter(Adapter):
                 await asyncio.gather(*pending, return_exceptions=True)
             except Exception:
                 logger.exception("Hyperliquid streams dispatch drain failed on stop")
+        # Parked fills publish now with current resolution — stopping must
+        # never silently drop a fill that only awaited its ack.
+        self._flush_all_parked()
         socket, self._ws = self._ws, None
         if socket is not None:
             try:
@@ -798,10 +819,15 @@ class HyperliquidAdapter(Adapter):
         The seen-set is peeked — not recorded — up front; the id is marked
         only after a successful publish, so a poison (untranslatable) entry
         never burns its id and its redelivery still publishes (issue 12).
+        Attributed fills publish instantly.  Unattributed fills park for
+        ``_FILL_ATTRIBUTION_HOLD_SECONDS`` so a racing ack can still claim
+        them (issue 16); expiry publishes with the raw-oid fallback, never
+        held hostage.  Duplicates of a parked fill are dropped; a fill the
+        snapshot seeds meanwhile is skipped at flush via the seen-set.
         """
         try:
             key = self._fill_key(entry)
-            if key is not None and key in self._seen_fill_ids:
+            if key is not None and (key in self._seen_fill_ids or key in self._pending_fills):
                 return
             coin = str(entry.get("coin") or "")
             if not coin:
@@ -813,9 +839,79 @@ class HyperliquidAdapter(Adapter):
             attributed = self._oid_clients.get(oid)
             if attributed is not None:
                 client_order_id, reason, fill_entry = attributed
+            elif key is None:
+                # Id-less entries cannot park or dedupe — publish raw now.
+                client_order_id, reason, fill_entry = (
+                    (oid or str(entry.get("hash") or "")),
+                    None,
+                    None,
+                )
             else:
-                # Match ``fetch_fills``: an unattributed fill keys by its L1
-                # hash.  A constant placeholder would collide across fills.
+                # Unattributed (usually: push beat the ack) — park for the
+                # hold instead of publishing raw immediately.  Fail-fast on
+                # poison first: validate now so garbage never occupies a
+                # task, then re-translate at flush with fresh attribution.
+                translate_fill(
+                    entry,
+                    instrument=instrument,
+                    client_order_id=(oid or str(entry.get("hash") or "")),
+                    reason=None,
+                    fill_entry=None,
+                )
+                self._park_fill(key, entry)
+                return
+            record = translate_fill(
+                entry,
+                instrument=instrument,
+                client_order_id=client_order_id,
+                reason=reason,
+                fill_entry=fill_entry,
+            )
+            self._publish_fill_record(record)
+            if key is not None:
+                self._seen_fill_ids.append(key)
+        except Exception:
+            logger.exception("Skipping untranslatable fill entry: %r", entry)
+
+    def _park_fill(self, key: str, entry: dict[str, Any]) -> None:
+        """Park an unattributed fill entry for deadline resolution (never raises)."""
+        try:
+            if len(self._pending_fills) >= _PENDING_FILL_CAP:
+                oldest = next(iter(self._pending_fills))
+                self._flush_parked(oldest)
+            self._pending_fills[key] = entry
+            task = asyncio.ensure_future(self._flush_parked_after_hold(key))
+            self._pending_fill_tasks.add(task)
+            task.add_done_callback(self._pending_fill_tasks.discard)
+        except Exception:
+            logger.exception("Fill parking failed for %r", key)
+
+    async def _flush_parked_after_hold(self, key: str) -> None:
+        """Publish one parked fill after the hold with current attribution."""
+        try:
+            await asyncio.sleep(_FILL_ATTRIBUTION_HOLD_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Parked-fill hold failed for %r", key)
+            return
+        self._flush_parked(key)
+
+    def _flush_parked(self, key: str) -> None:
+        """Publish one parked fill now with the best resolution available (never raises)."""
+        try:
+            entry = self._pending_fills.pop(key, None)
+            if entry is None or key in self._seen_fill_ids:
+                return
+            coin = str(entry.get("coin") or "")
+            instrument = from_hyperliquid_coin(
+                coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
+            )
+            oid = str(entry.get("oid") or "")
+            attributed = self._oid_clients.get(oid)
+            if attributed is not None:
+                client_order_id, reason, fill_entry = attributed
+            else:
                 client_order_id, reason, fill_entry = (
                     (oid or str(entry.get("hash") or "")),
                     None,
@@ -829,10 +925,21 @@ class HyperliquidAdapter(Adapter):
                 fill_entry=fill_entry,
             )
             self._publish_fill_record(record)
-            if key is not None:
-                self._seen_fill_ids.append(key)
+            self._seen_fill_ids.append(key)
         except Exception:
-            logger.exception("Skipping untranslatable fill entry: %r", entry)
+            logger.exception("Skipping untranslatable parked fill: %r", key)
+
+    def _flush_all_parked(self) -> None:
+        """Publish every parked fill immediately (shutdown path, never raises)."""
+        try:
+            for key in list(self._pending_fills):
+                self._flush_parked(key)
+        except Exception:
+            logger.exception("Parked-fill shutdown flush failed")
+        finally:
+            for task in set(self._pending_fill_tasks):
+                task.cancel()
+            self._pending_fill_tasks.clear()
 
     async def _handle_clearinghouse_message(self, data: Any) -> None:
         """Diff a ``clearinghouseState`` push into ``PositionUpdateEvent``s (never raises).
@@ -2087,9 +2194,13 @@ class HyperliquidAdapter(Adapter):
         with ``since`` reads ``userFillsByTime`` from that bound (server
         filters; a client-side guard holds the boundary).  Entries dedupe
         on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
-        children by parent with their reason), unknown oids key by raw oid.
-        Costs one open-orders scan (both shapes) plus one ``userState`` read
-        for oid attribution, plus the fills call itself.
+        children by parent with their reason); oids still unknown after the
+        index get one bounded ``orderStatus``-by-oid resolve each (issue
+        16 — same-session instant fills; pre-session history has no session
+        maps to resolve against and stays raw-keyed), then unknown oids key
+        by raw oid.  Costs one open-orders scan (both shapes) plus one
+        ``userState`` read for oid attribution, plus the fills call itself,
+        plus one read per previously-unseen unknown oid.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
@@ -2121,6 +2232,8 @@ class HyperliquidAdapter(Adapter):
             seen.add(key)
             oid = str(entry.get("oid") or "")
             attributed = self._oid_clients.get(oid)
+            if attributed is None and oid and oid not in self._oid_unresolvable:
+                attributed = await self._resolve_oid_attribution(oid)
             if attributed is not None:
                 client_order_id, reason, entry_side = attributed
             else:
@@ -2146,6 +2259,57 @@ class HyperliquidAdapter(Adapter):
                 continue
             result.setdefault(client_order_id, []).append(fill)
         return result
+
+    async def _resolve_oid_attribution(
+        self, oid: str
+    ) -> tuple[str, FillReason | None, FillEntry | None] | None:
+        """Attribute one unknown oid via ``orderStatus``-by-oid (issue 16).
+
+        Reads the order's cloid and maps it through the session indexes:
+        bracket children to ``(parent, reason, OUT)``, own cids back to
+        themselves.  Successes index into ``_oid_clients`` so every later
+        path benefits; definitive misses join ``_oid_unresolvable`` so
+        future reads never re-pay them (cleared on disconnect).  Transport
+        failures stay uncached — the next read retries.  Position legs
+        resolve while open via the index; closed ones keep the attribution
+        written at ack time.  Returns None when unresolvable (caller keys
+        by raw oid, as before).
+        """
+        try:
+            oid_int = int(oid)
+        except (TypeError, ValueError):
+            self._oid_unresolvable.add(oid)
+            return None
+        exchange = self._require_exchange()
+        try:
+            response = await self._run_exchange(
+                exchange.info.query_order_by_oid, self._config.wallet_address, oid_int
+            )
+        except Exception:
+            logger.exception("orderStatus-by-oid resolve failed for oid %r", oid)
+            return None
+        if not isinstance(response, dict) or response.get("status") == "unknownOid":
+            self._oid_unresolvable.add(oid)
+            return None
+        try:
+            raw = str(response["order"]["order"].get("cloid") or "")
+        except (KeyError, TypeError, AttributeError):
+            logger.exception("orderStatus-by-oid shape unexpected for oid %r", oid)
+            self._oid_unresolvable.add(oid)
+            return None
+        if not raw:
+            self._oid_unresolvable.add(oid)
+            return None
+        if raw in self._child_parents:
+            attributed: tuple[str, FillReason | None, FillEntry | None] = self._child_parents[raw]
+        else:
+            resolved = self._known_client_id(raw)
+            if resolved is None:
+                self._oid_unresolvable.add(oid)
+                return None
+            attributed = (resolved, None, None)
+        self._oid_clients[oid] = attributed
+        return attributed
 
     # ---- Leverage + margin intent ----
 

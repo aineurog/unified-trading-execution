@@ -346,3 +346,81 @@ async def test_spec_cache_ttl_expiry(adapter: HyperliquidAdapter) -> None:
     await adapter.fetch_instrument_spec(_perp())
     await adapter.fetch_instrument_spec(_perp())
     assert exchange.info.meta.call_count == 2
+
+
+def _rest_fill(*, oid: object = 77, tid: int = 9) -> dict[str, object]:
+    return {
+        "coin": "BTC",
+        "px": "100",
+        "sz": "0.01",
+        "side": "B",
+        "time": 2000,
+        "dir": "Open Long",
+        "hash": "0xh",
+        "oid": oid,
+        "fee": "0.01",
+        "feeToken": "USDC",
+        "tid": tid,
+    }
+
+
+def _oid_envelope(cloid: str) -> dict[str, object]:
+    return {"order": {"order": {"coin": "BTC", "cloid": cloid}}}
+
+
+async def test_fetch_fills_resolves_unknown_oid(adapter: HyperliquidAdapter) -> None:
+    """Issue 16B: an ack-missed oid resolves via orderStatus-by-oid to our cid."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    exchange = _connected(adapter)
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [_rest_fill()]
+    exchange.info.query_order_by_oid.return_value = _oid_envelope(
+        client_order_id_to_cloid("my-order-123")
+    )
+    fills = await adapter.fetch_fills()
+    assert set(fills) == {"my-order-123"}
+    assert adapter._oid_clients["77"][0] == "my-order-123"
+    await adapter.fetch_fills()  # indexed now — no second resolve read
+    assert exchange.info.query_order_by_oid.call_count == 1
+
+
+async def test_fetch_fills_caches_unresolvable_oid(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [_rest_fill()]
+    exchange.info.query_order_by_oid.return_value = {"status": "unknownOid"}
+    assert set(await adapter.fetch_fills()) == {"77"}
+    assert "77" in adapter._oid_unresolvable
+    await adapter.fetch_fills()
+    assert exchange.info.query_order_by_oid.call_count == 1  # never re-paid
+
+
+async def test_fetch_fills_transport_failure_retries(adapter: HyperliquidAdapter) -> None:
+    from hyperliquid.utils.error import ServerError
+
+    exchange = _connected(adapter)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [_rest_fill()]
+    exchange.info.query_order_by_oid.side_effect = ServerError(500, "boom")
+    assert set(await adapter.fetch_fills()) == {"77"}
+    assert "77" not in adapter._oid_unresolvable  # transient — retry next read
+    await adapter.fetch_fills()
+    assert exchange.info.query_order_by_oid.call_count == 2
+
+
+async def test_fetch_fills_non_numeric_oid_skips_query(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [_rest_fill(oid="abc")]
+    assert set(await adapter.fetch_fills()) == {"abc"}
+    assert exchange.info.query_order_by_oid.call_count == 0
