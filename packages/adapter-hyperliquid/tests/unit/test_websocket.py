@@ -208,3 +208,27 @@ def test_connect_daemonizes_manager_thread() -> None:
     manager = _manager_mock()
     _connect_recorded(ws, manager)
     assert manager.daemon is True
+
+
+def test_server_recycle_filter_demotes_only_routine_closes() -> None:
+    """Routine venue recycles go quiet; genuine failures stay loud."""
+    import logging
+
+    from unified_trading_execution.hyperliquid.websocket import _quiet_server_recycles
+
+    _quiet_server_recycles()
+    _quiet_server_recycles()  # idempotent — installed exactly once
+    lib_logger = logging.getLogger("websocket")
+    assert sum(1 for f in lib_logger.filters if type(f).__name__ == "_ServerCloseFilter") == 1
+
+    def level_for(message: str) -> int:
+        record = logging.LogRecord("websocket", logging.ERROR, __file__, 1, message, (), None)
+        for filt in lib_logger.filters:
+            filt.filter(record)
+        return record.levelno
+
+    assert level_for("fin=1 opcode=8 data=b'\\x03\\xe8Expired' - goodbye") == logging.DEBUG
+    assert level_for("Connection to remote host was lost. - goodbye") == logging.DEBUG
+    assert (
+        level_for("Handshake status 502 Bad Gateway -+-+- {} -+-+- b''") == logging.ERROR
+    )
