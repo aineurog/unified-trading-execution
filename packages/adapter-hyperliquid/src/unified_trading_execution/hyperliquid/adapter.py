@@ -138,6 +138,10 @@ DEFAULT_BLOCK_ON_OPEN_POSITION = True
 _WS_MONITOR_INTERVAL_SECONDS = 15.0
 #: Fill ids remembered for stream dedupe (matches the venue recent window).
 _WS_SEEN_FILL_IDS = 10000
+#: Identity-map seed window: recent order rows rebuild session maps.
+_IDENTITY_SEED_DAYS = 30
+#: Identity-map seed cap: bounds connect-time cost on busy accounts.
+_IDENTITY_SEED_LIMIT = 5000
 #: Seconds an unattributed fill waits for its ack before publishing raw.
 #: Acks land in hundreds of ms; the hold only ever delays fills the
 #: adapter could not yet attribute (issue 16) — attributed fills publish
@@ -279,6 +283,49 @@ class HyperliquidAdapter(Adapter):
             raise PlatformConnectionError("Hyperliquid adapter is not connected")
         return self._exchange
 
+    async def _seed_identity_maps(self) -> None:
+        """Rebuild session id maps from recent stored order rows (never raises).
+
+        Each persisted row already carries both ids, so no new writes are
+        needed — just pair them. In-session entries win over seeded ones.
+        Misses degrade to existing fallbacks (raw keys + reconcile).
+        """
+        store = self._state_store
+        if store is None:
+            return
+        try:
+            since = _utcnow() - timedelta(days=_IDENTITY_SEED_DAYS)
+            records = await store.query_orders(start=since, limit=_IDENTITY_SEED_LIMIT)
+        except Exception:
+            logger.exception("Identity-map seeding failed; continuing unseeded")
+            return
+        seeded = 0
+        for record in records:
+            cid = record.client_order_id
+            if not cid:
+                continue
+            try:
+                coin = to_hyperliquid_coin(record.instrument)
+            except Exception:
+                logger.warning("Identity-map seeding: skipping order %r", cid)
+                continue
+            is_spot = record.instrument.asset_class == AssetClass.SPOT
+            if cid not in self._client_coins:
+                self._client_coins[cid] = (coin, is_spot)
+                seeded += 1
+            for suffix, reason in (
+                (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+                (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+            ):
+                raw = client_order_id_to_cloid(f"{cid}:{suffix}")
+                if raw not in self._child_parents:
+                    self._child_parents[raw] = (cid, reason, FillEntry.OUT)
+            oid = record.platform_order_id
+            if oid and str(oid) not in self._oid_clients:
+                self._oid_clients[str(oid)] = (cid, None, None)
+        if seeded:
+            logger.info("Seeded %d order-id mappings from the state store", seeded)
+
     async def connect(self) -> None:
         """Open the transport and verify signing identity.
 
@@ -333,6 +380,7 @@ class HyperliquidAdapter(Adapter):
 
         self._exchange = exchange
         self._connected = True
+        await self._seed_identity_maps()
         await self._reapply_stored_intent()
         self._publish_connection_state(True)
 

@@ -127,3 +127,93 @@ async def test_exchange_required_when_disconnected() -> None:
     adapter = HyperliquidAdapter(_config(), event_bus=EventBus())
     with pytest.raises(PlatformConnectionError):
         adapter._require_exchange()
+
+
+def _stored_row(cid: str, oid: str | None = "77") -> Any:
+    from datetime import UTC, datetime
+    from decimal import Decimal
+
+    from unified_trading_execution.types.enums import (
+        AssetClass,
+        OrderSide,
+        OrderStatus,
+        OrderType,
+        TimeInForce,
+    )
+    from unified_trading_execution.types.instrument import Instrument
+    from unified_trading_execution.types.order import OrderRecord
+
+    return OrderRecord(
+        instrument=Instrument(
+            symbol="BTC", quote_currency="USDC", asset_class=AssetClass.FUTURES,
+            currency="USDC", multiplier=1,
+        ),
+        order_type=OrderType.MARKET,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.001"),
+        time_in_force=TimeInForce.IOC,
+        client_order_id=cid,
+        price=None,
+        stop_price=None,
+        reduce_only=False,
+        client_tag=None,
+        take_profit=None,
+        stop_loss=None,
+        platform_order_id=oid,
+        status=OrderStatus.FILLED,
+        filled_quantity=Decimal("0.001"),
+        average_fill_price=None,
+        correlation_id="corr-1",
+        created_at=datetime(2026, 10, 5, tzinfo=UTC),
+        updated_at=datetime(2026, 10, 5, tzinfo=UTC),
+    )
+
+
+def _store_with(rows: list[Any] | None) -> MagicMock:
+    from unittest.mock import AsyncMock
+
+    store = MagicMock()
+    store.query_orders = AsyncMock(return_value=rows)
+    return store
+
+
+async def test_seed_rebuilds_identity_maps() -> None:
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter = HyperliquidAdapter(_config(), event_bus=EventBus())
+    adapter.attach_state_store(_store_with([_stored_row("my-order-123")]))
+    await adapter._seed_identity_maps()
+    assert adapter._client_coins["my-order-123"] == ("BTC", False)
+    assert adapter._oid_clients["77"] == ("my-order-123", None, None)
+    child = client_order_id_to_cloid("my-order-123:take_profit")
+    assert adapter._child_parents[child][0] == "my-order-123"
+
+
+async def test_seed_skips_bad_rows() -> None:
+    adapter = HyperliquidAdapter(_config(), event_bus=EventBus())
+    adapter.attach_state_store(_store_with([_stored_row(""), _stored_row("ok-1", None)]))
+    await adapter._seed_identity_maps()
+    assert "" not in adapter._client_coins
+    assert adapter._client_coins["ok-1"] == ("BTC", False)
+    assert adapter._oid_clients == {}
+
+
+async def test_seed_without_store_or_on_failure_is_quiet() -> None:
+    adapter = HyperliquidAdapter(_config(), event_bus=EventBus())
+    await adapter._seed_identity_maps()  # no store attached
+    assert adapter._client_coins == {}
+    from unittest.mock import AsyncMock
+
+    store = MagicMock()
+    store.query_orders = AsyncMock(side_effect=RuntimeError("db down"))
+    adapter.attach_state_store(store)
+    await adapter._seed_identity_maps()
+    assert adapter._client_coins == {}
+
+
+async def test_seed_never_overwrites_session() -> None:
+    adapter = HyperliquidAdapter(_config(), event_bus=EventBus())
+    adapter._client_coins["my-order-123"] = ("ETH", False)
+    adapter.attach_state_store(_store_with([_stored_row("my-order-123")]))
+    await adapter._seed_identity_maps()
+    assert adapter._client_coins["my-order-123"] == ("ETH", False)
