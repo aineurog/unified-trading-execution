@@ -424,3 +424,15 @@ async def test_fetch_fills_non_numeric_oid_skips_query(adapter: HyperliquidAdapt
     exchange.info.user_fills.return_value = [_rest_fill(oid="abc")]
     assert set(await adapter.fetch_fills()) == {"abc"}
     assert exchange.info.query_order_by_oid.call_count == 0
+
+
+async def test_fetch_fills_seed_skips_oid_resolution(adapter: HyperliquidAdapter) -> None:
+    """Startup seeding consumes ids only — no per-oid reads, however many unknowns."""
+    exchange = _connected(adapter)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills.return_value = [_rest_fill(), _rest_fill(oid=78, tid=10)]
+    await adapter.fetch_fills(resolve_unknown_oids=False)
+    assert exchange.info.query_order_by_oid.call_count == 0
+    assert adapter._oid_unresolvable == set()

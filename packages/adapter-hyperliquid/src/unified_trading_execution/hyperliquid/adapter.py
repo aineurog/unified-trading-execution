@@ -605,10 +605,11 @@ class HyperliquidAdapter(Adapter):
         """Fold a REST fills snapshot into the seen-set.
 
         With ``publish_unseen=False`` (startup seed) history is only marked —
-        REST owns the past.  With True (post-reconnect gap cover) unseen
-        fills publish — the live channel missed them.
+        REST owns the past, and per-oid resolution is skipped (only ids are
+        consumed).  With True (post-reconnect gap cover) unseen fills publish
+        with full attribution — the live channel missed them.
         """
-        for records in (await self.fetch_fills()).values():
+        for records in (await self.fetch_fills(resolve_unknown_oids=publish_unseen)).values():
             for record in records:
                 key = record.platform_fill_id
                 if key in self._seen_fill_ids:
@@ -2235,7 +2236,9 @@ class HyperliquidAdapter(Adapter):
             result[key] = order
         return result
 
-    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None, resolve_unknown_oids: bool = True
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills, grouped by client order id.
 
         Without ``since`` reads the recent window (``userFills``, ≤2000);
@@ -2248,7 +2251,9 @@ class HyperliquidAdapter(Adapter):
         maps to resolve against and stays raw-keyed), then unknown oids key
         by raw oid.  Costs one open-orders scan (both shapes) plus one
         ``userState`` read for oid attribution, plus the fills call itself,
-        plus one read per previously-unseen unknown oid.
+        plus one read per previously-unseen unknown oid.  Pass
+        ``resolve_unknown_oids=False`` when only the fill ids are consumed
+        (startup seeding) to skip the per-oid reads entirely.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
@@ -2280,7 +2285,12 @@ class HyperliquidAdapter(Adapter):
             seen.add(key)
             oid = str(entry.get("oid") or "")
             attributed = self._oid_clients.get(oid)
-            if attributed is None and oid and oid not in self._oid_unresolvable:
+            if (
+                attributed is None
+                and resolve_unknown_oids
+                and oid
+                and oid not in self._oid_unresolvable
+            ):
                 attributed = await self._resolve_oid_attribution(oid)
             if attributed is not None:
                 client_order_id, reason, entry_side = attributed
