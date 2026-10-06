@@ -672,6 +672,40 @@ class HyperliquidAdapter(Adapter):
                 return client_order_id
         return None
 
+    @staticmethod
+    def _is_thin_update(payload: dict[str, Any]) -> bool:
+        """True when a WS order payload carries no type markers.
+
+        The thin ``WsBasicOrder`` shape omits ``orderType`` / ``isTrigger`` /
+        ``triggerPx`` — translating it standalone falls through to the
+        resting defaults (LIMIT/GTC, no attachments), which then overwrite
+        the true record.  Rich updates (any marker present) translate fully.
+        """
+        if payload.get("orderType") or payload.get("isTrigger"):
+            return False
+        try:
+            return payload.get("triggerPx") in (None, "", "0", "0.0")
+        except Exception:
+            return True
+
+    @staticmethod
+    def _merge_thin_update(thin: OrderRecord, local: OrderRecord) -> OrderRecord:
+        """Fold a thin WS update onto the stored record (WS-authoritative fields only).
+
+        Status, fill progress and timestamps come from the push; everything
+        static (type, TIF, price, attachments, …) stays local, so a MARKET
+        row can never regress to LIMIT.  Filled quantity is monotonic —
+        the max wins, guarding against a stale remaining-size echo.
+        """
+        return dataclasses.replace(
+            local,
+            status=thin.status,
+            filled_quantity=max(local.filled_quantity, thin.filled_quantity),
+            average_fill_price=thin.average_fill_price or local.average_fill_price,
+            platform_order_id=thin.platform_order_id or local.platform_order_id,
+            updated_at=thin.updated_at,
+        )
+
     async def _translate_order_update(self, entry: dict[str, Any]) -> OrderRecord:
         """Translate one ``WsOrder`` update.
 
@@ -680,6 +714,13 @@ class HyperliquidAdapter(Adapter):
         the record's ``updated_at`` would silently fall back to creation.
         The record's client id is restored to the caller id (same rule as
         ``fetch_open_orders``) — consumers match on values, not dict keys.
+
+        Thin updates (no type markers) merge onto the stored record instead
+        of translating standalone: only status/fill/timestamps are taken
+        from the push.  Unknown ids without a store fall back to
+        standalone translation (bare-adapter degradation, as before);
+        unknown ids *with* a store get one bounded ``orderStatus`` re-query,
+        and on failure the thin translation (never silence a status).
         """
         payload = entry.get("order")
         if not isinstance(payload, dict):
@@ -696,9 +737,60 @@ class HyperliquidAdapter(Adapter):
                 merged[key] = entry[key]
         record = translate_order_entry(merged, instrument=instrument)
         resolved = self._known_client_id(record.client_order_id)
+        cid = resolved or record.client_order_id
         if resolved is not None and resolved != record.client_order_id:
             record = dataclasses.replace(record, client_order_id=resolved)
+        if not self._is_thin_update(payload):
+            return record
+        store = self._state_store
+        if store is not None:
+            try:
+                local = await store.get_order(cid)
+            except Exception:
+                logger.exception("Stored-order lookup failed for %r", cid)
+                local = None
+            if local is not None:
+                return self._merge_thin_update(record, local)
+            try:
+                rich = await self._translate_unknown_update(record, instrument)
+                if rich.client_order_id != cid:
+                    rich = dataclasses.replace(rich, client_order_id=cid)
+                return rich
+            except Exception:
+                logger.exception("Orphan re-query failed for %r", cid)
         return record
+
+    async def _translate_unknown_update(
+        self, thin: OrderRecord, instrument: Instrument
+    ) -> OrderRecord:
+        """One bounded ``orderStatus`` re-query for an order with no local row.
+
+        Returns the rich translation; raises on ``unknownOid`` or transport
+        failure so the caller falls back to the thin record.  Orphan-only
+        path — every placed order has a local row, so the hot path never
+        pays this read.
+        """
+        exchange = self._require_exchange()
+        response = await self._run_exchange(
+            exchange.info.query_order_by_cloid,
+            self._config.wallet_address,
+            Cloid(client_order_id_to_cloid(thin.client_order_id)),
+        )
+        if not isinstance(response, dict) or response.get("status") == "unknownOid":
+            raise OrderNotFoundError(f"Order {thin.client_order_id} has no orderStatus")
+        try:
+            payload = response["order"]
+            detail = payload["order"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
+        if not isinstance(detail, dict):
+            raise PlatformError(f"OrderStatus is missing its order object: {response!r}")
+        rich = {
+            **detail,
+            "status": payload.get("status"),
+            "statusTimestamp": payload.get("statusTimestamp"),
+        }
+        return translate_order_entry(rich, instrument=instrument)
 
     async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
         """Translate one fill and publish it unless already seen (never raises).
