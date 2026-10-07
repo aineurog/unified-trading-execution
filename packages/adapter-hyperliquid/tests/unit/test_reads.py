@@ -436,3 +436,17 @@ async def test_fetch_fills_seed_skips_oid_resolution(adapter: HyperliquidAdapter
     await adapter.fetch_fills(resolve_unknown_oids=False)
     assert exchange.info.query_order_by_oid.call_count == 0
     assert adapter._oid_unresolvable == set()
+
+
+async def test_fetch_fills_gap_window_scopes_unknowns(adapter: HyperliquidAdapter) -> None:
+    """Gap cover reads the outage window only — bounded unknowns per call."""
+    exchange = _connected(adapter)
+    exchange.info.user_state.return_value = {}
+    exchange.info.open_orders.return_value = []
+    exchange.info.frontend_open_orders.return_value = []
+    exchange.info.user_fills_by_time.return_value = [_rest_fill(), _rest_fill(oid=78, tid=10)]
+    exchange.info.query_order_by_oid.return_value = {"status": "unknownOid"}
+    await adapter._absorb_fills(publish_unseen=True, since=datetime.now(UTC))
+    assert exchange.info.user_fills_by_time.call_count == 1
+    assert exchange.info.user_fills.call_count == 0
+    assert exchange.info.query_order_by_oid.call_count == 2

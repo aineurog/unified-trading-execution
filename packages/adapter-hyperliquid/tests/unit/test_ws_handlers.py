@@ -600,7 +600,8 @@ async def test_rebuild_resubscribes_and_gap_fills() -> None:
     adapter._ws = dead
     exchange = adapter._exchange
     assert isinstance(exchange, MagicMock)
-    exchange.info.user_fills.return_value = [_fill(), _fill(tid=10)]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    exchange.info.user_fills_by_time.return_value = [_fill(time=now_ms), _fill(tid=10, time=now_ms)]
     with patch(
         "unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"
     ) as socket_class:
@@ -716,7 +717,8 @@ async def test_gap_fill_skips_seen() -> None:
     adapter._ws = dead
     exchange = adapter._exchange
     assert isinstance(exchange, MagicMock)
-    exchange.info.user_fills.return_value = [_fill(), _fill(tid=10)]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    exchange.info.user_fills_by_time.return_value = [_fill(time=now_ms), _fill(tid=10, time=now_ms)]
     with patch("unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"):
         await adapter._rebuild_streams(dead)
         assert len(_of(seen, FillEvent)) == 1

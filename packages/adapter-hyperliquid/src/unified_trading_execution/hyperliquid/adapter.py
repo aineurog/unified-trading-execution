@@ -601,15 +601,18 @@ class HyperliquidAdapter(Adapter):
             )
         )
 
-    async def _absorb_fills(self, *, publish_unseen: bool) -> None:
+    async def _absorb_fills(self, *, publish_unseen: bool, since: datetime | None = None) -> None:
         """Fold a REST fills snapshot into the seen-set.
 
         With ``publish_unseen=False`` (startup seed) history is only marked —
         REST owns the past, and per-oid resolution is skipped (only ids are
         consumed).  With True (post-reconnect gap cover) unseen fills publish
-        with full attribution — the live channel missed them.
+        with full attribution — pass ``since`` bounding the outage so only
+        the gap window is read.
         """
-        for records in (await self.fetch_fills(resolve_unknown_oids=publish_unseen)).values():
+        for records in (
+            await self.fetch_fills(since=since, resolve_unknown_oids=publish_unseen)
+        ).values():
             for record in records:
                 key = record.platform_fill_id
                 if key in self._seen_fill_ids:
@@ -1238,7 +1241,11 @@ class HyperliquidAdapter(Adapter):
                 logger.exception("Hyperliquid unsubscribed replacement teardown failed")
             return
         try:
-            await self._absorb_fills(publish_unseen=True)
+            # Gap window from the monitor cadence: a drop is noticed within
+            # one tick (15s) plus rebuild time — 120s covers it several times
+            # over, so the cover reads a handful of fills, not history.
+            gap_since = _utcnow() - timedelta(seconds=120)
+            await self._absorb_fills(publish_unseen=True, since=gap_since)
         except Exception:
             logger.exception("Hyperliquid gap re-query after reconnect failed")
             return
