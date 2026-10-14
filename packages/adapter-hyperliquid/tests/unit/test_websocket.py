@@ -221,14 +221,10 @@ def test_server_recycle_filter_demotes_only_routine_closes() -> None:
     lib_logger = logging.getLogger("websocket")
     assert sum(1 for f in lib_logger.filters if type(f).__name__ == "_ServerCloseFilter") == 1
 
-    def level_for(message: str) -> int:
+    def kept(message: str) -> bool:
         record = logging.LogRecord("websocket", logging.ERROR, __file__, 1, message, (), None)
-        for filt in lib_logger.filters:
-            filt.filter(record)
-        return record.levelno
+        return all(filt.filter(record) for filt in lib_logger.filters)
 
-    assert level_for("fin=1 opcode=8 data=b'\\x03\\xe8Expired' - goodbye") == logging.DEBUG
-    assert level_for("Connection to remote host was lost. - goodbye") == logging.DEBUG
-    assert (
-        level_for("Handshake status 502 Bad Gateway -+-+- {} -+-+- b''") == logging.ERROR
-    )
+    assert kept("fin=1 opcode=8 data=b'\\x03\\xe8Expired' - goodbye") is False
+    assert kept("Connection to remote host was lost. - goodbye") is False
+    assert kept("Handshake status 502 Bad Gateway -+-+- {} -+-+- b''") is True

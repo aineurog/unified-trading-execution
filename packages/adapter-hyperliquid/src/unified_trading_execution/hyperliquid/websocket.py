@@ -39,19 +39,22 @@ _SERVER_CLOSE_SNIPPETS = ("Expired", "was lost.")
 
 
 class _ServerCloseFilter(logging.Filter):
-    """Demote routine server recycles; keep genuine failures loud."""
+    """Drop routine server recycles; keep genuine failures loud.
+
+    The adapter detects recycles via its liveness monitor and rebuilds by
+    itself, so these records carry no information at any level — not even
+    DEBUG, since consoles commonly run at DEBUG and would still show them.
+    """
 
     def filter(self, record: logging.LogRecord) -> bool:
         try:
             message = record.getMessage()
         except Exception:
             return True
-        if record.levelno == logging.ERROR and any(
+        recycled = record.levelno == logging.ERROR and any(
             snippet in message for snippet in _SERVER_CLOSE_SNIPPETS
-        ):
-            record.levelno = logging.DEBUG
-            record.levelname = "DEBUG"
-        return True
+        )
+        return not recycled
 
 
 def _quiet_server_recycles() -> None:
