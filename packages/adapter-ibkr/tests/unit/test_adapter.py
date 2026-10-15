@@ -1603,7 +1603,7 @@ class TestTerminalFromError:
 
 class TestParseGoodTillDate:
     def test_valid_utc(self) -> None:
-        dt = _parse_good_till_date("20260801 10:00:00")
+        dt = _parse_good_till_date("20260801-10:00:00")
         assert dt is not None
         assert dt.tzinfo is not None
         assert dt.year == 2026 and dt.month == 8 and dt.day == 1
@@ -1624,7 +1624,7 @@ class TestParseGoodTillDate:
         mock_ib = mock_ib_async_module
         trade = _trade(order_ref="cid-gtd", order_id=32, perm_id=778, status="Submitted")
         trade.contract = Contract(symbol="AAPL", secType="STK", exchange="SMART", currency="USD")
-        trade.order.goodTillDate = "20260901 12:00:00"
+        trade.order.goodTillDate = "20260901-12:00:00"
         mock_ib.openTrades.return_value = [trade]  # type: ignore[attr-defined]
 
         records = await adapter.fetch_open_orders()

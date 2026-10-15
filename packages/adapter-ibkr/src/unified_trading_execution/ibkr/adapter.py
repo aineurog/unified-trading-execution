@@ -140,8 +140,9 @@ def _snapshot_price(value: object) -> Decimal | None:
 def _parse_good_till_date(raw: str) -> datetime | None:
     """Parse an IBKR ``goodTillDate`` string into a timezone-aware datetime.
 
-    The write path formats GTD expiry as ``"%Y%m%d %H:%M:%S"`` in UTC, so the
-    read-back mirrors that contract.  A missing, empty, or malformed value
+    The write path formats GTD expiry as ``"%Y%m%d-%H:%M:%S"`` in UTC (the
+    explicit-UTC form IBKR requires, warning 2174), so the read-back mirrors
+    that contract.  A missing, empty, or malformed value
     returns ``None`` rather than raising — a read-back must never fail the
     whole snapshot on a stray field.
     """
@@ -149,7 +150,7 @@ def _parse_good_till_date(raw: str) -> datetime | None:
     if not raw:
         return None
     try:
-        return datetime.strptime(raw, "%Y%m%d %H:%M:%S").replace(tzinfo=UTC)
+        return datetime.strptime(raw, "%Y%m%d-%H:%M:%S").replace(tzinfo=UTC)
     except ValueError:
         return None
 
@@ -328,7 +329,7 @@ def _trade_to_record(trade: Trade) -> OrderRecord | None:
     if not client_order_id:
         return None
 
-    # GTD expiry: goodTillDate is written as "%Y%m%d %H:%M:%S" in UTC on the
+    # GTD expiry: goodTillDate is written as "%Y%m%d-%H:%M:%S" in UTC on the
     # place path, so parse it back for GTD orders to persist the expiry.
     expire_at = _parse_good_till_date(str(getattr(order, "goodTillDate", "") or ""))
     try:
