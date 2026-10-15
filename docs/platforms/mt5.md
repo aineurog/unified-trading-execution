@@ -641,7 +641,9 @@ crosses the adapter boundary. You never receive a raw MT5 code.
 | Unified exception | MT5 codes / causes |
 |---|---|
 | `PlatformConnectionError` (retryable) | 10004 requote, 10007 server-cancel, 10012 timeout, 10020 price-changed, 10021 no quotes, 10028 locked, 10031 no connection, 10026/10027 auto-trading disabled, `RES_E_AUTH_FAILED`, `RES_E_AUTO_TRADING_DISABLED`, IPC failures |
-| `InvalidSymbolError` | 10013 invalid request, 10014 invalid volume, 10015 invalid price, 10016 invalid stops, 10018 market closed, 10022 invalid expiration, 10034 volume limit, 4301/5040 unknown symbol |
+| `InvalidSymbolError` | 4301/5040 unknown symbol |
+| `InvalidOrderError` | 10013 invalid request, 10014 invalid volume, 10015 invalid price, 10016 invalid stops, 10022 invalid expiration, 10034 volume limit |
+| `MarketClosedError` | 10018 market closed, 10021 no quotes |
 | `InsufficientBalanceError` | 10019 no money |
 | `InstrumentHaltedError` | 10017 trading disabled, 10029 frozen |
 | `RateLimitError` | 10024 too many requests, 10033 limit orders |

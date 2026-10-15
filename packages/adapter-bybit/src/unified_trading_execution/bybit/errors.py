@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from unified_trading_execution.errors import (
     InsufficientBalanceError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -62,6 +63,10 @@ _RET_CODE_MAP: dict[int, type[UteError]] = {
     110050: InvalidSymbolError,  # "Invalid coin"
     170121: InvalidSymbolError,  # "Invalid symbol"
     170221: InvalidSymbolError,  # "This coin does not exist"
+    # ---- Invalid order (price validation) ----
+    10032: InvalidOrderError,  # "Order price exceeded upper limit"
+    10033: InvalidOrderError,  # "Order price below minimum"
+    10042: InvalidOrderError,  # "Order price is outside the permitted price range"
     # ---- Insufficient balance ----
     110004: InsufficientBalanceError,  # "Wallet balance is insufficient"
     110006: InsufficientBalanceError,  # "assets cannot cover position margin"

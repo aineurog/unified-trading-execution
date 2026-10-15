@@ -11,6 +11,7 @@ from __future__ import annotations
 from unified_trading_execution.errors import (
     DuplicateOrderIdError,
     InstrumentHaltedError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -38,10 +39,11 @@ class TestMapIBKRError:
             (103, DuplicateOrderIdError),  # Duplicate order ID
             # ---- Unsupported / Invalid Parameters ----
             (106, UnsupportedOrderTypeError),  # Can't transmit order ID
-            (109, UnsupportedOrderTypeError),  # Price out of precautionary range
-            (110, UnsupportedOrderTypeError),  # Minimum price variation mismatch
             (111, UnsupportedOrderTypeError),  # TIF and order type incompatible
             (113, UnsupportedOrderTypeError),  # TIF must be DAY for MOC/LOC
+            # ---- Invalid Order (price validation) ----
+            (109, InvalidOrderError),  # Price out of precautionary range
+            (110, InvalidOrderError),  # Minimum price variation mismatch
             # ---- Invalid Symbol ----
             (116, InvalidSymbolError),  # Dead exchange
             (124, InvalidSymbolError),  # No market rule for conid (non-tradeable)

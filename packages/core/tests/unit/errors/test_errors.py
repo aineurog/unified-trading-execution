@@ -10,6 +10,7 @@ from unified_trading_execution.errors import (
     EngineShutdownError,
     InstrumentHaltedError,
     InsufficientBalanceError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -28,6 +29,7 @@ def test_all_errors_inherit_from_ute_error():
     assert issubclass(RateLimitError, UteError)
     assert issubclass(OrderNotFoundError, UteError)
     assert issubclass(UnsupportedOrderTypeError, UteError)
+    assert issubclass(InvalidOrderError, UteError)
     assert issubclass(DuplicateOrderIdError, UteError)
     assert issubclass(PlatformConnectionError, UteError)
     assert issubclass(InstrumentHaltedError, UteError)

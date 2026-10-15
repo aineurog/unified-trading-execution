@@ -5,6 +5,7 @@ import pytest
 from unified_trading_execution.bybit.errors import map_bybit_error
 from unified_trading_execution.errors import (
     InsufficientBalanceError,
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -61,6 +62,10 @@ class TestMapBybitRetCode:
             (110050, InvalidSymbolError),
             (170121, InvalidSymbolError),
             (170221, InvalidSymbolError),
+            # Invalid order (price validation)
+            (10032, InvalidOrderError),
+            (10033, InvalidOrderError),
+            (10042, InvalidOrderError),
             # Insufficient balance
             (110004, InsufficientBalanceError),
             (110006, InsufficientBalanceError),

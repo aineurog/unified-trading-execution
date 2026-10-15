@@ -34,6 +34,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from unified_trading_execution.errors import (
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformError,
@@ -316,7 +317,7 @@ class TestPlaceOrder:
         )
         mock_mt5_module.last_error.return_value = (1, "")
 
-        with pytest.raises(InvalidSymbolError):
+        with pytest.raises(InvalidOrderError):
             await adapter.place_order(_order())
 
         assert _instrument() not in adapter._spec_cache
