@@ -692,7 +692,10 @@ class MT5Adapter(Adapter):
                     exc,
                 )
 
-            request = build_mt5_request(order, mt5_module=mt5)
+            self._server_time_offset_seconds(mt5, candidates=(mt5_symbol,))
+            request = build_mt5_request(
+                order, mt5_module=mt5, server_time_offset=self._server_time_offset
+            )
             request["symbol"] = mt5_symbol
             comment = encode_client_order_id(client_order_id)
             if comment is not None:

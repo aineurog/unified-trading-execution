@@ -126,6 +126,7 @@ async def dispatch_place_order(
         correlation_id=correlation_id,
         created_at=result.created_at,
         updated_at=result.updated_at,
+        expire_at=order.expire_at,
     )
     await state_store.upsert_order(record)
 
@@ -271,6 +272,7 @@ async def dispatch_modify_order(
         correlation_id=existing.correlation_id,
         created_at=existing.created_at,
         updated_at=result.updated_at,
+        expire_at=existing.expire_at,
     )
     await state_store.upsert_order(updated)
 
@@ -352,6 +354,7 @@ async def dispatch_cancel_order(
         correlation_id=existing.correlation_id,
         created_at=existing.created_at,
         updated_at=result.updated_at,
+        expire_at=existing.expire_at,
     )
     await state_store.upsert_order(updated)
 

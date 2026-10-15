@@ -59,7 +59,12 @@ from unified_trading_execution.types.order import (
 )
 
 
-def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]:
+def build_mt5_request(
+    order: UnifiedOrder,
+    *,
+    mt5_module: Any,
+    server_time_offset: int = 0,
+) -> dict[str, Any]:
     """Translate a ``UnifiedOrder`` into an MT5 request dict for ``order_send()``.
 
     The caller is responsible for:
@@ -71,6 +76,12 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
     so a leg-specific close (hedging mode) targets the right position.
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
+
+    *server_time_offset* is the server-as-epoch minus real-UTC offset (seconds,
+    see ``MT5Adapter._server_time_offset_seconds``).  MT5 interprets a GTD
+    ``expiration`` in *server* time, so the real-UTC ``expire_at`` is shifted
+    into the server basis here — the inverse of ``from_mt5_epoch`` on the read
+    path, keeping the round trip symmetric.
 
     Raises ``UnsupportedOrderTypeError`` if a TP/SL attachment carries a
     ``limit_price`` (MT5 TP/SL are price levels, not orders).
@@ -124,7 +135,8 @@ def build_mt5_request(order: UnifiedOrder, *, mt5_module: Any) -> dict[str, Any]
         if order.expire_at is None:
             raise ValueError("expire_at is required when time_in_force == GTD")
         request["type_time"] = mt5_module.ORDER_TIME_SPECIFIED
-        request["expiration"] = int(order.expire_at.timestamp())
+        # MT5 reads `expiration` in server time; expire_at is real UTC.
+        request["expiration"] = int(order.expire_at.timestamp()) + server_time_offset
 
     return request
 
