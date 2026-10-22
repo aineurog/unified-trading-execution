@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 #: Server-initiated close signatures the venue sends on routine recycles
 #: (roughly 10-minute TTL). The adapter detects these via its liveness
 #: monitor and rebuilds by itself — the library's ERROR-level goodbye adds
-#: noise, not information, so it is demoted to DEBUG. Anything else the
+#: noise, not information, so it is dropped entirely. Anything else the
 #: library reports (handshake failures, abnormal drops) keeps its level:
 #: if rebuilding itself starts failing, the adapter says so loudly via
 #: ``ConnectionStateEvent(False)`` and its own rebuild logs.

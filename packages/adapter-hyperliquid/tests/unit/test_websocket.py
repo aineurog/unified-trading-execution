@@ -210,7 +210,7 @@ def test_connect_daemonizes_manager_thread() -> None:
     assert manager.daemon is True
 
 
-def test_server_recycle_filter_demotes_only_routine_closes() -> None:
+def test_server_recycle_filter_drops_only_routine_closes() -> None:
     """Routine venue recycles go quiet; genuine failures stay loud."""
     import logging
 

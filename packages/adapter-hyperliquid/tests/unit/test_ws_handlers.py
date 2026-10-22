@@ -397,9 +397,7 @@ async def test_thin_update_filled_never_regresses() -> None:
     adapter, _, seen = _adapter()
     adapter.attach_state_store(_store_with(_stored_market(filled="0.0008")))
     adapter._client_coins["my-order-123"] = ("BTC", False)
-    update = _order_update(
-        status="open", cloid=client_order_id_to_cloid("my-order-123")
-    )
+    update = _order_update(status="open", cloid=client_order_id_to_cloid("my-order-123"))
     assert isinstance(update["order"], dict)
     update["order"]["origSz"] = "0.001"
     update["order"]["sz"] = "0.0009"  # thin math says 0.0001 < stored 0.0008
@@ -484,6 +482,21 @@ async def test_thin_update_store_failure_falls_back() -> None:
     adapter.attach_state_store(store)
     await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
     assert len(_of(seen, OrderStatusEvent)) == 1
+
+
+async def test_thin_venue_order_without_cloid_skips_requery() -> None:
+    """A venue order with no cloid cannot be looked up by cloid; publish thin."""
+    adapter, _, seen = _adapter()
+    store = _store_with(None)
+    adapter.attach_state_store(store)
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid="")]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.client_order_id == ""
+    assert adapter._exchange.info.query_order_by_cloid.call_count == 0
+    store.get_order.assert_not_called()
 
 
 async def test_rich_update_ignores_store() -> None:

@@ -227,6 +227,7 @@ class HyperliquidAdapter(Adapter):
         # legs are in hand; read-only on the WS path (never a read per
         # message).  Cold-cache leaks self-heal via reconcile.
         self._position_leg_cloids: set[str] = set()
+
     # ---- Identification ----
 
     @property
@@ -792,8 +793,10 @@ class HyperliquidAdapter(Adapter):
         of translating standalone: only status/fill/timestamps are taken
         from the push.  Unknown ids without a store fall back to
         standalone translation (bare-adapter degradation, as before);
-        unknown ids *with* a store get one bounded ``orderStatus`` re-query,
-        and on failure the thin translation (never silence a status).
+        unknown orders that carry an id get one bounded ``orderStatus``
+        read; on failure the thin translation publishes (never silence a
+        status).  Venue orders with no cloid cannot be resolved that way
+        and publish thin directly.
         """
         payload = entry.get("order")
         if not isinstance(payload, dict):
@@ -816,7 +819,7 @@ class HyperliquidAdapter(Adapter):
         if not self._is_thin_update(payload):
             return record
         store = self._state_store
-        if store is not None:
+        if store is not None and cid:
             try:
                 local = await store.get_order(cid)
             except Exception:

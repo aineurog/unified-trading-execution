@@ -145,8 +145,11 @@ def _stored_row(cid: str, oid: str | None = "77") -> Any:
 
     return OrderRecord(
         instrument=Instrument(
-            symbol="BTC", quote_currency="USDC", asset_class=AssetClass.FUTURES,
-            currency="USDC", multiplier=1,
+            symbol="BTC",
+            quote_currency="USDC",
+            asset_class=AssetClass.FUTURES,
+            currency="USDC",
+            multiplier=1,
         ),
         order_type=OrderType.MARKET,
         side=OrderSide.BUY,
