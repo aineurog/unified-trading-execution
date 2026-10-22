@@ -259,9 +259,7 @@ class TestBuildMT5Request:
         assert request["type_time"] == mock_mt5_module.ORDER_TIME_SPECIFIED
         assert request["expiration"] == int(expire_at.timestamp())
 
-    def test_gtd_shifts_expiration_into_server_time(
-        self, mock_mt5_module, mt5_constants
-    ) -> None:
+    def test_gtd_shifts_expiration_into_server_time(self, mock_mt5_module, mt5_constants) -> None:
         """A server offset shifts the GTD expiration into the server basis.
 
         MT5 reads ``expiration`` in server time while ``expire_at`` is real
