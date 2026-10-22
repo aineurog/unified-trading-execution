@@ -14,7 +14,7 @@ import asyncio
 import dataclasses
 import logging
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
@@ -138,10 +138,6 @@ DEFAULT_BLOCK_ON_OPEN_POSITION = True
 _WS_MONITOR_INTERVAL_SECONDS = 15.0
 #: Fill ids remembered for stream dedupe (matches the venue recent window).
 _WS_SEEN_FILL_IDS = 10000
-#: Identity-map seed window: recent order rows rebuild session maps.
-_IDENTITY_SEED_DAYS = 30
-#: Identity-map seed cap: bounds connect-time cost on busy accounts.
-_IDENTITY_SEED_LIMIT = 5000
 #: Seconds an unattributed fill waits for its ack before publishing raw.
 #: Acks land in hundreds of ms; the hold only ever delays fills the
 #: adapter could not yet attribute (issue 16) — attributed fills publish
@@ -149,6 +145,10 @@ _IDENTITY_SEED_LIMIT = 5000
 _FILL_ATTRIBUTION_HOLD_SECONDS = 2.0
 #: Parked-fill bound: overflow publishes oldest immediately, never drops.
 _PENDING_FILL_CAP = 1000
+#: Adapter-local order snapshots kept for thin push merges.  Bounded so a
+#: long session cannot grow without limit; an evicted order degrades to
+#: the bounded orphan re-query, never to a silent drop.
+_ORDER_SNAPSHOT_CAP = 10000
 
 
 def _new_id() -> str:
@@ -157,6 +157,37 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(UTC)
+
+
+def _snapshot_from_order(order: UnifiedOrder, client_order_id: str) -> OrderRecord:
+    """Build the adapter-owned record a thin push merges onto.
+
+    ``correlation_id`` is not on ``UnifiedOrder`` (core owns it), so the
+    client id stands in — the snapshot only ever feeds push translation.
+    """
+    now = _utcnow()
+    return OrderRecord(
+        instrument=order.instrument,
+        order_type=order.order_type,
+        side=order.side,
+        quantity=order.quantity,
+        time_in_force=order.time_in_force,
+        client_order_id=client_order_id,
+        price=order.price,
+        stop_price=order.stop_price,
+        reduce_only=order.reduce_only,
+        client_tag=order.client_tag,
+        take_profit=order.take_profit,
+        stop_loss=order.stop_loss,
+        platform_order_id=None,
+        status=OrderStatus.PENDING,
+        filled_quantity=Decimal("0"),
+        average_fill_price=None,
+        correlation_id=client_order_id,
+        created_at=now,
+        updated_at=now,
+        expire_at=order.expire_at,
+    )
 
 
 class HyperliquidAdapter(Adapter):
@@ -184,6 +215,12 @@ class HyperliquidAdapter(Adapter):
         # attribution; child-cloid raw -> (parent id, reason, entry).
         self._oid_clients: dict[str, tuple[str, FillReason | None, FillEntry | None]] = {}
         self._child_parents: dict[str, tuple[str, FillReason, FillEntry]] = {}
+        # Adapter-owned snapshots of orders placed this session, keyed by
+        # client id.  Thin order pushes omit type markers, so they merge
+        # onto the record built here — the adapter never reads the engine's
+        # order mirror.  FIFO-bounded; eviction falls back to one bounded
+        # ``orderStatus`` read.
+        self._order_snapshots: OrderedDict[str, OrderRecord] = OrderedDict()
         # InstrumentSpec cache with monotonic fetch times (TTL-governed).
         self._instrument_specs: dict[Instrument, tuple[InstrumentSpec, float]] = {}
         self._spec_ttl: float | None = config.instrument_spec_cache_ttl
@@ -284,49 +321,6 @@ class HyperliquidAdapter(Adapter):
             raise PlatformConnectionError("Hyperliquid adapter is not connected")
         return self._exchange
 
-    async def _seed_identity_maps(self) -> None:
-        """Rebuild session id maps from recent stored order rows (never raises).
-
-        Each persisted row already carries both ids, so no new writes are
-        needed — just pair them. In-session entries win over seeded ones.
-        Misses degrade to existing fallbacks (raw keys + reconcile).
-        """
-        store = self._state_store
-        if store is None:
-            return
-        try:
-            since = _utcnow() - timedelta(days=_IDENTITY_SEED_DAYS)
-            records = await store.query_orders(start=since, limit=_IDENTITY_SEED_LIMIT)
-        except Exception:
-            logger.exception("Identity-map seeding failed; continuing unseeded")
-            return
-        seeded = 0
-        for record in records:
-            cid = record.client_order_id
-            if not cid:
-                continue
-            try:
-                coin = to_hyperliquid_coin(record.instrument)
-            except Exception:
-                logger.warning("Identity-map seeding: skipping order %r", cid)
-                continue
-            is_spot = record.instrument.asset_class == AssetClass.SPOT
-            if cid not in self._client_coins:
-                self._client_coins[cid] = (coin, is_spot)
-                seeded += 1
-            for suffix, reason in (
-                (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
-                (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
-            ):
-                raw = client_order_id_to_cloid(f"{cid}:{suffix}")
-                if raw not in self._child_parents:
-                    self._child_parents[raw] = (cid, reason, FillEntry.OUT)
-            oid = record.platform_order_id
-            if oid and str(oid) not in self._oid_clients:
-                self._oid_clients[str(oid)] = (cid, None, None)
-        if seeded:
-            logger.info("Seeded %d order-id mappings from the state store", seeded)
-
     async def connect(self) -> None:
         """Open the transport and verify signing identity.
 
@@ -381,7 +375,6 @@ class HyperliquidAdapter(Adapter):
 
         self._exchange = exchange
         self._connected = True
-        await self._seed_identity_maps()
         await self._reapply_stored_intent()
         self._publish_connection_state(True)
 
@@ -402,6 +395,7 @@ class HyperliquidAdapter(Adapter):
         self._client_coins.clear()
         self._oid_clients.clear()
         self._child_parents.clear()
+        self._order_snapshots.clear()
         self._position_leg_cloids.clear()
         self._pending_fills.clear()
         self._oid_unresolvable.clear()
@@ -762,9 +756,16 @@ class HyperliquidAdapter(Adapter):
         except Exception:
             return True
 
+    def _remember_snapshot(self, client_order_id: str, record: OrderRecord) -> None:
+        """Store the latest adapter-owned snapshot, evicting the oldest when full."""
+        self._order_snapshots[client_order_id] = record
+        self._order_snapshots.move_to_end(client_order_id)
+        while len(self._order_snapshots) > _ORDER_SNAPSHOT_CAP:
+            self._order_snapshots.popitem(last=False)
+
     @staticmethod
     def _merge_thin_update(thin: OrderRecord, local: OrderRecord) -> OrderRecord:
-        """Fold a thin WS update onto the stored record (WS-authoritative fields only).
+        """Fold a thin WS update onto the local snapshot (WS-authoritative fields only).
 
         Status, fill progress and timestamps come from the push; everything
         static (type, TIF, price, attachments, …) stays local, so a MARKET
@@ -789,12 +790,11 @@ class HyperliquidAdapter(Adapter):
         The record's client id is restored to the caller id (same rule as
         ``fetch_open_orders``) — consumers match on values, not dict keys.
 
-        Thin updates (no type markers) merge onto the stored record instead
-        of translating standalone: only status/fill/timestamps are taken
-        from the push.  Unknown ids without a store fall back to
-        standalone translation (bare-adapter degradation, as before);
-        unknown orders that carry an id get one bounded ``orderStatus``
-        read; on failure the thin translation publishes (never silence a
+        Thin updates (no type markers) merge onto the adapter's local
+        snapshot instead of translating standalone: only status/fill/
+        timestamps are taken from the push.  Unknown ids get one bounded
+        ``orderStatus`` read and seed the snapshot with the rich record;
+        on failure the thin translation publishes (never silence a
         status).  Venue orders with no cloid cannot be resolved that way
         and publish thin directly.
         """
@@ -817,20 +817,22 @@ class HyperliquidAdapter(Adapter):
         if resolved is not None and resolved != record.client_order_id:
             record = dataclasses.replace(record, client_order_id=resolved)
         if not self._is_thin_update(payload):
+            # Rich pushes are complete: they become the next merge base,
+            # matching what core persists from this same event.
+            if cid:
+                self._remember_snapshot(cid, record)
             return record
-        store = self._state_store
-        if store is not None and cid:
-            try:
-                local = await store.get_order(cid)
-            except Exception:
-                logger.exception("Stored-order lookup failed for %r", cid)
-                local = None
-            if local is not None:
-                return self._merge_thin_update(record, local)
+        local = self._order_snapshots.get(cid)
+        if local is not None:
+            merged_record = self._merge_thin_update(record, local)
+            self._remember_snapshot(cid, merged_record)
+            return merged_record
+        if cid:
             try:
                 rich = await self._translate_unknown_update(record, instrument)
                 if rich.client_order_id != cid:
                     rich = dataclasses.replace(rich, client_order_id=cid)
+                self._remember_snapshot(cid, rich)
                 return rich
             except Exception:
                 logger.exception("Orphan re-query failed for %r", cid)
@@ -839,12 +841,12 @@ class HyperliquidAdapter(Adapter):
     async def _translate_unknown_update(
         self, thin: OrderRecord, instrument: Instrument
     ) -> OrderRecord:
-        """One bounded ``orderStatus`` re-query for an order with no local row.
+        """One bounded ``orderStatus`` re-query for an order with no snapshot.
 
         Returns the rich translation; raises on ``unknownOid`` or transport
         failure so the caller falls back to the thin record.  Orphan-only
-        path — every placed order has a local row, so the hot path never
-        pays this read.
+        path — every order placed this session has a snapshot, so the hot
+        path never pays this read.
         """
         exchange = self._require_exchange()
         response = await self._run_exchange(
@@ -1586,26 +1588,53 @@ class HyperliquidAdapter(Adapter):
                 reason,
                 FillEntry.OUT,
             )
-        requests, grouping = build_place_order_action(
-            order,
-            coin=coin,
-            client_order_id=client_order_id,
-            market_limit_price=market_limit_price,
-        )
-        for request in requests:
-            request["cloid"] = Cloid(request["cloid"])
-        response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
-        data = self._check_action_ok(response, context=f"placing order {client_order_id}")
+        # Same reasoning for the merge base: a push that beats the ack merges
+        # onto the full intent instead of translating thin.
+        self._remember_snapshot(client_order_id, _snapshot_from_order(order, client_order_id))
         try:
-            statuses = data["response"]["data"]["statuses"]
-        except (KeyError, TypeError) as exc:
-            raise PlatformError(
-                f"Unexpected order response shape {data!r} for {client_order_id}"
-            ) from exc
-        if not isinstance(statuses, list) or not statuses:
-            raise PlatformError(f"Empty order statuses for {client_order_id}")
-        raise_on_status_errors(statuses)
-        parent = parse_order_result(statuses[0], client_order_id, requested_quantity=order.quantity)
+            requests, grouping = build_place_order_action(
+                order,
+                coin=coin,
+                client_order_id=client_order_id,
+                market_limit_price=market_limit_price,
+            )
+            for request in requests:
+                request["cloid"] = Cloid(request["cloid"])
+            response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
+            data = self._check_action_ok(response, context=f"placing order {client_order_id}")
+            try:
+                statuses = data["response"]["data"]["statuses"]
+            except (KeyError, TypeError) as exc:
+                raise PlatformError(
+                    f"Unexpected order response shape {data!r} for {client_order_id}"
+                ) from exc
+            if not isinstance(statuses, list) or not statuses:
+                raise PlatformError(f"Empty order statuses for {client_order_id}")
+            raise_on_status_errors(statuses)
+            parent = parse_order_result(
+                statuses[0], client_order_id, requested_quantity=order.quantity
+            )
+        except Exception:
+            # A rejected submit leaves no venue order; drop the speculative
+            # snapshot.  If an ambiguous transport failure actually landed, the
+            # bounded orphan re-query recovers it on the next push.
+            self._order_snapshots.pop(client_order_id, None)
+            raise
+        previous = self._order_snapshots.get(client_order_id)
+        ack = dataclasses.replace(
+            _snapshot_from_order(order, client_order_id),
+            platform_order_id=parent.platform_order_id,
+            status=parent.status,
+            filled_quantity=max(
+                parent.filled_quantity,
+                previous.filled_quantity if previous is not None else Decimal("0"),
+            ),
+            average_fill_price=parent.average_fill_price
+            or (previous.average_fill_price if previous is not None else None),
+            created_at=parent.created_at,
+            updated_at=parent.updated_at,
+        )
+        self._remember_snapshot(client_order_id, ack)
         for status in statuses:
             if not isinstance(status, dict):
                 continue
@@ -1641,6 +1670,28 @@ class HyperliquidAdapter(Adapter):
                 None,
                 None,
             )
+        # Amend in place keeps the id but can change size/price.  Refresh the
+        # snapshot from the result rather than dropping it: a later thin push
+        # would otherwise re-query by cloid, which resolves to the cancelled
+        # original leg after a modify (see ``get_order_by_client_id``).
+        previous = self._order_snapshots.get(modification.client_order_id, current)
+        self._remember_snapshot(
+            modification.client_order_id,
+            dataclasses.replace(
+                previous,
+                price=modification.price if modification.price is not None else previous.price,
+                quantity=(
+                    modification.quantity
+                    if modification.quantity is not None
+                    else previous.quantity
+                ),
+                platform_order_id=result.platform_order_id or previous.platform_order_id,
+                status=result.status,
+                filled_quantity=max(previous.filled_quantity, result.filled_quantity),
+                average_fill_price=result.average_fill_price or previous.average_fill_price,
+                updated_at=result.updated_at,
+            ),
+        )
         return result
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
@@ -1661,7 +1712,7 @@ class HyperliquidAdapter(Adapter):
         result = await self.get_order_by_client_id(client_order_id)
         if result is None:
             now = _utcnow()
-            return OrderResult(
+            result = OrderResult(
                 client_order_id=client_order_id,
                 platform_order_id=None,
                 status=OrderStatus.CANCELLED,
@@ -1669,6 +1720,19 @@ class HyperliquidAdapter(Adapter):
                 average_fill_price=None,
                 created_at=now,
                 updated_at=now,
+            )
+        snapshot = self._order_snapshots.get(client_order_id)
+        if snapshot is not None:
+            self._remember_snapshot(
+                client_order_id,
+                dataclasses.replace(
+                    snapshot,
+                    status=result.status,
+                    filled_quantity=max(snapshot.filled_quantity, result.filled_quantity),
+                    average_fill_price=result.average_fill_price or snapshot.average_fill_price,
+                    platform_order_id=result.platform_order_id or snapshot.platform_order_id,
+                    updated_at=result.updated_at,
+                ),
             )
         return result
 
