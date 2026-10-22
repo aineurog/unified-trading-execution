@@ -15,6 +15,7 @@ from unified_trading_execution.errors import (
     PlatformError,
 )
 from unified_trading_execution.hyperliquid import HyperliquidAdapter
+from unified_trading_execution.hyperliquid.adapter import _snapshot_from_order
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -80,6 +81,12 @@ async def test_place_limit_posts_and_caches(
     result = await adapter.place_order(_order(client_order_id=_CLOID))
     assert (result.status, result.platform_order_id) == (OrderStatus.OPEN, "11")
     assert adapter._client_coins[_CLOID] == ("BTC", False)
+    snapshot = adapter._order_snapshots[_CLOID]
+    assert snapshot.order_type is OrderType.LIMIT
+    assert snapshot.time_in_force is TimeInForce.GTC
+    assert snapshot.status is OrderStatus.OPEN
+    assert snapshot.platform_order_id == "11"
+    assert snapshot.price == Decimal("50000")
     (requests,), kwargs = exchange.bulk_orders.call_args
     assert kwargs["grouping"] == "na"
     assert requests[0]["coin"] == "BTC"
@@ -132,6 +139,7 @@ async def test_place_venue_error_keeps_client_coin_for_late_pushes(
     with pytest.raises(InvalidOrderError):
         await adapter.place_order(_order(client_order_id="doomed-1"))
     assert adapter._client_coins["doomed-1"] == ("BTC", False)
+    assert "doomed-1" not in adapter._order_snapshots
 
 
 async def test_place_validation_reject_records_nothing(adapter: HyperliquidAdapter) -> None:
@@ -228,6 +236,7 @@ def _status_response() -> dict[str, Any]:
 async def test_modify_roundtrip(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     adapter._client_coins[_CLOID] = ("BTC", False)
+    adapter._order_snapshots[_CLOID] = _snapshot_from_order(_order(client_order_id=_CLOID), _CLOID)
     exchange.info.open_orders.return_value = []
     exchange.info.frontend_open_orders.return_value = [_open_entry()]
     exchange.modify_order.return_value = {"status": "ok", "response": {}}
@@ -240,6 +249,8 @@ async def test_modify_roundtrip(adapter: HyperliquidAdapter) -> None:
     _, kwargs = exchange.modify_order.call_args
     assert isinstance(kwargs["oid"], Cloid)
     assert kwargs["limit_px"] == 51000.0
+    # The snapshot carries the amended price so a later thin push keeps it.
+    assert adapter._order_snapshots[_CLOID].price == Decimal("51000")
 
 
 async def test_modify_unknown_raises(adapter: HyperliquidAdapter) -> None:
@@ -254,6 +265,7 @@ async def test_modify_unknown_raises(adapter: HyperliquidAdapter) -> None:
 async def test_cancel_gone_reads_cancelled(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     adapter._client_coins[_CLOID] = ("BTC", False)
+    adapter._order_snapshots[_CLOID] = _snapshot_from_order(_order(client_order_id=_CLOID), _CLOID)
     exchange.cancel_by_cloid.return_value = {
         "status": "ok",
         "response": {"type": "cancelByCloid", "data": {"statuses": ["success"]}},
@@ -262,6 +274,7 @@ async def test_cancel_gone_reads_cancelled(adapter: HyperliquidAdapter) -> None:
     result = await adapter.cancel_order(_CLOID)
     assert result.status is OrderStatus.CANCELLED
     assert result.platform_order_id is None
+    assert adapter._order_snapshots[_CLOID].status is OrderStatus.CANCELLED
     args, _ = exchange.cancel_by_cloid.call_args
     assert args[0] == "BTC"
     assert isinstance(args[1], Cloid)

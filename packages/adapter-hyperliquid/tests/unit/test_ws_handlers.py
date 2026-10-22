@@ -270,7 +270,7 @@ async def test_order_updates_unknown_coin_skips() -> None:
     assert seen == []
 
 
-def _stored_market(
+def _local_snapshot(
     cid: str = "my-order-123", *, filled: str = "0", status: OrderStatus = OrderStatus.OPEN
 ) -> OrderRecord:
     return OrderRecord(
@@ -300,14 +300,6 @@ def _stored_market(
         created_at=datetime(2026, 10, 5, tzinfo=UTC),
         updated_at=datetime(2026, 10, 5, tzinfo=UTC),
     )
-
-
-def _store_with(record: OrderRecord | None) -> MagicMock:
-    from unittest.mock import AsyncMock
-
-    store = MagicMock()
-    store.get_order = AsyncMock(return_value=record)
-    return store
 
 
 async def test_order_updates_skip_position_legs() -> None:
@@ -370,12 +362,12 @@ async def test_order_updates_carry_status_timestamp() -> None:
     assert event.order.updated_at == datetime.fromtimestamp(1700000001, tz=UTC)
 
 
-async def test_thin_update_merges_onto_stored_record() -> None:
-    """Issue 11: a thin MARKET update keeps type/TIF/attachments from the mirror."""
+async def test_thin_update_merges_onto_local_snapshot() -> None:
+    """Issue 11: a thin MARKET update keeps type/TIF/attachments from the snapshot."""
     from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
 
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(_stored_market()))
+    adapter._order_snapshots["my-order-123"] = _local_snapshot()
     adapter._client_coins["my-order-123"] = ("BTC", False)
     hashed = client_order_id_to_cloid("my-order-123")
     await adapter._dispatch_ws_message(
@@ -389,37 +381,33 @@ async def test_thin_update_merges_onto_stored_record() -> None:
     assert event.order.take_profit is not None and event.order.stop_loss is not None
     assert event.order.status is OrderStatus.FILLED
     assert event.order.correlation_id == "corr-1"
+    # The merged record becomes the next merge base.
+    assert adapter._order_snapshots["my-order-123"].status is OrderStatus.FILLED
 
 
 async def test_thin_update_filled_never_regresses() -> None:
     from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
 
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(_stored_market(filled="0.0008")))
+    adapter._order_snapshots["my-order-123"] = _local_snapshot(filled="0.0008")
     adapter._client_coins["my-order-123"] = ("BTC", False)
     update = _order_update(status="open", cloid=client_order_id_to_cloid("my-order-123"))
     assert isinstance(update["order"], dict)
     update["order"]["origSz"] = "0.001"
-    update["order"]["sz"] = "0.0009"  # thin math says 0.0001 < stored 0.0008
+    update["order"]["sz"] = "0.0009"  # thin math says 0.0001 < snapshot 0.0008
     await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [update]})
     (event,) = _of(seen, OrderStatusEvent)
     assert isinstance(event, OrderStatusEvent)
     assert event.order.filled_quantity == Decimal("0.0008")
 
 
-async def test_thin_update_without_store_keeps_legacy() -> None:
-    """Bare adapter (no store): thin translates standalone, as before."""
-    adapter, _, seen = _adapter()
-    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
-    (event,) = _of(seen, OrderStatusEvent)
-    assert isinstance(event, OrderStatusEvent)
-    assert event.order.order_type is OrderType.LIMIT
+async def test_thin_update_without_snapshot_requeries_once() -> None:
+    """No local snapshot: one bounded orderStatus read supplies the rich type.
 
-
-async def test_thin_update_unknown_with_store_requeries() -> None:
-    """Orphan with a store: one bounded orderStatus read supplies the rich type."""
+    The re-queried record seeds the snapshot, so a follow-up thin update on
+    the hot path never pays a second read.
+    """
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(None))
     rich = dict(_order_update()["order"])
     assert isinstance(rich, dict)
     rich["orderType"] = "Limit"
@@ -431,10 +419,15 @@ async def test_thin_update_unknown_with_store_requeries() -> None:
         "order": {"order": rich, "status": "filled", "statusTimestamp": 1700000001000},
     }
     await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
-    (event,) = _of(seen, OrderStatusEvent)
-    assert isinstance(event, OrderStatusEvent)
-    assert event.order.order_type is OrderType.LIMIT
-    assert event.order.status is OrderStatus.FILLED
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(status="filled")]}
+    )
+    first, second = _of(seen, OrderStatusEvent)
+    assert isinstance(first, OrderStatusEvent)
+    assert isinstance(second, OrderStatusEvent)
+    assert first.order.order_type is OrderType.LIMIT
+    assert first.order.status is OrderStatus.FILLED
+    assert second.order.order_type is OrderType.LIMIT
     assert adapter._exchange.info.query_order_by_cloid.call_count == 1
 
 
@@ -443,7 +436,6 @@ async def test_requeried_orphan_keeps_caller_client_id() -> None:
     from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
 
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(None))
     adapter._client_coins["my-order-123"] = ("BTC", False)
     hashed = client_order_id_to_cloid("my-order-123")
     rich = dict(_order_update()["order"])
@@ -465,7 +457,6 @@ async def test_requeried_orphan_keeps_caller_client_id() -> None:
 async def test_thin_update_requery_failure_falls_back() -> None:
     """Re-query miss/failure never silences a status — thin publishes."""
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(None))
     adapter._exchange.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
     await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
     (event,) = _of(seen, OrderStatusEvent)
@@ -473,22 +464,9 @@ async def test_thin_update_requery_failure_falls_back() -> None:
     assert event.order.order_type is OrderType.LIMIT
 
 
-async def test_thin_update_store_failure_falls_back() -> None:
-    from unittest.mock import AsyncMock
-
-    adapter, _, seen = _adapter()
-    store = _store_with(None)
-    store.get_order = AsyncMock(side_effect=RuntimeError("db down"))
-    adapter.attach_state_store(store)
-    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
-    assert len(_of(seen, OrderStatusEvent)) == 1
-
-
 async def test_thin_venue_order_without_cloid_skips_requery() -> None:
     """A venue order with no cloid cannot be looked up by cloid; publish thin."""
     adapter, _, seen = _adapter()
-    store = _store_with(None)
-    adapter.attach_state_store(store)
     await adapter._dispatch_ws_message(
         {"channel": "orderUpdates", "data": [_order_update(cloid="")]}
     )
@@ -496,15 +474,14 @@ async def test_thin_venue_order_without_cloid_skips_requery() -> None:
     assert isinstance(event, OrderStatusEvent)
     assert event.order.client_order_id == ""
     assert adapter._exchange.info.query_order_by_cloid.call_count == 0
-    store.get_order.assert_not_called()
 
 
-async def test_rich_update_ignores_store() -> None:
-    """Merge is thin-only: a rich update translates fully even against a stored row."""
+async def test_rich_update_replaces_snapshot_base() -> None:
+    """Rich updates translate fully and become the next thin-merge base."""
     from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
 
     adapter, _, seen = _adapter()
-    adapter.attach_state_store(_store_with(_stored_market()))
+    adapter._order_snapshots["my-order-123"] = _local_snapshot()
     adapter._client_coins["my-order-123"] = ("BTC", False)
     update = _order_update(cloid=client_order_id_to_cloid("my-order-123"))
     assert isinstance(update["order"], dict)
@@ -513,6 +490,17 @@ async def test_rich_update_ignores_store() -> None:
     (event,) = _of(seen, OrderStatusEvent)
     assert isinstance(event, OrderStatusEvent)
     assert event.order.order_type is OrderType.LIMIT
+    assert adapter._order_snapshots["my-order-123"].order_type is OrderType.LIMIT
+
+
+async def test_snapshot_cache_evicts_oldest(monkeypatch: pytest.MonkeyPatch) -> None:
+    import unified_trading_execution.hyperliquid.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_ORDER_SNAPSHOT_CAP", 2)
+    adapter, _, _ = _adapter()
+    for cid in ("a", "b", "c"):
+        adapter._remember_snapshot(cid, _local_snapshot(cid))
+    assert list(adapter._order_snapshots) == ["b", "c"]
 
 
 # ---- thread marshalling ----
