@@ -350,6 +350,7 @@ class MockAdapter(Adapter):
             correlation_id=existing.correlation_id,
             created_at=existing.created_at,
             updated_at=_utcnow(),
+            expire_at=existing.expire_at,
         )
         self._orders[existing.client_order_id] = updated
         return OrderResult(
@@ -395,6 +396,7 @@ class MockAdapter(Adapter):
             correlation_id=existing.correlation_id,
             created_at=existing.created_at,
             updated_at=now,
+            expire_at=existing.expire_at,
         )
         self._orders[existing.client_order_id] = cancelled
         return OrderResult(
@@ -526,4 +528,5 @@ def _order_request_to_record(order: UnifiedOrder, result: OrderResult) -> OrderR
         correlation_id=f"mock-{_new_id()[:8]}",
         created_at=result.created_at,
         updated_at=result.updated_at,
+        expire_at=order.expire_at,
     )

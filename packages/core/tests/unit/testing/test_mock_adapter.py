@@ -233,6 +233,20 @@ class TestPlaceOrder:
         assert mock.orders["abc"].status == OrderStatus.OPEN
 
     @pytest.mark.asyncio
+    async def test_gtd_order_records_expire_at(self):
+        bus = EventBus()
+        mock = MockAdapter(event_bus=bus)
+        expiry = datetime(2030, 1, 1, tzinfo=UTC)
+        await mock.place_order(
+            make_order(
+                client_order_id="gtd",
+                time_in_force=TimeInForce.GTD,
+                expire_at=expiry,
+            )
+        )
+        assert mock.orders["gtd"].expire_at == expiry
+
+    @pytest.mark.asyncio
     async def test_next_error_consumed_once(self):
         bus = EventBus()
         mock = MockAdapter(event_bus=bus)
@@ -291,6 +305,21 @@ class TestModifyOrder:
         assert result.client_order_id == "abc"
         assert mock.orders["abc"].price == Decimal("51000")
 
+    @pytest.mark.asyncio
+    async def test_gtd_order_keeps_expire_at_after_modify(self):
+        bus = EventBus()
+        mock = MockAdapter(event_bus=bus)
+        expiry = datetime(2030, 1, 1, tzinfo=UTC)
+        await mock.place_order(
+            make_order(
+                client_order_id="abc",
+                time_in_force=TimeInForce.GTD,
+                expire_at=expiry,
+            )
+        )
+        await mock.modify_order(OrderModification("abc", price=Decimal("51000")))
+        assert mock.orders["abc"].expire_at == expiry
+
 
 class TestCancelOrder:
     @pytest.mark.asyncio
@@ -340,6 +369,21 @@ class TestCancelOrder:
         result = await mock.cancel_order("abc")
         assert result.status == OrderStatus.CANCELLED
         assert mock.orders["abc"].status == OrderStatus.CANCELLED
+
+    @pytest.mark.asyncio
+    async def test_gtd_order_keeps_expire_at_after_cancel(self):
+        bus = EventBus()
+        mock = MockAdapter(event_bus=bus)
+        expiry = datetime(2030, 1, 1, tzinfo=UTC)
+        await mock.place_order(
+            make_order(
+                client_order_id="abc",
+                time_in_force=TimeInForce.GTD,
+                expire_at=expiry,
+            )
+        )
+        await mock.cancel_order("abc")
+        assert mock.orders["abc"].expire_at == expiry
 
 
 class TestGetOrderByClientId:
