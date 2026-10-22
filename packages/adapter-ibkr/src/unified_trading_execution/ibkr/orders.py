@@ -20,7 +20,7 @@ Wire conventions encoded here (verified against ``ib_async.order.Order``):
 - ``client_order_id`` maps to ``order.orderRef`` — the stable cross-restart
   handle the adapter queries by (``permId`` changes on amend).
 - GTD orders set ``tif="GTD"`` plus ``goodTillDate`` formatted
-  ``"%Y%m%d %H:%M:%S"`` in UTC.
+  ``"%Y%m%d-%H:%M:%S"`` in UTC (the explicit-UTC form IBKR requires).
 
 Bracket orders (TP/SL):
 
@@ -352,7 +352,7 @@ def _tif_fields(tif: TimeInForce, expire_at: datetime | None) -> dict[str, Any]:
     if tif is TimeInForce.GTD:
         if expire_at is None:  # defensive — UnifiedOrder validates this
             raise ValueError("GTD order is missing expire_at")
-        fields["goodTillDate"] = expire_at.astimezone(UTC).strftime("%Y%m%d %H:%M:%S")
+        fields["goodTillDate"] = expire_at.astimezone(UTC).strftime("%Y%m%d-%H:%M:%S")
     return fields
 
 
