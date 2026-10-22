@@ -183,11 +183,11 @@ class TestBuildIBKROrders:
             build_ibkr_orders(make_order(client_order_id=None))
 
     def test_gtd_carries_good_till_date(self) -> None:
-        """GTD sets tif=GTD and formats expire_at as UTC yyyymmdd hh:mm:ss."""
+        """GTD sets tif=GTD and formats expire_at as UTC yyyymmdd-hh:mm:ss."""
         expiry = datetime(2026, 12, 31, 23, 30, tzinfo=UTC)
         (ib_order,) = build_ibkr_orders(make_order(time_in_force=TimeInForce.GTD, expire_at=expiry))
         assert ib_order.tif == "GTD"
-        assert ib_order.goodTillDate == "20261231 23:30:00"
+        assert ib_order.goodTillDate == "20261231-23:30:00"
 
     @pytest.mark.parametrize("tif", list(TimeInForce))
     def test_all_time_in_force_values_map(self, tif: TimeInForce) -> None:
@@ -367,7 +367,7 @@ class TestBracketOrders:
         )
         _, tp = build_ibkr_orders(order)
         assert tp.tif == "GTD"
-        assert tp.goodTillDate == "20270630 00:00:00"
+        assert tp.goodTillDate == "20270630-00:00:00"
 
 
 class TestApplyIBKRModification:

@@ -57,6 +57,7 @@ from unified_trading_execution.state import (
     reconcile,
 )
 from unified_trading_execution.state.store import SQLiteStateStore, default_state_store_path
+from unified_trading_execution.types.enums import OrderStatus, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
     FillRecord,
@@ -117,6 +118,7 @@ class _ReconcileContext:
     fill_compare_end: datetime
     local_positions: list[Position]
     local_balances: dict[str, Balance]
+    local_orders: dict[str, OrderRecord]
     local_fills: dict[str, list[FillRecord]]
     platform_positions: list[Position] | None
     platform_balances: dict[str, Balance] | None
@@ -623,6 +625,7 @@ class Engine:
             fill_compare_end=fill_compare_end,
             local_positions=local_positions,
             local_balances=local_balances,
+            local_orders=local_orders,
             local_fills=local_fills,
             platform_positions=platform_positions,
             platform_balances=platform_balances,
@@ -781,8 +784,28 @@ class Engine:
                 logger.exception("Failed to import orphan order %s", order.client_order_id)
 
         # Orphan in local: remove from the open mirror.  The append-only
-        # order_history snapshot preserves the lifecycle record.
+        # order_history snapshot preserves the lifecycle record.  A GTD order
+        # whose expiry has passed is first marked EXPIRED so its terminal
+        # transition is recorded — otherwise it would look like it simply
+        # vanished while still OPEN.
         if result.orphan_orders_in_local:
+            now = _utcnow()
+            for client_order_id in result.orphan_orders_in_local:
+                local_order = context.local_orders.get(client_order_id)
+                if (
+                    local_order is not None
+                    and local_order.time_in_force == TimeInForce.GTD
+                    and local_order.expire_at is not None
+                    and local_order.expire_at <= now
+                ):
+                    try:
+                        await self._store.upsert_order(
+                            replace(local_order, status=OrderStatus.EXPIRED, updated_at=now)
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to record EXPIRED for orphan order %s", client_order_id
+                        )
             try:
                 await self._store.delete_orders_by_client_ids(result.orphan_orders_in_local)
             except Exception:

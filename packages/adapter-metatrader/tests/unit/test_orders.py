@@ -259,6 +259,29 @@ class TestBuildMT5Request:
         assert request["type_time"] == mock_mt5_module.ORDER_TIME_SPECIFIED
         assert request["expiration"] == int(expire_at.timestamp())
 
+    def test_gtd_shifts_expiration_into_server_time(self, mock_mt5_module, mt5_constants) -> None:
+        """A server offset shifts the GTD expiration into the server basis.
+
+        MT5 reads ``expiration`` in server time while ``expire_at`` is real
+        UTC; the offset is added so the round trip through ``from_mt5_epoch``
+        is symmetric (previously the server read the instant as hours past and
+        rejected it with "Invalid expiration").
+        """
+        expire_at = datetime.now(UTC) + timedelta(days=1)
+        offset = 3 * 60 * 60  # UTC+3 broker
+        request = build_mt5_request(
+            _order(
+                OrderType.LIMIT,
+                OrderSide.BUY,
+                price=Decimal("1.1000"),
+                time_in_force=TimeInForce.GTD,
+                expire_at=expire_at,
+            ),
+            mt5_module=mock_mt5_module,
+            server_time_offset=offset,
+        )
+        assert request["expiration"] == int(expire_at.timestamp()) + offset
+
     def test_day_sets_type_time(self, mock_mt5_module, mt5_constants) -> None:
         """DAY orders set type_time = ORDER_TIME_DAY (not GTC)."""
         request = build_mt5_request(
