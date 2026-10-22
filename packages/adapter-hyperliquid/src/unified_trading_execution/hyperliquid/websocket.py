@@ -28,6 +28,41 @@ from unified_trading_execution.hyperliquid.config import HyperliquidConfig
 
 logger = logging.getLogger(__name__)
 
+#: Server-initiated close signatures the venue sends on routine recycles
+#: (roughly 10-minute TTL). The adapter detects these via its liveness
+#: monitor and rebuilds by itself — the library's ERROR-level goodbye adds
+#: noise, not information, so it is dropped entirely. Anything else the
+#: library reports (handshake failures, abnormal drops) keeps its level:
+#: if rebuilding itself starts failing, the adapter says so loudly via
+#: ``ConnectionStateEvent(False)`` and its own rebuild logs.
+_SERVER_CLOSE_SNIPPETS = ("Expired", "was lost.")
+
+
+class _ServerCloseFilter(logging.Filter):
+    """Drop routine server recycles; keep genuine failures loud.
+
+    The adapter detects recycles via its liveness monitor and rebuilds by
+    itself, so these records carry no information at any level — not even
+    DEBUG, since consoles commonly run at DEBUG and would still show them.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            return True
+        recycled = record.levelno == logging.ERROR and any(
+            snippet in message for snippet in _SERVER_CLOSE_SNIPPETS
+        )
+        return not recycled
+
+
+def _quiet_server_recycles() -> None:
+    """Install the recycle filter on the ``websocket-client`` logger, once."""
+    lib_logger = logging.getLogger("websocket")
+    if not any(isinstance(f, _ServerCloseFilter) for f in lib_logger.filters):
+        lib_logger.addFilter(_ServerCloseFilter())
+
 
 class _AccountStateWebsocketManager(WebsocketManager):  # type: ignore[misc]
     """SDK manager plus ``clearinghouseState`` / ``spotState`` routing.
@@ -118,7 +153,7 @@ class _AccountStateWebsocketManager(WebsocketManager):  # type: ignore[misc]
             logging.debug("Websocket message from an unexpected subscription: %s", identifier)
             return
         for sub in subs:
-            sub.callback(ws_msg)
+            sub.callback(cast(Any, ws_msg))
 
 
 _CONNECT_POLL_SECONDS = 0.05
@@ -153,6 +188,7 @@ class HyperliquidWebSocket:
         """
         if self._manager is not None:
             return
+        _quiet_server_recycles()
         try:
             manager = _AccountStateWebsocketManager(self._base_url)
             # Daemon: graceful stop is always attempted first (disconnect),

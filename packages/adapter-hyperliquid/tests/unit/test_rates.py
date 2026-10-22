@@ -20,6 +20,7 @@ from unified_trading_execution.hyperliquid import HyperliquidAdapter, Hyperliqui
 from unified_trading_execution.hyperliquid.rates import (
     CONNECT_WEIGHT,
     IP_WEIGHT_BUDGET_PER_MINUTE,
+    IP_WEIGHT_WINDOW_SECONDS,
     RateBudget,
     describe_call,
     request_weight,
@@ -131,6 +132,18 @@ def test_budget_slides_and_floors() -> None:
     assert budget.resets_in() == 0.0
 
 
+def test_record_prunes_expired_entries() -> None:
+    """Issue 2: write-only workloads must not grow the ledger unboundedly."""
+    clock = _Clock()
+    budget = RateBudget(time_fn=clock)
+    for _ in range(100):
+        clock.now += IP_WEIGHT_WINDOW_SECONDS + 1.0  # prior entries age out first
+        budget.record(10)
+        assert len(budget._entries) == 1
+        assert budget.spent() == 10  # accounting survives pruning
+    assert budget.remaining() == IP_WEIGHT_BUDGET_PER_MINUTE - 10
+
+
 def test_budget_ignores_non_positive() -> None:
     budget = RateBudget()
     budget.record(0)
@@ -163,6 +176,7 @@ def _adapter_with(info: _FakeInfo) -> HyperliquidAdapter:
     exchange.info = info
     adapter._exchange = exchange
     adapter._connected = True
+    assert adapter._exchange is not None
     return adapter
 
 

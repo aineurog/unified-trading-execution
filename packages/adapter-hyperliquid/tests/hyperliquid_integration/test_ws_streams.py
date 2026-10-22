@@ -240,6 +240,9 @@ async def test_position_update_push(
     ]
     assert opened, "leg appearance must publish exactly one PositionUpdateEvent"
     assert opened[0].position.quantity == qty
+    # Drain so the close wait below blocks for fresh pushes: wait_for scans
+    # the whole collector, otherwise it returns the open event instantly.
+    collect_events.drain()
 
     await flatten_all(connected_adapter)
     deleted = await collect_events.wait_for(PositionUpdateEvent, timeout=30.0)

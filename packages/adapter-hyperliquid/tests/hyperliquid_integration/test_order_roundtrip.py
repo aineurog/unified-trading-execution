@@ -95,7 +95,9 @@ async def test_market_fill_with_attribution(
     fills = await connected_adapter.fetch_fills()
     mine = fills.get(cid, [])
     assert mine, "market fill must attribute back to our client id"
-    assert mine[0].fill_quantity == qty
+    # The venue may split one IOC across book levels (partial fills are
+    # legitimate) — attribution is per fill, completeness is the sum.
+    assert sum((f.fill_quantity for f in mine), Decimal("0")) == qty
 
 
 async def test_modify_resting_limit_price(

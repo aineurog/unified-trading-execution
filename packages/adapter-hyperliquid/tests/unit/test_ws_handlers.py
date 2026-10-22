@@ -21,7 +21,15 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
 )
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
-from unified_trading_execution.types.enums import OrderStatus
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+    TimeInForce,
+)
+from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.order import OrderRecord, TpSlAttachment
 
 _TEST_ADDRESS = "0x0000000000000000000000000000000000000001"
 _TEST_KEY = "0x" + "11" * 32
@@ -108,6 +116,7 @@ async def test_user_fills_streaming_publishes() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
+    adapter._flush_all_parked()  # unattributed fills park until the hold expires
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert (event.fill.fill_quantity, event.fill.fill_price) == (Decimal("0.01"), Decimal("100"))
@@ -133,6 +142,7 @@ async def test_user_fills_malformed_entry_skips_rest_processes() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [bad, _fill(tid=10)]}}
     )
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
 
 
@@ -161,6 +171,7 @@ async def test_fill_without_oid_falls_back_to_hash() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill(oid="")]}}
     )
+    adapter._flush_all_parked()
     (event,) = _of(seen, FillEvent)
     assert isinstance(event, FillEvent)
     assert event.fill.client_order_id == "0xh"
@@ -177,6 +188,7 @@ async def test_user_channel_fills_share_seen_set() -> None:
     await adapter._dispatch_ws_message(
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
 
 
@@ -258,6 +270,90 @@ async def test_order_updates_unknown_coin_skips() -> None:
     assert seen == []
 
 
+def _stored_market(
+    cid: str = "my-order-123", *, filled: str = "0", status: OrderStatus = OrderStatus.OPEN
+) -> OrderRecord:
+    return OrderRecord(
+        instrument=Instrument(
+            symbol="BTC",
+            quote_currency="USDC",
+            asset_class=AssetClass.FUTURES,
+            currency="USDC",
+            multiplier=1,
+        ),
+        order_type=OrderType.MARKET,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.001"),
+        time_in_force=TimeInForce.IOC,
+        client_order_id=cid,
+        price=None,
+        stop_price=None,
+        reduce_only=False,
+        client_tag=None,
+        take_profit=TpSlAttachment(trigger_price=Decimal("86113")),
+        stop_loss=TpSlAttachment(trigger_price=Decimal("86806")),
+        platform_order_id="7",
+        status=status,
+        filled_quantity=Decimal(filled),
+        average_fill_price=None,
+        correlation_id="corr-1",
+        created_at=datetime(2026, 10, 5, tzinfo=UTC),
+        updated_at=datetime(2026, 10, 5, tzinfo=UTC),
+    )
+
+
+def _store_with(record: OrderRecord | None) -> MagicMock:
+    from unittest.mock import AsyncMock
+
+    store = MagicMock()
+    store.get_order = AsyncMock(return_value=record)
+    return store
+
+
+async def test_order_updates_skip_position_legs() -> None:
+    """Position TP/SL legs are attachments: no status, no cancel, no history."""
+    from unified_trading_execution.hyperliquid.orders import (
+        TP_CLOID_SUFFIX,
+        position_tpsl_cloid,
+    )
+
+    adapter, _, seen = _adapter()
+    leg = position_tpsl_cloid("BTC:oneWay", TP_CLOID_SUFFIX)
+    adapter._position_leg_cloids.add(leg)
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=leg), _order_update(oid=8)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.platform_order_id == "8"
+    assert _of(seen, OrderCancelledEvent) == []
+    # A terminal leg update is swallowed too — never mirrored, never cancelled.
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=leg, status="canceled")]}
+    )
+    assert len(_of(seen, OrderStatusEvent)) == 1
+    assert _of(seen, OrderCancelledEvent) == []
+
+
+async def test_order_updates_skip_bracket_children() -> None:
+    """Placement-time TP/SL legs (same-batch children) never mirror either."""
+    from unified_trading_execution.hyperliquid.orders import (
+        TP_CLOID_SUFFIX,
+        client_order_id_to_cloid,
+    )
+
+    adapter, _, seen = _adapter()
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    child = client_order_id_to_cloid(f"my-order-123:{TP_CLOID_SUFFIX}")
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=child), _order_update(oid=8)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.platform_order_id == "8"
+    assert _of(seen, OrderCancelledEvent) == []
+
+
 async def test_order_updates_carry_status_timestamp() -> None:
     """``updated_at`` tracks the sibling ``statusTimestamp``, not creation.
 
@@ -274,6 +370,151 @@ async def test_order_updates_carry_status_timestamp() -> None:
     assert event.order.updated_at == datetime.fromtimestamp(1700000001, tz=UTC)
 
 
+async def test_thin_update_merges_onto_stored_record() -> None:
+    """Issue 11: a thin MARKET update keeps type/TIF/attachments from the mirror."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(_stored_market()))
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    hashed = client_order_id_to_cloid("my-order-123")
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(status="filled", cloid=hashed)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.client_order_id == "my-order-123"
+    assert event.order.order_type is OrderType.MARKET
+    assert event.order.time_in_force is TimeInForce.IOC
+    assert event.order.take_profit is not None and event.order.stop_loss is not None
+    assert event.order.status is OrderStatus.FILLED
+    assert event.order.correlation_id == "corr-1"
+
+
+async def test_thin_update_filled_never_regresses() -> None:
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(_stored_market(filled="0.0008")))
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    update = _order_update(status="open", cloid=client_order_id_to_cloid("my-order-123"))
+    assert isinstance(update["order"], dict)
+    update["order"]["origSz"] = "0.001"
+    update["order"]["sz"] = "0.0009"  # thin math says 0.0001 < stored 0.0008
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [update]})
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.filled_quantity == Decimal("0.0008")
+
+
+async def test_thin_update_without_store_keeps_legacy() -> None:
+    """Bare adapter (no store): thin translates standalone, as before."""
+    adapter, _, seen = _adapter()
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.order_type is OrderType.LIMIT
+
+
+async def test_thin_update_unknown_with_store_requeries() -> None:
+    """Orphan with a store: one bounded orderStatus read supplies the rich type."""
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(None))
+    rich = dict(_order_update()["order"])
+    assert isinstance(rich, dict)
+    rich["orderType"] = "Limit"
+    # True envelope: top-level status is the response kind ("order"), the
+    # order's own status rides one level down — folding the top level
+    # mistranslates (regression: "Unknown order status 'order'").
+    adapter._exchange.info.query_order_by_cloid.return_value = {
+        "status": "order",
+        "order": {"order": rich, "status": "filled", "statusTimestamp": 1700000001000},
+    }
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.order_type is OrderType.LIMIT
+    assert event.order.status is OrderStatus.FILLED
+    assert adapter._exchange.info.query_order_by_cloid.call_count == 1
+
+
+async def test_requeried_orphan_keeps_caller_client_id() -> None:
+    """The rich fallback must not drop the resolved caller id for raw hex."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(None))
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    hashed = client_order_id_to_cloid("my-order-123")
+    rich = dict(_order_update()["order"])
+    assert isinstance(rich, dict)
+    rich["orderType"] = "Limit"
+    rich["cloid"] = hashed
+    adapter._exchange.info.query_order_by_cloid.return_value = {
+        "status": "order",
+        "order": {"order": rich, "status": "open", "statusTimestamp": 1700000001000},
+    }
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid=hashed)]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.client_order_id == "my-order-123"
+
+
+async def test_thin_update_requery_failure_falls_back() -> None:
+    """Re-query miss/failure never silences a status — thin publishes."""
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(None))
+    adapter._exchange.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.order_type is OrderType.LIMIT
+
+
+async def test_thin_update_store_failure_falls_back() -> None:
+    from unittest.mock import AsyncMock
+
+    adapter, _, seen = _adapter()
+    store = _store_with(None)
+    store.get_order = AsyncMock(side_effect=RuntimeError("db down"))
+    adapter.attach_state_store(store)
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [_order_update()]})
+    assert len(_of(seen, OrderStatusEvent)) == 1
+
+
+async def test_thin_venue_order_without_cloid_skips_requery() -> None:
+    """A venue order with no cloid cannot be looked up by cloid; publish thin."""
+    adapter, _, seen = _adapter()
+    store = _store_with(None)
+    adapter.attach_state_store(store)
+    await adapter._dispatch_ws_message(
+        {"channel": "orderUpdates", "data": [_order_update(cloid="")]}
+    )
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.client_order_id == ""
+    assert adapter._exchange.info.query_order_by_cloid.call_count == 0
+    store.get_order.assert_not_called()
+
+
+async def test_rich_update_ignores_store() -> None:
+    """Merge is thin-only: a rich update translates fully even against a stored row."""
+    from unified_trading_execution.hyperliquid.orders import client_order_id_to_cloid
+
+    adapter, _, seen = _adapter()
+    adapter.attach_state_store(_store_with(_stored_market()))
+    adapter._client_coins["my-order-123"] = ("BTC", False)
+    update = _order_update(cloid=client_order_id_to_cloid("my-order-123"))
+    assert isinstance(update["order"], dict)
+    update["order"]["orderType"] = "Limit"
+    await adapter._dispatch_ws_message({"channel": "orderUpdates", "data": [update]})
+    (event,) = _of(seen, OrderStatusEvent)
+    assert isinstance(event, OrderStatusEvent)
+    assert event.order.order_type is OrderType.LIMIT
+
+
 # ---- thread marshalling ----
 
 
@@ -283,6 +524,7 @@ async def test_on_ws_message_schedules() -> None:
         {"channel": "userFills", "data": {"user": _TEST_ADDRESS, "fills": [_fill()]}}
     )
     await asyncio.sleep(0.05)
+    adapter._flush_all_parked()
     assert len(_of(seen, FillEvent)) == 1
     assert adapter._ws_pending == set()
 
@@ -371,7 +613,8 @@ async def test_rebuild_resubscribes_and_gap_fills() -> None:
     adapter._ws = dead
     exchange = adapter._exchange
     assert isinstance(exchange, MagicMock)
-    exchange.info.user_fills.return_value = [_fill(), _fill(tid=10)]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    exchange.info.user_fills_by_time.return_value = [_fill(time=now_ms), _fill(tid=10, time=now_ms)]
     with patch(
         "unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"
     ) as socket_class:
@@ -487,7 +730,8 @@ async def test_gap_fill_skips_seen() -> None:
     adapter._ws = dead
     exchange = adapter._exchange
     assert isinstance(exchange, MagicMock)
-    exchange.info.user_fills.return_value = [_fill(), _fill(tid=10)]
+    now_ms = int(datetime.now(UTC).timestamp() * 1000)
+    exchange.info.user_fills_by_time.return_value = [_fill(time=now_ms), _fill(tid=10, time=now_ms)]
     with patch("unified_trading_execution.hyperliquid.adapter.HyperliquidWebSocket"):
         await adapter._rebuild_streams(dead)
         assert len(_of(seen, FillEvent)) == 1
@@ -693,3 +937,77 @@ async def test_spot_non_list_balances_does_not_falsely_zero() -> None:
     }
     await adapter._dispatch_ws_message(malformed)
     assert [e for e in seen if isinstance(e, BalanceUpdateEvent)] == []
+
+
+async def test_poison_fill_does_not_burn_seen_id() -> None:
+    """Issue 12: a poison entry must not block its own redelivery."""
+    adapter, _, seen = _adapter()
+    poison = _fill(coin="")
+    await adapter._publish_fill_entry(poison)
+    assert _of(seen, FillEvent) == []
+    await adapter._publish_fill_entry(_fill())
+    adapter._flush_all_parked()  # hold expiry: now valid, still unattributed → raw
+    (event,) = _of(seen, FillEvent)
+    assert isinstance(event, FillEvent)
+    assert event.fill.platform_fill_id == "0xh:9"
+    # Genuine duplicates are still swallowed.
+    await adapter._publish_fill_entry(_fill())
+    adapter._flush_all_parked()
+    assert len(_of(seen, FillEvent)) == 1
+
+
+async def test_parked_fill_resolves_on_ack() -> None:
+    """Issue 16: a fill parked pre-ack publishes with the uuid once indexed."""
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    assert _of(seen, FillEvent) == []  # parked, not published
+    adapter._oid_clients["5"] = ("parent-1", None, None)  # the ack lands
+    adapter._flush_all_parked()
+    (event,) = _of(seen, FillEvent)
+    assert isinstance(event, FillEvent)
+    assert event.fill.client_order_id == "parent-1"
+
+
+async def test_parked_duplicate_dropped_and_seed_wins() -> None:
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await adapter._publish_fill_entry(_fill())  # duplicate while parked
+    adapter._seen_fill_ids.append("0xh:9")  # snapshot seeds meanwhile
+    adapter._flush_all_parked()
+    assert _of(seen, FillEvent) == []
+
+
+async def test_stop_streams_flushes_parked() -> None:
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    assert _of(seen, FillEvent) == []
+    await adapter.stop_streams()
+    assert len(_of(seen, FillEvent)) == 1
+    assert adapter._pending_fills == {}
+
+
+async def test_park_cap_overflow_publishes_oldest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import unified_trading_execution.hyperliquid.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_PENDING_FILL_CAP", 1)
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await adapter._publish_fill_entry(_fill(tid=10))  # evicts the first, publishes it
+    assert len(_of(seen, FillEvent)) == 1
+    adapter._flush_all_parked()
+    assert len(_of(seen, FillEvent)) == 2
+
+
+async def test_park_deadline_fires_with_hold(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The timer path itself: expiry publishes without an explicit flush."""
+    import unified_trading_execution.hyperliquid.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "_FILL_ATTRIBUTION_HOLD_SECONDS", 0.01)
+    adapter, _, seen = _adapter()
+    await adapter._publish_fill_entry(_fill())
+    await asyncio.sleep(0.05)
+    assert len(_of(seen, FillEvent)) == 1

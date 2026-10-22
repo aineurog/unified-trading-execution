@@ -78,11 +78,14 @@ async def test_attach_read_detach_roundtrip(
     assert got[0] is not None and got[0].trigger_price == tp
     assert got[1] is not None and got[1].trigger_price == sl
 
-    # Detach = cancel both legs by their deterministic cloid keys.
-    opens = await connected_adapter.fetch_open_orders()
+    # Detach = cancel both legs by deterministic cloid. Legs are attachments:
+    # excluded from fetch_open_orders, addressed via _position_tpsl_entries.
+    entries = await connected_adapter._position_tpsl_entries("BTC:oneWay")
+    assert set(entries) == {"take_profit", "stop_loss"}
     tp_cloid = position_tpsl_cloid("BTC:oneWay", "take_profit")
     sl_cloid = position_tpsl_cloid("BTC:oneWay", "stop_loss")
-    assert tp_cloid in opens and sl_cloid in opens
+    opens = await connected_adapter.fetch_open_orders()
+    assert tp_cloid not in opens and sl_cloid not in opens
     await connected_adapter.cancel_order(tp_cloid)
     await connected_adapter.cancel_order(sl_cloid)
     got_after = await connected_adapter.get_position_tpsl(btc_perp, "BTC:oneWay")
@@ -110,8 +113,11 @@ async def test_construction_is_one_leg_per_side(
     opens = await connected_adapter.fetch_open_orders()
     tp_key = position_tpsl_cloid("BTC:oneWay", "take_profit")
     sl_key = position_tpsl_cloid("BTC:oneWay", "stop_loss")
-    assert [k for k in opens if k == tp_key] == [tp_key]
-    assert [k for k in opens if k == sl_key] == [sl_key]
+    # Legs are attachments, not orders: absent from the open map, present
+    # as working legs addressable by deterministic cloid.
+    assert tp_key not in opens and sl_key not in opens
+    entries = await connected_adapter._position_tpsl_entries("BTC:oneWay")
+    assert set(entries) == {"take_profit", "stop_loss"}
     # Deterministic cloids: same inputs always mint the same leg ids.
     assert position_tpsl_cloid("BTC:oneWay", "take_profit") == position_tpsl_cloid(
         "BTC:oneWay", "take_profit"

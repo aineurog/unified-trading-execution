@@ -138,6 +138,17 @@ DEFAULT_BLOCK_ON_OPEN_POSITION = True
 _WS_MONITOR_INTERVAL_SECONDS = 15.0
 #: Fill ids remembered for stream dedupe (matches the venue recent window).
 _WS_SEEN_FILL_IDS = 10000
+#: Identity-map seed window: recent order rows rebuild session maps.
+_IDENTITY_SEED_DAYS = 30
+#: Identity-map seed cap: bounds connect-time cost on busy accounts.
+_IDENTITY_SEED_LIMIT = 5000
+#: Seconds an unattributed fill waits for its ack before publishing raw.
+#: Acks land in hundreds of ms; the hold only ever delays fills the
+#: adapter could not yet attribute (issue 16) — attributed fills publish
+#: instantly, statuses never wait.
+_FILL_ATTRIBUTION_HOLD_SECONDS = 2.0
+#: Parked-fill bound: overflow publishes oldest immediately, never drops.
+_PENDING_FILL_CAP = 1000
 
 
 def _new_id() -> str:
@@ -188,6 +199,15 @@ class HyperliquidAdapter(Adapter):
         # reported — shared by both fill channels so dual-subscribed fills
         # publish exactly once.  Bounded: matches the venue recent window.
         self._seen_fill_ids: deque[str] = deque(maxlen=_WS_SEEN_FILL_IDS)
+        # Fills parked awaiting attribution (issue 16): key → raw entry for
+        # fills whose oid was unknown when the push arrived.  A deadline task
+        # publishes each with the best resolution then available; shutdown
+        # flushes them synchronously instead of dropping.  Oids that fail
+        # REST resolution are remembered in ``_oid_unresolvable`` so
+        # ``fetch_fills`` never re-pays them.
+        self._pending_fills: dict[str, dict[str, Any]] = {}
+        self._pending_fill_tasks: set[asyncio.Task[None]] = set()
+        self._oid_unresolvable: set[str] = set()
         # Push-channel link state.  ``_ws_task`` polls it (see below).
         self._streams_up = False
         # Account-state baselines for the ``clearinghouseState`` / ``spotState``
@@ -201,6 +221,12 @@ class HyperliquidAdapter(Adapter):
         # ``stop_streams`` clears); reconnects keep baselines and diff across
         # the outage instead of re-seeding.
         self._account_seeded: set[str] = set()
+        # Raw cloids of working position TP/SL legs.  Legs are position
+        # attachments, not orders, so ``fetch_open_orders`` and the
+        # ``orderUpdates`` handler both skip them.  Warmed wherever venue
+        # legs are in hand; read-only on the WS path (never a read per
+        # message).  Cold-cache leaks self-heal via reconcile.
+        self._position_leg_cloids: set[str] = set()
 
     # ---- Identification ----
 
@@ -258,6 +284,49 @@ class HyperliquidAdapter(Adapter):
             raise PlatformConnectionError("Hyperliquid adapter is not connected")
         return self._exchange
 
+    async def _seed_identity_maps(self) -> None:
+        """Rebuild session id maps from recent stored order rows (never raises).
+
+        Each persisted row already carries both ids, so no new writes are
+        needed — just pair them. In-session entries win over seeded ones.
+        Misses degrade to existing fallbacks (raw keys + reconcile).
+        """
+        store = self._state_store
+        if store is None:
+            return
+        try:
+            since = _utcnow() - timedelta(days=_IDENTITY_SEED_DAYS)
+            records = await store.query_orders(start=since, limit=_IDENTITY_SEED_LIMIT)
+        except Exception:
+            logger.exception("Identity-map seeding failed; continuing unseeded")
+            return
+        seeded = 0
+        for record in records:
+            cid = record.client_order_id
+            if not cid:
+                continue
+            try:
+                coin = to_hyperliquid_coin(record.instrument)
+            except Exception:
+                logger.warning("Identity-map seeding: skipping order %r", cid)
+                continue
+            is_spot = record.instrument.asset_class == AssetClass.SPOT
+            if cid not in self._client_coins:
+                self._client_coins[cid] = (coin, is_spot)
+                seeded += 1
+            for suffix, reason in (
+                (TP_CLOID_SUFFIX, FillReason.TAKE_PROFIT),
+                (SL_CLOID_SUFFIX, FillReason.STOP_LOSS),
+            ):
+                raw = client_order_id_to_cloid(f"{cid}:{suffix}")
+                if raw not in self._child_parents:
+                    self._child_parents[raw] = (cid, reason, FillEntry.OUT)
+            oid = record.platform_order_id
+            if oid and str(oid) not in self._oid_clients:
+                self._oid_clients[str(oid)] = (cid, None, None)
+        if seeded:
+            logger.info("Seeded %d order-id mappings from the state store", seeded)
+
     async def connect(self) -> None:
         """Open the transport and verify signing identity.
 
@@ -312,6 +381,7 @@ class HyperliquidAdapter(Adapter):
 
         self._exchange = exchange
         self._connected = True
+        await self._seed_identity_maps()
         await self._reapply_stored_intent()
         self._publish_connection_state(True)
 
@@ -332,6 +402,9 @@ class HyperliquidAdapter(Adapter):
         self._client_coins.clear()
         self._oid_clients.clear()
         self._child_parents.clear()
+        self._position_leg_cloids.clear()
+        self._pending_fills.clear()
+        self._oid_unresolvable.clear()
         self._publish_connection_state(False)
 
     @property
@@ -417,6 +490,9 @@ class HyperliquidAdapter(Adapter):
                 await asyncio.gather(*pending, return_exceptions=True)
             except Exception:
                 logger.exception("Hyperliquid streams dispatch drain failed on stop")
+        # Parked fills publish now with current resolution — stopping must
+        # never silently drop a fill that only awaited its ack.
+        self._flush_all_parked()
         socket, self._ws = self._ws, None
         if socket is not None:
             try:
@@ -498,6 +574,12 @@ class HyperliquidAdapter(Adapter):
 
         Id-less entries always report False — they still translate (or skip
         loudly) downstream; dedupe needs an id to key on.
+
+        Snapshot-seeding only: the id is recorded up front because there is
+        no translation to fail. The live path (``_publish_fill_entry``) and
+        the gap path (``_absorb_fills``) peek at the seen-set and record
+        only after a successful publish, so a poison entry never burns
+        its id (issue 12).
         """
         key = self._fill_key(entry)
         if key is None:
@@ -520,21 +602,25 @@ class HyperliquidAdapter(Adapter):
             )
         )
 
-    async def _absorb_fills(self, *, publish_unseen: bool) -> None:
+    async def _absorb_fills(self, *, publish_unseen: bool, since: datetime | None = None) -> None:
         """Fold a REST fills snapshot into the seen-set.
 
         With ``publish_unseen=False`` (startup seed) history is only marked —
-        REST owns the past.  With True (post-reconnect gap cover) unseen
-        fills publish — the live channel missed them.
+        REST owns the past, and per-oid resolution is skipped (only ids are
+        consumed).  With True (post-reconnect gap cover) unseen fills publish
+        with full attribution — pass ``since`` bounding the outage so only
+        the gap window is read.
         """
-        for records in (await self.fetch_fills()).values():
+        for records in (
+            await self.fetch_fills(since=since, resolve_unknown_oids=publish_unseen)
+        ).values():
             for record in records:
                 key = record.platform_fill_id
                 if key in self._seen_fill_ids:
                     continue
-                self._seen_fill_ids.append(key)
                 if publish_unseen:
                     self._publish_fill_record(record)
+                self._seen_fill_ids.append(key)
 
     async def _seed_seen_fills(self) -> None:
         """Mark current REST history seen so streams never re-publish the past."""
@@ -576,12 +662,46 @@ class HyperliquidAdapter(Adapter):
             return
         logger.warning("Ignoring unknown user-channel update: %r", sorted(data))
 
+    def _bracket_child_cloids(self) -> set[str]:
+        """Raw cloids of bracket TP/SL children minted this session (pure, sync).
+
+        Same derivation as ``fetch_open_orders``: per placed cid the
+        ``{cid}:tp`` / ``{cid}:sl`` hashes, plus every ``_child_parents``
+        raw.  No network — safe to call per WS message.
+        """
+        found: set[str] = set()
+        for client_order_id in list(self._client_coins):
+            found.update(
+                client_order_id_to_cloid(f"{client_order_id}:{suffix}")
+                for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+            )
+        found.update(self._child_parents)
+        return found
+
     async def _handle_order_updates_message(self, data: Any) -> None:
-        """Publish an ``OrderStatusEvent`` per order update (+ cancel on terminal)."""
+        """Publish an ``OrderStatusEvent`` per order update (+ cancel on terminal).
+
+        TP/SL legs — bracket children and position legs alike — are
+        attachments, not orders: their updates are skipped before
+        translating (same exclusion as ``fetch_open_orders``, Bybit
+        ``createType`` parity), so legs never reach the mirror or the
+        history via this path.  Leg activity stays auditable through
+        fills, which carry the parent id plus reason.  The exclusion
+        consults in-memory sets only (position cache + session child
+        derivation — no network read per message); a cold position cache
+        only lets a leg through until the first refresh, and reconcile
+        deletes the strays.
+        """
         entries = data if isinstance(data, list) else [data]
+        bracket = self._bracket_child_cloids()
         for entry in entries:
             if not isinstance(entry, dict):
                 logger.warning("Skipping malformed order update: %r", entry)
+                continue
+            payload = entry.get("order")
+            raw = str(payload.get("cloid") or "") if isinstance(payload, dict) else ""
+            if raw and (raw in self._position_leg_cloids or raw in bracket):
+                logger.debug("Skipping TP/SL leg update (attachment): %r", raw)
                 continue
             try:
                 record = await self._translate_order_update(entry)
@@ -626,6 +746,40 @@ class HyperliquidAdapter(Adapter):
                 return client_order_id
         return None
 
+    @staticmethod
+    def _is_thin_update(payload: dict[str, Any]) -> bool:
+        """True when a WS order payload carries no type markers.
+
+        The thin ``WsBasicOrder`` shape omits ``orderType`` / ``isTrigger`` /
+        ``triggerPx`` — translating it standalone falls through to the
+        resting defaults (LIMIT/GTC, no attachments), which then overwrite
+        the true record.  Rich updates (any marker present) translate fully.
+        """
+        if payload.get("orderType") or payload.get("isTrigger"):
+            return False
+        try:
+            return payload.get("triggerPx") in (None, "", "0", "0.0")
+        except Exception:
+            return True
+
+    @staticmethod
+    def _merge_thin_update(thin: OrderRecord, local: OrderRecord) -> OrderRecord:
+        """Fold a thin WS update onto the stored record (WS-authoritative fields only).
+
+        Status, fill progress and timestamps come from the push; everything
+        static (type, TIF, price, attachments, …) stays local, so a MARKET
+        row can never regress to LIMIT.  Filled quantity is monotonic —
+        the max wins, guarding against a stale remaining-size echo.
+        """
+        return dataclasses.replace(
+            local,
+            status=thin.status,
+            filled_quantity=max(local.filled_quantity, thin.filled_quantity),
+            average_fill_price=thin.average_fill_price or local.average_fill_price,
+            platform_order_id=thin.platform_order_id or local.platform_order_id,
+            updated_at=thin.updated_at,
+        )
+
     async def _translate_order_update(self, entry: dict[str, Any]) -> OrderRecord:
         """Translate one ``WsOrder`` update.
 
@@ -634,6 +788,15 @@ class HyperliquidAdapter(Adapter):
         the record's ``updated_at`` would silently fall back to creation.
         The record's client id is restored to the caller id (same rule as
         ``fetch_open_orders``) — consumers match on values, not dict keys.
+
+        Thin updates (no type markers) merge onto the stored record instead
+        of translating standalone: only status/fill/timestamps are taken
+        from the push.  Unknown ids without a store fall back to
+        standalone translation (bare-adapter degradation, as before);
+        unknown orders that carry an id get one bounded ``orderStatus``
+        read; on failure the thin translation publishes (never silence a
+        status).  Venue orders with no cloid cannot be resolved that way
+        and publish thin directly.
         """
         payload = entry.get("order")
         if not isinstance(payload, dict):
@@ -650,14 +813,76 @@ class HyperliquidAdapter(Adapter):
                 merged[key] = entry[key]
         record = translate_order_entry(merged, instrument=instrument)
         resolved = self._known_client_id(record.client_order_id)
+        cid = resolved or record.client_order_id
         if resolved is not None and resolved != record.client_order_id:
             record = dataclasses.replace(record, client_order_id=resolved)
+        if not self._is_thin_update(payload):
+            return record
+        store = self._state_store
+        if store is not None and cid:
+            try:
+                local = await store.get_order(cid)
+            except Exception:
+                logger.exception("Stored-order lookup failed for %r", cid)
+                local = None
+            if local is not None:
+                return self._merge_thin_update(record, local)
+            try:
+                rich = await self._translate_unknown_update(record, instrument)
+                if rich.client_order_id != cid:
+                    rich = dataclasses.replace(rich, client_order_id=cid)
+                return rich
+            except Exception:
+                logger.exception("Orphan re-query failed for %r", cid)
         return record
 
-    async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
-        """Translate one fill and publish it unless already seen (never raises)."""
+    async def _translate_unknown_update(
+        self, thin: OrderRecord, instrument: Instrument
+    ) -> OrderRecord:
+        """One bounded ``orderStatus`` re-query for an order with no local row.
+
+        Returns the rich translation; raises on ``unknownOid`` or transport
+        failure so the caller falls back to the thin record.  Orphan-only
+        path — every placed order has a local row, so the hot path never
+        pays this read.
+        """
+        exchange = self._require_exchange()
+        response = await self._run_exchange(
+            exchange.info.query_order_by_cloid,
+            self._config.wallet_address,
+            Cloid(client_order_id_to_cloid(thin.client_order_id)),
+        )
+        if not isinstance(response, dict) or response.get("status") == "unknownOid":
+            raise OrderNotFoundError(f"Order {thin.client_order_id} has no orderStatus")
         try:
-            if self._fill_seen(entry):
+            payload = response["order"]
+            detail = payload["order"]
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(f"Unexpected orderStatus shape {response!r}") from exc
+        if not isinstance(detail, dict):
+            raise PlatformError(f"OrderStatus is missing its order object: {response!r}")
+        rich = {
+            **detail,
+            "status": payload.get("status"),
+            "statusTimestamp": payload.get("statusTimestamp"),
+        }
+        return translate_order_entry(rich, instrument=instrument)
+
+    async def _publish_fill_entry(self, entry: dict[str, Any]) -> None:
+        """Translate one fill and publish it unless already seen (never raises).
+
+        The seen-set is peeked — not recorded — up front; the id is marked
+        only after a successful publish, so a poison (untranslatable) entry
+        never burns its id and its redelivery still publishes (issue 12).
+        Attributed fills publish instantly.  Unattributed fills park for
+        ``_FILL_ATTRIBUTION_HOLD_SECONDS`` so a racing ack can still claim
+        them (issue 16); expiry publishes with the raw-oid fallback, never
+        held hostage.  Duplicates of a parked fill are dropped; a fill the
+        snapshot seeds meanwhile is skipped at flush via the seen-set.
+        """
+        try:
+            key = self._fill_key(entry)
+            if key is not None and (key in self._seen_fill_ids or key in self._pending_fills):
                 return
             coin = str(entry.get("coin") or "")
             if not coin:
@@ -669,9 +894,79 @@ class HyperliquidAdapter(Adapter):
             attributed = self._oid_clients.get(oid)
             if attributed is not None:
                 client_order_id, reason, fill_entry = attributed
+            elif key is None:
+                # Id-less entries cannot park or dedupe — publish raw now.
+                client_order_id, reason, fill_entry = (
+                    (oid or str(entry.get("hash") or "")),
+                    None,
+                    None,
+                )
             else:
-                # Match ``fetch_fills``: an unattributed fill keys by its L1
-                # hash.  A constant placeholder would collide across fills.
+                # Unattributed (usually: push beat the ack) — park for the
+                # hold instead of publishing raw immediately.  Fail-fast on
+                # poison first: validate now so garbage never occupies a
+                # task, then re-translate at flush with fresh attribution.
+                translate_fill(
+                    entry,
+                    instrument=instrument,
+                    client_order_id=(oid or str(entry.get("hash") or "")),
+                    reason=None,
+                    fill_entry=None,
+                )
+                self._park_fill(key, entry)
+                return
+            record = translate_fill(
+                entry,
+                instrument=instrument,
+                client_order_id=client_order_id,
+                reason=reason,
+                fill_entry=fill_entry,
+            )
+            self._publish_fill_record(record)
+            if key is not None:
+                self._seen_fill_ids.append(key)
+        except Exception:
+            logger.exception("Skipping untranslatable fill entry: %r", entry)
+
+    def _park_fill(self, key: str, entry: dict[str, Any]) -> None:
+        """Park an unattributed fill entry for deadline resolution (never raises)."""
+        try:
+            if len(self._pending_fills) >= _PENDING_FILL_CAP:
+                oldest = next(iter(self._pending_fills))
+                self._flush_parked(oldest)
+            self._pending_fills[key] = entry
+            task = asyncio.ensure_future(self._flush_parked_after_hold(key))
+            self._pending_fill_tasks.add(task)
+            task.add_done_callback(self._pending_fill_tasks.discard)
+        except Exception:
+            logger.exception("Fill parking failed for %r", key)
+
+    async def _flush_parked_after_hold(self, key: str) -> None:
+        """Publish one parked fill after the hold with current attribution."""
+        try:
+            await asyncio.sleep(_FILL_ATTRIBUTION_HOLD_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Parked-fill hold failed for %r", key)
+            return
+        self._flush_parked(key)
+
+    def _flush_parked(self, key: str) -> None:
+        """Publish one parked fill now with the best resolution available (never raises)."""
+        try:
+            entry = self._pending_fills.pop(key, None)
+            if entry is None or key in self._seen_fill_ids:
+                return
+            coin = str(entry.get("coin") or "")
+            instrument = from_hyperliquid_coin(
+                coin, is_spot=self._is_spot_coin(coin), spot_pair_coins=self._reverse_pair_coins()
+            )
+            oid = str(entry.get("oid") or "")
+            attributed = self._oid_clients.get(oid)
+            if attributed is not None:
+                client_order_id, reason, fill_entry = attributed
+            else:
                 client_order_id, reason, fill_entry = (
                     (oid or str(entry.get("hash") or "")),
                     None,
@@ -685,8 +980,21 @@ class HyperliquidAdapter(Adapter):
                 fill_entry=fill_entry,
             )
             self._publish_fill_record(record)
+            self._seen_fill_ids.append(key)
         except Exception:
-            logger.exception("Skipping untranslatable fill entry: %r", entry)
+            logger.exception("Skipping untranslatable parked fill: %r", key)
+
+    def _flush_all_parked(self) -> None:
+        """Publish every parked fill immediately (shutdown path, never raises)."""
+        try:
+            for key in list(self._pending_fills):
+                self._flush_parked(key)
+        except Exception:
+            logger.exception("Parked-fill shutdown flush failed")
+        finally:
+            for task in set(self._pending_fill_tasks):
+                task.cancel()
+            self._pending_fill_tasks.clear()
 
     async def _handle_clearinghouse_message(self, data: Any) -> None:
         """Diff a ``clearinghouseState`` push into ``PositionUpdateEvent``s (never raises).
@@ -936,7 +1244,11 @@ class HyperliquidAdapter(Adapter):
                 logger.exception("Hyperliquid unsubscribed replacement teardown failed")
             return
         try:
-            await self._absorb_fills(publish_unseen=True)
+            # Gap window from the monitor cadence: a drop is noticed within
+            # one tick (15s) plus rebuild time — 120s covers it several times
+            # over, so the cover reads a handful of fills, not history.
+            gap_since = _utcnow() - timedelta(seconds=120)
+            await self._absorb_fills(publish_unseen=True, since=gap_since)
         except Exception:
             logger.exception("Hyperliquid gap re-query after reconnect failed")
             return
@@ -1125,6 +1437,39 @@ class HyperliquidAdapter(Adapter):
             direction="up" if side == OrderSide.BUY else "down",
         )
 
+    @staticmethod
+    def _position_leg_cloids_from_legs(legs: Any) -> set[str]:
+        """Raw cloids of position TP/SL legs for open venue legs (pure).
+
+        Same derivation as ``_refresh_oid_index`` and ``modify_position_tpsl``:
+        per leg, ``position_tpsl_cloid(f"{coin}:oneWay", suffix)`` for both
+        suffixes.  Stateless — position ids come from venue truth, so the
+        set survives restarts with no stored state.
+        """
+        found: set[str] = set()
+        for leg in legs or []:
+            position = leg.get("position") if isinstance(leg, dict) else None
+            if not isinstance(position, dict) or not position.get("coin"):
+                continue
+            position_id = f"{position['coin']}:oneWay"
+            found.add(position_tpsl_cloid(position_id, TP_CLOID_SUFFIX))
+            found.add(position_tpsl_cloid(position_id, SL_CLOID_SUFFIX))
+        return found
+
+    async def _refresh_position_leg_cloids(self) -> set[str]:
+        """Rebuild the position-leg exclusion cache from venue legs.
+
+        One ``userState`` read; stores into ``_position_leg_cloids`` and
+        returns the set.  ``fetch_open_orders`` calls this every time so
+        its exclusion is never stale; the WS push path consults the cache
+        read-only instead.
+        """
+        exchange = self._require_exchange()
+        state = await self._run_exchange(exchange.info.user_state, self._config.wallet_address)
+        legs = state.get("assetPositions") if isinstance(state, dict) else None
+        self._position_leg_cloids = self._position_leg_cloids_from_legs(legs)
+        return set(self._position_leg_cloids)
+
     async def _refresh_oid_index(self) -> None:
         """Rebuild oid→client attribution from open orders carrying our cloids.
 
@@ -1151,6 +1496,9 @@ class HyperliquidAdapter(Adapter):
             ):
                 raw = position_tpsl_cloid(position_id, suffix)
                 position_cloids[raw] = (raw, reason, FillEntry.OUT)
+        # Warm the WS exclusion cache with the same derivation — fills reads
+        # already paid for the venue legs, so the push path stays warm free.
+        self._position_leg_cloids.update(position_cloids)
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
@@ -1593,7 +1941,9 @@ class HyperliquidAdapter(Adapter):
         stay working.  Legs are full-size at attach time (fixed-size — the
         venue does not auto-resize API-placed legs, verified live), so
         re-attach after resizing the leg.  Detach one side by cancelling its
-        leg (visible in ``fetch_open_orders`` keyed by cloid); both None
+        leg by position cloid (legs are attachments: excluded from
+        ``fetch_open_orders`` and the order push stream, never mirrored —
+        use ``_position_tpsl_entries`` to address them); both None
         raises ``ValueError`` per the ABC contract.  No open leg reads back
         as ``OrderNotFoundError``; spot raises ``InvalidSymbolError``.
         """
@@ -1656,6 +2006,12 @@ class HyperliquidAdapter(Adapter):
         )
         for request in requests:
             request["cloid"] = Cloid(request["cloid"])
+        # Warm the exclusion cache before submitting: pushes beat the ack,
+        # and these cloids derive from the position id alone — no read needed.
+        self._position_leg_cloids.update(
+            position_tpsl_cloid(position_id, suffix)
+            for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
+        )
         response = await self._run_exchange(exchange.bulk_orders, requests, grouping=grouping)
         data = self._check_action_ok(response, context=f"setting position TP/SL for {coin}")
         try:
@@ -1838,9 +2194,14 @@ class HyperliquidAdapter(Adapter):
 
         Derived TP/SL child legs are attachments of their parent in the
         unified model, not orders of their own, so they are excluded — the
-        parent is reported, keyed by client id.  Venue-created legs we never
-        minted a cloid for key by platform oid; entries with neither id are
-        skipped, never collapsed onto an empty key.
+        parent is reported, keyed by client id.  Position TP/SL legs are
+        attachments of the position and excluded the same way (Bybit
+        ``createType`` parity): their cloids derive statelessly from open
+        venue legs, so the exclusion survives restarts with no stored
+        state.  Costs one ``userState`` read for the exclusion set, plus
+        the open-orders scan.  Venue-created legs we never minted a cloid
+        for key by platform oid; entries with neither id are skipped, never
+        collapsed onto an empty key.
         """
         result: dict[str, OrderRecord] = {}
         cloid_to_client: dict[str, str] = {}
@@ -1852,6 +2213,7 @@ class HyperliquidAdapter(Adapter):
                 for suffix in (TP_CLOID_SUFFIX, SL_CLOID_SUFFIX)
             )
         child_cloids.update(self._child_parents)
+        child_cloids.update(await self._refresh_position_leg_cloids())
         for entry in await self._open_order_entries():
             if not isinstance(entry, dict):
                 continue
@@ -1884,16 +2246,24 @@ class HyperliquidAdapter(Adapter):
             result[key] = order
         return result
 
-    async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
+    async def fetch_fills(
+        self, *, since: datetime | None = None, resolve_unknown_oids: bool = True
+    ) -> dict[str, list[FillRecord]]:
         """Fetch recent fills, grouped by client order id.
 
         Without ``since`` reads the recent window (``userFills``, ≤2000);
         with ``since`` reads ``userFillsByTime`` from that bound (server
         filters; a client-side guard holds the boundary).  Entries dedupe
         on ``(hash, tid)``; oid-attributed fills key by client id (TP/SL
-        children by parent with their reason), unknown oids key by raw oid.
-        Costs one open-orders scan (both shapes) plus one ``userState`` read
-        for oid attribution, plus the fills call itself.
+        children by parent with their reason); oids still unknown after the
+        index get one bounded ``orderStatus``-by-oid resolve each (issue
+        16 — same-session instant fills; pre-session history has no session
+        maps to resolve against and stays raw-keyed), then unknown oids key
+        by raw oid.  Costs one open-orders scan (both shapes) plus one
+        ``userState`` read for oid attribution, plus the fills call itself,
+        plus one read per previously-unseen unknown oid.  Pass
+        ``resolve_unknown_oids=False`` when only the fill ids are consumed
+        (startup seeding) to skip the per-oid reads entirely.
         """
         await self._refresh_oid_index()
         exchange = self._require_exchange()
@@ -1925,6 +2295,13 @@ class HyperliquidAdapter(Adapter):
             seen.add(key)
             oid = str(entry.get("oid") or "")
             attributed = self._oid_clients.get(oid)
+            if (
+                attributed is None
+                and resolve_unknown_oids
+                and oid
+                and oid not in self._oid_unresolvable
+            ):
+                attributed = await self._resolve_oid_attribution(oid)
             if attributed is not None:
                 client_order_id, reason, entry_side = attributed
             else:
@@ -1950,6 +2327,57 @@ class HyperliquidAdapter(Adapter):
                 continue
             result.setdefault(client_order_id, []).append(fill)
         return result
+
+    async def _resolve_oid_attribution(
+        self, oid: str
+    ) -> tuple[str, FillReason | None, FillEntry | None] | None:
+        """Attribute one unknown oid via ``orderStatus``-by-oid (issue 16).
+
+        Reads the order's cloid and maps it through the session indexes:
+        bracket children to ``(parent, reason, OUT)``, own cids back to
+        themselves.  Successes index into ``_oid_clients`` so every later
+        path benefits; definitive misses join ``_oid_unresolvable`` so
+        future reads never re-pay them (cleared on disconnect).  Transport
+        failures stay uncached — the next read retries.  Position legs
+        resolve while open via the index; closed ones keep the attribution
+        written at ack time.  Returns None when unresolvable (caller keys
+        by raw oid, as before).
+        """
+        try:
+            oid_int = int(oid)
+        except (TypeError, ValueError):
+            self._oid_unresolvable.add(oid)
+            return None
+        exchange = self._require_exchange()
+        try:
+            response = await self._run_exchange(
+                exchange.info.query_order_by_oid, self._config.wallet_address, oid_int
+            )
+        except Exception:
+            logger.exception("orderStatus-by-oid resolve failed for oid %r", oid)
+            return None
+        if not isinstance(response, dict) or response.get("status") == "unknownOid":
+            self._oid_unresolvable.add(oid)
+            return None
+        try:
+            raw = str(response["order"]["order"].get("cloid") or "")
+        except (KeyError, TypeError, AttributeError):
+            logger.exception("orderStatus-by-oid shape unexpected for oid %r", oid)
+            self._oid_unresolvable.add(oid)
+            return None
+        if not raw:
+            self._oid_unresolvable.add(oid)
+            return None
+        if raw in self._child_parents:
+            attributed: tuple[str, FillReason | None, FillEntry | None] = self._child_parents[raw]
+        else:
+            resolved = self._known_client_id(raw)
+            if resolved is None:
+                self._oid_unresolvable.add(oid)
+                return None
+            attributed = (resolved, None, None)
+        self._oid_clients[oid] = attributed
+        return attributed
 
     # ---- Leverage + margin intent ----
 

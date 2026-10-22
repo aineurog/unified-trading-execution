@@ -129,7 +129,9 @@ class RateBudget:
         if weight <= 0:
             return
         with self._lock:
-            self._entries.append((self._time_fn(), weight))
+            now = self._time_fn()
+            self._prune(now)
+            self._entries.append((now, weight))
 
     def _prune(self, now: float) -> None:
         cutoff = now - self._window
