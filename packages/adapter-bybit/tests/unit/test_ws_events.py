@@ -432,6 +432,35 @@ class TestStreamEmission:
         assert captured[0].fill.reason == FillReason.STOP_LOSS
         assert captured[0].fill.entry == FillEntry.OUT
 
+    def test_execution_records_trailing_close_fill(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "orderId": "cffa-trail",
+                        "createType": "CreateByTrailingStop",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # A trailing-triggered close is a real fill — recorded under the
+        # synthesized venue key, not dropped for lack of a client order id.
+        assert len(captured) == 1
+        assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-trail"
+
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
         captured: list[PositionUpdateEvent] = []
@@ -573,6 +602,26 @@ class TestStreamEmission:
 
         # Native TP/SL children are position TP/SL state, not user orders —
         # they must never surface as phantom OrderPlacedEvents in the mirror.
+        assert placed == []
+
+    def test_order_skips_trailing_close(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+
+        adapter._on_order_message(
+            {
+                "data": [
+                    _base_order_entry(
+                        orderLinkId="",
+                        orderId="cffa-trail",
+                        createType="CreateByTrailingStop",
+                    )
+                ]
+            }
+        )
+
+        # A venue-created trailing close is position state, not a user order.
         assert placed == []
 
     def test_order_terminal_echo_not_replaced(
