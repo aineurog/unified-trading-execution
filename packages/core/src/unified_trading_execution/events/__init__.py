@@ -16,9 +16,12 @@ from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
+from decimal import Decimal
 from typing import Literal, TypeAlias
 
+from unified_trading_execution.trailing.types import TrailingMode, TrailingPhase
 from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import FillRecord, OrderRecord
 from unified_trading_execution.types.position import Balance, Position
 
@@ -47,6 +50,17 @@ class PositionUpdateEvent(Event):
 @dataclass(frozen=True, slots=True)
 class BalanceUpdateEvent(Event):
     balance: Balance
+
+
+@dataclass(frozen=True, slots=True)
+class TickerEvent(Event):
+    """A sampled ticker for an instrument with an active synthetic state.
+
+    Published by the trailing worker only when configured to do so.
+    """
+
+    instrument: Instrument
+    ticker: Ticker
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +98,20 @@ class OrderStatusEvent(Event):
     """
 
     order: OrderRecord
+
+
+@dataclass(frozen=True, slots=True)
+class TrailingStateEvent(Event):
+    """Published on every trailing phase change and every reprice."""
+
+    trailing_id: str
+    instrument: Instrument
+    position_id: str
+    previous_phase: TrailingPhase
+    phase: TrailingPhase
+    mode: TrailingMode
+    current_stop: Decimal | None
+    reason: str | None
 
 
 @dataclass(frozen=True, slots=True)

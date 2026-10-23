@@ -16,6 +16,8 @@ from unified_trading_execution.errors import (
     PlatformConnectionError,
     PlatformError,
     RateLimitError,
+    TrailingNotSupportedError,
+    TrailingStateError,
     UnsupportedOrderTypeError,
     UteError,
 )
@@ -36,6 +38,8 @@ def test_all_errors_inherit_from_ute_error():
     assert issubclass(AccountHaltedError, UteError)
     assert issubclass(PlatformError, UteError)
     assert issubclass(EngineShutdownError, UteError)
+    assert issubclass(TrailingNotSupportedError, UteError)
+    assert issubclass(TrailingStateError, UteError)
 
 
 def test_ute_error_inherits_from_exception():

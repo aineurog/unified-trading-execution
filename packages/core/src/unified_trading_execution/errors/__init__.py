@@ -110,6 +110,26 @@ class ReconciliationError(UteError):
     """
 
 
+# ---- Trailing ----
+
+
+class TrailingNotSupportedError(UteError):
+    """The platform, instrument, mode, or parameter combination cannot trail.
+
+    Raised at routing time when neither native nor synthetic execution can
+    express the request, and at ATR warmup failure.
+    """
+
+
+class TrailingStateError(UteError):
+    """Invalid trailing lifecycle, duplicate active attach, or resolution.
+
+    Covers transitions that are not allowed from the current phase, a second
+    active state for the same leg, ambiguous position resolution, and a
+    restart identity mismatch.
+    """
+
+
 # ---- Catch-all ----
 
 

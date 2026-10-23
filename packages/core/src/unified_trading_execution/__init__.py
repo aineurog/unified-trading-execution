@@ -20,6 +20,8 @@ from unified_trading_execution.errors import (
     PlatformError,
     RateLimitError,
     ReconciliationError,
+    TrailingNotSupportedError,
+    TrailingStateError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
@@ -40,6 +42,8 @@ from unified_trading_execution.events import (
     ReconciliationCompleteEvent,
     ReconciliationEvent,
     ReconciliationMismatch,
+    TickerEvent,
+    TrailingStateEvent,
 )
 from unified_trading_execution.state import SQLiteStateStore, StateStore
 from unified_trading_execution.sync import SyncEngine
@@ -112,6 +116,8 @@ __all__ = [
     "OrderPlacedEvent",
     "OrderModifiedEvent",
     "OrderCancelledEvent",
+    "TickerEvent",
+    "TrailingStateEvent",
     "ReconciliationCompleteEvent",
     "ReconciliationEvent",
     "ReconciliationMismatch",
@@ -133,6 +139,8 @@ __all__ = [
     "PlatformError",
     "RateLimitError",
     "ReconciliationError",
+    "TrailingNotSupportedError",
+    "TrailingStateError",
     "UnsupportedOrderTypeError",
     # Audit
     "AuditEvent",

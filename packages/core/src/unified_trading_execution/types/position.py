@@ -16,6 +16,11 @@ class Position:
     ``position_id`` is the platform-assigned identifier for this specific leg
     (MT5 ticket, Bybit positionIdx, cTrader positionId), unique within the
     instrument.  ``None`` for a derived/synthetic position.
+
+    ``opened_at`` is the venue-reported open time when the adapter can supply
+    it.  It is used to tell a genuine reopen of a stable leg id (Bybit
+    ``positionIdx``, Hyperliquid ``{coin}:oneWay``) from the position a
+    pre-restart trailing state was attached to.
     """
 
     instrument: Instrument
@@ -23,10 +28,13 @@ class Position:
     average_entry_price: Decimal
     updated_at: datetime  # UTC, timezone-aware
     position_id: str | None = None  # platform leg id, unique within the instrument
+    opened_at: datetime | None = None  # UTC, tz-aware when the venue reports it
 
     def __post_init__(self) -> None:
         if self.updated_at.tzinfo is None:
             raise ValueError("updated_at must be timezone-aware (UTC)")
+        if self.opened_at is not None and self.opened_at.tzinfo is None:
+            raise ValueError("opened_at must be timezone-aware (UTC) when set")
 
 
 @dataclass(frozen=True, slots=True)
