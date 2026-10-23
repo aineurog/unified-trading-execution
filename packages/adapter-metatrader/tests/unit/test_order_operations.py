@@ -18,7 +18,8 @@ Tests cases:
     - cancel_order: TRADE_ACTION_REMOVE with correct ticket
     - get_order_by_client_id: unknown id / inactive order → None
     - get_order_by_client_id: active order → OrderResult; real error raises
-    - modify_position_tpsl: TRADE_ACTION_SLTP with position, tp, sl
+    - modify_position_tpsl: TRADE_ACTION_SLTP always sends both tp and sl
+    - modify_position_tpsl: unmentioned side is preserved; missing position raises
     - modify_position_tpsl: limit_price raises UnsupportedOrderTypeError
 """
 
@@ -714,7 +715,7 @@ class TestGetOrderByClientId:
 
 
 class TestModifyPositionTpsl:
-    """modify_position_tpsl — TRADE_ACTION_SLTP construction and guards."""
+    """modify_position_tpsl — TRADE_ACTION_SLTP construction and merge."""
 
     async def test_modifies_both_levels(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
@@ -735,21 +736,80 @@ class TestModifyPositionTpsl:
         assert request["position"] == 789
         assert request["tp"] == 1.3
         assert request["sl"] == 1.0
+        mock_mt5_module.positions_get.assert_not_called()
 
-    async def test_modifies_only_stop_loss(
+    async def test_modifies_only_stop_loss_preserves_take_profit(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
     ) -> None:
-        """Only the provided level is sent."""
+        """An unmentioned take profit is read back and re-sent unchanged."""
         _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
 
         await adapter.modify_position_tpsl(
-            _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0000"))
+            _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0500"))
         )
 
         request = _request(mock_mt5_module)
-        assert request["symbol"] == "EURUSD.m"
+        assert request["tp"] == 1.3
+        assert request["sl"] == 1.05
+        mock_mt5_module.positions_get.assert_called_once_with(ticket=789)
+
+    async def test_modifies_only_take_profit_preserves_stop_loss(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """An unmentioned stop loss is read back and re-sent unchanged."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
+
+        await adapter.modify_position_tpsl(
+            _instrument(), "789", take_profit=TpSlAttachment(Decimal("1.3500"))
+        )
+
+        request = _request(mock_mt5_module)
+        assert request["tp"] == 1.35
         assert request["sl"] == 1.0
-        assert "tp" not in request
+
+    async def test_unset_side_stays_unset(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """Zero is sent for a side that was already unset, so it stays unset."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=0.0),)
+
+        await adapter.modify_position_tpsl(
+            _instrument(), "789", take_profit=TpSlAttachment(Decimal("1.3500"))
+        )
+
+        request = _request(mock_mt5_module)
+        assert request["tp"] == 1.35
+        assert request["sl"] == 0.0
+
+    async def test_flat_position_raises(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A missing position is reported instead of clearing the other side."""
+        mock_mt5_module.positions_get.return_value = ()
+
+        with pytest.raises(OrderNotFoundError):
+            await adapter.modify_position_tpsl(
+                _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0500"))
+            )
+
+        mock_mt5_module.order_send.assert_not_called()
+
+    async def test_positions_get_failure_does_not_send(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A read failure aborts before order_send — never clear blind."""
+        mock_mt5_module.positions_get.return_value = None
+        mock_mt5_module.last_error.return_value = (-2, "invalid params")
+
+        with pytest.raises(PlatformError):
+            await adapter.modify_position_tpsl(
+                _instrument(), "789", stop_loss=TpSlAttachment(Decimal("1.0500"))
+            )
+
+        mock_mt5_module.order_send.assert_not_called()
 
     async def test_limit_price_unsupported(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants

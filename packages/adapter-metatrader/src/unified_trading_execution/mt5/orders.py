@@ -239,8 +239,8 @@ def build_mt5_sltp_request(
     position_id: str,
     symbol: str,
     *,
-    take_profit: float | None = None,
-    stop_loss: float | None = None,
+    take_profit: float,
+    stop_loss: float,
     mt5_module: Any,
 ) -> dict[str, Any]:
     """Build an MT5 ``TRADE_ACTION_SLTP`` request dict to modify TP/SL on an
@@ -250,24 +250,22 @@ def build_mt5_sltp_request(
     broker symbol the position belongs to.  MT5 requires **both** — the
     terminal does not resolve the symbol from the ticket alone and rejects
     the request with ``TRADE_RETCODE_INVALID`` (10013) when *symbol* is
-    absent.  At least one of *take_profit* or *stop_loss* must be provided
-    (as float).
+    absent.
+
+    Both *take_profit* and *stop_loss* are always emitted.  The binding
+    defaults an omitted numeric request field to ``0.0``, and for
+    ``TRADE_ACTION_SLTP`` zero means "no level"; omitting a side therefore
+    clears it.  Pass ``0.0`` explicitly to leave a side unset.
 
     *mt5_module* is the lazily-imported ``MetaTrader5`` module reference.
     """
-    if take_profit is None and stop_loss is None:
-        raise ValueError("at least one of take_profit or stop_loss must be provided")
-
-    request: dict[str, Any] = {
+    return {
         "action": mt5_module.TRADE_ACTION_SLTP,
         "symbol": symbol,
         "position": int(position_id),
+        "tp": take_profit,
+        "sl": stop_loss,
     }
-    if take_profit is not None:
-        request["tp"] = take_profit
-    if stop_loss is not None:
-        request["sl"] = stop_loss
-    return request
 
 
 def parse_mt5_result(
