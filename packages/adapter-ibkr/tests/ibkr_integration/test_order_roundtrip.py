@@ -366,12 +366,15 @@ async def test_modify_position_tpsl(connected_adapter: IBKRAdapter) -> None:
         # Adapter-internal: carved out of the order mirror.
         open_orders = await adapter.fetch_open_orders()
         assert not [cid for cid in open_orders if "-tp-" in cid or "-sl-" in cid]
+        refs_before = {t.order.orderRef for t in _protection_trades(adapter, position_id)}
 
         # Single-side update replaces the pair and preserves the SL.
         await adapter.modify_position_tpsl(
             nvda.instrument, position_id, take_profit=TpSlAttachment(Decimal("305"))
         )
         await asyncio.sleep(1)
+        refs_after = {t.order.orderRef for t in _protection_trades(adapter, position_id)}
+        assert refs_after.isdisjoint(refs_before)  # fresh, unique refs per generation
         assert await adapter.get_position_tpsl(nvda.instrument, position_id) == (
             TpSlAttachment(Decimal("305")),
             TpSlAttachment(Decimal("200")),

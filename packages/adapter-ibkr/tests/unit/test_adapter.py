@@ -692,6 +692,35 @@ class TestModifyPositionTpsl:
         assert placed[0].orderType == "LMT" and placed[0].lmtPrice == Decimal("120")
         assert placed[1].orderType == "STP" and placed[1].auxPrice == Decimal("85")
 
+    async def test_protective_refs_are_unique_across_replaces(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        live = self._live_orders(
+            mock_ib,
+            [
+                _protection_trade("111-tp-old001", 1, lmt="120"),
+                _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+            ],
+        )
+        placed = self._capture_places(mock_ib)
+
+        for i in range(4):
+            await adapter.modify_position_tpsl(
+                AAPL,
+                "111",
+                take_profit=TpSlAttachment(Decimal(str(150 + i))),
+                stop_loss=TpSlAttachment(Decimal(str(90 - i))),
+            )
+
+        refs = [o.orderRef for o in placed]
+        assert live == []  # each call replaced, never stacked
+        assert len(refs) == 8
+        assert len(set(refs)) == 8  # every protective order gets its own ref
+        assert all(len(r.rsplit("-", 1)[-1]) == 12 for r in refs)
+
     async def test_cancel_not_confirmed_refuses_to_stack(
         self,
         adapter: IBKRAdapter,
@@ -987,6 +1016,13 @@ class TestProtectionCarveOut:
             adapter._on_error(84, 202, "Order Canceled - reason:")
 
         assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_protection_ref_suffix_is_random_not_time_bucketed(self) -> None:
+        from unified_trading_execution.ibkr.adapter import _protection_ref_suffix
+
+        suffixes = {_protection_ref_suffix() for _ in range(50)}
+        assert len(suffixes) == 50  # time-bucketed suffixes would all be equal
+        assert all(len(s) == 12 for s in suffixes)
 
     def test_bracket_child_status_still_publishes(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock

@@ -142,6 +142,16 @@ def _protection_ref_prefixes(position_id: str) -> tuple[str, str]:
     )
 
 
+def _protection_ref_suffix() -> str:
+    """Short collision-free suffix for a protective ``orderRef``.
+
+    The UUID7 string ends in its 48 random bits; taking the tail avoids the
+    time-bucketed prefix, which is constant within a session and therefore
+    not unique on its own, while keeping the ref short.
+    """
+    return str(uuid7()).replace("-", "")[-12:]
+
+
 def _new_id() -> str:
     return str(uuid7())
 
@@ -1178,7 +1188,7 @@ class IBKRAdapter(Adapter):
                 totalQuantity=abs_qty,
                 orderType="LMT",
                 lmtPrice=effective_tp.trigger_price,
-                orderRef=f"{position_id}-tp-{str(uuid7()).replace('-', '')[:6]}",
+                orderRef=f"{position_id}-tp-{_protection_ref_suffix()}",
                 **tif_kwargs,  # type: ignore[arg-type]
             )
             orders.append(tp)
@@ -1189,7 +1199,7 @@ class IBKRAdapter(Adapter):
                 "totalQuantity": abs_qty,
                 "orderType": sl_type,
                 "auxPrice": effective_sl.trigger_price,
-                "orderRef": f"{position_id}-sl-{str(uuid7()).replace('-', '')[:6]}",
+                "orderRef": f"{position_id}-sl-{_protection_ref_suffix()}",
                 **tif_kwargs,
             }
             if effective_sl.limit_price is not None:
