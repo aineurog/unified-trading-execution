@@ -129,14 +129,19 @@ _MAX_TRACKED_FINAL_ORDER_IDS = 10_000
 # PlatformConnectionError.  Mutations are never retried here — see _run_request.
 _READ_RETRIES = 3
 _READ_RETRY_BACKOFF_SECONDS = 0.5
-# Native TP/SL child orders Bybit auto-creates on a parent order/position.
-# These are not user orders and must be excluded from the open-order mirror.
+# Orders Bybit auto-creates on a parent order/position: native TP/SL children
+# and the close produced when a position trailing stop triggers
+# (``CreateByTrailingStop``). These are not user orders and must be excluded
+# from the open-order mirror and the order stream, and keyed by their order id
+# for fills. Any partial trailing variant the venue emits is added here once
+# confirmed on testnet.
 _TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
     {
         "CreateByTakeProfit",
         "CreateByStopLoss",
         "CreateByPartialStopLoss",
         "CreateByPartialTakeProfit",
+        "CreateByTrailingStop",
     }
 )
 
