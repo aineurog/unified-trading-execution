@@ -101,17 +101,21 @@ async def spec_price(adapter: MT5Adapter, instrument: Instrument, reference: Dec
 
 
 def position_for_symbol(
-    positions: dict[Instrument, Position],
+    positions: list[Position],
     instrument: Instrument,
 ) -> Position | None:
-    """Find a netted position by base symbol/asset class.
+    """Find a position leg by base symbol/asset class.
 
-    Polling keys positions by the resolved ``Instrument`` (which carries a
-    ``platform_symbol``), so plain dict lookup by a caller-built instrument
-    fails — compare the identity fields instead.
+    ``fetch_positions()`` returns one ``Position`` per terminal leg, each
+    carrying the resolved ``Instrument`` (which includes ``platform_symbol``),
+    so a caller-built instrument is matched on its identity fields instead.
     """
-    for key, position in positions.items():
-        if key.symbol == instrument.symbol and key.asset_class == instrument.asset_class:
+    for position in positions:
+        candidate = position.instrument
+        if (
+            candidate.symbol == instrument.symbol
+            and candidate.asset_class == instrument.asset_class
+        ):
             return position
     return None
 
@@ -132,7 +136,8 @@ async def cleanup_adapter(adapter: MT5Adapter) -> None:
     for _ in range(5):
         positions = await adapter.fetch_positions()
         legs: list[tuple[Instrument, Any]] = []
-        for instrument in positions:
+        for position in positions:
+            instrument = position.instrument
             broker_symbol = instrument.platform_symbol
             if not broker_symbol:
                 continue

@@ -831,15 +831,23 @@ class MT5Adapter(Adapter):
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
-        """Modify TP/SL on an existing position via ``TRADE_ACTION_SLTP``.
+        """Modify the take-profit and/or stop-loss levels of an open position.
 
-        *position_id* is the MT5 position ticket (as a string); it is globally
-        unique, but the terminal still requires the broker symbol alongside the
-        ticket for ``TRADE_ACTION_SLTP``, so *instrument* is used to resolve it.
-        At least one of *take_profit* or *stop_loss* must be provided.
+        The update is sent as ``TRADE_ACTION_SLTP``.  *position_id* is the MT5
+        position ticket (as a string); *instrument* resolves the broker symbol
+        the request also requires.  At least one of *take_profit* or
+        *stop_loss* must be provided.
 
-        Raises ``UnsupportedOrderTypeError`` if an attachment carries a
-        ``limit_price`` — MT5 TP/SL are price levels, not orders.
+        A level that is not supplied keeps its current value: it is read from
+        the position and sent back unchanged, so a partial update changes only
+        the requested side.
+
+        Raises:
+            ValueError: neither *take_profit* nor *stop_loss* was provided.
+            OrderNotFoundError: the position no longer exists and a current
+                level must be read.
+            UnsupportedOrderTypeError: an attachment carries a ``limit_price``;
+                MT5 TP/SL are price levels, not orders.
         """
         if take_profit is not None and take_profit.limit_price is not None:
             raise UnsupportedOrderTypeError(
@@ -849,16 +857,29 @@ class MT5Adapter(Adapter):
             raise UnsupportedOrderTypeError(
                 "stop_loss.limit_price is not supported by MT5 — stop loss is a price level"
             )
+        if take_profit is None and stop_loss is None:
+            raise ValueError("At least one of take_profit or stop_loss must be provided")
         mt5 = _get_mt5()
         mt5_symbol = self._resolve_mt5_symbol(instrument)
+        need_current = take_profit is None or stop_loss is None
 
         def _modify() -> None:
             self._ensure_symbol_selected(mt5_symbol, mt5)
+            current_tp: Decimal | None = None
+            current_sl: Decimal | None = None
+            if need_current:
+                current = self._read_position_tpsl_sync(mt5, position_id)
+                if current is None:
+                    raise OrderNotFoundError(f"No open MT5 position with ticket {position_id!r}")
+                current_tp, current_sl = current
+
+            resolved_tp = take_profit.trigger_price if take_profit is not None else current_tp
+            resolved_sl = stop_loss.trigger_price if stop_loss is not None else current_sl
             request = build_mt5_sltp_request(
                 position_id,
                 mt5_symbol,
-                take_profit=float(take_profit.trigger_price) if take_profit is not None else None,
-                stop_loss=float(stop_loss.trigger_price) if stop_loss is not None else None,
+                take_profit=float(resolved_tp) if resolved_tp is not None else 0.0,
+                stop_loss=float(resolved_sl) if resolved_sl is not None else 0.0,
                 mt5_module=mt5,
             )
             result = mt5.order_send(request)
@@ -867,6 +888,27 @@ class MT5Adapter(Adapter):
             parse_mt5_result(result, position_id, mt5_module=mt5)
 
         await asyncio.to_thread(_modify)
+
+    def _read_position_tpsl_sync(
+        self, mt5: Any, position_id: str
+    ) -> tuple[Decimal | None, Decimal | None] | None:
+        """Read ``(take_profit, stop_loss)`` as Decimals, or ``None`` when flat.
+
+        Must run on the MT5 worker thread.  A transport failure raises through
+        ``_check_call_result``; an empty result means the position does not
+        exist.
+        """
+        positions = mt5.positions_get(ticket=int(position_id))
+        self._check_call_result("positions_get", positions)
+        if not positions:
+            return None
+        pos = positions[0]
+        tp = getattr(pos, "tp", 0.0)
+        sl = getattr(pos, "sl", 0.0)
+        return (
+            Decimal(str(tp)) if tp else None,
+            Decimal(str(sl)) if sl else None,
+        )
 
     async def get_position_tpsl(
         self,
@@ -885,16 +927,13 @@ class MT5Adapter(Adapter):
         mt5 = _get_mt5()
 
         def _read() -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
-            positions = mt5.positions_get(ticket=int(position_id))
-            self._check_call_result("positions_get", positions)
-            if not positions:
+            current = self._read_position_tpsl_sync(mt5, position_id)
+            if current is None:
                 return None
-            pos = positions[0]
-            tp = getattr(pos, "tp", 0.0)
-            sl = getattr(pos, "sl", 0.0)
+            tp, sl = current
             return (
-                TpSlAttachment(trigger_price=Decimal(str(tp))) if tp else None,
-                TpSlAttachment(trigger_price=Decimal(str(sl))) if sl else None,
+                TpSlAttachment(trigger_price=tp) if tp is not None else None,
+                TpSlAttachment(trigger_price=sl) if sl is not None else None,
             )
 
         return await asyncio.to_thread(_read)
