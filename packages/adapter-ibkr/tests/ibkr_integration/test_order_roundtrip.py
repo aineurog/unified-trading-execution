@@ -9,6 +9,7 @@ Coverage:
   - LIMIT / STOP / STOP_LIMIT roundtrip (place → get → cancel → gone)
   - MARKET fill (fills + positions)
   - bracket LIMIT+TP/SL (OCA, parentId)
+  - position TP/SL replace (no stacking, OCA, single-side preserve, carve-out)
   - fetch_reconciliation (positions/balances/open_orders/fills + since)
   - get_rate_limits
 """
@@ -23,6 +24,7 @@ from uuid import uuid4
 
 import pytest
 
+from unified_trading_execution.errors import OrderNotFoundError
 from unified_trading_execution.ibkr import IBKRAdapter
 from unified_trading_execution.types.enums import (
     AssetClass,
@@ -36,7 +38,7 @@ from unified_trading_execution.types.order import OrderModification, TpSlAttachm
 
 pytestmark = pytest.mark.asyncio
 
-SYMBOL = "NVDA"
+SYMBOL = "SAP"
 FX_SYMBOL = "EUR"
 
 
@@ -45,11 +47,36 @@ def _cid(prefix: str = "itest") -> str:
 
 
 def _stock() -> Instrument:
-    return Instrument(symbol=SYMBOL, asset_class=AssetClass.STOCK, currency="USD")
+    return Instrument(symbol=SYMBOL, asset_class=AssetClass.STOCK, currency="EUR")
 
 
 def _fx() -> Instrument:
     return Instrument(symbol=FX_SYMBOL, quote_currency="USD", asset_class=AssetClass.MARGIN_FX)
+
+
+def _protection_trades(adapter: IBKRAdapter, position_id: str | None = None) -> list:
+    """Live position-protection trades, optionally scoped to one conId."""
+
+    def _match(ref: str) -> bool:
+        if position_id is not None:
+            return ref.startswith(f"{position_id}-tp-") or ref.startswith(f"{position_id}-sl-")
+        return "-tp-" in ref or "-sl-" in ref
+
+    ib = adapter._require_ib()
+    return [t for t in ib.openTrades() if _match(str(getattr(t.order, "orderRef", "") or ""))]
+
+
+async def _cancel_all_protection(adapter: IBKRAdapter) -> None:
+    ib = adapter._require_ib()
+    canceled = False
+    for trade in list(ib.openTrades()):
+        ref = str(getattr(trade.order, "orderRef", "") or "")
+        if "-tp-" in ref or "-sl-" in ref:
+            with contextlib.suppress(Exception):
+                ib.cancelOrder(trade.order)
+                canceled = True
+    if canceled:
+        await asyncio.sleep(1)
 
 
 async def _wait_gone(adapter: IBKRAdapter, cid: str, timeout: float = 6) -> bool:
@@ -276,74 +303,106 @@ async def test_fetch_reconciliation(connected_adapter: IBKRAdapter) -> None:
 
 
 async def test_modify_position_tpsl(connected_adapter: IBKRAdapter) -> None:
-    """Create a 1-share NVDA position via MARKET, then set TP/SL via OCA."""
+    """Position TP/SL is replaced as a pair, never stacked.
+
+    Regression guard: repeated ``modify_position_tpsl`` calls leave exactly one
+    OCA pair, a TP-only update preserves the SL, the pair is carved out of
+    ``fetch_open_orders``, and a flat-leg modify cancels the leftovers before
+    raising ``OrderNotFoundError``.
+    """
     adapter = connected_adapter
     inst = _stock()
-    # Ensure flat first
-    for pos in await adapter.fetch_positions():
-        if pos.instrument.symbol == SYMBOL and pos.quantity != 0:
-            # flatten any existing NVDA
-            side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
-            await adapter.place_order(
-                UnifiedOrder(
-                    instrument=inst,
-                    order_type=OrderType.MARKET,
-                    side=side,
-                    quantity=abs(pos.quantity),
-                    time_in_force=TimeInForce.GTC,
-                    client_order_id=_cid("flatten"),
+    position_id: str | None = None
+
+    async def _flatten() -> None:
+        for pos in await adapter.fetch_positions():
+            if pos.instrument.symbol == SYMBOL and pos.quantity != 0:
+                side = OrderSide.SELL if pos.quantity > 0 else OrderSide.BUY
+                await adapter.place_order(
+                    UnifiedOrder(
+                        instrument=inst,
+                        order_type=OrderType.MARKET,
+                        side=side,
+                        quantity=abs(pos.quantity),
+                        time_in_force=TimeInForce.GTC,
+                        client_order_id=_cid("flatten"),
+                    )
                 )
+                await asyncio.sleep(1.5)
+
+    try:
+        await _flatten()
+        await adapter.place_order(
+            UnifiedOrder(
+                instrument=inst,
+                order_type=OrderType.MARKET,
+                side=OrderSide.BUY,
+                quantity=Decimal("1"),
+                time_in_force=TimeInForce.GTC,
+                client_order_id=_cid("tpsl-pos"),
             )
-            await asyncio.sleep(1.5)
-    # Open 1 share
-    cid = _cid("tpsl-pos")
-    await adapter.place_order(
-        UnifiedOrder(
-            instrument=inst,
-            order_type=OrderType.MARKET,
-            side=OrderSide.BUY,
-            quantity=Decimal("1"),
-            time_in_force=TimeInForce.GTC,
-            client_order_id=cid,
         )
-    )
-    await asyncio.sleep(2)
-    positions = await adapter.fetch_positions()
-    nvda = next((p for p in positions if p.instrument.symbol == SYMBOL), None)
-    assert nvda is not None and nvda.position_id is not None, "no NVDA position for tpsl test"
-    # Place TP/SL
-    await adapter.modify_position_tpsl(
-        nvda.instrument,
-        nvda.position_id,
-        take_profit=TpSlAttachment(Decimal("300")),
-        stop_loss=TpSlAttachment(Decimal("200")),
-    )
-    await asyncio.sleep(1)
-    open_orders = await adapter.fetch_open_orders()
-    # Should have 2 OCA orders for that conId (TP LMT 300, SL STP 200)
-    tpsl = [
-        o
-        for o in open_orders.values()
-        if o.quantity == Decimal("1") and o.price in (Decimal("300"), None)
-    ]
-    assert len(tpsl) >= 1  # at least TP
-    # Cleanup tpsl
-    for oid in list(open_orders.keys()):
-        with contextlib.suppress(Exception):
-            await adapter.cancel_order(oid)
-    await asyncio.sleep(1)
-    # Flatten
-    await adapter.place_order(
-        UnifiedOrder(
-            instrument=inst,
-            order_type=OrderType.MARKET,
-            side=OrderSide.SELL,
-            quantity=Decimal("1"),
-            time_in_force=TimeInForce.GTC,
-            client_order_id=_cid("flat2"),
+        await asyncio.sleep(2)
+        nvda = next(
+            (p for p in await adapter.fetch_positions() if p.instrument.symbol == SYMBOL), None
         )
-    )
-    await asyncio.sleep(1)
+        assert nvda is not None and nvda.position_id is not None, "no position for tpsl test"
+        position_id = nvda.position_id
+
+        # Set the pair, read back through get_position_tpsl.
+        await adapter.modify_position_tpsl(
+            nvda.instrument,
+            position_id,
+            take_profit=TpSlAttachment(Decimal("300")),
+            stop_loss=TpSlAttachment(Decimal("200")),
+        )
+        await asyncio.sleep(1)
+        assert await adapter.get_position_tpsl(nvda.instrument, position_id) == (
+            TpSlAttachment(Decimal("300")),
+            TpSlAttachment(Decimal("200")),
+        )
+        assert len(_protection_trades(adapter, position_id)) == 2
+
+        # Adapter-internal: carved out of the order mirror.
+        open_orders = await adapter.fetch_open_orders()
+        assert not [cid for cid in open_orders if "-tp-" in cid or "-sl-" in cid]
+        refs_before = {t.order.orderRef for t in _protection_trades(adapter, position_id)}
+
+        # Single-side update replaces the pair and preserves the SL.
+        await adapter.modify_position_tpsl(
+            nvda.instrument, position_id, take_profit=TpSlAttachment(Decimal("305"))
+        )
+        await asyncio.sleep(1)
+        refs_after = {t.order.orderRef for t in _protection_trades(adapter, position_id)}
+        assert refs_after.isdisjoint(refs_before)  # fresh, unique refs per generation
+        assert await adapter.get_position_tpsl(nvda.instrument, position_id) == (
+            TpSlAttachment(Decimal("305")),
+            TpSlAttachment(Decimal("200")),
+        )
+        pair = _protection_trades(adapter, position_id)
+        assert len(pair) == 2, "replace must not stack"
+        assert {str(t.order.orderType) for t in pair} == {"LMT", "STP"}
+        assert {t.order.ocaGroup for t in pair} == {f"pos-tpsl-{position_id}"}
+        lmt = {Decimal(str(t.order.lmtPrice)) for t in pair if t.order.orderType == "LMT"}
+        aux = {Decimal(str(t.order.auxPrice)) for t in pair if t.order.orderType == "STP"}
+        assert lmt == {Decimal("305")}  # stale 300 is gone
+        assert aux == {Decimal("200")}  # unmentioned SL preserved
+
+        # An external close leaves the pair live until the adapter is asked.
+        await _flatten()
+        assert _protection_trades(adapter, position_id), "external close is not auto-cleared"
+
+        # A flat-leg modify clears the leftovers, then raises.
+        with pytest.raises(OrderNotFoundError):
+            await adapter.modify_position_tpsl(
+                nvda.instrument, position_id, take_profit=TpSlAttachment(Decimal("305"))
+            )
+        await asyncio.sleep(1)
+        assert _protection_trades(adapter, position_id) == []
+    finally:
+        if adapter.is_connected:
+            await _cancel_all_protection(adapter)
+            await _flatten()
 
 
 async def test_tif_variants(connected_adapter: IBKRAdapter) -> None:

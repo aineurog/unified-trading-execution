@@ -25,7 +25,7 @@ from unified_trading_execution.errors import (
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.ibkr import IBKRAdapter, IBKRConfig
-from unified_trading_execution.ibkr.adapter import _parse_good_till_date
+from unified_trading_execution.ibkr.adapter import _parse_good_till_date, _trade_to_record
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -81,6 +81,45 @@ def _trade(
         permId=perm_id,
     )
     return Trade(contract=Contract(), order=order, orderStatus=order_status)
+
+
+def _protection_trade(
+    ref: str,
+    order_id: int,
+    *,
+    order_type: str = "LMT",
+    lmt: object = None,
+    aux: object = None,
+    total_qty: float = 10,
+) -> Trade:
+    """Build an opposite-side position-protection Trade (``<conId>-tp-...``)."""
+    order = Order(
+        orderId=order_id,
+        permId=order_id,
+        orderRef=ref,
+        action="SELL",
+        totalQuantity=total_qty,
+        orderType=order_type,
+    )
+    if lmt is not None:
+        order.lmtPrice = Decimal(str(lmt))
+    if aux is not None:
+        order.auxPrice = Decimal(str(aux))
+    status = IBOrderStatus(
+        orderId=order_id,
+        status="Submitted",
+        filled=0,
+        remaining=total_qty,
+        avgFillPrice=0,
+        permId=order_id,
+    )
+    return Trade(contract=Contract(), order=order, orderStatus=status)
+
+
+def _stock_contract(symbol: str = "AAPL", con_id: int = 111) -> Contract:
+    contract = Contract(symbol=symbol, secType="STK", exchange="SMART", currency="USD")
+    contract.conId = con_id
+    return contract
 
 
 # ---------------------------------------------------------------------------
@@ -554,6 +593,190 @@ class TestModifyPositionTpsl:
                 AAPL, "111", take_profit=TpSlAttachment(Decimal("1"))
             )
 
+    def _live_orders(self, mock_ib: MagicMock, trades: list[Trade]) -> list[Trade]:
+        """Wire ``openTrades``/``cancelOrder`` to a mutable live list.
+
+        ``cancelOrder`` removes the trade so the bounded-confirmation loop can
+        see it leave. Returns the list so tests can assert it is empty.
+        """
+        live = list(trades)
+        mock_ib.openTrades.side_effect = lambda: list(live)  # type: ignore[attr-defined]
+
+        def _cancel(order: Order) -> None:
+            live[:] = [t for t in live if t.order.orderId != order.orderId]
+
+        mock_ib.cancelOrder.side_effect = _cancel  # type: ignore[attr-defined]
+        return live
+
+    def _capture_places(self, mock_ib: MagicMock) -> list[Order]:
+        placed: list[Order] = []
+
+        def _place(_c: Contract, o: Order) -> Trade:
+            o.orderId = 100 + len(placed)
+            o.permId = 100 + len(placed)
+            placed.append(o)
+            return _trade(order_ref=o.orderRef, order_id=o.orderId, perm_id=o.permId)
+
+        mock_ib.placeOrder.side_effect = _place  # type: ignore[attr-defined]
+        return placed
+
+    async def test_replaces_existing_pair(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        live = self._live_orders(
+            mock_ib,
+            [
+                _protection_trade("111-tp-old001", 1, lmt="120"),
+                _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+            ],
+        )
+        placed = self._capture_places(mock_ib)
+
+        await adapter.modify_position_tpsl(
+            AAPL,
+            "111",
+            take_profit=TpSlAttachment(Decimal("150")),
+            stop_loss=TpSlAttachment(Decimal("90")),
+        )
+
+        assert mock_ib.cancelOrder.call_count == 2  # old pair cleared
+        assert live == []  # confirmed gone before placing
+        assert len(placed) == 2  # exactly one replacement pair, no stacking
+        assert placed[0].lmtPrice == Decimal("150")
+        assert placed[1].auxPrice == Decimal("90")
+        assert placed[0].ocaGroup == placed[1].ocaGroup == "pos-tpsl-111"
+
+    async def test_single_side_tp_update_preserves_sl(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        self._live_orders(
+            mock_ib,
+            [
+                _protection_trade("111-tp-old001", 1, lmt="120"),
+                _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+            ],
+        )
+        placed = self._capture_places(mock_ib)
+
+        await adapter.modify_position_tpsl(AAPL, "111", take_profit=TpSlAttachment(Decimal("140")))
+
+        assert len(placed) == 2  # preserved SL is re-placed, not silently dropped
+        assert placed[0].orderType == "LMT" and placed[0].lmtPrice == Decimal("140")
+        assert placed[1].orderType == "STP" and placed[1].auxPrice == Decimal("80")
+        assert placed[0].ocaGroup == placed[1].ocaGroup == "pos-tpsl-111"
+
+    async def test_single_side_sl_update_preserves_tp(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        self._live_orders(
+            mock_ib,
+            [
+                _protection_trade("111-tp-old001", 1, lmt="120"),
+                _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+            ],
+        )
+        placed = self._capture_places(mock_ib)
+
+        await adapter.modify_position_tpsl(AAPL, "111", stop_loss=TpSlAttachment(Decimal("85")))
+
+        assert len(placed) == 2
+        assert placed[0].orderType == "LMT" and placed[0].lmtPrice == Decimal("120")
+        assert placed[1].orderType == "STP" and placed[1].auxPrice == Decimal("85")
+
+    async def test_protective_refs_are_unique_across_replaces(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        live = self._live_orders(
+            mock_ib,
+            [
+                _protection_trade("111-tp-old001", 1, lmt="120"),
+                _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+            ],
+        )
+        placed = self._capture_places(mock_ib)
+
+        for i in range(4):
+            await adapter.modify_position_tpsl(
+                AAPL,
+                "111",
+                take_profit=TpSlAttachment(Decimal(str(150 + i))),
+                stop_loss=TpSlAttachment(Decimal(str(90 - i))),
+            )
+
+        refs = [o.orderRef for o in placed]
+        assert live == []  # each call replaced, never stacked
+        assert len(refs) == 8
+        assert len(set(refs)) == 8  # every protective order gets its own ref
+        assert all(len(r.rsplit("-", 1)[-1]) == 12 for r in refs)
+
+    async def test_cancel_not_confirmed_refuses_to_stack(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import unified_trading_execution.ibkr.adapter as adapter_module
+
+        monkeypatch.setattr(adapter_module, "_PROTECTION_CANCEL_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(adapter_module, "_PROTECTION_CANCEL_POLL_SECONDS", 0.01)
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=10)]  # type: ignore[attr-defined]
+        live = [
+            _protection_trade("111-tp-old001", 1, lmt="120"),
+            _protection_trade("111-sl-old001", 2, order_type="STP", aux="80"),
+        ]
+        mock_ib.openTrades.side_effect = lambda: list(live)  # type: ignore[attr-defined]
+        mock_ib.cancelOrder.side_effect = lambda _o: None  # type: ignore[attr-defined]
+
+        with pytest.raises(PlatformError, match="did not cancel"):
+            await adapter.modify_position_tpsl(
+                AAPL, "111", take_profit=TpSlAttachment(Decimal("150"))
+            )
+        assert not mock_ib.placeOrder.called  # never stack on an unclear pair
+
+    async def test_flat_position_clears_leftovers_then_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = [self._pos(con_id=111, qty=0)]  # type: ignore[attr-defined]
+        live = self._live_orders(mock_ib, [_protection_trade("111-tp-old001", 1, lmt="120")])
+
+        with pytest.raises(OrderNotFoundError, match="flat"):
+            await adapter.modify_position_tpsl(
+                AAPL, "111", take_profit=TpSlAttachment(Decimal("150"))
+            )
+        assert live == []  # leftover cancelled despite the flat leg
+        assert not mock_ib.placeOrder.called
+
+    async def test_absent_position_clears_leftovers_then_raises(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        mock_ib.positions.return_value = []  # type: ignore[attr-defined]
+        live = self._live_orders(mock_ib, [_protection_trade("999-tp-old001", 1, lmt="120")])
+
+        with pytest.raises(OrderNotFoundError, match="no position"):
+            await adapter.modify_position_tpsl(
+                AAPL, "999", take_profit=TpSlAttachment(Decimal("150"))
+            )
+        assert live == []
+        assert not mock_ib.placeOrder.called
+
 
 class TestGetPositionTpsl:
     def _pos(self, con_id: int = 111, qty: float = 10) -> object:
@@ -666,6 +889,154 @@ class TestGetPositionTpsl:
     async def test_not_connected(self, adapter: IBKRAdapter) -> None:
         with pytest.raises(PlatformConnectionError):
             await adapter.get_position_tpsl(AAPL, "111")
+
+
+class TestProtectionCarveOut:
+    async def test_fetch_open_orders_excludes_protection(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        normal = _trade(order_ref="cid-normal", order_id=10)
+        normal.contract = _stock_contract()
+        protection = _protection_trade("111-tp-ab12cd", 11, lmt="150")
+        protection.contract = _stock_contract()
+        mock_ib.openTrades.return_value = [normal, protection]  # type: ignore[attr-defined]
+
+        records = await adapter.fetch_open_orders()
+
+        assert set(records) == {"cid-normal"}  # internal protection not mirrored
+
+    def test_on_order_status_skips_protection(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        protection = _protection_trade("111-tp-ab12cd", 11, lmt="150")
+        protection.contract = _stock_contract()
+
+        adapter._on_order_status(protection)
+
+        assert captured == []  # never enters the order mirror via the push stream
+
+    async def test_user_ref_with_infix_head_is_kept(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        user = _trade(order_ref="acct-tp-1", order_id=20)
+        user.contract = _stock_contract()
+        mock_ib.openTrades.return_value = [user]  # type: ignore[attr-defined]
+
+        records = await adapter.fetch_open_orders()
+
+        assert set(records) == {"acct-tp-1"}  # non-numeric head is not protection
+
+    def test_user_ref_status_publishes(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        user = _trade(order_ref="acct-tp-1", order_id=20)
+        user.contract = _stock_contract()
+
+        adapter._on_order_status(user)
+
+        assert len(captured) == 1  # a non-numeric head must still be mirrored
+
+    def test_publish_status_guard_rejects_protection(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        trade = _protection_trade("111-tp-ab12cd", 11, lmt="150")
+        trade.contract = _stock_contract()
+        record = _trade_to_record(trade)
+        assert record is not None
+
+        published = adapter._publish_status_event(record)
+
+        assert published is False
+        assert captured == []
+
+    def test_terminal_from_error_skips_protection(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        trade = _protection_trade("111-tp-ab12cd", 42, lmt="150")
+        trade.contract = _stock_contract()
+        mock_ib_async_module.trades.return_value = [trade]  # type: ignore[attr-defined]
+
+        adapter._publish_terminal_from_error(42, OrderStatus.CANCELLED)
+
+        assert captured == []  # 202 cancel of a protective order stays out of the mirror
+
+    async def test_protection_cancel_ack_is_debug_not_warning(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        await adapter.connect()
+        trade = _protection_trade("111-tp-ab12cd", 83, lmt="150")
+        trade.contract = _stock_contract()
+        mock_ib_async_module.trades.return_value = [trade]  # type: ignore[attr-defined]
+
+        with caplog.at_level(logging.WARNING, logger="unified_trading_execution.ibkr.adapter"):
+            adapter._on_error(83, 202, "Order Canceled - reason:Order was discarded.")
+            adapter._on_error(83, 161, "Cancel attempted when order is not in a cancellable state.")
+
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    async def test_normal_cancel_ack_still_warns(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: MagicMock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        await adapter.connect()
+        trade = _trade(order_ref="cid-real", order_id=84)
+        trade.contract = _stock_contract()
+        mock_ib_async_module.trades.return_value = [trade]  # type: ignore[attr-defined]
+
+        with caplog.at_level(logging.WARNING, logger="unified_trading_execution.ibkr.adapter"):
+            adapter._on_error(84, 202, "Order Canceled - reason:")
+
+        assert [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    def test_protection_ref_suffix_is_random_not_time_bucketed(self) -> None:
+        from unified_trading_execution.ibkr.adapter import _protection_ref_suffix
+
+        suffixes = {_protection_ref_suffix() for _ in range(50)}
+        assert len(suffixes) == 50  # time-bucketed suffixes would all be equal
+        assert all(len(s) == 12 for s in suffixes)
+
+    def test_bracket_child_status_still_publishes(
+        self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock
+    ) -> None:
+        from unified_trading_execution.events import OrderStatusEvent
+
+        captured: list[OrderStatusEvent] = []
+        adapter._event_bus.subscribe(OrderStatusEvent, lambda e: captured.append(e))  # type: ignore[arg-type]
+        child = _trade(order_ref="parent-1:tp", order_id=12, status="Submitted")
+        child.contract = _stock_contract()
+
+        adapter._on_order_status(child)
+
+        assert len(captured) == 1  # bracket children are engine orders, not carved out
 
 
 # ---------------------------------------------------------------------------

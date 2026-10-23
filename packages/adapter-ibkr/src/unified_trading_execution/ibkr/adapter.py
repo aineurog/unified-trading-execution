@@ -110,6 +110,47 @@ _BALANCE_TAGS: frozenset[str] = frozenset(
     {"TotalCashValue", "NetLiquidation", "CashBalance", "AvailableFunds"}
 )
 
+# Position-protection orders (``<conId>-tp-...`` / ``<conId>-sl-...``) are
+# internal adapter artifacts, not engine orders: they are carved out of the
+# order mirror and are always replaced as a pair. A replacement cancel must be
+# confirmed by the order leaving ``openTrades()``; the bound below stops a
+# stuck cancel from silently becoming a second live pair.
+_PROTECTION_TP_INFIX = "-tp-"
+_PROTECTION_SL_INFIX = "-sl-"
+_PROTECTION_CANCEL_TIMEOUT_SECONDS = 5.0
+_PROTECTION_CANCEL_POLL_SECONDS = 0.2
+
+
+def _is_position_protection_ref(client_order_id: str) -> bool:
+    """True for a position-protection ``orderRef`` (``<conId>-tp-...``).
+
+    ``position_id`` is ``str(conId)``, so the prefix before the infix must be
+    all digits. This keeps an arbitrary user-supplied ``client_order_id`` that
+    merely contains ``-tp-``/``-sl-`` from being hidden from the mirror.
+    """
+    for infix in (_PROTECTION_TP_INFIX, _PROTECTION_SL_INFIX):
+        head, sep, _ = client_order_id.partition(infix)
+        if sep and head.isdigit():
+            return True
+    return False
+
+
+def _protection_ref_prefixes(position_id: str) -> tuple[str, str]:
+    return (
+        f"{position_id}{_PROTECTION_TP_INFIX}",
+        f"{position_id}{_PROTECTION_SL_INFIX}",
+    )
+
+
+def _protection_ref_suffix() -> str:
+    """Short collision-free suffix for a protective ``orderRef``.
+
+    The UUID7 string ends in its 48 random bits; taking the tail avoids the
+    time-bucketed prefix, which is constant within a session and therefore
+    not unique on its own, while keeping the ref short.
+    """
+    return str(uuid7()).replace("-", "")[-12:]
+
 
 def _new_id() -> str:
     return str(uuid7())
@@ -1064,14 +1105,29 @@ class IBKRAdapter(Adapter):
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
     ) -> None:
-        """Modify TP/SL on an existing open position.
+        """Replace the TP/SL on an existing open position.
 
-        Places OCA-linked opposite-side orders for the position's contract.
-        ``position_id`` is ``str(contract.conId)`` from ``Position``; it is
-        globally unique, so *instrument* is accepted for interface uniformity
-        and not used to address the position.  At least one of
-        ``take_profit``/``stop_loss`` must be provided.
-        Uses the same ``LMT``/``STP``/``STP LMT`` mapping as brackets.
+        The position's protective OCA pair is replaced, never stacked. The
+        existing ``<conId>-tp-``/``<conId>-sl-`` orders are cancelled and
+        confirmed gone, then a new pair is placed holding the requested sides
+        plus whichever side the caller did not mention (read back before the
+        cancel, so a single-side update preserves the other side at the
+        current quantity). ``position_id`` is ``str(contract.conId)`` from
+        ``Position``; it is globally unique, so *instrument* is accepted for
+        interface uniformity and not used to address the position. At least
+        one of ``take_profit``/``stop_loss`` must be provided. Uses the same
+        ``LMT``/``STP``/``STP LMT`` mapping as brackets.
+
+        A flat or absent leg still has its leftover pair cancelled before
+        ``OrderNotFoundError`` is raised: a protective order is not
+        reduce-only, so a leftover with no position could open new exposure.
+
+        Raises:
+            ValueError: neither side given, or ``take_profit.limit_price`` is
+                set (a profit-taker is LMT at its trigger).
+            OrderNotFoundError: no open position at *position_id*.
+            PlatformError: the previous pair could not be confirmed cancelled,
+                or listing/cancelling it failed.
         """
         if take_profit is None and stop_loss is None:
             raise ValueError("at least one of take_profit or stop_loss must be provided")
@@ -1080,7 +1136,7 @@ class IBKRAdapter(Adapter):
                 "take_profit.limit_price is not supported — profit-taker is LMT at trigger"
             )
         ib = self._require_ib()
-        # Find the position leg by conId
+        # Find the position leg by conId.
         target = None
         for pos in ib.positions():
             cid = str(getattr(pos.contract, "conId", "") or "")
@@ -1088,11 +1144,31 @@ class IBKRAdapter(Adapter):
                 target = pos
                 break
         if target is None:
+            await self._cancel_owned_protection(position_id)
             raise OrderNotFoundError(f"no position for conId {position_id!r}")
         qty = Decimal(str(target.position))
         if qty == 0:
+            await self._cancel_owned_protection(position_id)
             raise OrderNotFoundError(f"position {position_id!r} is flat")
-        # Opposite side closes the position
+
+        # Snapshot the unmentioned sides before clearing the existing pair, so
+        # a single-side update is a true merge rather than a silent clear.
+        effective_tp = take_profit
+        effective_sl = stop_loss
+        if effective_tp is None or effective_sl is None:
+            current_tp, current_sl = await self.get_position_tpsl(instrument, position_id) or (
+                None,
+                None,
+            )
+            if effective_tp is None:
+                effective_tp = current_tp
+            if effective_sl is None:
+                effective_sl = current_sl
+
+        # Clear the previous pair and confirm it is gone before writing.
+        await self._cancel_owned_protection(position_id)
+
+        # Opposite side closes the position.
         is_long = qty > 0
         action = "SELL" if is_long else "BUY"
         abs_qty = float(abs(qty))
@@ -1106,40 +1182,90 @@ class IBKRAdapter(Adapter):
         orders: list[Order] = []
         # Use GTC for protective orders (IBKR default for held orders)
         tif_kwargs: dict[str, object] = {"tif": "GTC"}
-        if take_profit is not None:
+        if effective_tp is not None:
             tp = Order(
                 action=action,
                 totalQuantity=abs_qty,
                 orderType="LMT",
-                lmtPrice=take_profit.trigger_price,
-                orderRef=f"{position_id}-tp-{str(uuid7()).replace('-', '')[:6]}",
+                lmtPrice=effective_tp.trigger_price,
+                orderRef=f"{position_id}-tp-{_protection_ref_suffix()}",
                 **tif_kwargs,  # type: ignore[arg-type]
             )
             orders.append(tp)
-        if stop_loss is not None:
-            sl_type = "STP LMT" if stop_loss.limit_price is not None else "STP"
+        if effective_sl is not None:
+            sl_type = "STP LMT" if effective_sl.limit_price is not None else "STP"
             sl_kwargs: dict[str, object] = {
                 "action": action,
                 "totalQuantity": abs_qty,
                 "orderType": sl_type,
-                "auxPrice": stop_loss.trigger_price,
-                "orderRef": f"{position_id}-sl-{str(uuid7()).replace('-', '')[:6]}",
+                "auxPrice": effective_sl.trigger_price,
+                "orderRef": f"{position_id}-sl-{_protection_ref_suffix()}",
                 **tif_kwargs,
             }
-            if stop_loss.limit_price is not None:
-                sl_kwargs["lmtPrice"] = stop_loss.limit_price
+            if effective_sl.limit_price is not None:
+                sl_kwargs["lmtPrice"] = effective_sl.limit_price
             sl = Order(**sl_kwargs)  # type: ignore[arg-type]
             orders.append(sl)
         if len(orders) == 2:
             oca = f"pos-tpsl-{position_id}"
             for o in orders:
                 o.ocaGroup = oca
-        # Transmit atomically: only last transmits
+        # Transmit atomically: only last transmits.
         for o in orders[:-1]:
             o.transmit = False
         orders[-1].transmit = True
         for o in orders:
             ib.placeOrder(order_contract, o)
+
+    async def _cancel_owned_protection(self, position_id: str) -> None:
+        """Cancel every ``<conId>-tp-``/``<conId>-sl-`` order and confirm it left.
+
+        Best-effort and idempotent: a no-op when no owned protection exists.
+        Raises ``PlatformError`` when the orders are still live after the
+        bounded wait, so the caller never places a replacement pair on top of
+        one it could not clear.
+        """
+        ib = self._require_ib()
+        tp_prefix, sl_prefix = _protection_ref_prefixes(position_id)
+
+        def _matching() -> list[Trade]:
+            try:
+                trades = ib.openTrades()
+            except UteError:
+                raise
+            except Exception as exc:
+                raise PlatformConnectionError(
+                    f"failed to list IBKR open orders while replacing protection: {exc}"
+                ) from exc
+            return [
+                trade
+                for trade in trades
+                if str(getattr(trade.order, "orderRef", "") or "").startswith(
+                    (tp_prefix, sl_prefix)
+                )
+            ]
+
+        for trade in _matching():
+            ref = str(getattr(trade.order, "orderRef", "") or "")
+            try:
+                ib.cancelOrder(trade.order)
+            except UteError:
+                raise
+            except Exception as exc:
+                raise PlatformError(
+                    f"failed to cancel existing protective order {ref!r}: {exc}"
+                ) from exc
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _PROTECTION_CANCEL_TIMEOUT_SECONDS
+        while loop.time() < deadline:
+            if not _matching():
+                return
+            await asyncio.sleep(_PROTECTION_CANCEL_POLL_SECONDS)
+        raise PlatformError(
+            f"protective orders for conId {position_id!r} did not cancel within "
+            f"{_PROTECTION_CANCEL_TIMEOUT_SECONDS:.0f}s; refusing to stack a new pair"
+        )
 
     async def get_position_tpsl(
         self,
@@ -1173,8 +1299,7 @@ class IBKRAdapter(Adapter):
 
         take_profit: TpSlAttachment | None = None
         stop_loss: TpSlAttachment | None = None
-        tp_prefix = f"{position_id}-tp-"
-        sl_prefix = f"{position_id}-sl-"
+        tp_prefix, sl_prefix = _protection_ref_prefixes(position_id)
 
         # ib_async uses the UNSET_DOUBLE sentinel (~1.797e308) for unset price
         # fields rather than None — treat anything absurdly large as unset.
@@ -1309,6 +1434,12 @@ class IBKRAdapter(Adapter):
         ``_trade_to_record`` (shared with the ``orderStatusEvent`` handler).
         Keyed by ``client_order_id`` (``orderRef``) falling back to
         ``platform_order_id`` so orphans remain reconcilable.
+
+        Position-protection orders (``<conId>-tp-``/``<conId>-sl-``) are
+        adapter-internal artifacts, not engine orders; they are excluded here
+        by their deterministic ``orderRef`` prefix and read through
+        :meth:`get_position_tpsl` instead, so they are never imported into the
+        order mirror or flagged as orphans.
         """
         ib = self._require_ib()
         try:
@@ -1320,6 +1451,9 @@ class IBKRAdapter(Adapter):
 
         result: dict[str, OrderRecord] = {}
         for trade in trades:
+            ref = str(getattr(getattr(trade, "order", None), "orderRef", "") or "")
+            if _is_position_protection_ref(ref):
+                continue
             record = _trade_to_record(trade)
             if record is None:
                 continue
@@ -1512,6 +1646,17 @@ class IBKRAdapter(Adapter):
                     instrument = from_ibkr_contract(candidate)
                     self._invalidate_spec_cache(instrument)
             mapped = map_ibkr_error(error_code, error_string)
+            if error_code in (161, 202) and self._req_id_is_protection(req_id):
+                # Expected acknowledgement while cancelling the previous
+                # protective pair before a replace (202 "discarded", 161
+                # "not cancellable"). Debug, not a warning.
+                logger.debug(
+                    "IBKR protection cancel ack %s (reqId=%s): %s",
+                    error_code,
+                    req_id,
+                    error_string,
+                )
+                return
             logger.warning(
                 "IBKR error %s (reqId=%s) mapped to %s: %s",
                 error_code,
@@ -1526,6 +1671,30 @@ class IBKRAdapter(Adapter):
                 )
         except Exception as exc:
             logger.warning("Skipping errorEvent %r: %s", error_code, exc)
+
+    def _req_id_is_protection(self, req_id: int) -> bool:
+        """True when ``req_id`` is a position-protection order.
+
+        Used only to keep expected cancel acknowledgements (161/202 while the
+        pair is being replaced) out of the warning log. An unresolved reqId
+        returns False, so a real failure is never silently hidden.
+        """
+        if not req_id:
+            return False
+        ib = self._ib
+        if ib is None:
+            return False
+        try:
+            trades = ib.trades()
+        except Exception:
+            return False
+        return any(
+            getattr(getattr(t, "order", None), "orderId", None) == req_id
+            and _is_position_protection_ref(
+                str(getattr(getattr(t, "order", None), "orderRef", "") or "")
+            )
+            for t in trades
+        )
 
     def _publish_terminal_from_error(self, req_id: int, status: OrderStatus) -> None:
         """Publish a terminal ``OrderStatusEvent`` for a 201/202 rejection.
@@ -1872,8 +2041,16 @@ class IBKRAdapter(Adapter):
         open orders on every reconnect; replays upsert identical live states
         (idempotent), while repeats of an already-final state are suppressed
         via the bounded final set.
+
+        Position-protection orders are skipped for the same reason they are
+        excluded from :meth:`fetch_open_orders`: they are adapter-internal,
+        not engine orders, and must not enter the mirror. Their fills still
+        arrive through the execution stream.
         """
         try:
+            ref = str(getattr(getattr(trade, "order", None), "orderRef", "") or "")
+            if _is_position_protection_ref(ref):
+                return
             record = _trade_to_record(trade)
             if record is None:
                 return
@@ -1887,8 +2064,15 @@ class IBKRAdapter(Adapter):
         Shared by the ``orderStatusEvent`` stream, the 201/202 terminal
         path, and OCA sibling inference — one suppression rule everywhere.
         Returns True when published.
+
+        Position-protection orders are never published: this single choke
+        point covers the status stream, the 201/202 terminal-from-error path,
+        and OCA sibling inference, so no path can leak an adapter-internal
+        order into the mirror.
         """
         cid = record.client_order_id
+        if _is_position_protection_ref(cid):
+            return False
         with self._status_lock:
             if cid in self._status_final_ids:
                 return False
