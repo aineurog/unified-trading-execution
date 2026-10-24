@@ -19,6 +19,18 @@ from unified_trading_execution.events import (
     ReconciliationEvent,
     ReconciliationMismatch,
 )
+from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
+    ProtectionLevel,
+    ProtectionLevelType,
+    TrailingActivation,
+    TrailingBasis,
+    TrailingMode,
+    TrailingOffsetType,
+    TrailingPhase,
+    TrailingSpec,
+    TrailingState,
+)
 from unified_trading_execution.types.enums import (
     LIVE_ORDER_STATUSES,
     AssetClass,
@@ -109,6 +121,218 @@ def _deserialise_instrument(d: dict[str, Any]) -> Instrument:
 
 def _serialise_decimal_list(items: list[Decimal]) -> str:
     return json.dumps([str(x) for x in items])
+
+
+# ============================================================
+# Trailing state serialisation helpers
+# ============================================================
+
+# Column order used by every trailing_states insert/select.  ``offset`` is an
+# SQL keyword, so the generated column list double-quotes every name.
+_TRAILING_COLUMNS: tuple[str, ...] = (
+    "trailing_id",
+    "symbol",
+    "quote_currency",
+    "asset_class",
+    "exchange",
+    "currency",
+    "expiry",
+    "strike",
+    "option_right",
+    "multiplier",
+    "platform_symbol",
+    "position_id",
+    "position_opened_at",
+    "side",
+    "mode",
+    "routing_reason",
+    "phase",
+    "offset_type",
+    "offset",
+    "basis",
+    "resolved_basis",
+    "protection_trigger_basis",
+    "activation",
+    "activation_price",
+    "activation_profit_percent",
+    "initial_stop_type",
+    "initial_stop_value",
+    "take_profit_type",
+    "take_profit_value",
+    "step",
+    "atr_period",
+    "atr_timeframe",
+    "atr_value",
+    "atr_as_of",
+    "entry_price",
+    "quantity",
+    "current_stop",
+    "current_take_profit",
+    "stop_owned",
+    "take_profit_owned",
+    "previous_stop_loss",
+    "previous_take_profit",
+    "best_basis",
+    "resolved_activation_price",
+    "activated",
+    "native_id",
+    "last_reprice_at",
+    "reprice_count",
+    "last_error",
+    "failure_count",
+    "created_at",
+    "updated_at",
+)
+
+
+def _decimal_or_none(value: Decimal | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _datetime_or_none(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _parse_decimal(value: str | None) -> Decimal | None:
+    return Decimal(value) if value is not None else None
+
+
+def _parse_datetime(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value is not None else None
+
+
+def _serialise_protection_level(
+    level: ProtectionLevel | None,
+) -> tuple[str | None, str | None]:
+    if level is None:
+        return None, None
+    return level.type.value, str(level.value)
+
+
+def _deserialise_protection_level(
+    type_value: str | None, value: str | None
+) -> ProtectionLevel | None:
+    if type_value is None or value is None:
+        return None
+    return ProtectionLevel(type=ProtectionLevelType(type_value), value=Decimal(value))
+
+
+def _serialise_trailing_state(state: TrailingState) -> dict[str, Any]:
+    i = _serialise_instrument(state.instrument)
+    spec = state.spec
+    initial_stop_type, initial_stop_value = _serialise_protection_level(spec.initial_stop)
+    take_profit_type, take_profit_value = _serialise_protection_level(spec.take_profit)
+    return {
+        "trailing_id": state.trailing_id,
+        **i,
+        "position_id": state.position_id,
+        "position_opened_at": _datetime_or_none(state.position_opened_at),
+        "side": state.side.value,
+        "mode": state.mode.value,
+        "routing_reason": state.routing_reason,
+        "phase": state.phase.value,
+        "offset_type": spec.offset_type.value,
+        "offset": str(spec.offset),
+        "basis": spec.basis.value if spec.basis is not None else None,
+        "resolved_basis": (
+            state.resolved_basis.value if state.resolved_basis is not None else None
+        ),
+        "protection_trigger_basis": (
+            state.protection_trigger_basis.value
+            if state.protection_trigger_basis is not None
+            else None
+        ),
+        "activation": spec.activation.value,
+        "activation_price": _decimal_or_none(spec.activation_price),
+        "activation_profit_percent": _decimal_or_none(spec.activation_profit_percent),
+        "initial_stop_type": initial_stop_type,
+        "initial_stop_value": initial_stop_value,
+        "take_profit_type": take_profit_type,
+        "take_profit_value": take_profit_value,
+        "step": _decimal_or_none(spec.step),
+        "atr_period": spec.atr_period,
+        "atr_timeframe": (spec.atr_timeframe.value if spec.atr_timeframe is not None else None),
+        "atr_value": _decimal_or_none(state.atr_value),
+        "atr_as_of": _datetime_or_none(state.atr_as_of),
+        "entry_price": str(state.entry_price),
+        "quantity": str(state.quantity),
+        "current_stop": _decimal_or_none(state.current_stop),
+        "current_take_profit": _decimal_or_none(state.current_take_profit),
+        "stop_owned": int(state.stop_owned),
+        "take_profit_owned": int(state.take_profit_owned),
+        "previous_stop_loss": _decimal_or_none(state.previous_stop_loss),
+        "previous_take_profit": _decimal_or_none(state.previous_take_profit),
+        "best_basis": _decimal_or_none(state.best_basis),
+        "resolved_activation_price": _decimal_or_none(state.resolved_activation_price),
+        "activated": int(state.activated),
+        "native_id": state.native_id,
+        "last_reprice_at": _datetime_or_none(state.last_reprice_at),
+        "reprice_count": state.reprice_count,
+        "last_error": state.last_error,
+        "failure_count": state.failure_count,
+        "created_at": state.created_at.isoformat(),
+        "updated_at": state.updated_at.isoformat(),
+    }
+
+
+def _row_to_trailing_state(row: aiosqlite.Row) -> TrailingState:
+    atr_timeframe = row["atr_timeframe"]
+    spec = TrailingSpec(
+        offset_type=TrailingOffsetType(row["offset_type"]),
+        offset=Decimal(row["offset"]),
+        basis=TrailingBasis(row["basis"]) if row["basis"] is not None else None,
+        activation=TrailingActivation(row["activation"]),
+        activation_price=_parse_decimal(row["activation_price"]),
+        activation_profit_percent=_parse_decimal(row["activation_profit_percent"]),
+        initial_stop=_deserialise_protection_level(
+            row["initial_stop_type"], row["initial_stop_value"]
+        ),
+        take_profit=_deserialise_protection_level(
+            row["take_profit_type"], row["take_profit_value"]
+        ),
+        step=_parse_decimal(row["step"]),
+        atr_period=row["atr_period"],
+        atr_timeframe=CandleTimeframe(atr_timeframe) if atr_timeframe is not None else None,
+    )
+    return TrailingState(
+        trailing_id=row["trailing_id"],
+        instrument=_deserialise_instrument(dict(row)),
+        position_id=row["position_id"],
+        mode=TrailingMode(row["mode"]),
+        phase=TrailingPhase(row["phase"]),
+        spec=spec,
+        side=OrderSide(row["side"]),
+        entry_price=Decimal(row["entry_price"]),
+        quantity=Decimal(row["quantity"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        position_opened_at=_parse_datetime(row["position_opened_at"]),
+        routing_reason=row["routing_reason"],
+        resolved_basis=(
+            TrailingBasis(row["resolved_basis"]) if row["resolved_basis"] is not None else None
+        ),
+        protection_trigger_basis=(
+            TrailingBasis(row["protection_trigger_basis"])
+            if row["protection_trigger_basis"] is not None
+            else None
+        ),
+        current_stop=_parse_decimal(row["current_stop"]),
+        current_take_profit=_parse_decimal(row["current_take_profit"]),
+        stop_owned=bool(row["stop_owned"]),
+        take_profit_owned=bool(row["take_profit_owned"]),
+        previous_stop_loss=_parse_decimal(row["previous_stop_loss"]),
+        previous_take_profit=_parse_decimal(row["previous_take_profit"]),
+        best_basis=_parse_decimal(row["best_basis"]),
+        resolved_activation_price=_parse_decimal(row["resolved_activation_price"]),
+        activated=bool(row["activated"]),
+        atr_value=_parse_decimal(row["atr_value"]),
+        atr_as_of=_parse_datetime(row["atr_as_of"]),
+        native_id=row["native_id"],
+        last_reprice_at=_parse_datetime(row["last_reprice_at"]),
+        reprice_count=row["reprice_count"],
+        last_error=row["last_error"],
+        failure_count=row["failure_count"],
+    )
 
 
 # ============================================================
@@ -277,6 +501,37 @@ class StateStore(ABC):
         """
         return None
 
+    async def upsert_trailing_state(self, state: TrailingState) -> None:
+        """Write one trailing state row (insert or full replace).
+
+        Concrete default is a no-op; SQLite overrides this to persist the row.
+        Callers must hold the state's lock and pass the current full record,
+        never a snapshot captured before an await.
+        """
+        return None
+
+    async def get_trailing_state(self, trailing_id: str) -> TrailingState | None:
+        """Load one trailing state, or ``None`` when it does not exist.
+
+        Concrete default returns ``None``; SQLite overrides this.
+        """
+        return None
+
+    async def list_trailing_states(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        phases: tuple[TrailingPhase, ...] | None = None,
+    ) -> list[TrailingState]:
+        """List trailing states, newest first.
+
+        ``instrument`` filters on the full instrument identity, including
+        ``quote_currency``; never on ``symbol`` alone.  ``phases`` restricts
+        the result to the given lifecycle phases.  Concrete default returns an
+        empty list; SQLite overrides this.
+        """
+        return []
+
     @abstractmethod
     async def initialize(self) -> None: ...
     @abstractmethod
@@ -411,8 +666,9 @@ class SQLiteStateStore(StateStore):
                     """INSERT INTO positions
                        (symbol, quote_currency, asset_class, exchange, currency,
                         expiry, strike, option_right, multiplier, platform_symbol,
-                        position_id, quantity, average_entry_price, updated_at)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        position_id, quantity, average_entry_price, updated_at,
+                        opened_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         i["symbol"],
                         i["quote_currency"],
@@ -428,6 +684,7 @@ class SQLiteStateStore(StateStore):
                         str(position.quantity),
                         str(position.average_entry_price),
                         now,
+                        position.opened_at.isoformat() if position.opened_at else None,
                     ),
                 )
             except BaseException:
@@ -848,7 +1105,7 @@ class SQLiteStateStore(StateStore):
         async with self._write_lock:
             i = _serialise_instrument(instrument)
             cursor = await self.conn.execute(
-                "SELECT quantity, average_entry_price, updated_at, position_id "
+                "SELECT quantity, average_entry_price, updated_at, position_id, opened_at "
                 "FROM positions WHERE symbol=? AND quote_currency IS ? AND asset_class=?",
                 (i["symbol"], i["quote_currency"], i["asset_class"]),
             )
@@ -859,6 +1116,7 @@ class SQLiteStateStore(StateStore):
                     average_entry_price=Decimal(row["average_entry_price"]),
                     updated_at=datetime.fromisoformat(row["updated_at"]),
                     position_id=row["position_id"],
+                    opened_at=_parse_datetime(row["opened_at"]),
                 )
                 for row in await cursor.fetchall()
             ]
@@ -1048,6 +1306,64 @@ class SQLiteStateStore(StateStore):
                     (scope, i["symbol"], i["quote_currency"], i["asset_class"]),
                 )
 
+    # ---- Trailing states ----
+
+    async def upsert_trailing_state(self, state: TrailingState) -> None:
+        """Insert or fully replace one trailing state row."""
+        values = _serialise_trailing_state(state)
+        columns = ", ".join(f'"{name}"' for name in _TRAILING_COLUMNS)
+        placeholders = ", ".join("?" for _ in _TRAILING_COLUMNS)
+        params = tuple(values[name] for name in _TRAILING_COLUMNS)
+        async with self._write_lock:
+            await self.conn.execute("BEGIN")
+            try:
+                await self.conn.execute(
+                    "DELETE FROM trailing_states WHERE trailing_id=?",
+                    (state.trailing_id,),
+                )
+                await self.conn.execute(
+                    f"INSERT INTO trailing_states ({columns}) VALUES ({placeholders})",
+                    params,
+                )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
+
+    async def get_trailing_state(self, trailing_id: str) -> TrailingState | None:
+        """Load one trailing state by id; terminal rows remain queryable."""
+        async with self._write_lock:
+            cursor = await self.conn.execute(
+                "SELECT * FROM trailing_states WHERE trailing_id=?",
+                (trailing_id,),
+            )
+            row = await cursor.fetchone()
+            return _row_to_trailing_state(row) if row is not None else None
+
+    async def list_trailing_states(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        phases: tuple[TrailingPhase, ...] | None = None,
+    ) -> list[TrailingState]:
+        """List trailing states, newest first, optionally filtered."""
+        query = "SELECT * FROM trailing_states WHERE 1=1"
+        params: list[Any] = []
+        if instrument is not None:
+            i = _serialise_instrument(instrument)
+            query += " AND symbol=? AND quote_currency IS ? AND asset_class=?"
+            params.extend([i["symbol"], i["quote_currency"], i["asset_class"]])
+        if phases is not None:
+            if not phases:
+                return []
+            query += f" AND phase IN ({', '.join('?' for _ in phases)})"
+            params.extend(phase.value for phase in phases)
+        query += " ORDER BY updated_at DESC"
+        async with self._write_lock:
+            cursor = await self.conn.execute(query, params)
+            return [_row_to_trailing_state(row) for row in await cursor.fetchall()]
+
     # ---- Filtered queries ----
 
     async def query_orders(
@@ -1144,6 +1460,7 @@ class SQLiteStateStore(StateStore):
                         average_entry_price=Decimal(row["average_entry_price"]),
                         updated_at=datetime.fromisoformat(row["updated_at"]),
                         position_id=row["position_id"],
+                        opened_at=_parse_datetime(row["opened_at"]),
                     )
                 )
             return results
