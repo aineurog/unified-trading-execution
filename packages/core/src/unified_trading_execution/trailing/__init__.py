@@ -8,6 +8,8 @@ from unified_trading_execution.trailing.types import (
     ACTIVE_TRAILING_PHASES,
     TERMINAL_TRAILING_PHASES,
     CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
     ProtectionLevel,
     ProtectionLevelType,
     TrailingActivation,
@@ -26,6 +28,8 @@ __all__ = [
     "TERMINAL_TRAILING_PHASES",
     # Types
     "CandleTimeframe",
+    "NativeTrailingRequest",
+    "NativeTrailingResult",
     "ProtectionLevel",
     "ProtectionLevelType",
     "TrailingActivation",

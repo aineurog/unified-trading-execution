@@ -12,6 +12,8 @@ from unified_trading_execution.trailing.types import (
     ACTIVE_TRAILING_PHASES,
     TERMINAL_TRAILING_PHASES,
     CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
     ProtectionLevel,
     ProtectionLevelType,
     TrailingActivation,
@@ -327,3 +329,40 @@ def test_state_defaults() -> None:
     assert state.reprice_count == 0
     assert state.failure_count == 0
     assert state.activated is False
+
+
+# ============================================================
+# Native trailing types
+# ============================================================
+
+
+def test_native_request_fields() -> None:
+    request = NativeTrailingRequest(
+        instrument=make_instrument(),
+        position_id="leg-1",
+        side=OrderSide.SELL,
+        quantity=Decimal("1"),
+        offset=Decimal("2"),
+        offset_type=TrailingOffsetType.ATR,
+        basis=TrailingBasis.LAST,
+        activation_price=Decimal("105"),
+        client_id="tr-1",
+    )
+    assert request.position_id == "leg-1"
+    assert request.side is OrderSide.SELL
+    assert request.offset_type is TrailingOffsetType.ATR
+    assert request.basis is TrailingBasis.LAST
+
+
+def test_native_result_fields() -> None:
+    result = NativeTrailingResult(
+        native_id="native-1",
+        confirmed_offset=Decimal("2"),
+        current_stop=None,
+        activated=False,
+        position_scoped=True,
+    )
+    assert result.native_id == "native-1"
+    assert result.confirmed_offset == Decimal("2")
+    assert result.activated is False
+    assert result.position_scoped is True

@@ -228,6 +228,32 @@ class TrailingRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeTrailingRequest:
+    """A native trailing-stop placement or replacement for one position leg."""
+
+    instrument: Instrument
+    position_id: str
+    side: OrderSide
+    quantity: Decimal
+    offset: Decimal
+    offset_type: TrailingOffsetType
+    basis: TrailingBasis | None
+    activation_price: Decimal | None
+    client_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class NativeTrailingResult:
+    """The venue's view of a native trailing stop."""
+
+    native_id: str
+    confirmed_offset: Decimal | None
+    current_stop: Decimal | None
+    activated: bool
+    position_scoped: bool
+
+
+@dataclass(frozen=True, slots=True)
 class TrailingState:
     """Persisted state for one trailing position leg.
 
