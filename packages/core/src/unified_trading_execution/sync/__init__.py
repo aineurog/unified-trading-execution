@@ -30,6 +30,11 @@ from unified_trading_execution.errors import EngineShutdownError
 from unified_trading_execution.events import EventBus, HaltEvent, ReconciliationEvent
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, ReconciliationResult, StateStore
+from unified_trading_execution.trailing import (
+    TrailingConfig,
+    TrailingRequest,
+    TrailingState,
+)
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -79,6 +84,7 @@ class SyncEngine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        trailing_config: TrailingConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
         fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
@@ -89,12 +95,14 @@ class SyncEngine:
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            trailing_config=trailing_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
             fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread: threading.Thread | None = None
         self._shutdown = False
+        self._trailing = SyncTrailingManager(self)
 
     def _ensure_loop(self) -> asyncio.AbstractEventLoop:
         """Lazily start the persistent background event loop on first use."""
@@ -305,6 +313,11 @@ class SyncEngine:
         """
         return self._async_engine.state_store
 
+    @property
+    def trailing(self) -> SyncTrailingManager:
+        """Blocking trailing facade backed by the async engine's manager."""
+        return self._trailing
+
     # ---- Adapter method auto-proxy ----
 
     def __getattr__(self, name: str) -> Any:
@@ -331,3 +344,47 @@ class SyncEngine:
     def _check_not_shutdown(self) -> None:
         if self._shutdown:
             raise EngineShutdownError("SyncEngine has been shut down and is permanently unusable.")
+
+
+class SyncTrailingManager:
+    """Blocking facade over the async engine's ``TrailingManager``.
+
+    Every call is submitted to the SyncEngine background loop, so the worker
+    and all trailing state stay on the same loop as the async engine.
+    """
+
+    def __init__(self, engine: SyncEngine) -> None:
+        self._engine = engine
+
+    def attach(self, request: TrailingRequest) -> TrailingState:
+        return self._engine._run(self._engine._async_engine.trailing.attach(request))
+
+    def cancel(
+        self,
+        trailing_id: str,
+        *,
+        clear_protection: bool = False,
+        reason: str | None = None,
+    ) -> TrailingState:
+        return self._engine._run(
+            self._engine._async_engine.trailing.cancel(
+                trailing_id,
+                clear_protection=clear_protection,
+                reason=reason,
+            )
+        )
+
+    def get(self, trailing_id: str) -> TrailingState | None:
+        return self._engine._run(self._engine._async_engine.trailing.get(trailing_id))
+
+    def list(
+        self,
+        *,
+        instrument: Instrument | None = None,
+        active_only: bool = False,
+    ) -> list[TrailingState]:
+        return self._engine._run(
+            self._engine._async_engine.trailing.list(
+                instrument=instrument, active_only=active_only
+            )
+        )
