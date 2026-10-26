@@ -373,18 +373,35 @@ class TestPositionTargeting:
         assert "entry 51000" in message
         assert "opened" in message
 
-    async def test_unknown_position_id_is_invalid_order(self, store):
-        await store.upsert_position(make_position())
+    async def test_unknown_position_id_lists_open_ids(self, store):
+        await store.upsert_position(make_position(position_id="1", quantity="1"))
+        await store.upsert_position(make_position(position_id="2", quantity="0"))
         manager, _, _ = await make_manager(store)
 
-        with pytest.raises(InvalidOrderError):
+        with pytest.raises(InvalidOrderError) as excinfo:
             await manager.attach(TrailingRequest(make_inst(), make_spec(), position_id="missing"))
 
-    async def test_no_open_position_is_invalid_order(self, store):
+        message = str(excinfo.value)
+        assert "missing" in message
+        assert "'1'" in message
+        assert "'2'" not in message
+
+    async def test_no_open_position_reports_mirror_lag(self, store):
         manager, _, _ = await make_manager(store)
 
-        with pytest.raises(InvalidOrderError):
+        with pytest.raises(InvalidOrderError) as excinfo:
             await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        message = str(excinfo.value)
+        assert "no open position" in message
+        assert "mirror can lag" in message
+        assert "retry" in message
+
+    def test_duplicate_position_id_is_a_mirror_defect(self):
+        legs = [make_position(position_id="1"), make_position(position_id="1", entry="51000")]
+
+        with pytest.raises(TrailingStateError, match="mirror is defective"):
+            resolve_position_leg(legs, make_inst(), "1")
 
     async def test_zero_quantity_leg_is_not_targeted(self, store):
         await store.upsert_position(make_position(position_id="1", quantity="0"))
@@ -402,8 +419,40 @@ class TestPositionTargeting:
             position_id=None,
         )
 
-        with pytest.raises(TrailingStateError):
+        with pytest.raises(TrailingStateError, match="mirror is defective"):
             resolve_position_leg([position], make_inst(), None)
+
+    def test_missing_id_on_any_leg_blocks_automatic_targeting(self):
+        legs = [
+            make_position(position_id="1", quantity="1"),
+            Position(
+                instrument=make_inst(),
+                quantity=Decimal("2"),
+                average_entry_price=Decimal("51000"),
+                updated_at=NOW,
+                position_id=None,
+            ),
+        ]
+
+        with pytest.raises(TrailingStateError, match="mirror is defective"):
+            resolve_position_leg(legs, make_inst(), None)
+
+    def test_explicit_id_ignores_unrelated_leg_without_id(self):
+        legs = [
+            make_position(position_id="1", quantity="1"),
+            Position(
+                instrument=make_inst(),
+                quantity=Decimal("2"),
+                average_entry_price=Decimal("51000"),
+                updated_at=NOW,
+                position_id=None,
+            ),
+        ]
+
+        leg, resolved = resolve_position_leg(legs, make_inst(), "1")
+
+        assert leg.position_id == "1"
+        assert resolved == "1"
 
 
 class TestLifecycle:

@@ -254,6 +254,18 @@ def test_atr_initial_stop_requires_atr_fields() -> None:
         make_spec(initial_stop=level)
 
 
+def test_atr_take_profit_requires_atr_fields() -> None:
+    level = ProtectionLevel(type=ProtectionLevelType.ATR, value=Decimal("2"))
+    with pytest.raises(ValueError, match="both atr_period and atr_timeframe"):
+        make_spec(take_profit=level)
+
+
+def test_atr_take_profit_requires_both_fields() -> None:
+    level = ProtectionLevel(type=ProtectionLevelType.ATR, value=Decimal("2"))
+    with pytest.raises(ValueError, match="both atr_period and atr_timeframe"):
+        make_spec(take_profit=level, atr_period=14)
+
+
 def test_atr_take_profit_accepts_atr_fields() -> None:
     level = ProtectionLevel(type=ProtectionLevelType.ATR, value=Decimal("2"))
     spec = make_spec(

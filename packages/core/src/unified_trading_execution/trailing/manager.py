@@ -283,7 +283,17 @@ def resolve_position_leg(
     if position_id is not None:
         matches = [leg for leg in legs if leg.position_id == position_id]
         if not matches:
-            raise InvalidOrderError(f"no open position {position_id!r} on {instrument.symbol}")
+            open_ids = [leg.position_id for leg in legs if leg.quantity != 0]
+            listed = ", ".join(repr(open_id) for open_id in open_ids) or "none"
+            raise InvalidOrderError(
+                f"no open position {position_id!r} on {instrument.symbol}; "
+                f"open position ids: {listed}"
+            )
+        if len(matches) > 1:
+            raise TrailingStateError(
+                f"position id {position_id!r} matches {len(matches)} legs on "
+                f"{instrument.symbol}; the mirror is defective"
+            )
         leg = matches[0]
         if leg.quantity == 0:
             raise InvalidOrderError(f"position {position_id!r} on {instrument.symbol} is closed")
@@ -291,7 +301,15 @@ def resolve_position_leg(
 
     open_legs = [leg for leg in legs if leg.quantity != 0]
     if not open_legs:
-        raise InvalidOrderError(f"no open position on {instrument.symbol}")
+        raise InvalidOrderError(
+            f"no open position on {instrument.symbol}; the mirror can lag a fresh "
+            "entry, retry after the position update"
+        )
+    if any(leg.position_id is None for leg in open_legs):
+        raise TrailingStateError(
+            f"the open positions on {instrument.symbol} include a leg without a "
+            "platform position_id; the mirror is defective"
+        )
     if len(open_legs) > 1:
         candidates = "; ".join(_describe_leg(leg) for leg in open_legs)
         raise TrailingStateError(
@@ -299,11 +317,12 @@ def resolve_position_leg(
             f"pass position_id to choose one: {candidates}"
         )
     leg = open_legs[0]
-    if leg.position_id is None:
+    resolved_id = leg.position_id
+    if resolved_id is None:  # pragma: no cover - guarded above, narrows the type
         raise TrailingStateError(
             f"the open position on {instrument.symbol} has no platform position_id"
         )
-    return leg, leg.position_id
+    return leg, resolved_id
 
 
 def _resolve_bases(
