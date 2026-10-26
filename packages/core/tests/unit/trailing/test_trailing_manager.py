@@ -236,6 +236,11 @@ class CountingCandlesAdapter(CapabilityAdapter):
         return await super().fetch_candles(instrument, timeframe, limit=limit)
 
 
+class NoNativePositionReadAdapter(CapabilityAdapter):
+    async def get_position_trailing_stop(self, instrument, position_id):
+        raise NotImplementedError("no position-scoped native read")
+
+
 @pytest_asyncio.fixture
 async def store():
     s = SQLiteStateStore(":memory:")
@@ -1757,6 +1762,53 @@ class TestNativeExecution:
         assert request.offset_type is TrailingOffsetType.PRICE
         assert request.basis is TrailingBasis.LAST
         assert request.client_id == state.trailing_id
+
+    async def test_native_attach_requires_takeover_for_existing_trail(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        adapter.seed_native_trail(make_inst(), "1", offset=Decimal("250"))
+
+        with pytest.raises(TrailingStateError, match="take_over_existing_protection"):
+            await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert adapter.native_requests == ()
+        assert await manager.list() == []
+
+    async def test_native_takeover_replaces_trail_and_audits_previous_offset(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        adapter.seed_native_trail(
+            make_inst(), "1", offset=Decimal("250"), current_stop=Decimal("49500")
+        )
+
+        state = await manager.attach(
+            TrailingRequest(
+                make_inst(), make_spec(), take_over_existing_protection=True
+            )
+        )
+
+        assert state.phase is TrailingPhase.ARMED
+        assert adapter.native_requests[-1].offset == Decimal("100")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.takeover"
+        ]
+        assert audits[-1].payload["previous_native_offset"] == "250"
+        assert audits[-1].payload["previous_native_stop"] == "49500"
+
+    async def test_native_attach_fails_closed_without_position_read(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(
+            store,
+            native=make_native_exact(),
+            adapter_cls=NoNativePositionReadAdapter,
+        )
+
+        with pytest.raises(TrailingNotSupportedError, match="position-scoped"):
+            await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert await manager.list() == []
 
     async def test_native_attach_writes_owned_take_profit(self, store):
         await store.upsert_position(make_position())

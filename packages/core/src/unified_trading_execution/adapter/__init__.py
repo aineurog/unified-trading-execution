@@ -410,8 +410,32 @@ class Adapter(ABC):
 
         Optional — raises ``NotImplementedError`` by default.  Returns ``None``
         only when the venue confirms the trail is absent.
+
+        This is the post-placement read: it needs a ``native_id`` returned by
+        :meth:`place_trailing_stop` or loaded from persisted state.  Use
+        :meth:`get_position_trailing_stop` to detect a trail before attaching.
         """
         raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
+
+    async def get_position_trailing_stop(
+        self, instrument: Instrument, position_id: str
+    ) -> NativeTrailingResult | None:
+        """Read the native trailing stop attached to one position leg.
+
+        Optional — raises ``NotImplementedError`` by default.  Unlike
+        :meth:`get_trailing_stop`, this is keyed by the position leg, not by a
+        venue ``native_id``, so it can be called before ``place_trailing_stop``
+        to detect a pre-existing trail and apply the takeover rule.
+
+        Return ``None`` only when the venue confirms the leg has no native
+        trail.  Raise on transport errors.  ``position_id`` follows the same
+        conventions as :meth:`modify_position_tpsl`.  Adapters that declare
+        native trailing support must implement this before native attach can
+        run.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support reading a native trailing stop by position"
+        )
 
     # ---- Reconciliation data (optional — not required for basic operation) ----
 

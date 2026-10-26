@@ -730,6 +730,29 @@ class TrailingManager:
                 f"profit {previous_tp.trigger_price}; pass take_over_existing_protection=True"
             )
 
+        try:
+            previous_native = await self._adapter.get_position_trailing_stop(
+                instrument, position_id
+            )
+        except NotImplementedError as exc:
+            raise TrailingNotSupportedError(
+                f"{self._adapter.platform_name} cannot read an existing native trailing "
+                f"stop for {instrument.symbol}; native attach requires position-scoped "
+                "detection"
+            ) from exc
+
+        if previous_native is not None and not request.take_over_existing_protection:
+            details: list[str] = []
+            if previous_native.confirmed_offset is not None:
+                details.append(f"offset {previous_native.confirmed_offset}")
+            if previous_native.current_stop is not None:
+                details.append(f"stop {previous_native.current_stop}")
+            description = ", ".join(details) or f"native_id {previous_native.native_id!r}"
+            raise TrailingStateError(
+                f"position {position_id!r} on {instrument.symbol} already has a native "
+                f"trailing stop ({description}); pass take_over_existing_protection=True"
+            )
+
         if not self._halt_machine.can_place_order(instrument, reduce_only=True):
             raise InstrumentHaltedError(
                 f"cannot attach trailing on {instrument.symbol}: instrument or account is halted"
@@ -863,14 +886,31 @@ class TrailingManager:
             reason="attached",
         )
         if request.take_over_existing_protection and (
-            arming.previous_stop_loss is not None or arming.previous_take_profit is not None
+            arming.previous_stop_loss is not None
+            or arming.previous_take_profit is not None
+            or previous_native is not None
         ):
+            extra_payload: dict[str, object] | None = None
+            if previous_native is not None:
+                extra_payload = {
+                    "previous_native_offset": (
+                        str(previous_native.confirmed_offset)
+                        if previous_native.confirmed_offset is not None
+                        else None
+                    ),
+                    "previous_native_stop": (
+                        str(previous_native.current_stop)
+                        if previous_native.current_stop is not None
+                        else None
+                    ),
+                }
             await self._write_audit(
                 "trailing.takeover",
                 final,
                 previous_stop=arming.previous_stop_loss,
                 current_stop=final.current_stop,
                 reason="takeover",
+                extra_payload=extra_payload,
             )
         return final
 
@@ -2943,7 +2983,18 @@ class TrailingManager:
         previous_stop: Decimal | None,
         current_stop: Decimal | None,
         reason: str | None,
+        extra_payload: dict[str, object] | None = None,
     ) -> None:
+        payload: dict[str, object] = {
+            "trailing_id": state.trailing_id,
+            "position_id": state.position_id,
+            "mode": state.mode.value,
+            "previous_stop": str(previous_stop) if previous_stop is not None else None,
+            "current_stop": str(current_stop) if current_stop is not None else None,
+            "reason": reason,
+        }
+        if extra_payload is not None:
+            payload.update(extra_payload)
         await self._state_store.write_audit_event(
             AuditEvent(
                 event_id=self._id_factory(),
@@ -2952,13 +3003,6 @@ class TrailingManager:
                 account_id=self._adapter.account_id,
                 correlation_id=state.trailing_id,
                 event_type=event_type,
-                payload={
-                    "trailing_id": state.trailing_id,
-                    "position_id": state.position_id,
-                    "mode": state.mode.value,
-                    "previous_stop": str(previous_stop) if previous_stop is not None else None,
-                    "current_stop": str(current_stop) if current_stop is not None else None,
-                    "reason": reason,
-                },
+                payload=payload,
             )
         )

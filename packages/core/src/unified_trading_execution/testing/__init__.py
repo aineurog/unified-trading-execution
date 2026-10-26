@@ -36,6 +36,7 @@ from unified_trading_execution.trailing.types import (
     CandleTimeframe,
     NativeTrailingRequest,
     NativeTrailingResult,
+    TrailingOffsetType,
 )
 from unified_trading_execution.types.enums import (
     OrderSide,
@@ -351,6 +352,42 @@ class MockAdapter(Adapter):
     ) -> None:
         """Seed the protection levels ``get_position_tpsl()`` returns."""
         self._protection[(instrument, position_id)] = (take_profit, stop_loss)
+
+    def seed_native_trail(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        offset: Decimal,
+        native_id: str | None = None,
+        current_stop: Decimal | None = None,
+        activated: bool = True,
+    ) -> NativeTrailingResult:
+        """Seed an existing native trail for one position leg."""
+        position = self._open_position(instrument, position_id)
+        side = OrderSide.BUY if position is None or position.quantity > 0 else OrderSide.SELL
+        resolved_native_id = native_id or f"native-{position_id}"
+        request = NativeTrailingRequest(
+            instrument=instrument,
+            position_id=position_id,
+            side=side,
+            quantity=abs(position.quantity) if position is not None else Decimal("0"),
+            offset=offset,
+            offset_type=TrailingOffsetType.PRICE,
+            basis=None,
+            activation_price=None,
+            client_id=resolved_native_id,
+        )
+        result = NativeTrailingResult(
+            native_id=resolved_native_id,
+            confirmed_offset=offset,
+            current_stop=current_stop,
+            activated=activated,
+            position_scoped=True,
+        )
+        self._drop_native_trails_for_position(instrument, position_id)
+        self._native_trails[(instrument, resolved_native_id)] = (request, result)
+        return result
 
     # -- Order book seeding --
 
@@ -729,6 +766,7 @@ class MockAdapter(Adapter):
             activated=False,
             position_scoped=True,
         )
+        self._drop_native_trails_for_position(request.instrument, request.position_id)
         self._native_trails[(request.instrument, result.native_id)] = (request, result)
         self._native_requests.append(request)
         return result
@@ -754,6 +792,19 @@ class MockAdapter(Adapter):
             raise err
         entry = self._native_trails.get((instrument, native_id))
         return entry[1] if entry is not None else None
+
+    async def get_position_trailing_stop(
+        self, instrument: Instrument, position_id: str
+    ) -> NativeTrailingResult | None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_native_error) is not None:
+            self._next_native_error = None
+            raise err
+        for (trail_instrument, _), (request, result) in self._native_trails.items():
+            if trail_instrument == instrument and request.position_id == position_id:
+                return result
+        return None
 
     # ---- Reconciliation data (optional Adapter ABC methods) ----
 
@@ -833,6 +884,17 @@ class MockAdapter(Adapter):
             self.inject_position_update(position)
 
     # ---- Internal ----
+
+    def _drop_native_trails_for_position(
+        self, instrument: Instrument, position_id: str
+    ) -> None:
+        stale = [
+            key
+            for key, (request, _) in self._native_trails.items()
+            if request.instrument == instrument and request.position_id == position_id
+        ]
+        for key in stale:
+            del self._native_trails[key]
 
     def _open_position(self, instrument: Instrument, position_id: str) -> Position | None:
         for position in self._positions:
