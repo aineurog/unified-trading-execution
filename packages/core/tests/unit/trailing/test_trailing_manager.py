@@ -19,6 +19,7 @@ from unified_trading_execution.adapter import (
 from unified_trading_execution.errors import (
     InvalidOrderError,
     PlatformConnectionError,
+    RateLimitError,
     TrailingNotSupportedError,
     TrailingStateError,
 )
@@ -225,6 +226,16 @@ class CountingAdapter(CapabilityAdapter):
         return await super().fetch_ticker(instrument)
 
 
+class CountingCandlesAdapter(CapabilityAdapter):
+    def __init__(self, event_bus, *, protection, native, market):
+        super().__init__(event_bus, protection=protection, native=native, market=market)
+        self.candle_calls = 0
+
+    async def fetch_candles(self, instrument, timeframe, *, limit):
+        self.candle_calls += 1
+        return await super().fetch_candles(instrument, timeframe, limit=limit)
+
+
 @pytest_asyncio.fixture
 async def store():
     s = SQLiteStateStore(":memory:")
@@ -241,6 +252,7 @@ async def make_manager(
     market=None,
     config=None,
     clock=None,
+    reserve_rate_limit=None,
     adapter_cls=CapabilityAdapter,
     connect=True,
 ):
@@ -265,7 +277,7 @@ async def make_manager(
         adapter,
         store,
         halt_machine=HaltStateMachine(),
-        reserve_rate_limit=lambda: True,
+        reserve_rate_limit=reserve_rate_limit or (lambda: True),
         event_bus=bus,
         config=config,
         id_factory=lambda: f"id-{next(ids)}",
@@ -599,6 +611,58 @@ class TestSyntheticAttach:
         assert states[0].last_error == "venue rejected"
         assert states[0].failure_count == 1
 
+    async def test_attach_rejects_a_stop_inside_minimum_distance(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        adapter.add_instrument_spec(
+            make_inst(),
+            replace(make_instrument_spec(), min_stop_distance=Decimal("200")),
+        )
+
+        with pytest.raises(TrailingNotSupportedError, match="minimum stop distance"):
+            await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert await manager.list() == []
+        assert adapter.protection_writes == ()
+
+    async def test_attach_stops_when_rate_limit_is_exhausted(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store, reserve_rate_limit=lambda: False
+        )
+
+        with pytest.raises(RateLimitError, match="rate limit"):
+            await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert await manager.list() == []
+        assert adapter.protection_writes == ()
+
+    async def test_crash_after_venue_write_blocks_a_second_active_attach(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        original = store.upsert_trailing_state
+        armed_attempts = 0
+
+        async def fail_before_armed(state):
+            nonlocal armed_attempts
+            if state.phase is TrailingPhase.ARMED:
+                armed_attempts += 1
+                raise RuntimeError("simulated crash")
+            await original(state)
+
+        store.upsert_trailing_state = fail_before_armed  # type: ignore[method-assign]
+        try:
+            with pytest.raises(RuntimeError, match="simulated crash"):
+                await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        finally:
+            store.upsert_trailing_state = original  # type: ignore[method-assign]
+
+        assert armed_attempts == 1
+        assert len(adapter.protection_writes) == 1
+        with pytest.raises(TrailingStateError, match="already attached"):
+            await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert len(await manager.list(active_only=True)) == 1
+
 
 class TestLifecycle:
     async def test_duplicate_active_attach_is_rejected(self, store):
@@ -787,6 +851,51 @@ class TestReprice:
         assert written.current_stop == Decimal("50500.00")
         assert written.reprice_count == 1
 
+    async def test_reprice_skips_a_stop_inside_minimum_distance(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        repriced = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("50500"))
+        )
+        assert repriced is not None
+        assert repriced.current_stop == Decimal("50400.00")
+        assert repriced.reprice_count == 1
+
+        adapter.add_instrument_spec(
+            make_inst(),
+            replace(make_instrument_spec(), min_stop_distance=Decimal("200")),
+        )
+        blocked = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("50600"))
+        )
+
+        assert blocked is not None
+        assert blocked.current_stop == Decimal("50400.00")
+        assert blocked.best_basis == Decimal("50600")
+        assert blocked.reprice_count == 1
+        assert len(adapter.protection_writes) == 2
+
+    async def test_reprice_skips_when_rate_limit_is_exhausted(self, store):
+        await store.upsert_position(make_position())
+        allowed = [True]
+        manager, adapter, _ = await make_manager(
+            store, reserve_rate_limit=lambda: allowed[0]
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        allowed[0] = False
+
+        skipped = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("50500"))
+        )
+
+        assert skipped is not None
+        assert skipped.current_stop == Decimal("49900.00")
+        assert skipped.best_basis == Decimal("50500")
+        assert skipped.reprice_count == 0
+        assert len(adapter.protection_writes) == 1
+
     async def test_fetch_failures_degrade_then_recover(self, store):
         await store.upsert_position(make_position())
         manager, _, _ = await make_manager(
@@ -953,6 +1062,67 @@ class TestAtrAndActivation:
         assert refreshed is not None
         assert refreshed.atr_value == Decimal("20")
         assert refreshed.atr_as_of == wall[0]
+
+    async def test_atr_take_profit_is_computed_once(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        spec = make_spec(
+            take_profit=ProtectionLevel(ProtectionLevelType.ATR, Decimal("4")),
+            atr_period=14,
+            atr_timeframe=CandleTimeframe.H1,
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+        assert state.current_take_profit == Decimal("50008.00")
+
+        refreshed = await manager.on_atr(
+            state.trailing_id, Decimal("20"), as_of=NOW + timedelta(hours=1)
+        )
+
+        assert refreshed is not None
+        assert refreshed.atr_value == Decimal("20")
+        assert refreshed.current_take_profit == Decimal("50008.00")
+
+    async def test_one_candle_fetch_serves_two_states(self, store):
+        positions = [
+            make_position(position_id="1", entry="50000"),
+            make_position(position_id="2", entry="50000"),
+        ]
+        for position in positions:
+            await store.upsert_position(position)
+        wall = [NOW]
+        config = TrailingConfig(
+            poll_interval_seconds=1.0, candle_settle_seconds=0
+        )
+        manager, adapter, _ = await make_manager(
+            store, config=config, adapter_cls=CountingCandlesAdapter
+        )
+        adapter.queue_candles_response(make_candles())
+        first = await manager.attach(
+            TrailingRequest(make_inst(), atr_spec(), position_id="1")
+        )
+        second = await manager.attach(
+            TrailingRequest(make_inst(), atr_spec(), position_id="2")
+        )
+        assert adapter.candle_calls == 2
+
+        adapter.queue_candles_response(make_candles(width="10"))
+        worker = TrailingWorker(
+            manager,
+            adapter,
+            config,
+            clock=lambda: 0.0,
+            wall_clock=lambda: wall[0],
+        )
+        wall[0] = NOW + timedelta(hours=1)
+        await worker.run_once(now=10.0)
+
+        assert adapter.candle_calls == 3
+        first_after = await manager.get(first.trailing_id)
+        second_after = await manager.get(second.trailing_id)
+        assert first_after is not None
+        assert second_after is not None
+        assert first_after.atr_value == Decimal("20")
+        assert second_after.atr_value == Decimal("20")
 
     async def test_worker_degrades_stale_atr_then_recovers(self, store):
         await store.upsert_position(make_position())
@@ -1352,6 +1522,70 @@ class TestRestartRecovery:
         ]
         assert audits[-1].payload["reason"] == "adopted_tighter_stop"
 
+    async def test_rehydrate_reprices_the_synthetic_candidate(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.best_basis == Decimal("50000")
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("49900")),
+        )
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("50500")))
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.current_stop == Decimal("50400.00")
+        assert restored.best_basis == Decimal("50500")
+        assert restored.reprice_count == 1
+        write = adapter.protection_writes[-1]
+        assert write.stop_loss is not None
+        assert write.stop_loss.trigger_price == Decimal("50400.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "rehydrate_reprice"
+
+    async def test_rehydrate_respects_the_minimum_reprice_interval(self, store):
+        await store.upsert_position(make_position())
+        protection = make_protection(min_reprice_interval_seconds=10)
+        first, _, _ = await make_manager(store, protection=protection)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+        repriced = await first.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("50500"))
+        )
+        assert repriced is not None
+        assert repriced.current_stop == Decimal("50400.00")
+        assert repriced.last_reprice_at == NOW
+
+        second, adapter, _ = await make_manager(
+            store,
+            protection=protection,
+            clock=lambda: NOW + timedelta(seconds=5),
+        )
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("50400")),
+        )
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("50600")))
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.current_stop == Decimal("50400.00")
+        assert restored.best_basis == Decimal("50600")
+        assert restored.reprice_count == 1
+        assert adapter.protection_writes == ()
+
     async def test_looser_venue_stop_is_restored_on_rehydrate(self, store):
         await store.upsert_position(make_position())
         first, _, _ = await make_manager(store)
@@ -1692,6 +1926,25 @@ class TestEventsAndAudit:
         assert audit.payload["position_id"] == "1"
         assert audit.payload["mode"] == state.mode.value
         assert audit.payload["reason"] == "attached"
+
+    async def test_attach_writes_routing_audit(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.routing"
+        ]
+        assert len(audits) == 1
+        audit = audits[0]
+        assert audit.correlation_id == state.trailing_id
+        assert audit.payload["position_id"] == "1"
+        assert audit.payload["mode"] == TrailingMode.SYNTHETIC.value
+        assert audit.payload["reason"] == state.routing_reason
+        assert audit.payload["current_stop"] == str(state.current_stop)
 
     async def test_cancel_writes_audit(self, store):
         await store.upsert_position(make_position())

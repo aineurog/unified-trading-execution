@@ -521,13 +521,22 @@ class TrailingManager:
             )
 
             if mode is TrailingMode.SYNTHETIC:
-                return await self._attach_synthetic(
+                final = await self._attach_synthetic(
+                    request, leg, position_id, reason, protection, market_data
+                )
+            else:
+                final = await self._attach_native(
                     request, leg, position_id, reason, protection, market_data
                 )
 
-            return await self._attach_native(
-                request, leg, position_id, reason, protection, market_data
+            await self._write_audit(
+                "trailing.routing",
+                final,
+                previous_stop=final.previous_stop_loss,
+                current_stop=final.current_stop,
+                reason=reason,
             )
+            return final
 
     async def _attach_synthetic(
         self,
@@ -2148,6 +2157,121 @@ class TrailingManager:
                     updated_at=now,
                 )
                 reasons.append("rehydrate_stop")
+
+        if activated and base.stop_owned and base.current_stop is not None:
+            try:
+                candidate = quantize_stop(
+                    candidate_stop(
+                        side=base.side,
+                        best_basis=best,
+                        spec=base.spec,
+                        atr=atr,
+                    ),
+                    tick_size,
+                    base.side,
+                )
+            except Exception as exc:
+                return await self._rehydrate_degraded(
+                    base,
+                    f"candidate: rehydrate: {str(exc) or type(exc).__name__}",
+                    now=now,
+                )
+
+            instrument_spec = await self._instrument_spec(base.instrument)
+            capability = self._adapter.position_protection_capability(
+                base.instrument
+            )
+            reprice_interval_elapsed = (
+                base.last_reprice_at is None
+                or (now - base.last_reprice_at).total_seconds()
+                >= capability.min_reprice_interval_seconds
+            )
+            if (
+                candidate > 0
+                and respects_min_stop_distance(
+                    side=base.side,
+                    candidate=candidate,
+                    basis=basis,
+                    min_stop_distance=instrument_spec.min_stop_distance,
+                )
+                and ratchet_accepts(
+                    side=base.side,
+                    current_stop=base.current_stop,
+                    candidate=candidate,
+                    step=base.spec.step,
+                )
+                and reprice_interval_elapsed
+                and self._halt_machine.can_place_order(
+                    base.instrument, reduce_only=True
+                )
+                and self._reserve_rate_limit()
+            ):
+                if capability.reprice_gap:
+                    await self._write_audit(
+                        "trailing.reprice_gap",
+                        base,
+                        previous_stop=base.current_stop,
+                        current_stop=base.current_stop,
+                        reason="gap_start",
+                    )
+                try:
+                    await self._adapter.modify_position_tpsl(
+                        base.instrument,
+                        base.position_id,
+                        stop_loss=TpSlAttachment(trigger_price=candidate),
+                    )
+                except Exception as exc:
+                    if capability.reprice_gap:
+                        await self._write_audit(
+                            "trailing.reprice_gap",
+                            base,
+                            previous_stop=base.current_stop,
+                            current_stop=base.current_stop,
+                            reason="gap_end_failed",
+                        )
+                    return await self._rehydrate_degraded(
+                        base,
+                        f"protection: rehydrate reprice: "
+                        f"{str(exc) or type(exc).__name__}",
+                        now=now,
+                    )
+                confirmed_stop, detail = await self._confirm_stop(
+                    base, candidate, tick_size
+                )
+                if confirmed_stop is None:
+                    if capability.reprice_gap:
+                        await self._write_audit(
+                            "trailing.reprice_gap",
+                            base,
+                            previous_stop=base.current_stop,
+                            current_stop=base.current_stop,
+                            reason="gap_end_failed",
+                        )
+                    return await self._rehydrate_degraded(
+                        base,
+                        f"protection: rehydrate reprice confirm: "
+                        f"{detail or 'mismatch'}",
+                        now=now,
+                    )
+                base = replace(
+                    base,
+                    current_stop=confirmed_stop,
+                    resolved_activation_price=activation_price,
+                    activated=True,
+                    stop_owned=True,
+                    last_reprice_at=now,
+                    reprice_count=base.reprice_count + 1,
+                    updated_at=now,
+                )
+                reasons.append("rehydrate_reprice")
+                if capability.reprice_gap:
+                    await self._write_audit(
+                        "trailing.reprice_gap",
+                        base,
+                        previous_stop=state.current_stop,
+                        current_stop=base.current_stop,
+                        reason="gap_end",
+                    )
 
         target_phase = (
             TrailingPhase.TRIGGERED

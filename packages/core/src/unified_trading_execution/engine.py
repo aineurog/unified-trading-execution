@@ -86,6 +86,11 @@ logger = logging.getLogger(__name__)
 # ``reconcile_interval_seconds=None`` to disable it entirely.
 DEFAULT_RECONCILE_INTERVAL_SECONDS: float = 30.0
 
+# Independent cadence for the trailing integrity pass.  Reconcile also runs a
+# pass, but this timer keeps protection checked when the reconcile loop is
+# disabled, and bounds how long a drifted stop can go unnoticed.
+DEFAULT_TRAILING_INTEGRITY_INTERVAL_SECONDS: float = 60.0
+
 # Default fill settle lag: the leading edge of the reconciliation fill window
 # (in seconds) that is left un-compared, because an execution-stream event can
 # land a beat after the REST snapshot already sees the fill.  Comparing that
@@ -224,6 +229,7 @@ class Engine:
             raise ValueError(f"fill_settle_lag_seconds must be >= 0, got {fill_settle_lag_seconds}")
         self._fill_settle_lag_seconds = fill_settle_lag_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
+        self._trailing_integrity_task: asyncio.Task[None] | None = None
         # Serialises manual / reconnect / periodic reconciles so they never
         # run concurrently and never mutate the mirror at the same time.
         self._reconcile_lock = asyncio.Lock()
@@ -285,6 +291,12 @@ class Engine:
         # Start the optional periodic reconciliation loop, if enabled.
         if self._reconcile_interval_seconds is not None:
             self._reconcile_loop_task = asyncio.ensure_future(self._reconcile_loop())
+
+        # Integrity has its own cadence so protection is still checked when the
+        # reconcile loop is disabled.
+        self._trailing_integrity_task = asyncio.ensure_future(
+            self._trailing_integrity_loop()
+        )
 
     async def _resolve_account_id(self) -> str:
         """Resolve the canonical platform account identity for store-path keying.
@@ -454,6 +466,27 @@ class Engine:
             except Exception:
                 logger.warning("Periodic reconciliation failed", exc_info=True)
 
+    async def _trailing_integrity_loop(self) -> None:
+        """Run the trailing integrity pass on its own cadence."""
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(DEFAULT_TRAILING_INTEGRITY_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            await self._run_trailing_integrity_once()
+
+    async def _run_trailing_integrity_once(self) -> None:
+        """Run one integrity pass when the manager and adapter are ready."""
+        manager = self._trailing_manager
+        if manager is None or not self._trailing_ready:
+            return
+        if not self._adapter.is_connected:
+            return
+        try:
+            await manager.integrity_pass()
+        except Exception:
+            logger.exception("Trailing integrity pass failed")
+
     async def disconnect(self) -> None:
         """Disconnect the adapter gracefully."""
         await self._stop_trailing_worker()
@@ -517,6 +550,11 @@ class Engine:
             self._reconcile_task.cancel()
         if self._reconcile_loop_task is not None and not self._reconcile_loop_task.done():
             self._reconcile_loop_task.cancel()
+        if (
+            self._trailing_integrity_task is not None
+            and not self._trailing_integrity_task.done()
+        ):
+            self._trailing_integrity_task.cancel()
         # Step 4 — close state store
         if self._state_store is not None:
             await self._state_store.close()
@@ -800,11 +838,10 @@ class Engine:
         await self._adapter.reconcile_user_intent()
 
         # -- 9. Trailing rehydration retry / integrity pass --
-        # Runs after every reconcile, clean or not.  The reconcile loop is the
-        # background timer and reconnect triggers a reconcile, so both cadences
-        # are covered.  With the periodic loop disabled, integrity only runs on
-        # explicit reconciles.  While rehydration is still pending, retry it;
-        # once ready, verify venue protection.
+        # Runs after every reconcile, clean or not.  The reconcile loop and the
+        # independent trailing integrity timer both trigger passes; reconnect
+        # triggers a reconcile as well.  While rehydration is still pending,
+        # retry it; once ready, verify venue protection.
         manager = self._trailing_manager
         if manager is not None:
             if not self._trailing_ready:

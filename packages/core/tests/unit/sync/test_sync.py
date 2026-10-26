@@ -17,12 +17,25 @@ from decimal import Decimal
 
 import pytest
 
-from unified_trading_execution.adapter import RateLimits
-from unified_trading_execution.errors import EngineShutdownError
+from unified_trading_execution.adapter import (
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+)
+from unified_trading_execution.errors import EngineShutdownError, PlatformConnectionError
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.sync import SyncEngine
 from unified_trading_execution.testing import MockAdapter
+from unified_trading_execution.trailing import (
+    TrailingBasis,
+    TrailingConfig,
+    TrailingMode,
+    TrailingOffsetType,
+    TrailingPhase,
+    TrailingRequest,
+    TrailingSpec,
+)
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -31,7 +44,9 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import OrderResult, UnifiedOrder
+from unified_trading_execution.types.position import Position
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -78,6 +93,18 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+def _position() -> Position:
+    now = datetime(2026, 7, 28, 12, tzinfo=UTC)
+    return Position(
+        instrument=_instrument(),
+        quantity=Decimal("1"),
+        average_entry_price=Decimal("50000"),
+        updated_at=now,
+        position_id="1",
+        opened_at=now,
+    )
+
+
 # ── fixtures ─────────────────────────────────────────────────────────
 
 
@@ -103,6 +130,80 @@ def sync_engine():
         eng.shutdown()
     except Exception:
         pass
+
+
+@pytest.fixture
+def sync_trailing_engine():
+    """Connected SyncEngine with a seeded leg and protection capability."""
+    event_bus = EventBus()
+    adapter = MockAdapter(event_bus=event_bus)
+    adapter.add_instrument_spec(_instrument(), _spec())
+    adapter.set_rate_limits(
+        RateLimits(
+            requests_per_interval=1000,
+            interval_seconds=60.0,
+            remaining=1000,
+            reset_at=datetime(2099, 1, 1, tzinfo=UTC),
+        )
+    )
+    adapter.set_ticker(_instrument(), Ticker(last=Decimal("50000")))
+    adapter.set_position_protection_capability(
+        _instrument(),
+        PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.LAST}),
+            min_reprice_interval_seconds=0.0,
+            reprice_gap=False,
+        ),
+    )
+    adapter.set_market_data_capability(
+        _instrument(),
+        MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.LAST}),
+            min_ticker_interval_seconds=0.0,
+            candle_timeframes=frozenset(),
+            streaming_ticker=False,
+        ),
+    )
+    adapter.seed_position(_position())
+
+    store = SQLiteStateStore(":memory:")
+    eng = SyncEngine(
+        adapter=adapter,
+        state_store=store,
+        event_bus=event_bus,
+        trailing_config=TrailingConfig(poll_interval_seconds=0.1),
+    )
+    eng.connect()
+    yield eng
+    try:
+        eng.shutdown()
+    except Exception:
+        pass
+
+
+def _trailing_request() -> TrailingRequest:
+    return TrailingRequest(
+        instrument=_instrument(),
+        spec=TrailingSpec(
+            offset_type=TrailingOffsetType.PRICE,
+            offset=Decimal("100"),
+        ),
+    )
+
+
+def _wait_until(predicate, timeout: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.01)
+    raise AssertionError("condition was not met within timeout")
 
 
 # ── single-threaded sanity ───────────────────────────────────────────
@@ -439,3 +540,72 @@ class TestAdapterAutoProxy:
 
         with pytest.raises(EngineShutdownError):
             sync_engine.fetch_positions()
+
+
+class TestSyncTrailingManager:
+    """SyncTrailingManager routes every call onto the persistent sync loop."""
+
+    def test_attach_get_list_cancel(self, sync_trailing_engine):
+        engine = sync_trailing_engine
+        state = engine.trailing.attach(_trailing_request())
+        try:
+            assert state.mode is TrailingMode.SYNTHETIC
+            assert state.phase is TrailingPhase.ARMED
+            assert state.current_stop == Decimal("49900")
+
+            fetched = engine.trailing.get(state.trailing_id)
+            assert fetched is not None
+            assert fetched.trailing_id == state.trailing_id
+
+            active = engine.trailing.list(active_only=True)
+            assert [item.trailing_id for item in active] == [state.trailing_id]
+
+            worker = engine._async_engine._trailing_worker
+            assert worker is not None
+            _wait_until(lambda: worker.running)
+            assert worker._task is not None
+            assert worker._task.get_loop() is engine._loop
+
+            cancelled = engine.trailing.cancel(state.trailing_id, reason="manual")
+            assert cancelled.phase is TrailingPhase.CANCELLED
+            assert engine.trailing.list(active_only=True) == []
+            _wait_until(lambda: not worker.running)
+        finally:
+            engine.shutdown()
+
+    def test_attach_before_connect_raises(self):
+        adapter = MockAdapter(event_bus=EventBus())
+        adapter.add_instrument_spec(_instrument(), _spec())
+        store = SQLiteStateStore(":memory:")
+        engine = SyncEngine(adapter=adapter, state_store=store, event_bus=EventBus())
+        try:
+            with pytest.raises(PlatformConnectionError):
+                engine.trailing.attach(_trailing_request())
+        finally:
+            engine.shutdown()
+
+    def test_shutdown_blocks_trailing_calls(self, sync_trailing_engine):
+        engine = sync_trailing_engine
+        engine.shutdown()
+        with pytest.raises(EngineShutdownError):
+            engine.trailing.attach(_trailing_request())
+
+    def test_worker_reprices_on_ticker_from_sync_loop(self, sync_trailing_engine):
+        engine = sync_trailing_engine
+        state = engine.trailing.attach(_trailing_request())
+        try:
+            assert state.current_stop == Decimal("49900")
+
+            adapter = engine._async_engine.adapter
+            adapter.set_ticker(_instrument(), Ticker(last=Decimal("50500")))
+
+            def _repriced() -> bool:
+                current = engine.trailing.get(state.trailing_id)
+                return current is not None and current.current_stop == Decimal("50400")
+
+            _wait_until(_repriced)
+            reprice = engine.trailing.get(state.trailing_id)
+            assert reprice is not None
+            assert reprice.best_basis == Decimal("50500")
+        finally:
+            engine.shutdown()

@@ -357,6 +357,7 @@ class SyncTrailingManager:
         self._engine = engine
 
     def attach(self, request: TrailingRequest) -> TrailingState:
+        self._engine._check_not_shutdown()
         return self._engine._run(self._engine._async_engine.trailing.attach(request))
 
     def cancel(
@@ -366,6 +367,7 @@ class SyncTrailingManager:
         clear_protection: bool = False,
         reason: str | None = None,
     ) -> TrailingState:
+        self._engine._check_not_shutdown()
         return self._engine._run(
             self._engine._async_engine.trailing.cancel(
                 trailing_id,
@@ -375,6 +377,7 @@ class SyncTrailingManager:
         )
 
     def get(self, trailing_id: str) -> TrailingState | None:
+        self._engine._check_not_shutdown()
         return self._engine._run(self._engine._async_engine.trailing.get(trailing_id))
 
     def list(
@@ -383,6 +386,7 @@ class SyncTrailingManager:
         instrument: Instrument | None = None,
         active_only: bool = False,
     ) -> list[TrailingState]:
+        self._engine._check_not_shutdown()
         return self._engine._run(
             self._engine._async_engine.trailing.list(
                 instrument=instrument, active_only=active_only

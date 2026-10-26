@@ -18,6 +18,7 @@ from unified_trading_execution.trailing.types import (
     ProtectionLevelType,
     TrailingActivation,
     TrailingBasis,
+    TrailingConfig,
     TrailingMode,
     TrailingOffsetType,
     TrailingPhase,
@@ -286,6 +287,72 @@ def test_atr_is_shared_by_offset_and_levels() -> None:
         atr_timeframe=CandleTimeframe.H1,
     )
     assert spec.atr_period == 14
+
+
+# ============================================================
+# TrailingConfig
+# ============================================================
+
+
+def test_config_defaults() -> None:
+    config = TrailingConfig()
+    assert config.poll_interval_seconds == 1.0
+    assert config.max_concurrent_fetches == 4
+    assert config.fetch_failure_threshold == 5
+    assert config.protection_failure_threshold == 3
+    assert config.rearm_on_reconnect is True
+    assert config.candle_settle_seconds == 2.0
+    assert config.atr_stale_after_candles == 2
+    assert config.publish_ticker_events is False
+
+
+def test_config_accepts_boundary_values() -> None:
+    config = TrailingConfig(
+        poll_interval_seconds=0.1,
+        max_concurrent_fetches=1,
+        fetch_failure_threshold=1,
+        protection_failure_threshold=1,
+        candle_settle_seconds=0,
+        atr_stale_after_candles=1,
+    )
+    assert config.poll_interval_seconds == 0.1
+    assert config.candle_settle_seconds == 0
+
+
+@pytest.mark.parametrize("value", [0.0, 0.099, float("nan"), float("inf")])
+def test_config_rejects_invalid_poll_interval(value: float) -> None:
+    with pytest.raises(ValueError, match="poll_interval_seconds"):
+        TrailingConfig(poll_interval_seconds=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_config_rejects_invalid_max_concurrent_fetches(value: int) -> None:
+    with pytest.raises(ValueError, match="max_concurrent_fetches"):
+        TrailingConfig(max_concurrent_fetches=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_config_rejects_invalid_fetch_failure_threshold(value: int) -> None:
+    with pytest.raises(ValueError, match="fetch_failure_threshold"):
+        TrailingConfig(fetch_failure_threshold=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_config_rejects_invalid_protection_failure_threshold(value: int) -> None:
+    with pytest.raises(ValueError, match="protection_failure_threshold"):
+        TrailingConfig(protection_failure_threshold=value)
+
+
+@pytest.mark.parametrize("value", [-0.1, float("nan"), float("inf")])
+def test_config_rejects_invalid_candle_settle_seconds(value: float) -> None:
+    with pytest.raises(ValueError, match="candle_settle_seconds"):
+        TrailingConfig(candle_settle_seconds=value)
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_config_rejects_invalid_atr_stale_after_candles(value: int) -> None:
+    with pytest.raises(ValueError, match="atr_stale_after_candles"):
+        TrailingConfig(atr_stale_after_candles=value)
 
 
 # ============================================================
