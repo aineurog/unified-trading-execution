@@ -180,14 +180,15 @@ def make_instrument_spec():
     )
 
 
-def make_candles():
+def make_candles(width="1"):
+    distance = Decimal(width)
     return [
         Candle(
             open_time=NOW - timedelta(hours=15 - index),
             close_time=NOW - timedelta(hours=14 - index),
             open=Decimal("50000"),
-            high=Decimal("50001"),
-            low=Decimal("49999"),
+            high=Decimal("50000") + distance,
+            low=Decimal("50000") - distance,
             close=Decimal("50000"),
         )
         for index in range(15)
@@ -864,6 +865,134 @@ class TestReprice:
 
         assert adapter.ticker_calls == 2
         assert len(events) == 2
+
+
+class TestAtrAndActivation:
+    async def test_price_activation_writes_first_stop(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        spec = make_spec(
+            activation=TrailingActivation.PRICE,
+            activation_price=Decimal("51000"),
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+
+        assert state.phase is TrailingPhase.ARMED
+        assert state.activated is False
+        assert state.current_stop is None
+
+        below = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("50500"))
+        )
+        assert below is not None
+        assert below.activated is False
+        assert below.current_stop is None
+
+        activated = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("51000"))
+        )
+        assert activated is not None
+        assert activated.activated is True
+        assert activated.current_stop == Decimal("50900.00")
+        assert activated.stop_owned is True
+        assert activated.resolved_activation_price == Decimal("51000")
+
+    async def test_activation_with_looser_initial_stop_keeps_existing_stop(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        spec = make_spec(
+            offset=Decimal("2000"),
+            activation=TrailingActivation.PRICE,
+            activation_price=Decimal("51000"),
+            initial_stop=ProtectionLevel(
+                ProtectionLevelType.PRICE, Decimal("49500")
+            ),
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+        assert state.current_stop == Decimal("49500.00")
+        assert state.activated is False
+
+        activated = await manager.on_ticker(
+            state.trailing_id, Ticker(last=Decimal("51000"))
+        )
+
+        assert activated is not None
+        assert activated.activated is True
+        assert activated.current_stop == Decimal("49500.00")
+        assert activated.reprice_count == 0
+
+    async def test_worker_refreshes_atr_at_candle_close(self, store):
+        await store.upsert_position(make_position())
+        wall = [NOW]
+        config = TrailingConfig(
+            poll_interval_seconds=1.0, candle_settle_seconds=0
+        )
+        manager, adapter, _ = await make_manager(store, config=config)
+        state = await manager.attach(TrailingRequest(make_inst(), atr_spec()))
+        assert state.atr_value == Decimal("2")
+
+        adapter.queue_candles_response(make_candles(width="10"))
+        worker = TrailingWorker(
+            manager,
+            adapter,
+            config,
+            clock=lambda: 0.0,
+            wall_clock=lambda: wall[0],
+        )
+
+        await worker.run_once(now=10.0)
+        await worker.run_once(now=11.0)
+        still_initial = await manager.get(state.trailing_id)
+        assert still_initial is not None
+        assert still_initial.atr_value == Decimal("2")
+
+        wall[0] = NOW + timedelta(hours=1)
+        await worker.run_once(now=12.0)
+        refreshed = await manager.get(state.trailing_id)
+        assert refreshed is not None
+        assert refreshed.atr_value == Decimal("20")
+        assert refreshed.atr_as_of == wall[0]
+
+    async def test_worker_degrades_stale_atr_then_recovers(self, store):
+        await store.upsert_position(make_position())
+        wall = [NOW]
+        config = TrailingConfig(
+            poll_interval_seconds=1.0,
+            candle_settle_seconds=0,
+            atr_stale_after_candles=2,
+        )
+        manager, adapter, _ = await make_manager(store, config=config)
+        state = await manager.attach(TrailingRequest(make_inst(), atr_spec()))
+        worker = TrailingWorker(
+            manager,
+            adapter,
+            config,
+            clock=lambda: 0.0,
+            wall_clock=lambda: wall[0],
+        )
+
+        adapter.queue_candles_response(RuntimeError("candles down"))
+        wall[0] = NOW + timedelta(hours=1)
+        await worker.run_once(now=10.0)
+        first = await manager.get(state.trailing_id)
+        assert first is not None
+        assert first.phase is TrailingPhase.ARMED
+
+        adapter.queue_candles_response(RuntimeError("candles down"))
+        wall[0] = NOW + timedelta(hours=2)
+        await worker.run_once(now=11.0)
+        degraded = await manager.get(state.trailing_id)
+        assert degraded is not None
+        assert degraded.phase is TrailingPhase.DEGRADED
+        assert degraded.atr_value == Decimal("2")
+
+        adapter.queue_candles_response(make_candles(width="10"))
+        wall[0] = NOW + timedelta(hours=3)
+        await worker.run_once(now=12.0)
+        recovered = await manager.get(state.trailing_id)
+        assert recovered is not None
+        assert recovered.phase is TrailingPhase.ARMED
+        assert recovered.atr_value == Decimal("20")
 
 
 class TestEventsAndAudit:

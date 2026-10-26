@@ -168,6 +168,15 @@ class TrailingSpec:
     atr_period: int | None = None
     atr_timeframe: CandleTimeframe | None = None
 
+    @property
+    def uses_atr(self) -> bool:
+        """Whether any trailing distance or static level needs ATR data."""
+        return (
+            self.offset_type is TrailingOffsetType.ATR
+            or _is_atr(self.initial_stop)
+            or _is_atr(self.take_profit)
+        )
+
     def __post_init__(self) -> None:
         if self.offset <= 0:
             raise ValueError(f"offset must be > 0, got {self.offset}")

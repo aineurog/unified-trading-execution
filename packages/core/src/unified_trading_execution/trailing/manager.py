@@ -130,6 +130,7 @@ _NATIVE_BLOCKER_LABELS: dict[str, str] = {
 
 _FETCH_ERROR_PREFIX = "fetch: "
 _PROTECTION_ERROR_PREFIX = "protection: "
+_ATR_ERROR_PREFIX = "atr_stale: "
 
 _SYNTHETIC_BLOCKER_LABELS: dict[str, str] = {
     "synthetic_unsupported_protection": "position protection",
@@ -150,11 +151,7 @@ def _new_id() -> str:
 
 
 def _uses_atr(spec: TrailingSpec) -> bool:
-    return (
-        spec.offset_type is TrailingOffsetType.ATR
-        or (spec.initial_stop is not None and spec.initial_stop.type is ProtectionLevelType.ATR)
-        or (spec.take_profit is not None and spec.take_profit.type is ProtectionLevelType.ATR)
-    )
+    return spec.uses_atr
 
 
 def _native_blockers(
@@ -452,6 +449,7 @@ class TrailingManager:
         self._lock = asyncio.Lock()
         self._state_locks: dict[str, asyncio.Lock] = {}
         self._fetch_failures: dict[str, int] = {}
+        self._atr_failures: dict[str, int] = {}
         self._instrument_specs: dict[Instrument, InstrumentSpec] = {}
 
     async def attach(self, request: TrailingRequest) -> TrailingState:
@@ -845,8 +843,36 @@ class TrailingManager:
                 state = replace(state, best_basis=best, updated_at=now)
                 await self._state_store.upsert_trailing_state(state)
 
-            if not state.activated:
+            activation_price = resolve_activation_price(
+                state.spec, state.side, state.entry_price
+            )
+            if activation_price != state.resolved_activation_price:
+                state = replace(
+                    state,
+                    resolved_activation_price=activation_price,
+                    updated_at=now,
+                )
+                await self._state_store.upsert_trailing_state(state)
+
+            if not is_activation_reached(state.side, basis, activation_price):
                 return state
+
+            if not state.activated and state.current_stop is not None:
+                activated_state = replace(
+                    state,
+                    activated=True,
+                    updated_at=now,
+                )
+                await self._state_store.upsert_trailing_state(activated_state)
+                self._publish(activated_state, previous=state.phase, reason="activated")
+                await self._write_audit(
+                    "trailing.activated",
+                    activated_state,
+                    previous_stop=activated_state.current_stop,
+                    current_stop=activated_state.current_stop,
+                    reason="activation_reached",
+                )
+                return activated_state
 
             instrument_spec = await self._instrument_spec(state.instrument)
             atr = state.atr_value
@@ -945,6 +971,9 @@ class TrailingManager:
                 attempt_state,
                 phase=phase,
                 current_stop=confirmed,
+                resolved_activation_price=activation_price,
+                activated=True,
+                stop_owned=True,
                 reprice_count=attempt_state.reprice_count + 1,
                 failure_count=0,
                 last_error=None,
@@ -979,6 +1008,96 @@ class TrailingManager:
             if state.phase not in (TrailingPhase.ARMED, TrailingPhase.DEGRADED):
                 return state
             return await self._record_fetch_failure(state, reason)
+
+    async def on_atr(
+        self, trailing_id: str, atr: Decimal, *, as_of: datetime
+    ) -> TrailingState | None:
+        """Persist a refreshed ATR and recover an ATR-stale state."""
+        self._require_ready()
+        async with self._state_lock(trailing_id):
+            state = await self._state_store.get_trailing_state(trailing_id)
+            if state is None or state.mode is not TrailingMode.SYNTHETIC:
+                return state
+            if not state.spec.uses_atr:
+                return state
+            if state.phase not in (TrailingPhase.ARMED, TrailingPhase.DEGRADED):
+                return state
+
+            self._atr_failures[trailing_id] = 0
+            recover = state.phase is TrailingPhase.DEGRADED and (
+                state.last_error or ""
+            ).startswith(_ATR_ERROR_PREFIX)
+            updated = replace(
+                state,
+                phase=TrailingPhase.ARMED if recover else state.phase,
+                atr_value=atr,
+                atr_as_of=as_of,
+                last_error=None if recover else state.last_error,
+                updated_at=self._clock(),
+            )
+            await self._state_store.upsert_trailing_state(updated)
+            if recover:
+                self._publish(
+                    updated,
+                    previous=TrailingPhase.DEGRADED,
+                    reason="atr_refreshed",
+                )
+                await self._write_audit(
+                    "trailing.recovered",
+                    updated,
+                    previous_stop=updated.current_stop,
+                    current_stop=updated.current_stop,
+                    reason="atr_refreshed",
+                )
+            return updated
+
+    async def on_atr_failure(
+        self, trailing_id: str, reason: str
+    ) -> TrailingState | None:
+        """Count a candle refresh failure and degrade after the stale limit."""
+        self._require_ready()
+        async with self._state_lock(trailing_id):
+            state = await self._state_store.get_trailing_state(trailing_id)
+            if state is None or state.mode is not TrailingMode.SYNTHETIC:
+                return state
+            if not state.spec.uses_atr:
+                return state
+            if state.phase not in (TrailingPhase.ARMED, TrailingPhase.DEGRADED):
+                return state
+
+            count = self._atr_failures.get(trailing_id, 0) + 1
+            self._atr_failures[trailing_id] = count
+            if count < self._config.atr_stale_after_candles:
+                return state
+
+            error = f"{_ATR_ERROR_PREFIX}{reason}"
+            if state.phase is TrailingPhase.DEGRADED:
+                if not (state.last_error or "").startswith(_ATR_ERROR_PREFIX):
+                    return state
+                updated = replace(
+                    state,
+                    last_error=error,
+                    updated_at=self._clock(),
+                )
+                await self._state_store.upsert_trailing_state(updated)
+                return updated
+
+            degraded = replace(
+                state,
+                phase=TrailingPhase.DEGRADED,
+                last_error=error,
+                updated_at=self._clock(),
+            )
+            await self._state_store.upsert_trailing_state(degraded)
+            self._publish(degraded, previous=state.phase, reason="atr_stale")
+            await self._write_audit(
+                "trailing.degraded",
+                degraded,
+                previous_stop=state.current_stop,
+                current_stop=state.current_stop,
+                reason="atr_stale",
+            )
+            return degraded
 
     def publish_ticker_event(self, instrument: Instrument, ticker: Ticker) -> None:
         """Publish a sampled ticker when the worker is configured to do so."""
