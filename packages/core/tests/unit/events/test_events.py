@@ -21,7 +21,10 @@ from unified_trading_execution.events import (
     ReconciliationCompleteEvent,
     ReconciliationEvent,
     ReconciliationMismatch,
+    TickerEvent,
+    TrailingStateEvent,
 )
+from unified_trading_execution.trailing.types import TrailingMode, TrailingPhase
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -30,6 +33,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
+from unified_trading_execution.types.market_data import Ticker
 from unified_trading_execution.types.order import FillRecord, OrderRecord
 from unified_trading_execution.types.position import Balance, Position
 
@@ -578,3 +582,48 @@ class TestEventBus:
         source = inspect.getsource(EventBus.publish)
         assert "write_audit" not in source
         assert "state_store" not in source
+
+
+# ============================================================
+# Trailing events
+# ============================================================
+
+
+def test_ticker_event_carries_instrument_and_ticker():
+    ticker = Ticker(last=Decimal("100"))
+    event = TickerEvent(
+        event_id="e1",
+        timestamp=NOW,
+        adapter_name="bybit",
+        account_id="acct",
+        correlation_id=None,
+        instrument=make_instrument(),
+        ticker=ticker,
+    )
+
+    assert event.instrument.symbol == "BTC"
+    assert event.ticker is ticker
+    assert event.timestamp == NOW
+
+
+def test_trailing_state_event_carries_transition():
+    event = TrailingStateEvent(
+        event_id="e2",
+        timestamp=NOW,
+        adapter_name="bybit",
+        account_id="acct",
+        correlation_id="tr-1",
+        trailing_id="tr-1",
+        instrument=make_instrument(),
+        position_id="leg-1",
+        previous_phase=TrailingPhase.ARMING,
+        phase=TrailingPhase.ARMED,
+        mode=TrailingMode.NATIVE,
+        current_stop=Decimal("99"),
+        reason=None,
+    )
+
+    assert event.previous_phase is TrailingPhase.ARMING
+    assert event.phase is TrailingPhase.ARMED
+    assert event.mode is TrailingMode.NATIVE
+    assert event.current_stop == Decimal("99")

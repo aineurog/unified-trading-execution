@@ -111,3 +111,18 @@ modules = [
     "unified_trading_execution.ibkr",
     "unified_trading_execution.hyperliquid",
 ]
+
+[[tool.importlinter.contracts]]
+id = "trailing-types-is-leaf"
+name = "trailing/types.py may import only stdlib and core types"
+type = "forbidden"
+source_modules = ["unified_trading_execution.trailing.types"]
+forbidden_modules = [
+    "unified_trading_execution.adapter",
+    "unified_trading_execution.engine",
+    "unified_trading_execution.state",
+    "unified_trading_execution.events",
+    "unified_trading_execution.trailing.math",
+    "unified_trading_execution.trailing.manager",
+    "unified_trading_execution.trailing.worker",
+]

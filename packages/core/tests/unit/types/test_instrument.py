@@ -507,3 +507,30 @@ def test_instrument_spec_is_frozen():
     )
     with pytest.raises(Exception):
         spec.price_precision = 5  # type: ignore[misc]
+
+
+def test_instrument_spec_min_stop_distance_defaults_to_none():
+    spec = InstrumentSpec(
+        tick_size=Decimal("0.01"),
+        lot_size=Decimal("1"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("100"),
+        min_notional=Decimal("10"),
+        price_precision=2,
+        qty_precision=3,
+    )
+    assert spec.min_stop_distance is None
+
+
+def test_instrument_spec_min_stop_distance_can_be_set():
+    spec = InstrumentSpec(
+        tick_size=Decimal("0.01"),
+        lot_size=Decimal("1"),
+        min_qty=Decimal("0.001"),
+        max_qty=Decimal("100"),
+        min_notional=Decimal("10"),
+        price_precision=2,
+        qty_precision=3,
+        min_stop_distance=Decimal("0.5"),
+    )
+    assert spec.min_stop_distance == Decimal("0.5")

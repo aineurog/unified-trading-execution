@@ -72,6 +72,36 @@ class TestPosition:
         with pytest.raises(Exception):
             p.quantity = Decimal("1.0")  # type: ignore[misc]
 
+    def test_opened_at_defaults_to_none(self):
+        p = Position(
+            instrument=make_btc(),
+            quantity=Decimal("0.5"),
+            average_entry_price=Decimal("50000"),
+            updated_at=NOW,
+        )
+        assert p.opened_at is None
+
+    def test_opened_at_must_be_timezone_aware(self):
+        with pytest.raises(ValueError, match="opened_at must be timezone-aware"):
+            Position(
+                instrument=make_btc(),
+                quantity=Decimal("0.5"),
+                average_entry_price=Decimal("50000"),
+                updated_at=NOW,
+                opened_at=datetime(2026, 7, 28, 12, 0, 0),
+            )
+
+    def test_opened_at_accepts_aware_datetime(self):
+        opened = datetime(2026, 7, 28, 11, 0, 0, tzinfo=UTC)
+        p = Position(
+            instrument=make_btc(),
+            quantity=Decimal("0.5"),
+            average_entry_price=Decimal("50000"),
+            updated_at=NOW,
+            opened_at=opened,
+        )
+        assert p.opened_at == opened
+
 
 # ============================================================
 # Balance

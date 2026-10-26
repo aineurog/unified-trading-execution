@@ -14,9 +14,17 @@ from typing import TYPE_CHECKING
 
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.state.halt import HaltStateMachine
+from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
+    TrailingActivation,
+    TrailingBasis,
+    TrailingOffsetType,
+)
 from unified_trading_execution.types.enums import OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -39,6 +47,46 @@ class RateLimits:
     interval_seconds: float
     remaining: int
     reset_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class PositionProtectionCapability:
+    """What an adapter can do with static TP/SL on one position leg."""
+
+    supported: bool
+    can_set_stop: bool
+    can_set_take_profit: bool
+    can_clear_stop: bool
+    can_clear_take_profit: bool
+    preserves_unmentioned_side: bool
+    trigger_bases: frozenset[TrailingBasis]
+    min_reprice_interval_seconds: float
+    reprice_gap: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TrailingCapability:
+    """What an adapter can express as a native venue trailing stop."""
+
+    supported: bool
+    offset_types: frozenset[TrailingOffsetType]
+    bases: frozenset[TrailingBasis]
+    activations: frozenset[TrailingActivation]
+    supports_step: bool
+    supports_initial_stop: bool
+    supports_take_profit: bool
+    position_scoped: bool
+    min_reprice_interval_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDataCapability:
+    """What ticker and candle data an adapter can serve for one instrument."""
+
+    ticker_bases: frozenset[TrailingBasis]
+    min_ticker_interval_seconds: float
+    candle_timeframes: frozenset[CandleTimeframe]
+    streaming_ticker: bool
 
 
 class Adapter(ABC):
@@ -160,6 +208,58 @@ class Adapter(ABC):
         """
         ...
 
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Return what this adapter can do with static TP/SL on a position leg.
+
+        The default is fully unsupported.  Synthetic trailing requires
+        ``supported`` and ``preserves_unmentioned_side``; the manager also
+        needs ``get_position_tpsl`` to read protection back.
+        """
+        return PositionProtectionCapability(
+            supported=False,
+            can_set_stop=False,
+            can_set_take_profit=False,
+            can_clear_stop=False,
+            can_clear_take_profit=False,
+            preserves_unmentioned_side=False,
+            trigger_bases=frozenset(),
+            min_reprice_interval_seconds=0.0,
+            reprice_gap=False,
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Return the native trailing features this adapter can honour.
+
+        The default is fully unsupported.  Declare venue terms only; a
+        ``PROFIT_PERCENT`` activation is resolved to a price before the call.
+        """
+        return TrailingCapability(
+            supported=False,
+            offset_types=frozenset(),
+            bases=frozenset(),
+            activations=frozenset(),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=False,
+            min_reprice_interval_seconds=0.0,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Return the ticker and candle data this adapter can serve.
+
+        The default advertises no data.  ``ticker_bases`` describes what
+        ``fetch_ticker`` actually populates, not what the venue publishes.
+        """
+        return MarketDataCapability(
+            ticker_bases=frozenset(),
+            min_ticker_interval_seconds=0.0,
+            candle_timeframes=frozenset(),
+            streaming_ticker=False,
+        )
+
     # ---- Rate limits ----
 
     @abstractmethod
@@ -185,14 +285,32 @@ class Adapter(ABC):
         which must raise ``InvalidSymbolError``, and from an unsupported
         platform, which keeps the ``NotImplementedError`` default.
 
-        This is a fresh snapshot, not a cache; callers should not poll it in a
-        hot loop.  It is intentionally not wired into the engine's
-        reference-price sanity check — that remains the caller-supplied
-        ``get_reference_price`` callback.
+        This is a fresh snapshot, not a cache.  The trailing worker may poll it
+        at the minimum interval declared by ``market_data_capability``; other
+        callers should take one snapshot and not poll.  It is intentionally not
+        wired into the engine's reference-price sanity check - that remains the
+        caller-supplied ``get_reference_price`` callback.
         """
         raise NotImplementedError(
             f"{self.platform_name} does not support fetching a current price snapshot"
         )
+
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles for ATR, oldest first and most recent last.
+
+        Optional — raises ``NotImplementedError`` by default.  Never include the
+        candle that is still forming, and never return an empty list to hide a
+        transport failure.  A symbol the venue does not provide raises
+        ``InvalidSymbolError``.  ``limit`` is a maximum; returning fewer closed
+        candles is allowed.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not support fetching candles for ATR")
 
     # ---- Position TP/SL modification (optional) ----
 
@@ -210,6 +328,10 @@ class Adapter(ABC):
         support modifying TP/SL on positions (MT5 via ``TRADE_ACTION_SLTP``,
         IBKR via OCA orders, Bybit via ``set_trading_stop``) override this
         method.  At least one of *take_profit* or *stop_loss* must be provided.
+
+        Every side the caller does not mention is preserved.  An implementation
+        that cannot guarantee that must not report
+        ``PositionProtectionCapability.preserves_unmentioned_side``.
 
         *position_id* is the platform-assigned position identifier (MT5 ticket,
         Bybit ``positionIdx``, IBKR ``conId``, ...).  It is scoped by
@@ -240,6 +362,79 @@ class Adapter(ABC):
         """
         raise NotImplementedError(
             f"{self.platform_name} does not support reading TP/SL on open positions"
+        )
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named protection sides on an open position leg.
+
+        Optional — raises ``NotImplementedError`` by default.  At least one of
+        *take_profit* or *stop_loss* must be true.  Clear only the named sides
+        and preserve the others.  When the venue attaches protection to the
+        position and the position is confirmed flat, return quietly; venues
+        with separate protective orders must still cancel owned orders.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+        raise NotImplementedError(
+            f"{self.platform_name} does not support clearing TP/SL on open positions"
+        )
+
+    # ---- Native trailing (optional) ----
+
+    async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
+        """Place or replace a native trailing stop for one position leg.
+
+        Optional — raises ``NotImplementedError`` by default.  Must not clear
+        or alter the current take profit or stop loss.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
+
+    async def cancel_trailing_stop(self, native_id: str, instrument: Instrument) -> None:
+        """Cancel a native trailing stop by venue identifier.
+
+        Optional — raises ``NotImplementedError`` by default.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
+
+    async def get_trailing_stop(
+        self, native_id: str, instrument: Instrument
+    ) -> NativeTrailingResult | None:
+        """Read a native trailing stop by venue identifier.
+
+        Optional — raises ``NotImplementedError`` by default.  Returns ``None``
+        only when the venue confirms the trail is absent.
+
+        This is the post-placement read: it needs a ``native_id`` returned by
+        :meth:`place_trailing_stop` or loaded from persisted state.  Use
+        :meth:`get_position_trailing_stop` to detect a trail before attaching.
+        """
+        raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
+
+    async def get_position_trailing_stop(
+        self, instrument: Instrument, position_id: str
+    ) -> NativeTrailingResult | None:
+        """Read the native trailing stop attached to one position leg.
+
+        Optional — raises ``NotImplementedError`` by default.  Unlike
+        :meth:`get_trailing_stop`, this is keyed by the position leg, not by a
+        venue ``native_id``, so it can be called before ``place_trailing_stop``
+        to detect a pre-existing trail and apply the takeover rule.
+
+        Return ``None`` only when the venue confirms the leg has no native
+        trail.  Raise on transport errors.  ``position_id`` follows the same
+        conventions as :meth:`modify_position_tpsl`.  Adapters that declare
+        native trailing support must implement this before native attach can
+        run.
+        """
+        raise NotImplementedError(
+            f"{self.platform_name} does not support reading a native trailing stop by position"
         )
 
     # ---- Reconciliation data (optional — not required for basic operation) ----

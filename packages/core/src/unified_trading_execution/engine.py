@@ -32,7 +32,11 @@ from unified_trading_execution.dispatch import (
     dispatch_modify_order,
     dispatch_place_order,
 )
-from unified_trading_execution.errors import EngineShutdownError, ReconciliationError
+from unified_trading_execution.errors import (
+    EngineShutdownError,
+    PlatformConnectionError,
+    ReconciliationError,
+)
 from unified_trading_execution.events import (
     AccountChangedEvent,
     AuditEvent,
@@ -47,6 +51,7 @@ from unified_trading_execution.events import (
     PositionUpdateEvent,
     ReconciliationCompleteEvent,
     ReconciliationEvent,
+    TrailingStateEvent,
 )
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import (
@@ -57,6 +62,12 @@ from unified_trading_execution.state import (
     reconcile,
 )
 from unified_trading_execution.state.store import SQLiteStateStore, default_state_store_path
+from unified_trading_execution.trailing import (
+    TrailingConfig,
+    TrailingMode,
+)
+from unified_trading_execution.trailing.manager import TrailingManager
+from unified_trading_execution.trailing.worker import TrailingWorker
 from unified_trading_execution.types.enums import OrderStatus, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import (
@@ -74,6 +85,11 @@ logger = logging.getLogger(__name__)
 # by default so drift is caught without a manual step; pass
 # ``reconcile_interval_seconds=None`` to disable it entirely.
 DEFAULT_RECONCILE_INTERVAL_SECONDS: float = 30.0
+
+# Independent cadence for the trailing integrity pass.  Reconcile also runs a
+# pass, but this timer keeps protection checked when the reconcile loop is
+# disabled, and bounds how long a drifted stop can go unnoticed.
+DEFAULT_TRAILING_INTEGRITY_INTERVAL_SECONDS: float = 60.0
 
 # Default fill settle lag: the leading edge of the reconciliation fill window
 # (in seconds) that is left un-compared, because an execution-stream event can
@@ -163,6 +179,7 @@ class Engine:
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        trailing_config: TrailingConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
         fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
@@ -193,6 +210,15 @@ class Engine:
         self._last_connected: bool | None = None
         self._reconcile_task: asyncio.Task[None] | None = None
 
+        # Trailing is constructed on connect, once the store and adapter are
+        # ready.  Construction itself never starts the polling worker.
+        self._trailing_config = trailing_config or TrailingConfig()
+        self._trailing_manager: TrailingManager | None = None
+        self._trailing_worker: TrailingWorker | None = None
+        self._trailing_worker_lock = asyncio.Lock()
+        self._trailing_ready = False
+        self._rate_limit_refresh_pending = False
+
         # Periodic reconciliation (on by default; None disables it).
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
             raise ValueError(
@@ -203,6 +229,7 @@ class Engine:
             raise ValueError(f"fill_settle_lag_seconds must be >= 0, got {fill_settle_lag_seconds}")
         self._fill_settle_lag_seconds = fill_settle_lag_seconds
         self._reconcile_loop_task: asyncio.Task[None] | None = None
+        self._trailing_integrity_task: asyncio.Task[None] | None = None
         # Serialises manual / reconnect / periodic reconciles so they never
         # run concurrently and never mutate the mirror at the same time.
         self._reconcile_lock = asyncio.Lock()
@@ -218,6 +245,7 @@ class Engine:
         self._event_bus.subscribe(BalanceUpdateEvent, self._on_balance_update)
         self._event_bus.subscribe(ConnectionStateEvent, self._on_connection_state)
         self._event_bus.subscribe(AccountChangedEvent, self._on_account_changed)
+        self._event_bus.subscribe(TrailingStateEvent, self._on_trailing_state)
 
     # ── Lifecycle ──────────────────────────────────────────────────
 
@@ -257,9 +285,16 @@ class Engine:
         # Fetch initial rate limits
         await self._refresh_rate_limits()
 
+        # Restore trailing protection before returns/loops expose the engine.
+        await self._start_trailing()
+
         # Start the optional periodic reconciliation loop, if enabled.
         if self._reconcile_interval_seconds is not None:
             self._reconcile_loop_task = asyncio.ensure_future(self._reconcile_loop())
+
+        # Integrity has its own cadence so protection is still checked when the
+        # reconcile loop is disabled.
+        self._trailing_integrity_task = asyncio.ensure_future(self._trailing_integrity_loop())
 
     async def _resolve_account_id(self) -> str:
         """Resolve the canonical platform account identity for store-path keying.
@@ -343,6 +378,60 @@ class Engine:
             await self.reconcile()
         except Exception:
             logger.exception("Automatic reconciliation after reconnect failed")
+            return
+        if self._trailing_manager is not None and not self._trailing_ready:
+            try:
+                await self._rehydrate_trailing(self._trailing_manager)
+            except Exception:
+                logger.exception("Trailing rehydration after reconnect failed")
+
+    async def _start_trailing(self) -> None:
+        """Reconcile (when needed), rehydrate, and start the worker if required."""
+        manager = self._trailing_manager
+        if manager is None:
+            manager = TrailingManager(
+                adapter=self._adapter,
+                state_store=self._store,
+                halt_machine=self._halt_machine,
+                reserve_rate_limit=self.reserve_rate_limit,
+                event_bus=self._event_bus,
+                config=self._trailing_config,
+            )
+            self._trailing_manager = manager
+            self._trailing_worker = TrailingWorker(manager, self._adapter, self._trailing_config)
+
+        active = await manager.list(active_only=True)
+        if not active:
+            await manager.rehydrate(positions=[])
+            self._trailing_ready = True
+            await self._sync_trailing_worker()
+            return
+
+        # A clean reconciliation alone does not prove the position dataset was
+        # fetched, so rehydration also takes a direct snapshot below.
+        try:
+            await self.reconcile()
+        except Exception:
+            logger.warning("Trailing rehydration deferred: reconciliation failed", exc_info=True)
+            return
+        if not self._trailing_ready:
+            await self._rehydrate_trailing(manager)
+
+    async def _rehydrate_trailing(self, manager: TrailingManager) -> None:
+        """Restore active trailing states from a direct position snapshot."""
+        try:
+            snapshot = await self._adapter.fetch_positions()
+        except Exception:
+            logger.warning("Trailing rehydration deferred: position snapshot failed", exc_info=True)
+            return
+        try:
+            await manager.rehydrate(positions=snapshot)
+        except Exception:
+            logger.warning("Trailing rehydration deferred", exc_info=True)
+            return
+
+        self._trailing_ready = True
+        await self._sync_trailing_worker()
 
     async def _reconcile_loop(self) -> None:
         """Periodic reconciliation loop (only runs when the user opted in).
@@ -369,15 +458,75 @@ class Engine:
             except Exception:
                 logger.warning("Periodic reconciliation failed", exc_info=True)
 
+    async def _trailing_integrity_loop(self) -> None:
+        """Run the trailing integrity pass on its own cadence."""
+        while not self._shutdown:
+            try:
+                await asyncio.sleep(DEFAULT_TRAILING_INTEGRITY_INTERVAL_SECONDS)
+            except asyncio.CancelledError:
+                break
+            await self._run_trailing_integrity_once()
+
+    async def _run_trailing_integrity_once(self) -> None:
+        """Run one integrity pass when the manager and adapter are ready."""
+        manager = self._trailing_manager
+        if manager is None or not self._trailing_ready:
+            return
+        if not self._adapter.is_connected:
+            return
+        try:
+            await manager.integrity_pass()
+        except Exception:
+            logger.exception("Trailing integrity pass failed")
+
     async def disconnect(self) -> None:
         """Disconnect the adapter gracefully."""
+        await self._stop_trailing_worker()
         await self._adapter.disconnect()
+
+    async def _stop_trailing_worker(self) -> None:
+        """Stop and await the trailing worker before the adapter goes away."""
+        self._trailing_ready = False
+        worker = self._trailing_worker
+        if worker is not None:
+            async with self._trailing_worker_lock:
+                await worker.stop()
+
+    async def _sync_trailing_worker(self) -> None:
+        """Start or stop the worker to match the active synthetic states.
+
+        Serialized by ``_trailing_worker_lock`` so a terminal state event and a
+        new attach cannot race each other into two workers or a cleared stop
+        signal.  The readiness check is repeated under the lock because a
+        disconnect may have set it while this call was waiting.
+        """
+        async with self._trailing_worker_lock:
+            if self._shutdown or not self._trailing_ready:
+                return
+            manager = self._trailing_manager
+            worker = self._trailing_worker
+            if manager is None or worker is None:
+                return
+            try:
+                active = await manager.list(active_only=True)
+            except Exception:
+                logger.exception("Failed to inspect trailing states for worker sync")
+                return
+            if any(state.mode is TrailingMode.SYNTHETIC for state in active):
+                worker.start()
+            elif worker.running:
+                await worker.stop()
 
     async def ashutdown(self) -> None:
         """Ordered teardown: flush audit, disconnect adapter, close state store, mark dead."""
         if self._shutdown:
             return
         self._shutdown = True
+        # Step 0 — stop the trailing worker before flushing or disconnecting
+        try:
+            await self._stop_trailing_worker()
+        except Exception:
+            logger.exception("Error stopping trailing worker in shutdown")
         # Step 1 — flush pending audit writes to durable storage
         try:
             await self._store.flush()
@@ -393,6 +542,8 @@ class Engine:
             self._reconcile_task.cancel()
         if self._reconcile_loop_task is not None and not self._reconcile_loop_task.done():
             self._reconcile_loop_task.cancel()
+        if self._trailing_integrity_task is not None and not self._trailing_integrity_task.done():
+            self._trailing_integrity_task.cancel()
         # Step 4 — close state store
         if self._state_store is not None:
             await self._state_store.close()
@@ -674,6 +825,24 @@ class Engine:
         # Adapters that manage adapter-owned intent (e.g. Bybit leverage /
         # margin mode) detect and correct drift here.
         await self._adapter.reconcile_user_intent()
+
+        # -- 9. Trailing rehydration retry / integrity pass --
+        # Runs after every reconcile, clean or not.  The reconcile loop and the
+        # independent trailing integrity timer both trigger passes; reconnect
+        # triggers a reconcile as well.  While rehydration is still pending,
+        # retry it; once ready, verify venue protection.
+        manager = self._trailing_manager
+        if manager is not None:
+            if not self._trailing_ready:
+                try:
+                    await self._rehydrate_trailing(manager)
+                except Exception:
+                    logger.exception("Trailing rehydration retry failed")
+            else:
+                try:
+                    await manager.integrity_pass()
+                except Exception:
+                    logger.exception("Trailing integrity pass failed")
 
         return result
 
@@ -1182,6 +1351,14 @@ class Engine:
     def risk_config(self) -> RiskConfig:
         return self._risk_config
 
+    @property
+    def trailing(self) -> TrailingManager:
+        """The trailing manager, available once :meth:`connect` has run."""
+        manager = self._trailing_manager
+        if manager is None:
+            raise PlatformConnectionError("Trailing is not available before connect()")
+        return manager
+
     # ── Adapter method auto-proxy ─────────────────────────────────
 
     def __getattr__(self, name: str) -> Any:
@@ -1239,6 +1416,33 @@ class Engine:
         if _utcnow() >= self._rate_limit_reset_at:
             await self._refresh_rate_limits()
 
+    def reserve_rate_limit(self) -> bool:
+        """Reserve one venue action from the shared rate-limit budget.
+
+        Trailing protection writes and cancels call this synchronously before
+        every venue action.  When the current window has elapsed, a background
+        refresh is scheduled and the caller is told to retry on the next tick
+        rather than blocking or spinning.
+        """
+        if self._risk_config.rate_limit_budget_override is None and (
+            self._rate_limit_reset_at is None or _utcnow() >= self._rate_limit_reset_at
+        ):
+            if not self._rate_limit_refresh_pending:
+                self._rate_limit_refresh_pending = True
+                self._schedule(self._refresh_rate_limits_pending())
+            return False
+        if self._effective_budget() <= 0:
+            return False
+        if self._risk_config.rate_limit_budget_override is None:
+            self._rate_limit_budget -= 1
+        return True
+
+    async def _refresh_rate_limits_pending(self) -> None:
+        try:
+            await self._refresh_rate_limits()
+        finally:
+            self._rate_limit_refresh_pending = False
+
     # ── Internal: EventBus subscribers (state mirror) ──────────────
 
     def _schedule(self, awaitable: Awaitable[None]) -> None:
@@ -1261,6 +1465,18 @@ class Engine:
 
     def _on_position_update(self, event: PositionUpdateEvent) -> None:
         self._schedule(self._persist_position(event))
+        if self._trailing_ready and self._trailing_manager is not None:
+            self._schedule(self._forward_trailing_position(event.position))
+
+    def _on_trailing_state(self, event: TrailingStateEvent) -> None:
+        """Start or stop the worker as synthetic states become active or terminal."""
+        if self._shutdown or not self._trailing_ready or self._trailing_worker is None:
+            return
+        if event.mode is not TrailingMode.SYNTHETIC:
+            return
+        if event.phase == event.previous_phase:
+            return
+        self._schedule(self._sync_trailing_worker())
 
     def _on_balance_update(self, event: BalanceUpdateEvent) -> None:
         self._schedule(self._persist_balance(event))
@@ -1357,6 +1573,19 @@ class Engine:
                 await self._store.upsert_position(position)
         except Exception:
             logger.exception("Failed to persist position %s", event.event_id)
+
+    async def _forward_trailing_position(self, position: Position) -> None:
+        """Forward a position update only when it matches an active state."""
+        manager = self._trailing_manager
+        if manager is None or not self._trailing_ready:
+            return
+        try:
+            await manager.on_position_update(position)
+        except Exception:
+            logger.exception(
+                "Failed to forward position update to trailing for %s",
+                position.position_id,
+            )
 
     async def _persist_balance(self, event: BalanceUpdateEvent) -> None:
         try:

@@ -110,3 +110,6 @@ class InstrumentSpec:
     price_precision: int
     qty_precision: int
     max_leverage: Decimal | None = None  # None for spot / platforms without leverage
+    min_stop_distance: Decimal | None = (
+        None  # Minimum distance between the current price and a stop/protection level.
+    )

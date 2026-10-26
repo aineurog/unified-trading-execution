@@ -14,7 +14,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -43,6 +43,7 @@ __all__ = [
     "TimeInForce",
     # Data types
     "Balance",
+    "Candle",
     "FillRecord",
     "Instrument",
     "InstrumentSpec",
