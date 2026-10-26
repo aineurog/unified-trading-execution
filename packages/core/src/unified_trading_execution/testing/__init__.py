@@ -9,10 +9,17 @@ from __future__ import annotations
 
 import uuid
 from collections import deque
+from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from decimal import Decimal
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+    TrailingCapability,
+)
 from unified_trading_execution.errors import (
     InvalidSymbolError,
     OrderNotFoundError,
@@ -25,6 +32,11 @@ from unified_trading_execution.events import (
     OrderStatusEvent,
     PositionUpdateEvent,
 )
+from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
+)
 from unified_trading_execution.types.enums import (
     OrderSide,
     OrderStatus,
@@ -32,6 +44,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -49,6 +62,24 @@ def _new_id() -> str:
 
 def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectionWrite:
+    """One recorded position protection write or clear.
+
+    ``take_profit`` and ``stop_loss`` are the levels the adapter would send
+    after merging an update: a side omitted from the call keeps its previous
+    value.  The ``cleared_*`` flags identify sides explicitly removed.
+    """
+
+    instrument: Instrument
+    position_id: str
+    side: OrderSide
+    take_profit: TpSlAttachment | None
+    stop_loss: TpSlAttachment | None
+    cleared_take_profit: bool = False
+    cleared_stop_loss: bool = False
 
 
 class MockAdapter(Adapter):
@@ -119,6 +150,27 @@ class MockAdapter(Adapter):
         # Single-shot error injection
         self._next_error: BaseException | None = None
 
+        # Trailing support: scripted market data, capabilities, and writes.
+        self._ticker_queue: deque[Ticker | BaseException | None] = deque()
+        self._candle_queue: deque[list[Candle] | BaseException] = deque()
+        self._protection_capabilities: dict[Instrument, PositionProtectionCapability] = {}
+        self._trailing_capabilities: dict[Instrument, TrailingCapability] = {}
+        self._market_data_capabilities: dict[Instrument, MarketDataCapability] = {}
+        self._protection: dict[
+            tuple[Instrument, str], tuple[TpSlAttachment | None, TpSlAttachment | None]
+        ] = {}
+        self._protection_writes: list[ProtectionWrite] = []
+        self._native_trails: dict[
+            tuple[Instrument, str], tuple[NativeTrailingRequest, NativeTrailingResult]
+        ] = {}
+        self._native_requests: list[NativeTrailingRequest] = []
+
+        self._next_ticker_error: BaseException | None = None
+        self._next_candle_error: BaseException | None = None
+        self._next_set_protection_error: BaseException | None = None
+        self._next_clear_protection_error: BaseException | None = None
+        self._next_native_error: BaseException | None = None
+
     # ---- Helpers for test authors ----
 
     @property
@@ -128,8 +180,18 @@ class MockAdapter(Adapter):
 
     @property
     def orders(self) -> dict[str, OrderRecord]:
-        """The internal order book — for test assertions."""
+        """The internal order book �?" for test assertions."""
         return dict(self._orders)
+
+    @property
+    def protection_writes(self) -> tuple[ProtectionWrite, ...]:
+        """Every protection write or clear recorded in call order."""
+        return tuple(self._protection_writes)
+
+    @property
+    def native_requests(self) -> tuple[NativeTrailingRequest, ...]:
+        """Every native trailing placement request in call order."""
+        return tuple(self._native_requests)
 
     # -- Error injection --
 
@@ -139,6 +201,26 @@ class MockAdapter(Adapter):
         Consumed after one use. Set to None to clear.
         """
         self._next_error = exc
+
+    def set_next_ticker_error(self, exc: BaseException | None) -> None:
+        """Make the next ``fetch_ticker`` call raise *exc* once."""
+        self._next_ticker_error = exc
+
+    def set_next_candle_error(self, exc: BaseException | None) -> None:
+        """Make the next ``fetch_candles`` call raise *exc* once."""
+        self._next_candle_error = exc
+
+    def set_next_set_protection_error(self, exc: BaseException | None) -> None:
+        """Make the next ``modify_position_tpsl`` call raise *exc* once."""
+        self._next_set_protection_error = exc
+
+    def set_next_clear_protection_error(self, exc: BaseException | None) -> None:
+        """Make the next ``clear_position_tpsl`` call raise *exc* once."""
+        self._next_clear_protection_error = exc
+
+    def set_next_native_error(self, exc: BaseException | None) -> None:
+        """Make the next native trailing call raise *exc* once."""
+        self._next_native_error = exc
 
     # -- Response queueing --
 
@@ -157,6 +239,14 @@ class MockAdapter(Adapter):
     def queue_get_order_response(self, result: OrderResult | BaseException | None) -> None:
         """Queue a response for the next ``get_order_by_client_id()`` call."""
         self._get_order_queue.append(result)
+
+    def queue_ticker_response(self, response: Ticker | BaseException | None) -> None:
+        """Queue a response for the next ``fetch_ticker()`` call."""
+        self._ticker_queue.append(response)
+
+    def queue_candles_response(self, response: list[Candle] | BaseException) -> None:
+        """Queue a response for the next ``fetch_candles()`` call."""
+        self._candle_queue.append(response)
 
     # -- Event injection (simulates websocket stream) --
 
@@ -227,6 +317,35 @@ class MockAdapter(Adapter):
     def set_supported_order_types(self, types: frozenset[OrderType]) -> None:
         """Override the set returned by ``supported_order_types()``."""
         self._supported_order_types = types
+
+    def set_position_protection_capability(
+        self, instrument: Instrument, capability: PositionProtectionCapability
+    ) -> None:
+        """Override ``position_protection_capability()`` for one instrument."""
+        self._protection_capabilities[instrument] = capability
+
+    def set_trailing_capability(
+        self, instrument: Instrument, capability: TrailingCapability
+    ) -> None:
+        """Override ``trailing_capability()`` for one instrument."""
+        self._trailing_capabilities[instrument] = capability
+
+    def set_market_data_capability(
+        self, instrument: Instrument, capability: MarketDataCapability
+    ) -> None:
+        """Override ``market_data_capability()`` for one instrument."""
+        self._market_data_capabilities[instrument] = capability
+
+    def seed_protection(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        """Seed the protection levels ``get_position_tpsl()`` returns."""
+        self._protection[(instrument, position_id)] = (take_profit, stop_loss)
 
     # -- Order book seeding --
 
@@ -446,12 +565,190 @@ class MockAdapter(Adapter):
     def supported_order_types(self) -> frozenset[OrderType]:
         return self._supported_order_types
 
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        return self._protection_capabilities.get(
+            instrument, super().position_protection_capability(instrument)
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        return self._trailing_capabilities.get(
+            instrument, super().trailing_capability(instrument)
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        return self._market_data_capabilities.get(
+            instrument, super().market_data_capability(instrument)
+        )
+
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
         if (err := self._consume_error()) is not None:
             raise err
         return self._rate_limits
+
+    # ---- Market data (optional Adapter ABC methods) ----
+
+    async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_ticker_error) is not None:
+            self._next_ticker_error = None
+            raise err
+        if not self._ticker_queue:
+            return None
+        response = self._ticker_queue.popleft()
+        if isinstance(response, BaseException):
+            raise response
+        return response
+
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_candle_error) is not None:
+            self._next_candle_error = None
+            raise err
+        if not self._candle_queue:
+            return []
+        response = self._candle_queue.popleft()
+        if isinstance(response, BaseException):
+            raise response
+        return list(response)
+
+    # ---- Position protection (optional Adapter ABC methods) ----
+
+    async def modify_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+    ) -> None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_set_protection_error) is not None:
+            self._next_set_protection_error = None
+            raise err
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss is required")
+        position = self._open_position(instrument, position_id)
+        if position is None:
+            raise OrderNotFoundError(
+                f"no open position {position_id!r} on {instrument.symbol}"
+            )
+        current_tp, current_sl = self._protection.get((instrument, position_id), (None, None))
+        resolved_tp = take_profit if take_profit is not None else current_tp
+        resolved_sl = stop_loss if stop_loss is not None else current_sl
+        self._protection[(instrument, position_id)] = (resolved_tp, resolved_sl)
+        self._protection_writes.append(
+            ProtectionWrite(
+                instrument=instrument,
+                position_id=position_id,
+                side=OrderSide.BUY if position.quantity > 0 else OrderSide.SELL,
+                take_profit=resolved_tp,
+                stop_loss=resolved_sl,
+            )
+        )
+
+    async def get_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if self._open_position(instrument, position_id) is None:
+            return None
+        return self._protection.get((instrument, position_id), (None, None))
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_clear_protection_error) is not None:
+            self._next_clear_protection_error = None
+            raise err
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+        position = self._open_position(instrument, position_id)
+        if position is None:
+            self._protection.pop((instrument, position_id), None)
+            return
+        current_tp, current_sl = self._protection.get((instrument, position_id), (None, None))
+        resolved_tp = None if take_profit else current_tp
+        resolved_sl = None if stop_loss else current_sl
+        self._protection[(instrument, position_id)] = (resolved_tp, resolved_sl)
+        self._protection_writes.append(
+            ProtectionWrite(
+                instrument=instrument,
+                position_id=position_id,
+                side=OrderSide.BUY if position.quantity > 0 else OrderSide.SELL,
+                take_profit=resolved_tp,
+                stop_loss=resolved_sl,
+                cleared_take_profit=take_profit,
+                cleared_stop_loss=stop_loss,
+            )
+        )
+
+    # ---- Native trailing (optional Adapter ABC methods) ----
+
+    async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_native_error) is not None:
+            self._next_native_error = None
+            raise err
+        if self._open_position(request.instrument, request.position_id) is None:
+            raise OrderNotFoundError(
+                f"no open position {request.position_id!r} on {request.instrument.symbol}"
+            )
+        result = NativeTrailingResult(
+            native_id=f"native-{_new_id()[:8]}",
+            confirmed_offset=request.offset,
+            current_stop=None,
+            activated=False,
+            position_scoped=True,
+        )
+        self._native_trails[(request.instrument, result.native_id)] = (request, result)
+        self._native_requests.append(request)
+        return result
+
+    async def cancel_trailing_stop(self, native_id: str, instrument: Instrument) -> None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_native_error) is not None:
+            self._next_native_error = None
+            raise err
+        key = (instrument, native_id)
+        if key not in self._native_trails:
+            raise OrderNotFoundError(native_id)
+        del self._native_trails[key]
+
+    async def get_trailing_stop(
+        self, native_id: str, instrument: Instrument
+    ) -> NativeTrailingResult | None:
+        if (err := self._consume_error()) is not None:
+            raise err
+        if (err := self._next_native_error) is not None:
+            self._next_native_error = None
+            raise err
+        entry = self._native_trails.get((instrument, native_id))
+        return entry[1] if entry is not None else None
 
     # ---- Reconciliation data (optional Adapter ABC methods) ----
 
@@ -498,7 +795,49 @@ class MockAdapter(Adapter):
         """Pre-seed a fill for fetch_fills()."""
         self._fills.append(fill)
 
+    def update_position(self, position: Position, *, publish: bool = True) -> None:
+        """Replace or append a leg and publish a position update.
+
+        A zero quantity is treated as a closed leg: its protection and native
+        trailing state are dropped, mirroring venues that remove protection
+        with the position.
+        """
+        for index, existing in enumerate(self._positions):
+            if (
+                existing.instrument == position.instrument
+                and existing.position_id == position.position_id
+            ):
+                self._positions[index] = position
+                break
+        else:
+            self._positions.append(position)
+
+        if position.quantity == 0:
+            if position.position_id is not None:
+                self._protection.pop((position.instrument, position.position_id), None)
+            stale = [
+                key
+                for key, (request, _) in self._native_trails.items()
+                if request.instrument == position.instrument
+                and request.position_id == position.position_id
+            ]
+            for key in stale:
+                del self._native_trails[key]
+
+        if publish:
+            self.inject_position_update(position)
+
     # ---- Internal ----
+
+    def _open_position(self, instrument: Instrument, position_id: str) -> Position | None:
+        for position in self._positions:
+            if (
+                position.instrument == instrument
+                and position.position_id == position_id
+                and position.quantity != 0
+            ):
+                return position
+        return None
 
     def _consume_error(self) -> BaseException | None:
         err = self._next_error
