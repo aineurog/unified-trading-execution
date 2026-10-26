@@ -285,10 +285,11 @@ class Adapter(ABC):
         which must raise ``InvalidSymbolError``, and from an unsupported
         platform, which keeps the ``NotImplementedError`` default.
 
-        This is a fresh snapshot, not a cache; callers should not poll it in a
-        hot loop.  It is intentionally not wired into the engine's
-        reference-price sanity check — that remains the caller-supplied
-        ``get_reference_price`` callback.
+        This is a fresh snapshot, not a cache.  The trailing worker may poll it
+        at the minimum interval declared by ``market_data_capability``; other
+        callers should take one snapshot and not poll.  It is intentionally not
+        wired into the engine's reference-price sanity check - that remains the
+        caller-supplied ``get_reference_price`` callback.
         """
         raise NotImplementedError(
             f"{self.platform_name} does not support fetching a current price snapshot"

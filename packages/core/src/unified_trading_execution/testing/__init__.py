@@ -152,6 +152,7 @@ class MockAdapter(Adapter):
 
         # Trailing support: scripted market data, capabilities, and writes.
         self._ticker_queue: deque[Ticker | BaseException | None] = deque()
+        self._tickers: dict[Instrument, Ticker] = {}
         self._candle_queue: deque[list[Candle] | BaseException] = deque()
         self._protection_capabilities: dict[Instrument, PositionProtectionCapability] = {}
         self._trailing_capabilities: dict[Instrument, TrailingCapability] = {}
@@ -243,6 +244,10 @@ class MockAdapter(Adapter):
     def queue_ticker_response(self, response: Ticker | BaseException | None) -> None:
         """Queue a response for the next ``fetch_ticker()`` call."""
         self._ticker_queue.append(response)
+
+    def set_ticker(self, instrument: Instrument, ticker: Ticker) -> None:
+        """Set the recurring ticker returned when the queue is empty."""
+        self._tickers[instrument] = ticker
 
     def queue_candles_response(self, response: list[Candle] | BaseException) -> None:
         """Queue a response for the next ``fetch_candles()`` call."""
@@ -598,7 +603,7 @@ class MockAdapter(Adapter):
             self._next_ticker_error = None
             raise err
         if not self._ticker_queue:
-            return None
+            return self._tickers.get(instrument)
         response = self._ticker_queue.popleft()
         if isinstance(response, BaseException):
             raise response

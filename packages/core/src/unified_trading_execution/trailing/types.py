@@ -9,6 +9,7 @@ layering test enforce this.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -251,6 +252,34 @@ class NativeTrailingResult:
     current_stop: Decimal | None
     activated: bool
     position_scoped: bool
+
+
+@dataclass(frozen=True, slots=True)
+class TrailingConfig:
+    """Runtime tuning for polling, ATR refresh, and failure policy."""
+
+    poll_interval_seconds: float = 1.0
+    max_concurrent_fetches: int = 4
+    fetch_failure_threshold: int = 5
+    protection_failure_threshold: int = 3
+    rearm_on_reconnect: bool = True
+    candle_settle_seconds: float = 2.0
+    atr_stale_after_candles: int = 2
+    publish_ticker_events: bool = False
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.poll_interval_seconds) or self.poll_interval_seconds < 0.1:
+            raise ValueError("poll_interval_seconds must be a finite value >= 0.1")
+        if self.max_concurrent_fetches < 1:
+            raise ValueError("max_concurrent_fetches must be >= 1")
+        if self.fetch_failure_threshold < 1:
+            raise ValueError("fetch_failure_threshold must be >= 1")
+        if self.protection_failure_threshold < 1:
+            raise ValueError("protection_failure_threshold must be >= 1")
+        if not math.isfinite(self.candle_settle_seconds) or self.candle_settle_seconds < 0:
+            raise ValueError("candle_settle_seconds must be a finite value >= 0")
+        if self.atr_stale_after_candles < 1:
+            raise ValueError("atr_stale_after_candles must be >= 1")
 
 
 @dataclass(frozen=True, slots=True)
