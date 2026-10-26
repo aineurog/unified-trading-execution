@@ -1,4 +1,4 @@
-﻿"""Polling worker for synthetic trailing states.
+"""Polling worker for synthetic trailing states.
 
 One worker serves every synthetic state on an engine.  Each cycle groups states
 by instrument, samples each instrument at most once, and hands the snapshot to
@@ -55,9 +55,7 @@ def _next_candle_close(
 ) -> datetime:
     seconds = _TIMEFRAME_SECONDS[timeframe]
     next_epoch = (int(as_of.timestamp()) // seconds + 1) * seconds
-    return datetime.fromtimestamp(next_epoch, tz=UTC) + timedelta(
-        seconds=settle_seconds
-    )
+    return datetime.fromtimestamp(next_epoch, tz=UTC) + timedelta(seconds=settle_seconds)
 
 
 class TrailingWorker:
@@ -80,9 +78,7 @@ class TrailingWorker:
         self._last_fetch: dict[Instrument, float] = {}
         self._backoff_until: dict[Instrument, float] = {}
         self._backoff_attempts: dict[Instrument, int] = {}
-        self._next_atr_refresh: dict[
-            tuple[Instrument, CandleTimeframe], datetime
-        ] = {}
+        self._next_atr_refresh: dict[tuple[Instrument, CandleTimeframe], datetime] = {}
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -155,9 +151,9 @@ class TrailingWorker:
         states: list[TrailingState],
         wall_now: datetime,
     ) -> None:
-        groups: defaultdict[
-            tuple[Instrument, CandleTimeframe], list[TrailingState]
-        ] = defaultdict(list)
+        groups: defaultdict[tuple[Instrument, CandleTimeframe], list[TrailingState]] = defaultdict(
+            list
+        )
         for state in states:
             timeframe = state.spec.atr_timeframe
             if timeframe is None or state.spec.atr_period is None:
@@ -173,9 +169,7 @@ class TrailingWorker:
             async with semaphore:
                 await self._refresh_atr_group(key, group, wall_now)
 
-        await asyncio.gather(
-            *(refresh(key, group) for key, group in groups.items())
-        )
+        await asyncio.gather(*(refresh(key, group) for key, group in groups.items()))
 
     async def _refresh_atr_group(
         self,
@@ -190,18 +184,12 @@ class TrailingWorker:
                 (state.atr_as_of or wall_now for state in states),
                 default=wall_now,
             )
-            next_refresh = _next_candle_close(
-                as_of, timeframe, self._config.candle_settle_seconds
-            )
+            next_refresh = _next_candle_close(as_of, timeframe, self._config.candle_settle_seconds)
             self._next_atr_refresh[key] = next_refresh
         if wall_now < next_refresh:
             return
 
-        periods = {
-            state.spec.atr_period
-            for state in states
-            if state.spec.atr_period is not None
-        }
+        periods = {state.spec.atr_period for state in states if state.spec.atr_period is not None}
         if not periods:
             return
         try:
@@ -233,9 +221,7 @@ class TrailingWorker:
                     await self._manager.on_atr_failure(state.trailing_id, reason)
                 continue
             for state in period_states:
-                await self._manager.on_atr(
-                    state.trailing_id, atr, as_of=wall_now
-                )
+                await self._manager.on_atr(state.trailing_id, atr, as_of=wall_now)
 
         self._next_atr_refresh[key] = _next_candle_close(
             wall_now, timeframe, self._config.candle_settle_seconds
@@ -254,8 +240,7 @@ class TrailingWorker:
             attempt = self._backoff_attempts.get(instrument, 0) + 1
             self._backoff_attempts[instrument] = attempt
             delay = min(
-                max(self._config.poll_interval_seconds, 1.0)
-                * (2 ** min(attempt, 6)),
+                max(self._config.poll_interval_seconds, 1.0) * (2 ** min(attempt, 6)),
                 _MAX_BACKOFF_SECONDS,
             )
             self._backoff_until[instrument] = now + delay
@@ -277,9 +262,7 @@ class TrailingWorker:
         self._backoff_until.pop(instrument, None)
         if ticker is None:
             for state in states:
-                await self._manager.on_ticker_failure(
-                    state.trailing_id, "no ticker available"
-                )
+                await self._manager.on_ticker_failure(state.trailing_id, "no ticker available")
             return
 
         if self._config.publish_ticker_events:

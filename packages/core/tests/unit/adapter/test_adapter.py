@@ -159,6 +159,7 @@ class TestAdapterZeroImplementation:
                 "place_trailing_stop",
                 "cancel_trailing_stop",
                 "get_trailing_stop",
+                "get_position_trailing_stop",
                 "position_protection_capability",
                 "trailing_capability",
                 "market_data_capability",
@@ -293,7 +294,11 @@ class TestDefaultCapabilities:
 
 
 class TestOptionalMethodDefaults:
-    """New optional methods raise NotImplementedError unless overridden."""
+    """The ABC defaults raise unless an adapter overrides them.
+
+    The fixture is a :class:`MockAdapter` that does override these methods, so
+    each test calls the base implementation unbound to exercise the default.
+    """
 
     @pytest.fixture
     def adapter(self):
@@ -303,27 +308,33 @@ class TestOptionalMethodDefaults:
         return MockAdapter(event_bus=EventBus())
 
     @pytest.fixture
+    def abc(self):
+        from unified_trading_execution.adapter import Adapter
+
+        return Adapter
+
+    @pytest.fixture
     def instrument(self):
         from unified_trading_execution.types.enums import AssetClass
         from unified_trading_execution.types.instrument import Instrument
 
         return Instrument(symbol="BTC", quote_currency="USDT", asset_class=AssetClass.SPOT)
 
-    async def test_clear_position_tpsl_requires_a_named_side(self, adapter, instrument):
+    async def test_clear_position_tpsl_requires_a_named_side(self, abc, adapter, instrument):
         with pytest.raises(ValueError, match="at least one"):
-            await adapter.clear_position_tpsl(instrument, "leg-1")
+            await abc.clear_position_tpsl(adapter, instrument, "leg-1")
 
-    async def test_clear_position_tpsl_is_unsupported_by_default(self, adapter, instrument):
+    async def test_clear_position_tpsl_is_unsupported_by_default(self, abc, adapter, instrument):
         with pytest.raises(NotImplementedError, match="clearing TP/SL"):
-            await adapter.clear_position_tpsl(instrument, "leg-1", stop_loss=True)
+            await abc.clear_position_tpsl(adapter, instrument, "leg-1", stop_loss=True)
 
-    async def test_fetch_candles_is_unsupported_by_default(self, adapter, instrument):
+    async def test_fetch_candles_is_unsupported_by_default(self, abc, adapter, instrument):
         from unified_trading_execution.trailing.types import CandleTimeframe
 
         with pytest.raises(NotImplementedError, match="fetching candles"):
-            await adapter.fetch_candles(instrument, CandleTimeframe.H1, limit=20)
+            await abc.fetch_candles(adapter, instrument, CandleTimeframe.H1, limit=20)
 
-    async def test_place_trailing_stop_is_unsupported_by_default(self, adapter, instrument):
+    async def test_place_trailing_stop_is_unsupported_by_default(self, abc, adapter, instrument):
         from decimal import Decimal
 
         from unified_trading_execution.trailing.types import (
@@ -344,12 +355,18 @@ class TestOptionalMethodDefaults:
             client_id="tr-1",
         )
         with pytest.raises(NotImplementedError, match="native trailing"):
-            await adapter.place_trailing_stop(request)
+            await abc.place_trailing_stop(adapter, request)
 
     async def test_cancel_and_get_trailing_stop_are_unsupported_by_default(
-        self, adapter, instrument
+        self, abc, adapter, instrument
     ):
         with pytest.raises(NotImplementedError, match="native trailing"):
-            await adapter.cancel_trailing_stop("n1", instrument)
+            await abc.cancel_trailing_stop(adapter, "n1", instrument)
         with pytest.raises(NotImplementedError, match="native trailing"):
-            await adapter.get_trailing_stop("n1", instrument)
+            await abc.get_trailing_stop(adapter, "n1", instrument)
+
+    async def test_get_position_trailing_stop_is_unsupported_by_default(
+        self, abc, adapter, instrument
+    ):
+        with pytest.raises(NotImplementedError, match="by position"):
+            await abc.get_position_trailing_stop(adapter, instrument, "leg-1")

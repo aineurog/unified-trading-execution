@@ -294,9 +294,7 @@ class Engine:
 
         # Integrity has its own cadence so protection is still checked when the
         # reconcile loop is disabled.
-        self._trailing_integrity_task = asyncio.ensure_future(
-            self._trailing_integrity_loop()
-        )
+        self._trailing_integrity_task = asyncio.ensure_future(self._trailing_integrity_loop())
 
     async def _resolve_account_id(self) -> str:
         """Resolve the canonical platform account identity for store-path keying.
@@ -400,9 +398,7 @@ class Engine:
                 config=self._trailing_config,
             )
             self._trailing_manager = manager
-            self._trailing_worker = TrailingWorker(
-                manager, self._adapter, self._trailing_config
-            )
+            self._trailing_worker = TrailingWorker(manager, self._adapter, self._trailing_config)
 
         active = await manager.list(active_only=True)
         if not active:
@@ -416,9 +412,7 @@ class Engine:
         try:
             await self.reconcile()
         except Exception:
-            logger.warning(
-                "Trailing rehydration deferred: reconciliation failed", exc_info=True
-            )
+            logger.warning("Trailing rehydration deferred: reconciliation failed", exc_info=True)
             return
         if not self._trailing_ready:
             await self._rehydrate_trailing(manager)
@@ -428,9 +422,7 @@ class Engine:
         try:
             snapshot = await self._adapter.fetch_positions()
         except Exception:
-            logger.warning(
-                "Trailing rehydration deferred: position snapshot failed", exc_info=True
-            )
+            logger.warning("Trailing rehydration deferred: position snapshot failed", exc_info=True)
             return
         try:
             await manager.rehydrate(positions=snapshot)
@@ -550,10 +542,7 @@ class Engine:
             self._reconcile_task.cancel()
         if self._reconcile_loop_task is not None and not self._reconcile_loop_task.done():
             self._reconcile_loop_task.cancel()
-        if (
-            self._trailing_integrity_task is not None
-            and not self._trailing_integrity_task.done()
-        ):
+        if self._trailing_integrity_task is not None and not self._trailing_integrity_task.done():
             self._trailing_integrity_task.cancel()
         # Step 4 — close state store
         if self._state_store is not None:
@@ -1367,9 +1356,7 @@ class Engine:
         """The trailing manager, available once :meth:`connect` has run."""
         manager = self._trailing_manager
         if manager is None:
-            raise PlatformConnectionError(
-                "Trailing is not available before connect()"
-            )
+            raise PlatformConnectionError("Trailing is not available before connect()")
         return manager
 
     # ── Adapter method auto-proxy ─────────────────────────────────
@@ -1438,8 +1425,7 @@ class Engine:
         rather than blocking or spinning.
         """
         if self._risk_config.rate_limit_budget_override is None and (
-            self._rate_limit_reset_at is None
-            or _utcnow() >= self._rate_limit_reset_at
+            self._rate_limit_reset_at is None or _utcnow() >= self._rate_limit_reset_at
         ):
             if not self._rate_limit_refresh_pending:
                 self._rate_limit_refresh_pending = True

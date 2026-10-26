@@ -615,9 +615,7 @@ class MockAdapter(Adapter):
         )
 
     def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
-        return self._trailing_capabilities.get(
-            instrument, super().trailing_capability(instrument)
-        )
+        return self._trailing_capabilities.get(instrument, super().trailing_capability(instrument))
 
     def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
         return self._market_data_capabilities.get(
@@ -684,9 +682,7 @@ class MockAdapter(Adapter):
             raise ValueError("at least one of take_profit or stop_loss is required")
         position = self._open_position(instrument, position_id)
         if position is None:
-            raise OrderNotFoundError(
-                f"no open position {position_id!r} on {instrument.symbol}"
-            )
+            raise OrderNotFoundError(f"no open position {position_id!r} on {instrument.symbol}")
         current_tp, current_sl = self._protection.get((instrument, position_id), (None, None))
         resolved_tp = take_profit if take_profit is not None else current_tp
         resolved_sl = stop_loss if stop_loss is not None else current_sl
@@ -885,9 +881,7 @@ class MockAdapter(Adapter):
 
     # ---- Internal ----
 
-    def _drop_native_trails_for_position(
-        self, instrument: Instrument, position_id: str
-    ) -> None:
+    def _drop_native_trails_for_position(self, instrument: Instrument, position_id: str) -> None:
         stale = [
             key
             for key, (request, _) in self._native_trails.items()

@@ -485,9 +485,7 @@ class TestPositionUpdateForwarding:
         finally:
             await engine.ashutdown()
 
-    async def test_position_updates_are_not_forwarded_before_rehydration(
-        self, persistent_store
-    ):
+    async def test_position_updates_are_not_forwarded_before_rehydration(self, persistent_store):
         store = persistent_store
         bus = EventBus()
         first = await make_engine(store, build_adapter(bus, [make_position()]), bus)
@@ -722,9 +720,7 @@ class TestEndToEndLifecycle:
             await engine.ashutdown()
 
     @pytest.mark.parametrize("mode", [TrailingMode.SYNTHETIC, TrailingMode.NATIVE])
-    async def test_trailing_activity_leaves_orders_and_watermark_untouched(
-        self, store, mode
-    ):
+    async def test_trailing_activity_leaves_orders_and_watermark_untouched(self, store, mode):
         bus = EventBus()
         adapter = build_adapter(bus, [make_position()])
         if mode is TrailingMode.NATIVE:
@@ -741,9 +737,7 @@ class TestEndToEndLifecycle:
             )
             assert state.mode is mode
             if mode is TrailingMode.SYNTHETIC:
-                await engine.trailing.on_ticker(
-                    state.trailing_id, Ticker(last=Decimal("50500"))
-                )
+                await engine.trailing.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
 
             assert await store.get_reconcile_watermark() == watermark
             assert await store.query_orders() == []

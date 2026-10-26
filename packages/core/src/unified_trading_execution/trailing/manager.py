@@ -101,6 +101,7 @@ ALLOWED_TRAILING_TRANSITIONS: dict[TrailingPhase, frozenset[TrailingPhase]] = {
             TrailingPhase.DEGRADED,
             TrailingPhase.CANCELLED,
             TrailingPhase.DONE,
+            TrailingPhase.FAILED,
         }
     ),
     TrailingPhase.TRIGGERED: frozenset(
@@ -108,6 +109,7 @@ ALLOWED_TRAILING_TRANSITIONS: dict[TrailingPhase, frozenset[TrailingPhase]] = {
             TrailingPhase.DEGRADED,
             TrailingPhase.CANCELLED,
             TrailingPhase.DONE,
+            TrailingPhase.FAILED,
         }
     ),
     TrailingPhase.DEGRADED: frozenset(
@@ -377,6 +379,7 @@ def _resolve_bases(
     (bid for a long stop, ask for a short stop).  The trigger basis is only
     recorded when the adapter declares it; otherwise the venue default applies.
     """
+    basis: TrailingBasis | None
     if spec.basis is not None:
         basis = spec.basis
     elif mode is TrailingMode.NATIVE:
@@ -573,16 +576,12 @@ class TrailingManager:
 
         activation_price = resolve_activation_price(spec, side, entry)
         activated = is_activation_reached(side, basis, activation_price)
-        stop = self._first_stop(
-            spec, side, entry, basis, atr, instrument_spec, activated=activated
-        )
+        stop = self._first_stop(spec, side, entry, basis, atr, instrument_spec, activated=activated)
         take_profit = self._take_profit(spec, side, entry, atr, instrument_spec)
 
         existing = await self._adapter.get_position_tpsl(instrument, position_id)
         if existing is None:
-            raise InvalidOrderError(
-                f"no open position {position_id!r} on {instrument.symbol}"
-            )
+            raise InvalidOrderError(f"no open position {position_id!r} on {instrument.symbol}")
         previous_tp, previous_sl = existing
         if previous_sl is not None and not request.take_over_existing_protection:
             raise TrailingStateError(
@@ -711,9 +710,7 @@ class TrailingManager:
 
         existing = await self._adapter.get_position_tpsl(instrument, position_id)
         if existing is None:
-            raise InvalidOrderError(
-                f"no open position {position_id!r} on {instrument.symbol}"
-            )
+            raise InvalidOrderError(f"no open position {position_id!r} on {instrument.symbol}")
         previous_tp, previous_sl = existing
         if previous_sl is not None and not request.take_over_existing_protection:
             raise TrailingStateError(
@@ -788,9 +785,7 @@ class TrailingManager:
         await self._state_store.upsert_trailing_state(arming)
 
         try:
-            result = await self._adapter.place_trailing_stop(
-                self._native_request(arming, leg)
-            )
+            result = await self._adapter.place_trailing_stop(self._native_request(arming, leg))
         except Exception as exc:
             await self._attach_failed(arming, exc)
             raise
@@ -805,14 +800,10 @@ class TrailingManager:
         await self._state_store.upsert_trailing_state(armed)
 
         try:
-            confirmed = await self._adapter.get_trailing_stop(
-                result.native_id, instrument
-            )
+            confirmed = await self._adapter.get_trailing_stop(result.native_id, instrument)
         except Exception as exc:
             reason = str(exc) or type(exc).__name__
-            await self._degrade_attach(
-                armed, f"protection: native confirm: {reason}"
-            )
+            await self._degrade_attach(armed, f"protection: native confirm: {reason}")
             raise
         if confirmed is None:
             reason = "the venue did not confirm the native trailing stop"
@@ -829,25 +820,19 @@ class TrailingManager:
 
         take_profit_owned = False
         if take_profit is not None:
-            if not self._halt_machine.can_place_order(
-                instrument, reduce_only=True
-            ):
-                error = InstrumentHaltedError(
+            if not self._halt_machine.can_place_order(instrument, reduce_only=True):
+                error: Exception = InstrumentHaltedError(
                     f"native trail is armed on {instrument.symbol} but the instrument "
                     "or account is halted"
                 )
-                await self._degrade_attach(
-                    armed, f"protection: native take profit: {error}"
-                )
+                await self._degrade_attach(armed, f"protection: native take profit: {error}")
                 raise error
             if not self._reserve_rate_limit():
                 error = RateLimitError(
                     f"native trail is armed on {instrument.symbol} but the rate limit "
                     "budget is exhausted"
                 )
-                await self._degrade_attach(
-                    armed, f"protection: native take profit: {error}"
-                )
+                await self._degrade_attach(armed, f"protection: native take profit: {error}")
                 raise error
             try:
                 await self._adapter.modify_position_tpsl(
@@ -857,12 +842,9 @@ class TrailingManager:
                 )
             except Exception as exc:
                 reason = str(exc) or type(exc).__name__
-                await self._degrade_attach(
-                    armed, f"protection: native take profit: {reason}"
-                )
+                await self._degrade_attach(armed, f"protection: native take profit: {reason}")
                 raise TrailingStateError(
-                    f"native trail is armed but the take profit could not be written: "
-                    f"{reason}"
+                    f"native trail is armed but the take profit could not be written: {reason}"
                 ) from exc
             await self._confirm_protection(
                 armed, position_id, None, take_profit, instrument_spec.tick_size
@@ -914,9 +896,7 @@ class TrailingManager:
             )
         return final
 
-    def _native_request(
-        self, state: TrailingState, leg: Position
-    ) -> NativeTrailingRequest:
+    def _native_request(self, state: TrailingState, leg: Position) -> NativeTrailingRequest:
         activation_price = state.resolved_activation_price
         if activation_price is None:
             activation_price = resolve_activation_price(
@@ -1034,22 +1014,7 @@ class TrailingManager:
                 continue
 
         reason = str(last_error) if last_error is not None else "confirmation mismatch"
-        degraded = replace(
-            state,
-            phase=TrailingPhase.DEGRADED,
-            last_error=reason,
-            failure_count=state.failure_count + 1,
-            updated_at=self._clock(),
-        )
-        await self._state_store.upsert_trailing_state(degraded)
-        self._publish(degraded, previous=TrailingPhase.ARMING, reason=reason)
-        await self._write_audit(
-            "trailing.degraded",
-            degraded,
-            previous_stop=state.previous_stop_loss,
-            current_stop=None,
-            reason=reason,
-        )
+        await self._degrade_now(state, reason)
         raise TrailingStateError(f"could not confirm protection: {reason}")
 
     async def _attach_failed(self, state: TrailingState, exc: Exception) -> None:
@@ -1112,13 +1077,9 @@ class TrailingManager:
             )
             if basis is None:
                 field = (
-                    state.resolved_basis.value
-                    if state.resolved_basis is not None
-                    else "resolved"
+                    state.resolved_basis.value if state.resolved_basis is not None else "resolved"
                 )
-                await self._record_fetch_failure(
-                    state, f"ticker has no {field} price"
-                )
+                await self._record_fetch_failure(state, f"ticker has no {field} price")
                 return await self._state_store.get_trailing_state(trailing_id)
 
             self._fetch_failures[trailing_id] = 0
@@ -1130,9 +1091,7 @@ class TrailingManager:
                 state = replace(state, best_basis=best, updated_at=now)
                 await self._state_store.upsert_trailing_state(state)
 
-            activation_price = resolve_activation_price(
-                state.spec, state.side, state.entry_price
-            )
+            activation_price = resolve_activation_price(state.spec, state.side, state.entry_price)
             if activation_price != state.resolved_activation_price:
                 state = replace(
                     state,
@@ -1311,9 +1270,9 @@ class TrailingManager:
                 return state
 
             self._atr_failures[trailing_id] = 0
-            recover = state.phase is TrailingPhase.DEGRADED and (
-                state.last_error or ""
-            ).startswith(_ATR_ERROR_PREFIX)
+            recover = state.phase is TrailingPhase.DEGRADED and (state.last_error or "").startswith(
+                _ATR_ERROR_PREFIX
+            )
             updated = replace(
                 state,
                 phase=TrailingPhase.ARMED if recover else state.phase,
@@ -1338,9 +1297,7 @@ class TrailingManager:
                 )
             return updated
 
-    async def on_atr_failure(
-        self, trailing_id: str, reason: str
-    ) -> TrailingState | None:
+    async def on_atr_failure(self, trailing_id: str, reason: str) -> TrailingState | None:
         """Count a candle refresh failure and degrade after the stale limit."""
         self._require_ready()
         async with self._state_lock(trailing_id):
@@ -1409,24 +1366,7 @@ class TrailingManager:
 
             now = self._clock()
             if position.quantity == 0:
-                closed = replace(
-                    state,
-                    phase=TrailingPhase.DONE,
-                    quantity=Decimal("0"),
-                    last_error=None,
-                    updated_at=now,
-                )
-                await self._state_store.upsert_trailing_state(closed)
-                self._publish(closed, previous=state.phase, reason="position_closed")
-                await self._write_audit(
-                    "trailing.done",
-                    closed,
-                    previous_stop=state.current_stop,
-                    current_stop=closed.current_stop,
-                    reason="position_closed",
-                )
-                self._state_locks.pop(state.trailing_id, None)
-                return closed
+                return await self._complete_position_close(state, reason="position_closed", now=now)
 
             current_side = OrderSide.BUY if position.quantity > 0 else OrderSide.SELL
             if current_side is not state.side:
@@ -1440,9 +1380,7 @@ class TrailingManager:
                     updated_at=now,
                 )
                 await self._state_store.upsert_trailing_state(cancelled)
-                self._publish(
-                    cancelled, previous=state.phase, reason="position_side_flipped"
-                )
+                self._publish(cancelled, previous=state.phase, reason="position_side_flipped")
                 await self._write_audit(
                     "trailing.cancelled",
                     cancelled,
@@ -1465,9 +1403,7 @@ class TrailingManager:
             quantity_changed = quantity != state.quantity
             if quantity > state.quantity:
                 entry_price = position.average_entry_price
-                activation_price = resolve_activation_price(
-                    state.spec, state.side, entry_price
-                )
+                activation_price = resolve_activation_price(state.spec, state.side, entry_price)
                 updated = replace(
                     state,
                     quantity=quantity,
@@ -1506,9 +1442,7 @@ class TrailingManager:
                 return state
 
             try:
-                current = await self._adapter.get_position_tpsl(
-                    state.instrument, state.position_id
-                )
+                current = await self._adapter.get_position_tpsl(state.instrument, state.position_id)
             except Exception as exc:
                 return await self._record_protection_failure(
                     state, f"integrity read: {str(exc) or type(exc).__name__}"
@@ -1516,32 +1450,13 @@ class TrailingManager:
 
             now = self._clock()
             if current is None:
-                closed = replace(
-                    state,
-                    phase=TrailingPhase.DONE,
-                    quantity=Decimal("0"),
-                    last_error=None,
-                    updated_at=now,
-                )
-                await self._state_store.upsert_trailing_state(closed)
-                self._publish(closed, previous=state.phase, reason="position_closed")
-                await self._write_audit(
-                    "trailing.done",
-                    closed,
-                    previous_stop=state.current_stop,
-                    current_stop=closed.current_stop,
-                    reason="position_closed",
-                )
-                self._state_locks.pop(trailing_id, None)
-                return closed
+                return await self._complete_position_close(state, reason="position_closed", now=now)
 
             actual_tp, actual_sl = current
             instrument_spec = await self._instrument_spec(state.instrument)
             tick_size = instrument_spec.tick_size
             expected_stop = state.current_stop
-            expected_take_profit = (
-                state.current_take_profit if state.take_profit_owned else None
-            )
+            expected_take_profit = state.current_take_profit if state.take_profit_owned else None
 
             write_stop: Decimal | None = None
             write_take_profit: Decimal | None = None
@@ -1555,9 +1470,7 @@ class TrailingManager:
                     reasons.append("missing_stop")
                     protection_ok = False
                 elif abs(actual_sl.trigger_price - expected_stop) > tick_size:
-                    if _stop_is_tighter(
-                        state.side, actual_sl.trigger_price, expected_stop
-                    ):
+                    if _stop_is_tighter(state.side, actual_sl.trigger_price, expected_stop):
                         adopted_stop = actual_sl.trigger_price
                         reasons.append("adopted_tighter_stop")
                     else:
@@ -1571,12 +1484,8 @@ class TrailingManager:
                 protection_ok = False
 
             if write_stop is not None or write_take_profit is not None:
-                if not self._halt_machine.can_place_order(
-                    state.instrument, reduce_only=True
-                ):
-                    return await self._record_protection_failure(
-                        state, "integrity: halted"
-                    )
+                if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
+                    return await self._record_protection_failure(state, "integrity: halted")
                 if not self._reserve_rate_limit():
                     return state
                 try:
@@ -1650,9 +1559,10 @@ class TrailingManager:
 
             if not protection_ok:
                 return state
-            if not (state.last_error or "").startswith(
-                _PROTECTION_ERROR_PREFIX
-            ) and state.failure_count == 0:
+            if (
+                not (state.last_error or "").startswith(_PROTECTION_ERROR_PREFIX)
+                and state.failure_count == 0
+            ):
                 return state
 
             final, recovered = self._protection_confirmed(
@@ -1674,9 +1584,7 @@ class TrailingManager:
                 )
             return final
 
-    async def _check_native_integrity(
-        self, state: TrailingState
-    ) -> TrailingState | None:
+    async def _check_native_integrity(self, state: TrailingState) -> TrailingState | None:
         if state.phase not in (
             TrailingPhase.ARMED,
             TrailingPhase.DEGRADED,
@@ -1692,24 +1600,7 @@ class TrailingManager:
         now = self._clock()
         open_leg = _open_leg(leg)
         if open_leg is None:
-            closed = replace(
-                state,
-                phase=TrailingPhase.DONE,
-                quantity=Decimal("0"),
-                last_error=None,
-                updated_at=now,
-            )
-            await self._state_store.upsert_trailing_state(closed)
-            self._publish(closed, previous=state.phase, reason="position_closed")
-            await self._write_audit(
-                "trailing.done",
-                closed,
-                previous_stop=state.current_stop,
-                current_stop=closed.current_stop,
-                reason="position_closed",
-            )
-            self._state_locks.pop(state.trailing_id, None)
-            return closed
+            return await self._complete_position_close(state, reason="position_closed", now=now)
 
         try:
             instrument_spec = await self._instrument_spec(state.instrument)
@@ -1719,18 +1610,14 @@ class TrailingManager:
                 f"integrity: instrument spec: {str(exc) or type(exc).__name__}",
             )
 
-        identity, _ = _recovery_identity(
-            state, open_leg, instrument_spec.tick_size
-        )
+        identity, _ = _recovery_identity(state, open_leg, instrument_spec.tick_size)
         if identity is not None:
             return await self._degrade_now(state, identity)
 
         result: NativeTrailingResult | None = None
         if state.native_id is not None:
             try:
-                result = await self._adapter.get_trailing_stop(
-                    state.native_id, state.instrument
-                )
+                result = await self._adapter.get_trailing_stop(state.native_id, state.instrument)
             except Exception as exc:
                 return await self._record_protection_failure(
                     state,
@@ -1760,9 +1647,7 @@ class TrailingManager:
             )
             await self._state_store.upsert_trailing_state(final)
             if recovered:
-                self._publish(
-                    final, previous=TrailingPhase.DEGRADED, reason="integrity_restore"
-                )
+                self._publish(final, previous=TrailingPhase.DEGRADED, reason="integrity_restore")
                 await self._write_audit(
                     "trailing.recovered",
                     final,
@@ -1772,16 +1657,12 @@ class TrailingManager:
                 )
             return final
 
-        if not self._halt_machine.can_place_order(
-            state.instrument, reduce_only=True
-        ):
+        if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
             return await self._degrade_now(state, "halted: native trail missing")
         if not self._reserve_rate_limit():
             return state
         try:
-            result = await self._adapter.place_trailing_stop(
-                self._native_request(state, open_leg)
-            )
+            result = await self._adapter.place_trailing_stop(self._native_request(state, open_leg))
         except Exception as exc:
             return await self._degrade_now(
                 state,
@@ -1822,9 +1703,7 @@ class TrailingManager:
             try:
                 await self.check_integrity(state.trailing_id)
             except Exception:
-                logger.exception(
-                    "trailing integrity check failed for %s", state.trailing_id
-                )
+                logger.exception("trailing integrity check failed for %s", state.trailing_id)
 
     async def rehydrate(self, positions: list[Position] | None = None) -> None:
         """Restore active states from a direct venue position snapshot.
@@ -1842,11 +1721,7 @@ class TrailingManager:
             )
 
         try:
-            snapshot = (
-                positions
-                if positions is not None
-                else await self._adapter.fetch_positions()
-            )
+            snapshot = positions if positions is not None else await self._adapter.fetch_positions()
         except Exception:
             logger.exception("trailing rehydration deferred: position snapshot failed")
             raise
@@ -1872,9 +1747,7 @@ class TrailingManager:
                     mirror_by_leg.get(key),
                 )
             except Exception:
-                logger.exception(
-                    "trailing rehydration failed for %s", state.trailing_id
-                )
+                logger.exception("trailing rehydration failed for %s", state.trailing_id)
 
         async with self._lock:
             self._rehydrated = True
@@ -1882,9 +1755,7 @@ class TrailingManager:
     async def _require_rehydrated(self) -> None:
         if self._rehydrated is True:
             return
-        active = await self._state_store.list_trailing_states(
-            phases=tuple(ACTIVE_TRAILING_PHASES)
-        )
+        active = await self._state_store.list_trailing_states(phases=tuple(ACTIVE_TRAILING_PHASES))
         if active or self._rehydrated is False:
             raise TrailingStateError(
                 "trailing rehydration has not completed; attach is not available"
@@ -1909,17 +1780,12 @@ class TrailingManager:
                 await self._rehydrate_done(state, now)
                 return
             if snapshot_open is None or mirror_open is None:
-                await self._rehydrate_degraded(
-                    state, "position_dataset_inconsistent", now=now
-                )
+                await self._rehydrate_degraded(state, "position_dataset_inconsistent", now=now)
                 return
-            if (
-                abs(snapshot_open.quantity) != abs(mirror_open.quantity)
-                or (snapshot_open.quantity > 0) != (mirror_open.quantity > 0)
-            ):
-                await self._rehydrate_degraded(
-                    state, "position_dataset_inconsistent", now=now
-                )
+            if abs(snapshot_open.quantity) != abs(mirror_open.quantity) or (
+                snapshot_open.quantity > 0
+            ) != (mirror_open.quantity > 0):
+                await self._rehydrate_degraded(state, "position_dataset_inconsistent", now=now)
                 return
 
             if snapshot_open != mirror_open:
@@ -1968,9 +1834,7 @@ class TrailingManager:
                 state,
                 quantity=abs(snapshot_open.quantity),
                 entry_price=snapshot_open.average_entry_price,
-                position_opened_at=(
-                    snapshot_open.opened_at or state.position_opened_at
-                ),
+                position_opened_at=(snapshot_open.opened_at or state.position_opened_at),
                 resolved_activation_price=activation_price,
                 updated_at=now,
             )
@@ -1989,9 +1853,7 @@ class TrailingManager:
         now: datetime,
     ) -> TrailingState:
         try:
-            current = await self._adapter.get_position_tpsl(
-                state.instrument, state.position_id
-            )
+            current = await self._adapter.get_position_tpsl(state.instrument, state.position_id)
         except Exception as exc:
             return await self._rehydrate_degraded(
                 state,
@@ -2001,9 +1863,7 @@ class TrailingManager:
 
         actual_tp, actual_sl = current if current is not None else (None, None)
         expected_stop = state.current_stop
-        expected_tp = (
-            state.current_take_profit if state.take_profit_owned else None
-        )
+        expected_tp = state.current_take_profit if state.take_profit_owned else None
         stop_to_write: Decimal | None = None
         tp_to_write: Decimal | None = None
         reasons: list[str] = []
@@ -2017,9 +1877,7 @@ class TrailingManager:
                     stop_to_write = expected_stop
                     reasons.append("missing_stop")
                 elif abs(actual_sl.trigger_price - expected_stop) > tick_size:
-                    if _stop_is_tighter(
-                        state.side, actual_sl.trigger_price, expected_stop
-                    ):
+                    if _stop_is_tighter(state.side, actual_sl.trigger_price, expected_stop):
                         expected_stop = actual_sl.trigger_price
                         reasons.append("adopted_tighter_stop")
                     else:
@@ -2031,9 +1889,7 @@ class TrailingManager:
             reasons.append("missing_take_profit")
 
         if stop_to_write is not None or tp_to_write is not None:
-            if not self._halt_machine.can_place_order(
-                state.instrument, reduce_only=True
-            ):
+            if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
                 return await self._rehydrate_degraded(
                     state, "halted: rehydrate protection", now=now
                 )
@@ -2100,9 +1956,7 @@ class TrailingManager:
             atr_as_of = now
 
         if base.resolved_basis is None:
-            return await self._rehydrate_degraded(
-                base, "fetch: no sampling basis", now=now
-            )
+            return await self._rehydrate_degraded(base, "fetch: no sampling basis", now=now)
         try:
             ticker = await self._adapter.fetch_ticker(base.instrument)
         except Exception as exc:
@@ -2111,23 +1965,15 @@ class TrailingManager:
                 f"fetch: {str(exc) or type(exc).__name__}",
                 now=now,
             )
-        basis = (
-            _basis_price(ticker, base.resolved_basis)
-            if ticker is not None
-            else None
-        )
+        basis = _basis_price(ticker, base.resolved_basis) if ticker is not None else None
         if basis is None:
             return await self._rehydrate_degraded(
                 base, "fetch: ticker has no resolved basis", now=now
             )
 
         best = update_best_basis(base.side, base.best_basis, basis)
-        activation_price = resolve_activation_price(
-            base.spec, base.side, base.entry_price
-        )
-        activated = base.activated or is_activation_reached(
-            base.side, basis, activation_price
-        )
+        activation_price = resolve_activation_price(base.spec, base.side, base.entry_price)
+        activated = base.activated or is_activation_reached(base.side, basis, activation_price)
         base = replace(
             base,
             best_basis=best,
@@ -2135,9 +1981,7 @@ class TrailingManager:
             updated_at=now,
         )
 
-        if base.current_stop is None and (
-            activated or base.spec.initial_stop is not None
-        ):
+        if base.current_stop is None and (activated or base.spec.initial_stop is not None):
             try:
                 first_stop = self._first_stop(
                     base.spec,
@@ -2155,9 +1999,7 @@ class TrailingManager:
                     now=now,
                 )
             if first_stop is not None:
-                if not self._halt_machine.can_place_order(
-                    base.instrument, reduce_only=True
-                ):
+                if not self._halt_machine.can_place_order(base.instrument, reduce_only=True):
                     return await self._rehydrate_degraded(
                         base, "halted: rehydrate first stop", now=now
                     )
@@ -2176,18 +2018,14 @@ class TrailingManager:
                 except Exception as exc:
                     return await self._rehydrate_degraded(
                         base,
-                        f"protection: rehydrate first stop: "
-                        f"{str(exc) or type(exc).__name__}",
+                        f"protection: rehydrate first stop: {str(exc) or type(exc).__name__}",
                         now=now,
                     )
-                confirmed_stop, detail = await self._confirm_stop(
-                    base, first_stop, tick_size
-                )
+                confirmed_stop, detail = await self._confirm_stop(base, first_stop, tick_size)
                 if confirmed_stop is None:
                     return await self._rehydrate_degraded(
                         base,
-                        f"protection: rehydrate first stop confirm: "
-                        f"{detail or 'mismatch'}",
+                        f"protection: rehydrate first stop confirm: {detail or 'mismatch'}",
                         now=now,
                     )
                 base = replace(
@@ -2218,9 +2056,7 @@ class TrailingManager:
                 )
 
             instrument_spec = await self._instrument_spec(base.instrument)
-            capability = self._adapter.position_protection_capability(
-                base.instrument
-            )
+            capability = self._adapter.position_protection_capability(base.instrument)
             reprice_interval_elapsed = (
                 base.last_reprice_at is None
                 or (now - base.last_reprice_at).total_seconds()
@@ -2241,9 +2077,7 @@ class TrailingManager:
                     step=base.spec.step,
                 )
                 and reprice_interval_elapsed
-                and self._halt_machine.can_place_order(
-                    base.instrument, reduce_only=True
-                )
+                and self._halt_machine.can_place_order(base.instrument, reduce_only=True)
                 and self._reserve_rate_limit()
             ):
                 if capability.reprice_gap:
@@ -2271,13 +2105,10 @@ class TrailingManager:
                         )
                     return await self._rehydrate_degraded(
                         base,
-                        f"protection: rehydrate reprice: "
-                        f"{str(exc) or type(exc).__name__}",
+                        f"protection: rehydrate reprice: {str(exc) or type(exc).__name__}",
                         now=now,
                     )
-                confirmed_stop, detail = await self._confirm_stop(
-                    base, candidate, tick_size
-                )
+                confirmed_stop, detail = await self._confirm_stop(base, candidate, tick_size)
                 if confirmed_stop is None:
                     if capability.reprice_gap:
                         await self._write_audit(
@@ -2289,8 +2120,7 @@ class TrailingManager:
                         )
                     return await self._rehydrate_degraded(
                         base,
-                        f"protection: rehydrate reprice confirm: "
-                        f"{detail or 'mismatch'}",
+                        f"protection: rehydrate reprice confirm: {detail or 'mismatch'}",
                         now=now,
                     )
                 base = replace(
@@ -2357,9 +2187,7 @@ class TrailingManager:
         result: NativeTrailingResult | None = None
         if state.native_id is not None:
             try:
-                result = await self._adapter.get_trailing_stop(
-                    state.native_id, state.instrument
-                )
+                result = await self._adapter.get_trailing_stop(state.native_id, state.instrument)
             except Exception as exc:
                 return await self._rehydrate_degraded(
                     state,
@@ -2369,20 +2197,14 @@ class TrailingManager:
 
         rearmed = False
         if result is None:
-            if not self._halt_machine.can_place_order(
-                state.instrument, reduce_only=True
-            ):
-                return await self._rehydrate_degraded(
-                    state, "halted: native rearm", now=now
-                )
+            if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
+                return await self._rehydrate_degraded(state, "halted: native rearm", now=now)
             if not self._reserve_rate_limit():
                 return await self._rehydrate_degraded(
                     state, "rate limit budget exhausted: native rearm", now=now
                 )
             try:
-                result = await self._adapter.place_trailing_stop(
-                    self._native_request(state, leg)
-                )
+                result = await self._adapter.place_trailing_stop(self._native_request(state, leg))
             except Exception as exc:
                 return await self._rehydrate_degraded(
                     state,
@@ -2426,30 +2248,10 @@ class TrailingManager:
             )
         return final
 
-    async def _rehydrate_done(
-        self, state: TrailingState, now: datetime
-    ) -> TrailingState:
-        ensure_transition_allowed(state.phase, TrailingPhase.DONE)
-        closed = replace(
-            state,
-            phase=TrailingPhase.DONE,
-            quantity=Decimal("0"),
-            last_error=None,
-            updated_at=now,
+    async def _rehydrate_done(self, state: TrailingState, now: datetime) -> TrailingState:
+        return await self._complete_position_close(
+            state, reason="position_closed_while_offline", now=now
         )
-        await self._state_store.upsert_trailing_state(closed)
-        self._publish(
-            closed, previous=state.phase, reason="position_closed_while_offline"
-        )
-        await self._write_audit(
-            "trailing.done",
-            closed,
-            previous_stop=state.current_stop,
-            current_stop=closed.current_stop,
-            reason="position_closed_while_offline",
-        )
-        self._state_locks.pop(state.trailing_id, None)
-        return closed
 
     async def _rehydrate_degraded(
         self, state: TrailingState, reason: str, *, now: datetime
@@ -2498,18 +2300,12 @@ class TrailingManager:
                 state.instrument,
                 state.position_id,
                 take_profit=(
-                    TpSlAttachment(trigger_price=take_profit)
-                    if take_profit is not None
-                    else None
+                    TpSlAttachment(trigger_price=take_profit) if take_profit is not None else None
                 ),
-                stop_loss=(
-                    TpSlAttachment(trigger_price=stop) if stop is not None else None
-                ),
+                stop_loss=(TpSlAttachment(trigger_price=stop) if stop is not None else None),
             )
         except Exception as exc:
-            return await self._degrade_now(
-                state, f"resize: {str(exc) or type(exc).__name__}"
-            )
+            return await self._degrade_now(state, f"resize: {str(exc) or type(exc).__name__}")
 
         instrument_spec = await self._instrument_spec(state.instrument)
         confirmed_stop, confirmed_tp, detail = await self._confirm_levels(
@@ -2522,9 +2318,7 @@ class TrailingManager:
         )
         await self._state_store.upsert_trailing_state(final)
         if recovered:
-            self._publish(
-                final, previous=TrailingPhase.DEGRADED, reason="quantity_change"
-            )
+            self._publish(final, previous=TrailingPhase.DEGRADED, reason="quantity_change")
         await self._write_audit(
             "trailing.reprice",
             final,
@@ -2562,9 +2356,7 @@ class TrailingManager:
             self._instrument_specs[instrument] = spec
         return spec
 
-    async def _recover_fetch_degraded(
-        self, state: TrailingState, now: datetime
-    ) -> TrailingState:
+    async def _recover_fetch_degraded(self, state: TrailingState, now: datetime) -> TrailingState:
         if state.phase is not TrailingPhase.DEGRADED:
             return state
         if not (state.last_error or "").startswith(_FETCH_ERROR_PREFIX):
@@ -2586,9 +2378,7 @@ class TrailingManager:
         )
         return recovered
 
-    async def _record_fetch_failure(
-        self, state: TrailingState, reason: str
-    ) -> TrailingState:
+    async def _record_fetch_failure(self, state: TrailingState, reason: str) -> TrailingState:
         count = self._fetch_failures.get(state.trailing_id, 0) + 1
         self._fetch_failures[state.trailing_id] = count
         if count < self._config.fetch_failure_threshold:
@@ -2614,9 +2404,7 @@ class TrailingManager:
         )
         return degraded
 
-    async def _record_protection_failure(
-        self, state: TrailingState, reason: str
-    ) -> TrailingState:
+    async def _record_protection_failure(self, state: TrailingState, reason: str) -> TrailingState:
         now = self._clock()
         count = state.failure_count + 1
         error = f"{_PROTECTION_ERROR_PREFIX}{reason}"
@@ -2645,9 +2433,7 @@ class TrailingManager:
             )
         return target
 
-    async def _degrade_now(
-        self, state: TrailingState, reason: str
-    ) -> TrailingState:
+    async def _degrade_now(self, state: TrailingState, reason: str) -> TrailingState:
         if state.phase is not TrailingPhase.DEGRADED:
             ensure_transition_allowed(state.phase, TrailingPhase.DEGRADED)
         target = replace(
@@ -2677,12 +2463,8 @@ class TrailingManager:
         take_profit: Decimal | None,
         now: datetime,
     ) -> tuple[TrailingState, bool]:
-        had_protection_error = (state.last_error or "").startswith(
-            _PROTECTION_ERROR_PREFIX
-        )
-        recovered = (
-            state.phase is TrailingPhase.DEGRADED and had_protection_error
-        )
+        had_protection_error = (state.last_error or "").startswith(_PROTECTION_ERROR_PREFIX)
+        recovered = state.phase is TrailingPhase.DEGRADED and had_protection_error
         final = replace(
             state,
             phase=TrailingPhase.ARMED if recovered else state.phase,
@@ -2706,9 +2488,7 @@ class TrailingManager:
         detail: str | None = None
         for attempt in range(2):
             try:
-                current = await self._adapter.get_position_tpsl(
-                    state.instrument, state.position_id
-                )
+                current = await self._adapter.get_position_tpsl(state.instrument, state.position_id)
             except Exception as exc:
                 detail = str(exc) or type(exc).__name__
             else:
@@ -2716,9 +2496,9 @@ class TrailingManager:
                     detail = "position protection not found"
                 else:
                     actual_tp, actual_sl = current
-                    if _attachment_matches(
-                        actual_sl, stop, tick_size
-                    ) and _attachment_matches(actual_tp, take_profit, tick_size):
+                    if _attachment_matches(actual_sl, stop, tick_size) and _attachment_matches(
+                        actual_tp, take_profit, tick_size
+                    ):
                         confirmed_stop = (
                             actual_sl.trigger_price
                             if stop is not None and actual_sl is not None
@@ -2730,9 +2510,7 @@ class TrailingManager:
                             else None
                         )
                         return confirmed_stop, confirmed_tp, None
-                    actual_stop = (
-                        actual_sl.trigger_price if actual_sl is not None else "none"
-                    )
+                    actual_stop = actual_sl.trigger_price if actual_sl is not None else "none"
                     actual_take_profit = (
                         actual_tp.trigger_price if actual_tp is not None else "none"
                     )
@@ -2755,9 +2533,7 @@ class TrailingManager:
         detail: str | None = None
         for attempt in range(2):
             try:
-                current = await self._adapter.get_position_tpsl(
-                    state.instrument, state.position_id
-                )
+                current = await self._adapter.get_position_tpsl(state.instrument, state.position_id)
             except Exception as exc:
                 detail = str(exc) or type(exc).__name__
             else:
@@ -2765,10 +2541,7 @@ class TrailingManager:
                     detail = "position protection not found"
                 else:
                     actual = current[1]
-                    if (
-                        actual is not None
-                        and abs(actual.trigger_price - expected) <= tick_size
-                    ):
+                    if actual is not None and abs(actual.trigger_price - expected) <= tick_size:
                         return actual.trigger_price, None
                     detail = (
                         f"expected {expected}, got "
@@ -2792,47 +2565,46 @@ class TrailingManager:
         recorded in ``last_error``; the state still becomes ``CANCELLED``.
         """
         self._require_ready()
-        async with self._lock:
-            async with self._state_lock(trailing_id):
-                state = await self._state_store.get_trailing_state(trailing_id)
-                if state is None:
-                    raise TrailingStateError(f"unknown trailing state {trailing_id!r}")
-                ensure_transition_allowed(state.phase, TrailingPhase.CANCELLED)
+        async with self._lock, self._state_lock(trailing_id):
+            state = await self._state_store.get_trailing_state(trailing_id)
+            if state is None:
+                raise TrailingStateError(f"unknown trailing state {trailing_id!r}")
+            ensure_transition_allowed(state.phase, TrailingPhase.CANCELLED)
 
-                clear_note, cleared = await self._clear_protection_for_replacement(
-                    state, static=clear_protection
-                )
+            clear_note, cleared = await self._clear_protection_for_replacement(
+                state, static=clear_protection
+            )
 
-                last_error = clear_note if clear_note is not None else reason
-                if last_error is None:
-                    last_error = state.last_error
-                now = self._clock()
-                updated = replace(
-                    state,
-                    phase=TrailingPhase.CANCELLED,
-                    last_error=last_error,
-                    updated_at=now,
-                )
-                await self._state_store.upsert_trailing_state(updated)
-                event_reason = clear_note or reason or "cancelled"
-                self._publish(updated, previous=state.phase, reason=event_reason)
+            last_error = clear_note if clear_note is not None else reason
+            if last_error is None:
+                last_error = state.last_error
+            now = self._clock()
+            updated = replace(
+                state,
+                phase=TrailingPhase.CANCELLED,
+                last_error=last_error,
+                updated_at=now,
+            )
+            await self._state_store.upsert_trailing_state(updated)
+            event_reason = clear_note or reason or "cancelled"
+            self._publish(updated, previous=state.phase, reason=event_reason)
+            await self._write_audit(
+                "trailing.cancelled",
+                updated,
+                previous_stop=state.current_stop,
+                current_stop=updated.current_stop,
+                reason=event_reason,
+            )
+            if cleared:
                 await self._write_audit(
-                    "trailing.cancelled",
+                    "trailing.clear",
                     updated,
                     previous_stop=state.current_stop,
                     current_stop=updated.current_stop,
-                    reason=event_reason,
+                    reason=clear_note or "cleared",
                 )
-                if cleared:
-                    await self._write_audit(
-                        "trailing.clear",
-                        updated,
-                        previous_stop=state.current_stop,
-                        current_stop=updated.current_stop,
-                        reason=clear_note or "cleared",
-                    )
-                self._state_locks.pop(trailing_id, None)
-                return updated
+            self._state_locks.pop(trailing_id, None)
+            return updated
 
     async def _clear_owned_protection(self, state: TrailingState) -> tuple[str | None, bool]:
         if not state.stop_owned and not state.take_profit_owned:
@@ -2841,36 +2613,33 @@ class TrailingManager:
             return "halted: protection left in place", False
 
         try:
-            current = await self._adapter.get_position_tpsl(
-                state.instrument, state.position_id
-            )
+            current = await self._adapter.get_position_tpsl(state.instrument, state.position_id)
         except Exception as exc:
             return str(exc) or type(exc).__name__, False
-        if current is None:
-            return None, False
 
-        actual_tp, actual_sl = current
+        # ``get_position_tpsl`` returns None for a missing position, but on
+        # IBKR that also happens while owned protective orders are still live.
+        # Treat an absent reading as "nothing to match" and let the adapter
+        # decide whether a clear is needed.
+        actual_tp, actual_sl = current if current is not None else (None, None)
         clear_tp = False
         clear_sl = False
         notes: list[str] = []
         if state.take_profit_owned:
-            if actual_tp is not None:
-                if (
-                    state.current_take_profit is not None
-                    and actual_tp.trigger_price == state.current_take_profit
-                ):
-                    clear_tp = True
-                else:
-                    notes.append("protection_changed_externally")
+            if actual_tp is None or (
+                state.current_take_profit is not None
+                and actual_tp.trigger_price == state.current_take_profit
+            ):
+                clear_tp = True
+            else:
+                notes.append("protection_changed_externally")
         if state.stop_owned:
-            if actual_sl is not None:
-                if (
-                    state.current_stop is not None
-                    and actual_sl.trigger_price == state.current_stop
-                ):
-                    clear_sl = True
-                else:
-                    notes.append("protection_changed_externally")
+            if actual_sl is None or (
+                state.current_stop is not None and actual_sl.trigger_price == state.current_stop
+            ):
+                clear_sl = True
+            else:
+                notes.append("protection_changed_externally")
 
         note = ", ".join(dict.fromkeys(notes)) or None
         if not clear_tp and not clear_sl:
@@ -2889,9 +2658,7 @@ class TrailingManager:
             return str(exc) or type(exc).__name__, False
         return note, True
 
-    async def _cancel_native_trail(
-        self, state: TrailingState
-    ) -> tuple[str | None, bool]:
+    async def _cancel_native_trail(self, state: TrailingState) -> tuple[str | None, bool]:
         if state.mode is not TrailingMode.NATIVE or state.native_id is None:
             return None, False
         if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
@@ -2899,12 +2666,8 @@ class TrailingManager:
         if not self._reserve_rate_limit():
             return "rate limit budget exhausted; native trail left in place", False
         try:
-            await self._adapter.cancel_trailing_stop(
-                state.native_id, state.instrument
-            )
-            remaining = await self._adapter.get_trailing_stop(
-                state.native_id, state.instrument
-            )
+            await self._adapter.cancel_trailing_stop(state.native_id, state.instrument)
+            remaining = await self._adapter.get_trailing_stop(state.native_id, state.instrument)
         except Exception as exc:
             return str(exc) or type(exc).__name__, False
         if remaining is not None:
@@ -2927,6 +2690,71 @@ class TrailingManager:
                 notes.append(note)
             cleared = cleared or static_cleared
         return (", ".join(dict.fromkeys(notes)) or None), cleared
+
+    async def _complete_position_close(
+        self, state: TrailingState, *, reason: str, now: datetime
+    ) -> TrailingState:
+        """Finish a closed position, clearing owned protection first.
+
+        Position-attached venues treat the clear as a no-op; IBKR cancels the
+        separate protective orders.  A blocked or failed clear must surface,
+        because a live protective order with no position can open a new
+        opposite position.  Native trails are never cancelled here: the venue
+        owns them.
+        """
+        note, cleared = await self._clear_owned_protection(state)
+        # A side that changed externally is deliberately left alone; that is
+        # not a failure to clear an owned level.
+        blocked = note is not None and not cleared and note != "protection_changed_externally"
+        if blocked:
+            ensure_transition_allowed(state.phase, TrailingPhase.FAILED)
+            failed = replace(
+                state,
+                phase=TrailingPhase.FAILED,
+                quantity=Decimal("0"),
+                last_error=note,
+                failure_count=state.failure_count + 1,
+                updated_at=now,
+            )
+            await self._state_store.upsert_trailing_state(failed)
+            self._publish(failed, previous=state.phase, reason=reason)
+            await self._write_audit(
+                "trailing.failed",
+                failed,
+                previous_stop=state.current_stop,
+                current_stop=failed.current_stop,
+                reason=note,
+            )
+            self._state_locks.pop(state.trailing_id, None)
+            return failed
+
+        ensure_transition_allowed(state.phase, TrailingPhase.DONE)
+        closed = replace(
+            state,
+            phase=TrailingPhase.DONE,
+            quantity=Decimal("0"),
+            last_error=note,
+            updated_at=now,
+        )
+        await self._state_store.upsert_trailing_state(closed)
+        self._publish(closed, previous=state.phase, reason=reason)
+        await self._write_audit(
+            "trailing.done",
+            closed,
+            previous_stop=state.current_stop,
+            current_stop=closed.current_stop,
+            reason=reason,
+        )
+        if cleared:
+            await self._write_audit(
+                "trailing.clear",
+                closed,
+                previous_stop=state.current_stop,
+                current_stop=closed.current_stop,
+                reason=note or "cleared",
+            )
+        self._state_locks.pop(state.trailing_id, None)
+        return closed
 
     async def get(self, trailing_id: str) -> TrailingState | None:
         """Return one trailing state, including terminal history."""

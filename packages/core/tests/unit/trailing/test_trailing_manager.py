@@ -34,7 +34,6 @@ from unified_trading_execution.trailing.manager import (
     resolve_position_leg,
     resolve_routing,
 )
-from unified_trading_execution.trailing.worker import TrailingWorker
 from unified_trading_execution.trailing.types import (
     TERMINAL_TRAILING_PHASES,
     CandleTimeframe,
@@ -49,6 +48,7 @@ from unified_trading_execution.trailing.types import (
     TrailingRequest,
     TrailingSpec,
 )
+from unified_trading_execution.trailing.worker import TrailingWorker
 from unified_trading_execution.types.enums import AssetClass, OrderSide
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
@@ -56,6 +56,10 @@ from unified_trading_execution.types.order import TpSlAttachment
 from unified_trading_execution.types.position import Position
 
 NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
+
+# Shared across managers in one test: audit and event ids are globally unique
+# in the store, so per manager counters collide on restart tests.
+_IDS = count(1)
 
 
 def _phase_value(phase: TrailingPhase) -> str:
@@ -277,7 +281,6 @@ async def make_manager(
             adapter.set_ticker(instrument, Ticker(last=position.average_entry_price))
     adapter.add_instrument_spec(instrument, make_instrument_spec())
     adapter.queue_candles_response(make_candles())
-    ids = count(1)
     manager = TrailingManager(
         adapter,
         store,
@@ -285,7 +288,7 @@ async def make_manager(
         reserve_rate_limit=reserve_rate_limit or (lambda: True),
         event_bus=bus,
         config=config,
-        id_factory=lambda: f"id-{next(ids)}",
+        id_factory=lambda: f"id-{next(_IDS)}",
         clock=clock or (lambda: NOW),
     )
     return manager, adapter, bus
@@ -592,9 +595,7 @@ class TestSyntheticAttach:
         )
 
         state = await manager.attach(
-            TrailingRequest(
-                make_inst(), make_spec(), take_over_existing_protection=True
-            )
+            TrailingRequest(make_inst(), make_spec(), take_over_existing_protection=True)
         )
 
         assert state.previous_stop_loss == Decimal("49000")
@@ -632,9 +633,7 @@ class TestSyntheticAttach:
 
     async def test_attach_stops_when_rate_limit_is_exhausted(self, store):
         await store.upsert_position(make_position())
-        manager, adapter, _ = await make_manager(
-            store, reserve_rate_limit=lambda: False
-        )
+        manager, adapter, _ = await make_manager(store, reserve_rate_limit=lambda: False)
 
         with pytest.raises(RateLimitError, match="rate limit"):
             await manager.attach(TrailingRequest(make_inst(), make_spec()))
@@ -685,9 +684,7 @@ class TestLifecycle:
         await manager.cancel(first.trailing_id, reason="manual")
 
         second = await manager.attach(
-            TrailingRequest(
-                make_inst(), make_spec(), take_over_existing_protection=True
-            )
+            TrailingRequest(make_inst(), make_spec(), take_over_existing_protection=True)
         )
 
         assert second.trailing_id != first.trailing_id
@@ -710,9 +707,7 @@ class TestLifecycle:
     async def test_cancel_clears_only_matching_owned_protection(self, store):
         await store.upsert_position(make_position())
         manager, adapter, _ = await make_manager(store)
-        spec = make_spec(
-            take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("55000"))
-        )
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("55000")))
         state = await manager.attach(TrailingRequest(make_inst(), spec))
 
         cancelled = await manager.cancel(state.trailing_id, clear_protection=True)
@@ -787,18 +782,14 @@ class TestReprice:
         manager, _, _ = await make_manager(store)
         state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
 
-        updated = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        updated = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
 
         assert updated is not None
         assert updated.current_stop == Decimal("50400.00")
         assert updated.best_basis == Decimal("50500")
         assert updated.reprice_count == 1
 
-        pulled_back = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("49500"))
-        )
+        pulled_back = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("49500")))
 
         assert pulled_back is not None
         assert pulled_back.current_stop == Decimal("50400.00")
@@ -808,21 +799,15 @@ class TestReprice:
     async def test_step_skips_small_move_then_accepts_larger_move(self, store):
         await store.upsert_position(make_position())
         manager, _, _ = await make_manager(store)
-        state = await manager.attach(
-            TrailingRequest(make_inst(), make_spec(step=Decimal("200")))
-        )
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec(step=Decimal("200"))))
 
-        small = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50150"))
-        )
+        small = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50150")))
 
         assert small is not None
         assert small.current_stop == Decimal("49900.00")
         assert small.best_basis == Decimal("50150")
 
-        larger = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50300"))
-        )
+        larger = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50300")))
 
         assert larger is not None
         assert larger.current_stop == Decimal("50200.00")
@@ -839,18 +824,14 @@ class TestReprice:
         state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
 
         now[0] = NOW + timedelta(seconds=5)
-        skipped = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        skipped = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
 
         assert skipped is not None
         assert skipped.current_stop == Decimal("49900.00")
         assert skipped.best_basis == Decimal("50500")
 
         now[0] = NOW + timedelta(seconds=11)
-        written = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50600"))
-        )
+        written = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50600")))
 
         assert written is not None
         assert written.current_stop == Decimal("50500.00")
@@ -861,9 +842,7 @@ class TestReprice:
         manager, adapter, _ = await make_manager(store)
         state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
 
-        repriced = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        repriced = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
         assert repriced is not None
         assert repriced.current_stop == Decimal("50400.00")
         assert repriced.reprice_count == 1
@@ -872,9 +851,8 @@ class TestReprice:
             make_inst(),
             replace(make_instrument_spec(), min_stop_distance=Decimal("200")),
         )
-        blocked = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50600"))
-        )
+        manager._instrument_specs.clear()
+        blocked = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50600")))
 
         assert blocked is not None
         assert blocked.current_stop == Decimal("50400.00")
@@ -885,15 +863,11 @@ class TestReprice:
     async def test_reprice_skips_when_rate_limit_is_exhausted(self, store):
         await store.upsert_position(make_position())
         allowed = [True]
-        manager, adapter, _ = await make_manager(
-            store, reserve_rate_limit=lambda: allowed[0]
-        )
+        manager, adapter, _ = await make_manager(store, reserve_rate_limit=lambda: allowed[0])
         state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
         allowed[0] = False
 
-        skipped = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        skipped = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
 
         assert skipped is not None
         assert skipped.current_stop == Decimal("49900.00")
@@ -903,9 +877,7 @@ class TestReprice:
 
     async def test_fetch_failures_degrade_then_recover(self, store):
         await store.upsert_position(make_position())
-        manager, _, _ = await make_manager(
-            store, config=TrailingConfig(fetch_failure_threshold=2)
-        )
+        manager, _, _ = await make_manager(store, config=TrailingConfig(fetch_failure_threshold=2))
         state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
 
         still_armed = await manager.on_ticker_failure(state.trailing_id, "timeout")
@@ -918,9 +890,7 @@ class TestReprice:
         assert degraded.last_error == "fetch: timeout"
         assert degraded.current_stop == Decimal("49900.00")
 
-        recovered = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50000"))
-        )
+        recovered = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50000")))
         assert recovered is not None
         assert recovered.phase is TrailingPhase.ARMED
         assert recovered.last_error is None
@@ -947,9 +917,7 @@ class TestReprice:
         assert second.current_stop == Decimal("49900.00")
         assert second.failure_count == 2
 
-        recovered = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50600"))
-        )
+        recovered = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50600")))
         assert recovered is not None
         assert recovered.phase is TrailingPhase.ARMED
         assert recovered.current_stop == Decimal("50500.00")
@@ -958,9 +926,7 @@ class TestReprice:
 
     async def test_worker_groups_instrument_and_publishes_once(self, store):
         await store.upsert_position(make_position())
-        await store.upsert_position(
-            make_position(position_id="2", quantity="2", entry="50000")
-        )
+        await store.upsert_position(make_position(position_id="2", quantity="2", entry="50000"))
         config = TrailingConfig(poll_interval_seconds=1.0, publish_ticker_events=True)
         manager, base_adapter, bus = await make_manager(
             store, config=config, adapter_cls=CountingAdapter
@@ -996,16 +962,12 @@ class TestAtrAndActivation:
         assert state.activated is False
         assert state.current_stop is None
 
-        below = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        below = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
         assert below is not None
         assert below.activated is False
         assert below.current_stop is None
 
-        activated = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("51000"))
-        )
+        activated = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("51000")))
         assert activated is not None
         assert activated.activated is True
         assert activated.current_stop == Decimal("50900.00")
@@ -1019,17 +981,13 @@ class TestAtrAndActivation:
             offset=Decimal("2000"),
             activation=TrailingActivation.PRICE,
             activation_price=Decimal("51000"),
-            initial_stop=ProtectionLevel(
-                ProtectionLevelType.PRICE, Decimal("49500")
-            ),
+            initial_stop=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("49500")),
         )
         state = await manager.attach(TrailingRequest(make_inst(), spec))
         assert state.current_stop == Decimal("49500.00")
         assert state.activated is False
 
-        activated = await manager.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("51000"))
-        )
+        activated = await manager.on_ticker(state.trailing_id, Ticker(last=Decimal("51000")))
 
         assert activated is not None
         assert activated.activated is True
@@ -1039,9 +997,7 @@ class TestAtrAndActivation:
     async def test_worker_refreshes_atr_at_candle_close(self, store):
         await store.upsert_position(make_position())
         wall = [NOW]
-        config = TrailingConfig(
-            poll_interval_seconds=1.0, candle_settle_seconds=0
-        )
+        config = TrailingConfig(poll_interval_seconds=1.0, candle_settle_seconds=0)
         manager, adapter, _ = await make_manager(store, config=config)
         state = await manager.attach(TrailingRequest(make_inst(), atr_spec()))
         assert state.atr_value == Decimal("2")
@@ -1095,20 +1051,14 @@ class TestAtrAndActivation:
         for position in positions:
             await store.upsert_position(position)
         wall = [NOW]
-        config = TrailingConfig(
-            poll_interval_seconds=1.0, candle_settle_seconds=0
-        )
+        config = TrailingConfig(poll_interval_seconds=1.0, candle_settle_seconds=0)
         manager, base_adapter, _ = await make_manager(
             store, config=config, adapter_cls=CountingCandlesAdapter
         )
         adapter = cast(CountingCandlesAdapter, base_adapter)
         adapter.queue_candles_response(make_candles())
-        first = await manager.attach(
-            TrailingRequest(make_inst(), atr_spec(), position_id="1")
-        )
-        second = await manager.attach(
-            TrailingRequest(make_inst(), atr_spec(), position_id="2")
-        )
+        first = await manager.attach(TrailingRequest(make_inst(), atr_spec(), position_id="1"))
+        second = await manager.attach(TrailingRequest(make_inst(), atr_spec(), position_id="2"))
         assert adapter.candle_calls == 2
 
         adapter.queue_candles_response(make_candles(width="10"))
@@ -1197,9 +1147,7 @@ class TestPositionUpdates:
         state = await manager.attach(TrailingRequest(make_inst(), spec))
         assert state.resolved_activation_price == Decimal("55000")
 
-        updated = await manager.on_position_update(
-            make_position(quantity="2", entry="51000")
-        )
+        updated = await manager.on_position_update(make_position(quantity="2", entry="51000"))
 
         assert updated is not None
         assert updated.quantity == Decimal("2")
@@ -1212,11 +1160,7 @@ class TestPositionUpdates:
         manager, adapter, _ = await make_manager(
             store, protection=make_protection(reprice_gap=True)
         )
-        spec = make_spec(
-            take_profit=ProtectionLevel(
-                ProtectionLevelType.PRICE, Decimal("52000")
-            )
-        )
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("52000")))
         await manager.attach(TrailingRequest(make_inst(), spec))
         assert len(adapter.protection_writes) == 1
         adapter.update_position(make_position(quantity="0.5"), publish=False)
@@ -1243,9 +1187,7 @@ class TestPositionUpdates:
         await manager.attach(TrailingRequest(make_inst(), make_spec()))
         adapter.set_next_set_protection_error(RuntimeError("resize down"))
 
-        updated = await manager.on_position_update(
-            make_position(quantity="2", entry="51000")
-        )
+        updated = await manager.on_position_update(make_position(quantity="2", entry="51000"))
 
         assert updated is not None
         assert updated.phase is TrailingPhase.DEGRADED
@@ -1374,11 +1316,7 @@ class TestIntegrity:
     async def test_missing_take_profit_is_restored(self, store):
         await store.upsert_position(make_position())
         manager, adapter, _ = await make_manager(store)
-        spec = make_spec(
-            take_profit=ProtectionLevel(
-                ProtectionLevelType.PRICE, Decimal("52000")
-            )
-        )
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("52000")))
         state = await manager.attach(TrailingRequest(make_inst(), spec))
         adapter.seed_protection(
             make_inst(), "1", stop_loss=TpSlAttachment(trigger_price=Decimal("49900"))
@@ -1562,19 +1500,20 @@ class TestRestartRecovery:
     async def test_rehydrate_respects_the_minimum_reprice_interval(self, store):
         await store.upsert_position(make_position())
         protection = make_protection(min_reprice_interval_seconds=10)
-        first, _, _ = await make_manager(store, protection=protection)
+        clock = [NOW]
+        first_reprice_at = NOW + timedelta(seconds=10)
+        first, _, _ = await make_manager(store, protection=protection, clock=lambda: clock[0])
         state = await first.attach(TrailingRequest(make_inst(), make_spec()))
-        repriced = await first.on_ticker(
-            state.trailing_id, Ticker(last=Decimal("50500"))
-        )
+        clock[0] = first_reprice_at
+        repriced = await first.on_ticker(state.trailing_id, Ticker(last=Decimal("50500")))
         assert repriced is not None
         assert repriced.current_stop == Decimal("50400.00")
-        assert repriced.last_reprice_at == NOW
+        assert repriced.last_reprice_at == first_reprice_at
 
         second, adapter, _ = await make_manager(
             store,
             protection=protection,
-            clock=lambda: NOW + timedelta(seconds=5),
+            clock=lambda: first_reprice_at + timedelta(seconds=5),
         )
         adapter.seed_protection(
             make_inst(),
@@ -1622,11 +1561,7 @@ class TestRestartRecovery:
     async def test_missing_owned_take_profit_is_restored_on_rehydrate(self, store):
         await store.upsert_position(make_position())
         first, _, _ = await make_manager(store)
-        spec = make_spec(
-            take_profit=ProtectionLevel(
-                ProtectionLevelType.PRICE, Decimal("52000")
-            )
-        )
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("52000")))
         state = await first.attach(TrailingRequest(make_inst(), spec))
 
         second, adapter, _ = await make_manager(store)
@@ -1782,9 +1717,7 @@ class TestNativeExecution:
         )
 
         state = await manager.attach(
-            TrailingRequest(
-                make_inst(), make_spec(), take_over_existing_protection=True
-            )
+            TrailingRequest(make_inst(), make_spec(), take_over_existing_protection=True)
         )
 
         assert state.phase is TrailingPhase.ARMED
@@ -1813,11 +1746,7 @@ class TestNativeExecution:
     async def test_native_attach_writes_owned_take_profit(self, store):
         await store.upsert_position(make_position())
         manager, adapter, _ = await make_manager(store, native=make_native_exact())
-        spec = make_spec(
-            take_profit=ProtectionLevel(
-                ProtectionLevelType.PRICE, Decimal("52000")
-            )
-        )
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("52000")))
 
         state = await manager.attach(TrailingRequest(make_inst(), spec))
 
@@ -1831,9 +1760,7 @@ class TestNativeExecution:
 
     async def test_rehydrate_keeps_an_existing_native_trail(self, store):
         await store.upsert_position(make_position())
-        first, first_adapter, _ = await make_manager(
-            store, native=make_native_exact()
-        )
+        first, first_adapter, _ = await make_manager(store, native=make_native_exact())
         state = await first.attach(TrailingRequest(make_inst(), make_spec()))
 
         second, adapter, _ = await make_manager(store, native=make_native_exact())

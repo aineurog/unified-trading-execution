@@ -10,6 +10,7 @@ Verify that the sync facade:
 from __future__ import annotations
 
 import concurrent.futures
+import contextlib
 import sqlite3
 import time
 from datetime import UTC, datetime
@@ -181,10 +182,8 @@ def sync_trailing_engine():
     )
     eng.connect()
     yield eng
-    try:
+    with contextlib.suppress(Exception):
         eng.shutdown()
-    except Exception:
-        pass
 
 
 def _trailing_request() -> TrailingRequest:

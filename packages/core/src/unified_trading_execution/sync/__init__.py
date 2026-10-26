@@ -388,7 +388,5 @@ class SyncTrailingManager:
     ) -> list[TrailingState]:
         self._engine._check_not_shutdown()
         return self._engine._run(
-            self._engine._async_engine.trailing.list(
-                instrument=instrument, active_only=active_only
-            )
+            self._engine._async_engine.trailing.list(instrument=instrument, active_only=active_only)
         )

@@ -6,6 +6,7 @@ import inspect
 
 import pytest
 
+from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.bybit import BybitAdapter, BybitConfig, BybitEngine, SyncBybitEngine
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.sync import SyncEngine
@@ -37,7 +38,7 @@ class TestBybitEngine:
         engine_methods = set(dir(Engine)) - set(dir(object))
         adapter_only = {
             name
-            for name in set(dir(BybitAdapter)) - engine_methods - _skip
+            for name in set(dir(BybitAdapter)) - engine_methods - set(dir(Adapter)) - _skip
             if not name.startswith("_") and inspect.iscoroutinefunction(getattr(BybitAdapter, name))
         }
         missing = {name for name in adapter_only if not hasattr(BybitEngine, name)}
@@ -60,7 +61,7 @@ class TestSyncBybitEngine:
         sync_engine_methods = set(dir(SyncEngine)) - set(dir(object))
         adapter_only = {
             name
-            for name in set(dir(BybitAdapter)) - sync_engine_methods - _skip
+            for name in set(dir(BybitAdapter)) - sync_engine_methods - set(dir(Adapter)) - _skip
             if not name.startswith("_") and inspect.iscoroutinefunction(getattr(BybitAdapter, name))
         }
         missing = {name for name in adapter_only if not hasattr(SyncBybitEngine, name)}
