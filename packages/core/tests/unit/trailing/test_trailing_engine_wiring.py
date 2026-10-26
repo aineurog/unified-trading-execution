@@ -12,6 +12,7 @@ import asyncio
 import time
 from datetime import UTC, datetime
 from decimal import Decimal
+from typing import TypeVar
 
 import pytest
 import pytest_asyncio
@@ -149,12 +150,15 @@ def enable_native_trailing(adapter: MockAdapter) -> None:
     )
 
 
+_AdapterT = TypeVar("_AdapterT", bound=MockAdapter)
+
+
 def build_adapter(
     bus: EventBus,
     positions: list[Position],
     *,
-    adapter_cls: type[MockAdapter] = MockAdapter,
-) -> MockAdapter:
+    adapter_cls: type[_AdapterT] = MockAdapter,
+) -> _AdapterT:
     adapter = adapter_cls(event_bus=bus)
     instrument = make_inst()
     adapter.add_instrument_spec(instrument, make_instrument_spec())

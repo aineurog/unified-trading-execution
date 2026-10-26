@@ -81,7 +81,7 @@ def make_position(
     quantity="1",
     position_id="1",
     entry="50000",
-    opened_at=NOW,
+    opened_at: datetime | None = NOW,
 ):
     return Position(
         instrument=make_inst(),
@@ -1093,9 +1093,10 @@ class TestAtrAndActivation:
         config = TrailingConfig(
             poll_interval_seconds=1.0, candle_settle_seconds=0
         )
-        manager, adapter, _ = await make_manager(
+        manager, base_adapter, _ = await make_manager(
             store, config=config, adapter_cls=CountingCandlesAdapter
         )
+        adapter = cast(CountingCandlesAdapter, base_adapter)
         adapter.queue_candles_response(make_candles())
         first = await manager.attach(
             TrailingRequest(make_inst(), atr_spec(), position_id="1")
