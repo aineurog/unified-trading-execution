@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import count
@@ -993,6 +994,673 @@ class TestAtrAndActivation:
         assert recovered is not None
         assert recovered.phase is TrailingPhase.ARMED
         assert recovered.atr_value == Decimal("20")
+
+
+class TestPositionUpdates:
+    async def test_partial_close_updates_quantity_without_rewriting_stop(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        writes_before = len(adapter.protection_writes)
+
+        updated = await manager.on_position_update(make_position(quantity="0.5"))
+
+        assert updated is not None
+        assert updated.quantity == Decimal("0.5")
+        assert updated.current_stop == Decimal("49900.00")
+        assert updated.phase is TrailingPhase.ARMED
+        assert len(adapter.protection_writes) == writes_before
+
+    async def test_quantity_increase_recomputes_profit_percent_activation(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        spec = make_spec(
+            activation=TrailingActivation.PROFIT_PERCENT,
+            activation_profit_percent=Decimal("10"),
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+        assert state.resolved_activation_price == Decimal("55000")
+
+        updated = await manager.on_position_update(
+            make_position(quantity="2", entry="51000")
+        )
+
+        assert updated is not None
+        assert updated.quantity == Decimal("2")
+        assert updated.entry_price == Decimal("51000")
+        assert updated.resolved_activation_price == Decimal("56100")
+        assert updated.activated is False
+
+    async def test_resize_rewrites_protection_at_the_new_size(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store, protection=make_protection(reprice_gap=True)
+        )
+        spec = make_spec(
+            take_profit=ProtectionLevel(
+                ProtectionLevelType.PRICE, Decimal("52000")
+            )
+        )
+        await manager.attach(TrailingRequest(make_inst(), spec))
+        assert len(adapter.protection_writes) == 1
+        adapter.update_position(make_position(quantity="0.5"), publish=False)
+
+        updated = await manager.on_position_update(make_position(quantity="0.5"))
+
+        assert updated is not None
+        assert updated.quantity == Decimal("0.5")
+        assert len(adapter.protection_writes) == 2
+        write = adapter.protection_writes[-1]
+        assert write.stop_loss is not None
+        assert write.stop_loss.trigger_price == Decimal("49900.00")
+        assert write.take_profit is not None
+        assert write.take_profit.trigger_price == Decimal("52000.00")
+
+        await manager.on_position_update(make_position(quantity="0.5"))
+        assert len(adapter.protection_writes) == 2
+
+    async def test_resize_failure_degrades_immediately(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store, protection=make_protection(reprice_gap=True)
+        )
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.set_next_set_protection_error(RuntimeError("resize down"))
+
+        updated = await manager.on_position_update(
+            make_position(quantity="2", entry="51000")
+        )
+
+        assert updated is not None
+        assert updated.phase is TrailingPhase.DEGRADED
+        assert updated.quantity == Decimal("2")
+        assert updated.failure_count == 1
+        assert updated.last_error is not None
+        assert "resize" in updated.last_error
+
+    async def test_zero_quantity_marks_the_state_done(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, bus = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        events: list[TrailingStateEvent] = []
+        bus.subscribe(TrailingStateEvent, events.append)
+        closed_position = make_position(quantity="0")
+        adapter.update_position(closed_position, publish=False)
+
+        updated = await manager.on_position_update(closed_position)
+
+        assert updated is not None
+        assert updated.phase is TrailingPhase.DONE
+        assert updated.quantity == Decimal("0")
+        assert events[-1].phase is TrailingPhase.DONE
+        assert events[-1].reason == "position_closed"
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.done"
+        ]
+        assert len(audits) == 1
+        assert audits[0].payload["reason"] == "position_closed"
+
+    async def test_side_flip_cancels_and_clears_the_owned_stop(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, bus = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        flipped = make_position(quantity="-1")
+        adapter.update_position(flipped, publish=False)
+        events: list[TrailingStateEvent] = []
+        bus.subscribe(TrailingStateEvent, events.append)
+
+        updated = await manager.on_position_update(flipped)
+
+        assert updated is not None
+        assert updated.phase is TrailingPhase.CANCELLED
+        assert updated.last_error is None
+        assert events[-1].reason == "position_side_flipped"
+        assert adapter.protection_writes[-1].cleared_stop_loss is True
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.cancelled"
+        ]
+        assert len(audits) == 1
+        assert audits[0].payload["reason"] == "position_side_flipped"
+
+
+class TestIntegrity:
+    async def test_missing_stop_is_restored(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.seed_protection(make_inst(), "1")
+        writes_before = len(adapter.protection_writes)
+
+        restored = await manager.check_integrity(state.trailing_id)
+
+        assert restored is not None
+        assert restored.phase is TrailingPhase.ARMED
+        assert restored.current_stop == Decimal("49900.00")
+        assert len(adapter.protection_writes) == writes_before + 1
+        write = adapter.protection_writes[-1]
+        assert write.stop_loss is not None
+        assert write.stop_loss.trigger_price == Decimal("49900.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert len(audits) == 1
+        assert audits[0].payload["reason"] == "missing_stop"
+
+    async def test_looser_external_stop_is_restored(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.seed_protection(
+            make_inst(), "1", stop_loss=TpSlAttachment(trigger_price=Decimal("49800"))
+        )
+
+        restored = await manager.check_integrity(state.trailing_id)
+
+        assert restored is not None
+        assert restored.current_stop == Decimal("49900.00")
+        write = adapter.protection_writes[-1]
+        assert write.stop_loss is not None
+        assert write.stop_loss.trigger_price == Decimal("49900.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[0].payload["reason"] == "protection_changed_externally"
+
+    async def test_tighter_external_stop_is_adopted_without_a_write(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.seed_protection(
+            make_inst(), "1", stop_loss=TpSlAttachment(trigger_price=Decimal("50050"))
+        )
+        writes_before = len(adapter.protection_writes)
+
+        restored = await manager.check_integrity(state.trailing_id)
+
+        assert restored is not None
+        assert restored.current_stop == Decimal("50050")
+        assert len(adapter.protection_writes) == writes_before
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[0].payload["reason"] == "adopted_tighter_stop"
+
+    async def test_missing_take_profit_is_restored(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        spec = make_spec(
+            take_profit=ProtectionLevel(
+                ProtectionLevelType.PRICE, Decimal("52000")
+            )
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+        adapter.seed_protection(
+            make_inst(), "1", stop_loss=TpSlAttachment(trigger_price=Decimal("49900"))
+        )
+
+        restored = await manager.check_integrity(state.trailing_id)
+
+        assert restored is not None
+        assert restored.current_stop == Decimal("49900")
+        assert restored.current_take_profit == Decimal("52000.00")
+        write = adapter.protection_writes[-1]
+        assert write.take_profit is not None
+        assert write.take_profit.trigger_price == Decimal("52000.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[0].payload["reason"] == "missing_take_profit"
+
+    async def test_missing_position_marks_the_state_done(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.update_position(make_position(quantity="0"), publish=False)
+
+        closed = await manager.check_integrity(state.trailing_id)
+
+        assert closed is not None
+        assert closed.phase is TrailingPhase.DONE
+        assert closed.quantity == Decimal("0")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.done"
+        ]
+        assert len(audits) == 1
+
+    async def test_unactivated_state_without_an_initial_stop_is_left_alone(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store)
+        spec = make_spec(
+            activation=TrailingActivation.PRICE,
+            activation_price=Decimal("51000"),
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+        writes_before = len(adapter.protection_writes)
+
+        checked = await manager.check_integrity(state.trailing_id)
+
+        assert checked is not None
+        assert checked.phase is TrailingPhase.ARMED
+        assert checked.current_stop is None
+        assert len(adapter.protection_writes) == writes_before
+
+
+class TestRestartRecovery:
+    async def test_attach_refused_until_rehydration_completes(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.current_stop is not None
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=state.current_stop),
+        )
+
+        with pytest.raises(TrailingStateError, match="rehydration has not completed"):
+            await second.attach(TrailingRequest(make_inst(), make_spec()))
+
+        await second.rehydrate()
+
+        with pytest.raises(TrailingStateError, match="already attached"):
+            await second.attach(TrailingRequest(make_inst(), make_spec()))
+
+    async def test_position_closed_while_offline_marks_done(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store)
+        closed = make_position(quantity="0")
+        await store.upsert_position(closed)
+        adapter.update_position(closed, publish=False)
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DONE
+        assert restored.quantity == Decimal("0")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.done"
+        ]
+        assert audits[-1].payload["reason"] == "position_closed_while_offline"
+
+    async def test_missing_synthetic_stop_is_restored_on_rehydrate(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store)
+        writes_before = len(adapter.protection_writes)
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.ARMED
+        assert restored.current_stop == Decimal("49900.00")
+        assert len(adapter.protection_writes) == writes_before + 1
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "missing_stop"
+
+    async def test_tighter_venue_stop_is_adopted_on_rehydrate(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("50050")),
+        )
+        writes_before = len(adapter.protection_writes)
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.current_stop == Decimal("50050")
+        assert len(adapter.protection_writes) == writes_before
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "adopted_tighter_stop"
+
+    async def test_looser_venue_stop_is_restored_on_rehydrate(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("49800")),
+        )
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.current_stop == Decimal("49900.00")
+        write = adapter.protection_writes[-1]
+        assert write.stop_loss is not None
+        assert write.stop_loss.trigger_price == Decimal("49900.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "protection_changed_externally"
+
+    async def test_missing_owned_take_profit_is_restored_on_rehydrate(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        spec = make_spec(
+            take_profit=ProtectionLevel(
+                ProtectionLevelType.PRICE, Decimal("52000")
+            )
+        )
+        state = await first.attach(TrailingRequest(make_inst(), spec))
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("49900")),
+        )
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.current_take_profit == Decimal("52000.00")
+        write = adapter.protection_writes[-1]
+        assert write.take_profit is not None
+        assert write.take_profit.trigger_price == Decimal("52000.00")
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "missing_take_profit"
+
+    async def test_rearm_disabled_degrades_the_state(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.current_stop is not None
+
+        second, adapter, _ = await make_manager(
+            store, config=TrailingConfig(rearm_on_reconnect=False)
+        )
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=state.current_stop),
+        )
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DEGRADED
+        assert restored.last_error == "rearm_disabled"
+
+    async def test_dataset_gap_degrades_the_state(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, _, _ = await make_manager(store)
+        await second.rehydrate(positions=[])
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DEGRADED
+        assert restored.last_error == "position_dataset_inconsistent"
+
+    async def test_position_replaced_on_open_time_change(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, _, _ = await make_manager(store)
+        replacement = make_position(opened_at=NOW + timedelta(hours=1))
+        await second.rehydrate(positions=[replacement])
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DEGRADED
+        assert restored.last_error == "position_replaced"
+
+    async def test_identity_unverified_when_open_time_is_missing(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, _, _ = await make_manager(store)
+        replacement = make_position(opened_at=None)
+        await second.rehydrate(positions=[replacement])
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DEGRADED
+        assert restored.last_error == "position_identity_unverified"
+
+    async def test_restart_side_flip_clears_owned_protection(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store)
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store)
+        adapter.seed_protection(
+            make_inst(),
+            "1",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("49900")),
+        )
+        short = make_position(quantity="-1")
+        await store.upsert_position(short)
+        adapter.update_position(short, publish=False)
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.DEGRADED
+        assert restored.last_error == "position_replaced"
+        assert adapter.protection_writes[-1].cleared_stop_loss
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.clear"
+        ]
+        assert audits[-1].payload["reason"] == "cleared"
+
+
+class TestNativeExecution:
+    async def test_native_attach_places_the_trail(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert state.mode is TrailingMode.NATIVE
+        assert state.phase is TrailingPhase.ARMED
+        assert state.native_id is not None
+        assert state.current_stop is None
+        request = adapter.native_requests[-1]
+        assert request.side is OrderSide.BUY
+        assert request.quantity == Decimal("1")
+        assert request.offset == Decimal("100")
+        assert request.offset_type is TrailingOffsetType.PRICE
+        assert request.basis is TrailingBasis.LAST
+        assert request.client_id == state.trailing_id
+
+    async def test_native_attach_writes_owned_take_profit(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        spec = make_spec(
+            take_profit=ProtectionLevel(
+                ProtectionLevelType.PRICE, Decimal("52000")
+            )
+        )
+
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+
+        assert state.current_take_profit == Decimal("52000.00")
+        assert state.take_profit_owned
+        protection = await adapter.get_position_tpsl(make_inst(), "1")
+        assert protection is not None
+        assert protection[0] is not None
+        assert protection[0].trigger_price == Decimal("52000.00")
+        assert protection[1] is None
+
+    async def test_rehydrate_keeps_an_existing_native_trail(self, store):
+        await store.upsert_position(make_position())
+        first, first_adapter, _ = await make_manager(
+            store, native=make_native_exact()
+        )
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+
+        second, adapter, _ = await make_manager(store, native=make_native_exact())
+        seeded = await adapter.place_trailing_stop(first_adapter.native_requests[-1])
+        await store.upsert_trailing_state(
+            replace(
+                state,
+                native_id=seeded.native_id,
+                current_stop=seeded.current_stop,
+            )
+        )
+        requests_before = len(adapter.native_requests)
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.ARMED
+        assert restored.native_id == seeded.native_id
+        assert len(adapter.native_requests) == requests_before
+
+    async def test_rehydrate_rearms_a_missing_native_trail(self, store):
+        await store.upsert_position(make_position())
+        first, _, _ = await make_manager(store, native=make_native_exact())
+        state = await first.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+
+        second, adapter, _ = await make_manager(store, native=make_native_exact())
+
+        await second.rehydrate()
+
+        restored = await second.get(state.trailing_id)
+        assert restored is not None
+        assert restored.phase is TrailingPhase.ARMED
+        assert restored.native_id is not None
+        assert restored.native_id != state.native_id
+        assert len(adapter.native_requests) == 1
+
+    async def test_native_integrity_rearms_a_missing_trail(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+        await adapter.cancel_trailing_stop(state.native_id, make_inst())
+        requests_before = len(adapter.native_requests)
+
+        restored = await manager.check_integrity(state.trailing_id)
+
+        assert restored is not None
+        assert restored.phase is TrailingPhase.ARMED
+        assert restored.native_id is not None
+        assert restored.native_id != state.native_id
+        assert len(adapter.native_requests) == requests_before + 1
+        audits = [
+            audit
+            for audit in await store.query_audit_events()
+            if audit.event_type == "trailing.integrity_restore"
+        ]
+        assert audits[-1].payload["reason"] == "native_rearmed"
+
+    async def test_native_integrity_degrades_when_rearm_fails(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        await store.upsert_trailing_state(replace(state, native_id=None))
+        adapter.set_next_native_error(PlatformConnectionError("venue down"))
+
+        degraded = await manager.check_integrity(state.trailing_id)
+
+        assert degraded is not None
+        assert degraded.phase is TrailingPhase.DEGRADED
+        assert degraded.last_error is not None
+        assert "venue down" in degraded.last_error
+
+    async def test_native_integrity_degrades_when_read_fails(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store,
+            native=make_native_exact(),
+            config=TrailingConfig(protection_failure_threshold=1),
+        )
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        adapter.set_next_native_error(PlatformConnectionError("venue down"))
+
+        degraded = await manager.check_integrity(state.trailing_id)
+
+        assert degraded is not None
+        assert degraded.phase is TrailingPhase.DEGRADED
+        assert degraded.last_error is not None
+        assert "venue down" in degraded.last_error
+
+    async def test_native_side_flip_cancels_the_venue_trail(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+
+        cancelled = await manager.on_position_update(make_position(quantity="-1"))
+
+        assert cancelled is not None
+        assert cancelled.phase is TrailingPhase.CANCELLED
+        assert await adapter.get_trailing_stop(state.native_id, make_inst()) is None
+
+    async def test_native_cancel_removes_the_venue_trail(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+
+        cancelled = await manager.cancel(state.trailing_id)
+
+        assert cancelled is not None
+        assert cancelled.phase is TrailingPhase.CANCELLED
+        assert await adapter.get_trailing_stop(state.native_id, make_inst()) is None
 
 
 class TestEventsAndAudit:
