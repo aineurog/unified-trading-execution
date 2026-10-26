@@ -38,6 +38,8 @@ _TIMEFRAME_SECONDS: dict[CandleTimeframe, int] = {
     CandleTimeframe.M30: 1800,
     CandleTimeframe.H1: 3600,
     CandleTimeframe.H4: 14400,
+    CandleTimeframe.H8: 28800,
+    CandleTimeframe.H12: 43200,
     CandleTimeframe.D1: 86400,
 }
 

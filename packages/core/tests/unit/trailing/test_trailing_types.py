@@ -87,7 +87,17 @@ def test_phase_values_are_lowercase() -> None:
 
 
 def test_candle_timeframes_are_closed_set() -> None:
-    assert {tf.value for tf in CandleTimeframe} == {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+    assert {tf.value for tf in CandleTimeframe} == {
+        "1m",
+        "5m",
+        "15m",
+        "30m",
+        "1h",
+        "4h",
+        "8h",
+        "12h",
+        "1d",
+    }
 
 
 def test_basis_values() -> None:

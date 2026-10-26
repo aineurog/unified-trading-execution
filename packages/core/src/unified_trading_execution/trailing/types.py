@@ -86,6 +86,8 @@ class CandleTimeframe(StrEnum):
     M30 = "30m"
     H1 = "1h"
     H4 = "4h"
+    H8 = "8h"
+    H12 = "12h"
     D1 = "1d"
 
 
