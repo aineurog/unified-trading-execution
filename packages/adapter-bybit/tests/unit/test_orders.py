@@ -15,6 +15,7 @@ from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
     build_place_order_payload,
+    build_set_trading_stop_payload,
     map_order_status,
     parse_order_result,
 )
@@ -26,6 +27,7 @@ from unified_trading_execution.errors import (
     RateLimitError,
     UnsupportedOrderTypeError,
 )
+from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -510,6 +512,135 @@ class TestBuildCancelPayload:
             "symbol": "BTCUSDT",
             "orderLinkId": "c1",
         }
+
+
+class TestBuildSetTradingStopPayload:
+    def test_stop_loss_only_omits_take_profit(self) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=None,
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+        )
+
+        assert payload["stopLoss"] == "90000"
+        assert payload["slOrderType"] == "Market"
+        assert "takeProfit" not in payload
+        assert "tpOrderType" not in payload
+        assert "tpLimitPrice" not in payload
+
+    def test_take_profit_only_omits_stop_loss(self) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=TpSlAttachment(trigger_price=Decimal("120000")),
+            stop_loss=None,
+        )
+
+        assert payload["takeProfit"] == "120000"
+        assert payload["tpOrderType"] == "Market"
+        assert "stopLoss" not in payload
+        assert "slOrderType" not in payload
+        assert "slLimitPrice" not in payload
+
+    def test_both_sides_are_written(self) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=1,
+            take_profit=TpSlAttachment(trigger_price=Decimal("120000")),
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+        )
+
+        assert payload["positionIdx"] == 1
+        assert payload["takeProfit"] == "120000"
+        assert payload["stopLoss"] == "90000"
+
+    def test_limit_side_uses_partial_mode(self) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=None,
+            stop_loss=TpSlAttachment(
+                trigger_price=Decimal("90000"),
+                limit_price=Decimal("89900"),
+            ),
+        )
+
+        assert payload["tpslMode"] == "Partial"
+        assert payload["slOrderType"] == "Limit"
+        assert payload["slLimitPrice"] == "89900"
+        assert "takeProfit" not in payload
+
+    def test_no_sides_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            build_set_trading_stop_payload(
+                category="linear",
+                symbol="BTCUSDT",
+                position_idx=0,
+                take_profit=None,
+                stop_loss=None,
+            )
+
+    @pytest.mark.parametrize(
+        ("basis", "venue_basis"),
+        [
+            (TrailingBasis.LAST, "LastPrice"),
+            (TrailingBasis.MARK, "MarkPrice"),
+        ],
+    )
+    def test_trigger_basis_maps_written_sides(
+        self,
+        basis: TrailingBasis,
+        venue_basis: str,
+    ) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=TpSlAttachment(trigger_price=Decimal("120000")),
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+            trigger_basis=basis,
+        )
+
+        assert payload["tpTriggerBy"] == venue_basis
+        assert payload["slTriggerBy"] == venue_basis
+
+    def test_trigger_basis_leaves_the_unmentioned_side_alone(self) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=None,
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+            trigger_basis=TrailingBasis.MARK,
+        )
+
+        assert payload["slTriggerBy"] == "MarkPrice"
+        assert "tpTriggerBy" not in payload
+
+    @pytest.mark.parametrize(
+        "basis",
+        [None, TrailingBasis.BID, TrailingBasis.ASK, TrailingBasis.MID],
+    )
+    def test_unmappable_trigger_basis_is_omitted(
+        self,
+        basis: TrailingBasis | None,
+    ) -> None:
+        payload = build_set_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=TpSlAttachment(trigger_price=Decimal("120000")),
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+            trigger_basis=basis,
+        )
+
+        assert "tpTriggerBy" not in payload
+        assert "slTriggerBy" not in payload
 
 
 class TestParseOrderResult:

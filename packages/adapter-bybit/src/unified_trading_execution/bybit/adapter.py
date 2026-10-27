@@ -95,6 +95,7 @@ from unified_trading_execution.events import (
 )
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
+from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -2052,6 +2053,7 @@ class BybitAdapter(Adapter):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         """Modify TP/SL on an open position via ``set_trading_stop``.
 
@@ -2060,6 +2062,9 @@ class BybitAdapter(Adapter):
         ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
         ``translate_position`` — Bybit reuses the same ``positionIdx`` across
         every symbol, so *instrument* is required to address the correct leg.
+
+        *trigger_basis* sets the venue trigger feed for the sides being
+        written; ``None`` leaves Bybit's default untouched.
 
         Spot has no position concept on Bybit, so this raises
         ``UnsupportedOrderTypeError`` for spot instruments.
@@ -2081,6 +2086,7 @@ class BybitAdapter(Adapter):
             position_idx=position_idx,
             take_profit=take_profit,
             stop_loss=stop_loss,
+            trigger_basis=trigger_basis,
         )
         await self._run_request(self._session.set_trading_stop, **payload)
 

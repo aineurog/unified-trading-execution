@@ -46,6 +46,7 @@ from decimal import Decimal
 from typing import Any
 
 from unified_trading_execution.errors import PlatformError, UnsupportedOrderTypeError
+from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.order import (
     OrderModification,
@@ -65,6 +66,11 @@ _TIME_IN_FORCE: dict[TimeInForce, str] = {
     TimeInForce.GTC: "GTC",
     TimeInForce.IOC: "IOC",
     TimeInForce.FOK: "FOK",
+}
+
+_TRIGGER_BASIS: dict[TrailingBasis, str] = {
+    TrailingBasis.LAST: "LastPrice",
+    TrailingBasis.MARK: "MarkPrice",
 }
 
 _ORDER_STATUS_MAP: dict[str, OrderStatus] = {
@@ -276,13 +282,26 @@ def build_set_trading_stop_payload(
     position_idx: int,
     take_profit: TpSlAttachment | None,
     stop_loss: TpSlAttachment | None,
+    trigger_basis: TrailingBasis | None = None,
 ) -> dict[str, Any]:
     """Translate a position TP/SL modification into ``set_trading_stop`` params.
+
+    Only the sides that were passed are emitted, so Bybit preserves the other
+    side unchanged.  Clearing a side is not expressed by omission here; it is a
+    separate operation.
+
+    ``trigger_basis`` sets ``tpTriggerBy``/``slTriggerBy`` only for the sides
+    being written, so an update never changes the trigger feed of an untouched
+    side.  A basis Bybit cannot express in this surface is left at the venue
+    default.
 
     Mirrors the placement/amend TP/SL conventions: a ``limit_price`` on either
     attachment makes the whole request a ``Partial`` tpsl (that leg is a limit
     order); when both are market the mode is ``Full``.
     """
+    if take_profit is None and stop_loss is None:
+        raise ValueError("at least one of take_profit or stop_loss is required")
+
     payload: dict[str, Any] = {
         "category": category,
         "symbol": symbol,
@@ -308,6 +327,13 @@ def build_set_trading_stop_payload(
             payload["slLimitPrice"] = str(stop_loss.limit_price)
         else:
             payload["slOrderType"] = "Market"
+
+    trigger_by = _TRIGGER_BASIS.get(trigger_basis) if trigger_basis is not None else None
+    if trigger_by is not None:
+        if take_profit is not None:
+            payload["tpTriggerBy"] = trigger_by
+        if stop_loss is not None:
+            payload["slTriggerBy"] = trigger_by
 
     return payload
 
