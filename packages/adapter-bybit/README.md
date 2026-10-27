@@ -8,6 +8,8 @@ inverse perpetual markets.
 
 - All four guaranteed order types: **Market, Limit, Stop, Stop-Limit**
 - Native **take-profit and stop-loss** attachment at order placement
+- **Trailing stops** with native position trailing (linear and inverse) and
+  synthetic fallback for percent/ATR requests
 - **Reduce-only** orders for position closing
 - Real-time **WebSocket streams** for orders, executions, positions, and wallet balances
 - **Instrument metadata** fetching with TTL-based caching and automatic invalidation
