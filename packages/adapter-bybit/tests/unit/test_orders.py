@@ -995,8 +995,8 @@ class TestPlaceOrder:
     ) -> None:
         headers = {
             "X-Bapi-Limit": "100",
-            "X-Bapi-Remaining": "50",
-            "X-Bapi-Reset-Timestamp": "1684738540561",
+            "X-Bapi-Limit-Status": "50",
+            "X-Bapi-Limit-Reset-Timestamp": "1684738540561",
         }
         mock_pybit_http.place_order.return_value = (
             {"retCode": 0, "result": {"orderId": "o1", "orderLinkId": "c1"}},
@@ -1014,7 +1014,8 @@ class TestPlaceOrder:
 
         limits = await adapter.get_rate_limits()
         assert limits.requests_per_interval == 100
-        assert limits.remaining == 50
+        # A high-limit read must not authorize a write burst.
+        assert limits.remaining == 10
 
 
 class TestModifyOrder:

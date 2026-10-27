@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from unified_trading_execution.bybit.adapter import _parse_rate_limits, _safe_header_int
+from unified_trading_execution.bybit.adapter import (
+    _MAX_GLOBAL_RESERVE,
+    _has_rate_limit_headers,
+    _parse_rate_limits,
+    _safe_header_int,
+)
 
 
 class TestSafeHeaderInt:
@@ -35,24 +40,53 @@ class TestSafeHeaderInt:
     def test_key_absent_returns_default(self) -> None:
         assert _safe_header_int({}, "missing", 42) == 42
 
+    def test_key_is_case_insensitive(self) -> None:
+        assert _safe_header_int({"x-bapi-limit": "10"}, "X-Bapi-Limit", 99) == 10
+
+
+class TestHasRateLimitHeaders:
+    def test_authenticated_response(self) -> None:
+        headers = {
+            "X-Bapi-Limit": "10",
+            "X-Bapi-Limit-Status": "9",
+            "X-Bapi-Limit-Reset-Timestamp": "2000000000000",
+        }
+        assert _has_rate_limit_headers(headers) is True
+
+    def test_public_response_without_limit_headers(self) -> None:
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Ret_code": "0",
+            "Traceid": "abc",
+        }
+        assert _has_rate_limit_headers(headers) is False
+
+    def test_empty_headers(self) -> None:
+        assert _has_rate_limit_headers({}) is False
+
+    def test_lowercase_headers(self) -> None:
+        assert _has_rate_limit_headers({"x-bapi-limit-status": "9"}) is True
+
 
 class TestParseRateLimits:
     def test_full_headers(self) -> None:
         headers = {
-            "X-Bapi-Limit": "120",
-            "X-Bapi-Remaining": "85",
-            "X-Bapi-Reset-Timestamp": "2000000000000",
+            "X-Bapi-Limit": "10",
+            "X-Bapi-Limit-Status": "9",
+            "X-Bapi-Limit-Reset-Timestamp": "2000000000000",
         }
         rl = _parse_rate_limits(headers)
-        assert rl.requests_per_interval == 120
-        assert rl.remaining == 85
-        assert rl.interval_seconds == 60
+        assert rl.requests_per_interval == 10
+        assert rl.remaining == 9
+        assert rl.interval_seconds == 1.0
         assert rl.reset_at == datetime.fromtimestamp(2000000000, tz=UTC)
 
-    def test_missing_headers_defaults(self) -> None:
+    def test_missing_headers_use_conservative_defaults(self) -> None:
+        now = datetime.now(UTC)
         rl = _parse_rate_limits({})
-        assert rl.requests_per_interval == 120
-        assert rl.remaining == 120
+        assert rl.requests_per_interval == _MAX_GLOBAL_RESERVE
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
+        assert rl.reset_at > now
 
     # ---- Clamping: non-positive limit / negative remaining ----
 
@@ -69,8 +103,20 @@ class TestParseRateLimits:
         assert rl.requests_per_interval == expected_limit
 
     def test_negative_remaining_clamped_to_zero(self) -> None:
-        rl = _parse_rate_limits({"X-Bapi-Remaining": "-5"})
+        rl = _parse_rate_limits({"X-Bapi-Limit-Status": "-5"})
         assert rl.remaining == 0
+
+    def test_remaining_capped_to_lowest_write_bucket(self) -> None:
+        # A 50/s read endpoint must not authorize a 50-write burst.
+        rl = _parse_rate_limits(
+            {
+                "X-Bapi-Limit": "50",
+                "X-Bapi-Limit-Status": "49",
+                "X-Bapi-Limit-Reset-Timestamp": "2000000000000",
+            }
+        )
+        assert rl.requests_per_interval == 50
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
 
     # ---- Malformed headers do not crash ----
 
@@ -78,12 +124,12 @@ class TestParseRateLimits:
         ("headers", "label"),
         [
             ({"X-Bapi-Limit": ""}, "empty-limit"),
-            ({"X-Bapi-Remaining": ""}, "empty-remaining"),
-            ({"X-Bapi-Reset-Timestamp": ""}, "empty-reset-ts"),
+            ({"X-Bapi-Limit-Status": ""}, "empty-status"),
+            ({"X-Bapi-Limit-Reset-Timestamp": ""}, "empty-reset-ts"),
             ({"X-Bapi-Limit": "abc"}, "non-numeric-limit"),
-            ({"X-Bapi-Remaining": "abc"}, "non-numeric-remaining"),
-            ({"X-Bapi-Reset-Timestamp": "abc"}, "non-numeric-reset-ts"),
-            ({"X-Bapi-Limit": "", "X-Bapi-Remaining": "abc"}, "multiple-malformed"),
+            ({"X-Bapi-Limit-Status": "abc"}, "non-numeric-status"),
+            ({"X-Bapi-Limit-Reset-Timestamp": "abc"}, "non-numeric-reset-ts"),
+            ({"X-Bapi-Limit": "", "X-Bapi-Limit-Status": "abc"}, "multiple-malformed"),
         ],
     )
     def test_malformed_headers_use_defaults_and_dont_crash(
@@ -95,53 +141,82 @@ class TestParseRateLimits:
 
     # ---- Reset timestamp edge cases ----
 
-    def test_reset_timestamp_zero_falls_through_to_now(self) -> None:
-        rl = _parse_rate_limits({"X-Bapi-Reset-Timestamp": "0"})
+    def test_reset_in_the_past_is_replaced_with_a_future_window(self) -> None:
+        # Bybit reports approximately "now" unless the limit was exceeded.
+        # Core refuses every reservation when reset_at is already past.
         now = datetime.now(UTC)
-        delta = abs((rl.reset_at - now).total_seconds())
-        assert delta < 5, f"reset_at should be ~now, got {rl.reset_at}"
+        past_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        rl = _parse_rate_limits({"X-Bapi-Limit-Reset-Timestamp": str(past_ms)}, now=now)
+        assert rl.reset_at > now
+        assert rl.reset_at <= now + timedelta(seconds=2)
 
-    def test_reset_timestamp_explicit_zero_falls_through(self) -> None:
-        # "0" as a string — same behavior
-        rl = _parse_rate_limits({"X-Bapi-Reset-Timestamp": "0"})
+    def test_reset_timestamp_zero_falls_through_to_a_future_window(self) -> None:
         now = datetime.now(UTC)
-        assert abs((rl.reset_at - now).total_seconds()) < 5
-
-    def test_high_remaining_stored_as_is(self) -> None:
-        rl = _parse_rate_limits({"X-Bapi-Remaining": "99999"})
-        assert rl.remaining == 99999
+        rl = _parse_rate_limits({"X-Bapi-Limit-Reset-Timestamp": "0"}, now=now)
+        assert rl.reset_at > now
+        assert rl.reset_at <= now + timedelta(seconds=2)
 
 
 class TestGetRateLimits:
-    async def test_returns_default_before_any_call(self, adapter) -> None:
+    async def test_returns_usable_window_before_any_call(self, adapter) -> None:
+        now = datetime.now(UTC)
         rl = await adapter.get_rate_limits()
         assert rl.requests_per_interval >= 1
-        assert rl.remaining >= 0
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
+        assert rl.reset_at > now
 
     async def test_returns_updated_state(self, adapter) -> None:
         adapter._update_rate_limits(
             {
-                "X-Bapi-Limit": "120",
-                "X-Bapi-Remaining": "72",
-                "X-Bapi-Reset-Timestamp": "2100000000000",
+                "X-Bapi-Limit": "10",
+                "X-Bapi-Limit-Status": "7",
+                "X-Bapi-Limit-Reset-Timestamp": "2100000000000",
             }
         )
         rl = await adapter.get_rate_limits()
-        assert rl.remaining == 72
+        assert rl.remaining == 7
         assert rl.reset_at == datetime.fromtimestamp(2100000000, tz=UTC)
 
     async def test_multiple_updates(self, adapter) -> None:
-        adapter._update_rate_limits({"X-Bapi-Remaining": "100"})
-        assert (await adapter.get_rate_limits()).remaining == 100
-        adapter._update_rate_limits({"X-Bapi-Remaining": "50"})
-        assert (await adapter.get_rate_limits()).remaining == 50
+        adapter._update_rate_limits({"X-Bapi-Limit-Status": "7"})
+        assert (await adapter.get_rate_limits()).remaining == 7
+        adapter._update_rate_limits({"X-Bapi-Limit-Status": "3"})
+        assert (await adapter.get_rate_limits()).remaining == 3
+
+    async def test_public_response_does_not_clobber_the_last_observation(self, adapter) -> None:
+        adapter._update_rate_limits({"X-Bapi-Limit-Status": "3"})
+        adapter._update_rate_limits({})
+        assert (await adapter.get_rate_limits()).remaining == 3
 
     async def test_update_with_garbage_does_not_crash(self, adapter) -> None:
-        adapter._update_rate_limits({"X-Bapi-Remaining": "abc"})
+        adapter._update_rate_limits({"X-Bapi-Limit-Status": "abc"})
         rl = await adapter.get_rate_limits()
-        # Falls back to default
-        assert rl.remaining == 120
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
 
     async def test_update_with_negative_clamps_to_zero(self, adapter) -> None:
-        adapter._update_rate_limits({"X-Bapi-Remaining": "-10"})
+        adapter._update_rate_limits({"X-Bapi-Limit-Status": "-10"})
         assert (await adapter.get_rate_limits()).remaining == 0
+
+    async def test_elapsed_window_refills_the_bucket(self, adapter) -> None:
+        now = datetime.now(UTC)
+        adapter._last_rate_limits = type(adapter._last_rate_limits)(
+            requests_per_interval=10,
+            interval_seconds=1.0,
+            remaining=0,
+            reset_at=now - timedelta(seconds=1),
+        )
+        rl = await adapter.get_rate_limits()
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
+        assert rl.reset_at > now
+
+    async def test_elapsed_high_limit_window_refills_to_the_cap(self, adapter) -> None:
+        now = datetime.now(UTC)
+        adapter._last_rate_limits = type(adapter._last_rate_limits)(
+            requests_per_interval=50,
+            interval_seconds=1.0,
+            remaining=0,
+            reset_at=now - timedelta(seconds=1),
+        )
+        rl = await adapter.get_rate_limits()
+        assert rl.remaining == _MAX_GLOBAL_RESERVE
+        assert rl.reset_at > now

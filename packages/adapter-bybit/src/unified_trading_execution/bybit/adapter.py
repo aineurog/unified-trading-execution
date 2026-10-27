@@ -132,8 +132,18 @@ from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_REQUESTS_PER_INTERVAL = 120
-_DEFAULT_INTERVAL_SECONDS = 60
+# Bybit rate limits are per-endpoint and reset every second.  Core tracks one
+# shared budget, so the adapter reports a conservative global window: the
+# remaining count is capped at the lowest write bucket Bybit publishes
+# (trading-stop / order create / cancel are 10/s) and the window is one second.
+# A read on a 50/s endpoint therefore never authorizes a 50-write burst.
+_RATE_LIMIT_INTERVAL_SECONDS = 1.0
+_MAX_GLOBAL_RESERVE = 10
+_RATE_LIMIT_HEADERS = (
+    "X-Bapi-Limit",
+    "X-Bapi-Limit-Status",
+    "X-Bapi-Limit-Reset-Timestamp",
+)
 _CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
 _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 # The wallet is a Bybit unified-account concept; v1 targets that single
@@ -274,8 +284,20 @@ def _parse_stream_ms(raw: object) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
-def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
-    raw = headers.get(key)
+def _header_value(headers: Mapping[str, str], key: str) -> str | None:
+    """Return a header by name, tolerating plain dicts and case differences."""
+    value = headers.get(key)
+    if value is not None:
+        return value
+    lowered = key.lower()
+    for name, candidate in headers.items():
+        if name.lower() == lowered:
+            return candidate
+    return None
+
+
+def _safe_header_int(headers: Mapping[str, str], key: str, default: int) -> int:
+    raw = _header_value(headers, key)
     if raw is None:
         return default
     try:
@@ -284,23 +306,46 @@ def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
         return default
 
 
-def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
-    raw_limit = _safe_header_int(headers, "X-Bapi-Limit", _DEFAULT_REQUESTS_PER_INTERVAL)
+def _has_rate_limit_headers(headers: Mapping[str, str]) -> bool:
+    """Whether a response carries Bybit rate-limit headers.
+
+    Public market-data endpoints omit all three headers.  Those responses must
+    not overwrite the last authenticated observation with defaults.
+    """
+    return any(_header_value(headers, key) is not None for key in _RATE_LIMIT_HEADERS)
+
+
+def _parse_rate_limits(headers: Mapping[str, str], *, now: datetime | None = None) -> RateLimits:
+    """Translate Bybit rate-limit headers into the core's one-bucket model.
+
+    ``X-Bapi-Limit-Status`` is the remaining count for the endpoint just
+    called and ``X-Bapi-Limit-Reset-Timestamp`` is the reset time *only* when
+    the limit was exceeded; otherwise it is approximately the current time.
+    Core expects a future window, so a reset at or before ``now`` is replaced
+    with ``now + interval``.  The remaining count is capped so a high-limit
+    read cannot authorize a burst against a lower-limit write endpoint.
+    """
+    moment = now or datetime.now(UTC)
+
+    raw_limit = _safe_header_int(headers, "X-Bapi-Limit", _MAX_GLOBAL_RESERVE)
     limit = max(raw_limit, 1)
 
-    raw_remaining = _safe_header_int(headers, "X-Bapi-Remaining", _DEFAULT_REQUESTS_PER_INTERVAL)
-    remaining = max(raw_remaining, 0)
+    raw_remaining = _safe_header_int(headers, "X-Bapi-Limit-Status", limit)
+    remaining = min(max(raw_remaining, 0), _MAX_GLOBAL_RESERVE)
 
-    raw_reset_ts = _safe_header_int(headers, "X-Bapi-Reset-Timestamp", 0)
+    raw_reset_ts = _safe_header_int(headers, "X-Bapi-Limit-Reset-Timestamp", 0)
+    observed_reset = (
+        datetime.fromtimestamp(raw_reset_ts / 1000, tz=UTC) if raw_reset_ts > 0 else moment
+    )
     reset_at = (
-        datetime.fromtimestamp(raw_reset_ts / 1000, tz=UTC)
-        if raw_reset_ts > 0
-        else datetime.now(UTC)
+        observed_reset
+        if observed_reset > moment
+        else moment + timedelta(seconds=_RATE_LIMIT_INTERVAL_SECONDS)
     )
 
     return RateLimits(
         requests_per_interval=limit,
-        interval_seconds=_DEFAULT_INTERVAL_SECONDS,
+        interval_seconds=_RATE_LIMIT_INTERVAL_SECONDS,
         remaining=remaining,
         reset_at=reset_at,
     )
@@ -385,7 +430,9 @@ class BybitAdapter(Adapter):
             return_response_headers=True,
         )
 
-    def _update_rate_limits(self, headers: dict[str, str]) -> None:
+    def _update_rate_limits(self, headers: Mapping[str, str]) -> None:
+        if not _has_rate_limit_headers(headers):
+            return
         self._last_rate_limits = _parse_rate_limits(headers)
 
     @staticmethod
@@ -2822,7 +2869,23 @@ class BybitAdapter(Adapter):
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
-        return self._last_rate_limits
+        """Return a usable global view of Bybit's per-endpoint limits.
+
+        The last authenticated response describes one endpoint.  Once its
+        one-second window has elapsed the bucket refills, so report a fresh
+        window instead of a past reset time (which core would interpret as
+        "always expired" and refuse every reservation).
+        """
+        now = datetime.now(UTC)
+        current = self._last_rate_limits
+        if now < current.reset_at:
+            return current
+        return RateLimits(
+            requests_per_interval=current.requests_per_interval,
+            interval_seconds=current.interval_seconds,
+            remaining=min(current.requests_per_interval, _MAX_GLOBAL_RESERVE),
+            reset_at=now + timedelta(seconds=current.interval_seconds),
+        )
 
     # ---- Reconciliation data (Section 6.1, Section 6.3) ----
 

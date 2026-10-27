@@ -475,13 +475,13 @@ class TestRateLimits:
             None,
             {
                 "X-Bapi-Limit": "100",
-                "X-Bapi-Remaining": "42",
-                "X-Bapi-Reset-Timestamp": "1700000000000",
+                "X-Bapi-Limit-Status": "42",
+                "X-Bapi-Limit-Reset-Timestamp": "1700000000000",
             },
         )
 
         await adapter.fetch_positions()
 
         limits = await adapter.get_rate_limits()
-        assert limits.remaining == 42
+        assert limits.remaining == 10
         assert limits.requests_per_interval == 100
