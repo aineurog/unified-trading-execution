@@ -20,7 +20,7 @@ import logging
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
@@ -2696,12 +2696,23 @@ class BybitAdapter(Adapter):
 
     @staticmethod
     def _parse_candle_entry(
-        entry: dict[str, Any],
+        entry: Mapping[str, Any] | Sequence[Any],
         timeframe: CandleTimeframe,
         now: datetime,
     ) -> Candle | None:
         try:
-            start_ms = int(entry["startTime"])
+            if isinstance(entry, Mapping):
+                start_ms = int(entry["startTime"])
+                open_value = entry["openPrice"]
+                high_value = entry["highPrice"]
+                low_value = entry["lowPrice"]
+                close_value = entry["closePrice"]
+            else:
+                start_ms = int(entry[0])
+                open_value = entry[1]
+                high_value = entry[2]
+                low_value = entry[3]
+                close_value = entry[4]
             open_time = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
             close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
             if close_time > now:
@@ -2709,12 +2720,12 @@ class BybitAdapter(Adapter):
             return Candle(
                 open_time=open_time,
                 close_time=close_time,
-                open=Decimal(str(entry["openPrice"])),
-                high=Decimal(str(entry["highPrice"])),
-                low=Decimal(str(entry["lowPrice"])),
-                close=Decimal(str(entry["closePrice"])),
+                open=Decimal(str(open_value)),
+                high=Decimal(str(high_value)),
+                low=Decimal(str(low_value)),
+                close=Decimal(str(close_value)),
             )
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, IndexError, TypeError, ValueError):
             logger.warning("Skipping malformed Bybit kline entry: %s", entry)
             return None
 

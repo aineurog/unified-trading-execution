@@ -97,8 +97,19 @@ def _kline(
     }
 
 
+def _kline_array(
+    start_ms: int,
+    *,
+    open_price: str = "100",
+    high: str = "110",
+    low: str = "90",
+    close: str = "105",
+) -> list[str]:
+    return [str(start_ms), open_price, high, low, close, "1", "100"]
+
+
 def _response(
-    entries: list[dict[str, str]] | None,
+    entries: list[object] | None,
 ) -> tuple[dict[str, object], None, dict[str, str]]:
     return {"retCode": 0, "result": {"list": entries}}, None, {}
 
@@ -316,12 +327,53 @@ class TestFetchCandles:
         assert candle.close == Decimal("105.4")
         assert candle.close_time == candle.open_time + timedelta(hours=1)
 
+    async def test_v5_kline_arrays_are_parsed(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        entries = [
+            _kline_array(
+                1_600_000_000_000,
+                open_price="100.1",
+                high="110.2",
+                low="90.3",
+                close="105.4",
+            )
+        ]
+        mock_pybit_http.get_kline.return_value = _response(entries)
+
+        candles = await adapter.fetch_candles(_linear_instrument(), CandleTimeframe.H1, limit=1)
+
+        assert len(candles) == 1
+        assert candles[0].open == Decimal("100.1")
+        assert candles[0].high == Decimal("110.2")
+        assert candles[0].low == Decimal("90.3")
+        assert candles[0].close == Decimal("105.4")
+        assert candles[0].open_time == datetime.fromtimestamp(1_600_000_000, tz=UTC)
+
+    async def test_malformed_array_entry_is_skipped(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_kline.return_value = _response(
+            [
+                ["not-a-time", "1", "2", "0.5", "1.5"],
+                _kline_array(1_600_000_000_000),
+            ]
+        )
+
+        candles = await adapter.fetch_candles(_linear_instrument(), CandleTimeframe.M1, limit=5)
+
+        assert len(candles) == 1
+
     @pytest.mark.parametrize("entries", [None, []])
     async def test_empty_result_returns_no_candles(
         self,
         adapter: BybitAdapter,
         mock_pybit_http: MagicMock,
-        entries: list[dict[str, str]] | None,
+        entries: list[object] | None,
     ) -> None:
         mock_pybit_http.get_kline.return_value = _response(entries)
 
