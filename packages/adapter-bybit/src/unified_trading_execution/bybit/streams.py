@@ -114,6 +114,13 @@ def _parse_ms(raw: object, field: str) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
+def _parse_optional_ms(raw: object) -> datetime | None:
+    """Parse an optional millisecond timestamp, returning ``None`` when absent."""
+    if raw is None or raw == "":
+        return None
+    return _parse_ms(raw, "createdTime")
+
+
 def _parse_fee(raw: object) -> Decimal | None:
     """Parse the ``execFee`` field — zero fee is distinct from missing data."""
     if raw is None or raw == "":
@@ -164,6 +171,8 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
     ``position_id`` is ``{venue_symbol}:{positionIdx}`` (e.g. ``BTCUSDT:0``)
     — ``positionIdx`` alone collides across symbols (BTCUSDT 0 vs BTCUSD 0).
+    ``opened_at`` is the venue's ``createdTime`` when present; the position
+    update stream does not always carry it, so it may be ``None``.
     """
     side = entry.get("side")
     size = _decimal(entry.get("size"), "size")
@@ -184,6 +193,7 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
         average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
         position_id=position_id,
+        opened_at=_parse_optional_ms(entry.get("createdTime")),
     )
 
 

@@ -156,12 +156,14 @@ class TestStreamsTranslation:
                 "size": "0.5",
                 "entryPrice": "95900.1",
                 "updatedTime": "1700000000000",
+                "createdTime": "1690000000000",
             },
             instrument=_BTCUSDT,
         )
         assert pos.quantity == Decimal("0.5")
         assert pos.average_entry_price == Decimal("95900.1")
         assert pos.updated_at.tzinfo is not None
+        assert pos.opened_at == datetime.fromtimestamp(1690000000, tz=UTC)
 
     def test_translate_position_short_is_negative(self) -> None:
         pos = streams.translate_position(
