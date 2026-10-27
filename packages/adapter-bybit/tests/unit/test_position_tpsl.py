@@ -185,6 +185,29 @@ class TestModifyPositionTpSlPreservesUnmentionedSide:
             tpTriggerBy="LastPrice",
         )
 
+    async def test_none_trigger_basis_leaves_the_venue_default(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+
+        await adapter.modify_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:0",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+            trigger_basis=None,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=0,
+            tpslMode="Full",
+            stopLoss="90000",
+            slOrderType="Market",
+        )
+
     async def test_unsupported_trigger_basis_is_left_at_the_venue_default(
         self,
         adapter: BybitAdapter,

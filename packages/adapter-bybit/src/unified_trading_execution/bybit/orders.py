@@ -46,7 +46,11 @@ from decimal import Decimal
 from typing import Any
 
 from unified_trading_execution.errors import PlatformError, UnsupportedOrderTypeError
-from unified_trading_execution.trailing.types import TrailingBasis
+from unified_trading_execution.trailing.types import (
+    NativeTrailingRequest,
+    TrailingBasis,
+    TrailingOffsetType,
+)
 from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.order import (
     OrderModification,
@@ -334,6 +338,43 @@ def build_set_trading_stop_payload(
             payload["tpTriggerBy"] = trigger_by
         if stop_loss is not None:
             payload["slTriggerBy"] = trigger_by
+
+    return payload
+
+
+def build_native_trailing_stop_payload(
+    request: NativeTrailingRequest,
+    *,
+    category: str,
+    symbol: str,
+    position_idx: int,
+) -> dict[str, Any]:
+    """Translate a native trailing request into ``set_trading_stop`` params.
+
+    Bybit position trailing is an absolute price distance, so only a ``PRICE``
+    offset is expressible.  The trail is written alone: no static TP/SL fields
+    and no ``tpslMode`` are emitted, so a trail update cannot disturb existing
+    protection.  ``basis`` maps to ``slTriggerBy``; a basis Bybit cannot express
+    is left at the venue default.  ``activation_price`` maps to ``activePrice``
+    and is omitted for immediate activation.
+    """
+    if request.offset_type is not TrailingOffsetType.PRICE:
+        raise UnsupportedOrderTypeError(
+            f"Bybit native trailing supports price offsets only, got {request.offset_type.value}"
+        )
+
+    payload: dict[str, Any] = {
+        "category": category,
+        "symbol": symbol,
+        "positionIdx": position_idx,
+        "trailingStop": str(request.offset),
+    }
+    if request.activation_price is not None:
+        payload["activePrice"] = str(request.activation_price)
+
+    trigger_by = _TRIGGER_BASIS.get(request.basis) if request.basis is not None else None
+    if trigger_by is not None:
+        payload["slTriggerBy"] = trigger_by
 
     return payload
 
