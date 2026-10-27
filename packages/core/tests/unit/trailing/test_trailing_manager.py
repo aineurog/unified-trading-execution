@@ -245,6 +245,25 @@ class NoNativePositionReadAdapter(CapabilityAdapter):
         raise NotImplementedError("no position-scoped native read")
 
 
+class LegacyProtectionAdapter(CapabilityAdapter):
+    """An adapter whose protection write predates the ``trigger_basis`` keyword."""
+
+    async def modify_position_tpsl(
+        self,
+        instrument,
+        position_id,
+        *,
+        take_profit=None,
+        stop_loss=None,
+    ):
+        await super().modify_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+
+
 @pytest_asyncio.fixture
 async def store():
     s = SQLiteStateStore(":memory:")
@@ -1941,6 +1960,154 @@ class TestEventsAndAudit:
         assert len(audits) == 1
         assert audits[0].correlation_id == state.trailing_id
         assert audits[0].payload["reason"] == "manual"
+
+
+class TestTriggerBasisPassThrough:
+    """The resolved venue trigger basis reaches every protection write."""
+
+    async def _attach_mark(self, store, *, protection=None, market=None):
+        protection = protection or make_protection(trigger_bases=frozenset({TrailingBasis.MARK}))
+        market = market or make_market(ticker_bases=frozenset({TrailingBasis.MARK}))
+        manager, adapter, _ = await make_manager(store, protection=protection, market=market)
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("50000"), mark=Decimal("50000")))
+        state = await manager.attach(
+            TrailingRequest(make_inst(), make_spec(basis=TrailingBasis.MARK))
+        )
+        return manager, adapter, state
+
+    async def test_attach_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        _, adapter, state = await self._attach_mark(store)
+
+        assert state.resolved_basis is TrailingBasis.MARK
+        assert state.protection_trigger_basis is TrailingBasis.MARK
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_attach_leaves_the_trigger_basis_unset_when_undeclared(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store, protection=make_protection(trigger_bases=frozenset())
+        )
+
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert state.resolved_basis is TrailingBasis.LAST
+        assert state.protection_trigger_basis is None
+        assert adapter.protection_writes[-1].trigger_basis is None
+
+    async def test_legacy_adapter_without_the_keyword_still_attaches(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(
+            store,
+            protection=make_protection(trigger_bases=frozenset()),
+            adapter_cls=LegacyProtectionAdapter,
+        )
+
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        assert state.phase is TrailingPhase.ARMED
+        assert adapter.protection_writes[-1].trigger_basis is None
+
+    async def test_reprice_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, state = await self._attach_mark(store)
+
+        updated = await manager.on_ticker(state.trailing_id, Ticker(mark=Decimal("50500")))
+
+        assert updated is not None
+        assert updated.current_stop == Decimal("50400.00")
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_resize_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        protection = make_protection(
+            trigger_bases=frozenset({TrailingBasis.MARK}), reprice_gap=True
+        )
+        manager, adapter, _ = await self._attach_mark(store, protection=protection)
+        adapter.update_position(make_position(quantity="0.5"), publish=False)
+
+        updated = await manager.on_position_update(make_position(quantity="0.5"))
+
+        assert updated is not None
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_integrity_restore_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, state = await self._attach_mark(store)
+        adapter.seed_protection(make_inst(), "1")
+
+        await manager.check_integrity(state.trailing_id)
+
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_rehydrate_restore_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        await self._attach_mark(store)
+
+        second, adapter, _ = await make_manager(
+            store,
+            protection=make_protection(trigger_bases=frozenset({TrailingBasis.MARK})),
+            market=make_market(ticker_bases=frozenset({TrailingBasis.MARK})),
+        )
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("50000"), mark=Decimal("50000")))
+
+        await second.rehydrate()
+
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_rehydrate_first_stop_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        protection = make_protection(trigger_bases=frozenset({TrailingBasis.MARK}))
+        market = make_market(ticker_bases=frozenset({TrailingBasis.MARK}))
+        first, first_adapter, _ = await make_manager(store, protection=protection, market=market)
+        first_adapter.set_ticker(make_inst(), Ticker(last=Decimal("50000"), mark=Decimal("50000")))
+        state = await first.attach(
+            TrailingRequest(
+                make_inst(),
+                make_spec(
+                    basis=TrailingBasis.MARK,
+                    activation=TrailingActivation.PRICE,
+                    activation_price=Decimal("51000"),
+                ),
+            )
+        )
+        assert state.current_stop is None
+
+        second, adapter, _ = await make_manager(store, protection=protection, market=market)
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("51000"), mark=Decimal("51000")))
+
+        await second.rehydrate()
+
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_rehydrate_reprice_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        _, _, state = await self._attach_mark(store)
+        assert state.current_stop == Decimal("49900.00")
+
+        second, adapter, _ = await make_manager(
+            store,
+            protection=make_protection(trigger_bases=frozenset({TrailingBasis.MARK})),
+            market=make_market(ticker_bases=frozenset({TrailingBasis.MARK})),
+        )
+        adapter.seed_protection(
+            make_inst(), "1", stop_loss=TpSlAttachment(trigger_price=Decimal("49900"))
+        )
+        adapter.set_ticker(make_inst(), Ticker(last=Decimal("50500"), mark=Decimal("50500")))
+
+        await second.rehydrate()
+
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.MARK
+
+    async def test_native_take_profit_passes_the_resolved_trigger_basis(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        spec = make_spec(take_profit=ProtectionLevel(ProtectionLevelType.PRICE, Decimal("52000")))
+
+        state = await manager.attach(TrailingRequest(make_inst(), spec))
+
+        assert state.protection_trigger_basis is TrailingBasis.LAST
+        assert adapter.protection_writes[-1].trigger_basis is TrailingBasis.LAST
 
 
 class TestRequirements:

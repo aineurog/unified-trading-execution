@@ -638,7 +638,7 @@ class TrailingManager:
 
         if will_write:
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     instrument,
                     position_id,
                     take_profit=(
@@ -647,6 +647,7 @@ class TrailingManager:
                         else None
                     ),
                     stop_loss=TpSlAttachment(trigger_price=stop) if stop is not None else None,
+                    trigger_basis=trigger_basis,
                 )
             except Exception as exc:
                 await self._attach_failed(arming, exc)
@@ -835,10 +836,11 @@ class TrailingManager:
                 await self._degrade_attach(armed, f"protection: native take profit: {error}")
                 raise error
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     instrument,
                     position_id,
                     take_profit=TpSlAttachment(trigger_price=take_profit),
+                    trigger_basis=armed.protection_trigger_basis,
                 )
             except Exception as exc:
                 reason = str(exc) or type(exc).__name__
@@ -985,6 +987,36 @@ class TrailingManager:
             side=side, role="take_profit", level_price=price, reference_price=entry
         )
         return price
+
+    async def _modify_protection(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
+    ) -> None:
+        """Write protection, passing the trigger basis only when resolved.
+
+        Omitting the keyword when the venue default applies keeps adapters that
+        predate the ``trigger_basis`` parameter working unchanged.
+        """
+        if trigger_basis is None:
+            await self._adapter.modify_position_tpsl(
+                instrument,
+                position_id,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+            )
+            return
+        await self._adapter.modify_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            trigger_basis=trigger_basis,
+        )
 
     async def _confirm_protection(
         self,
@@ -1176,10 +1208,11 @@ class TrailingManager:
                     reason="gap_start",
                 )
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     state.instrument,
                     state.position_id,
                     stop_loss=TpSlAttachment(trigger_price=candidate),
+                    trigger_basis=state.protection_trigger_basis,
                 )
             except Exception as exc:
                 if capability.reprice_gap:
@@ -1489,7 +1522,7 @@ class TrailingManager:
                 if not self._reserve_rate_limit():
                     return state
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         state.instrument,
                         state.position_id,
                         take_profit=(
@@ -1502,6 +1535,7 @@ class TrailingManager:
                             if write_stop is not None
                             else None
                         ),
+                        trigger_basis=state.protection_trigger_basis,
                     )
                 except Exception as exc:
                     return await self._record_protection_failure(
@@ -1898,7 +1932,7 @@ class TrailingManager:
                     state, "rate limit budget exhausted: rehydrate protection", now=now
                 )
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     state.instrument,
                     state.position_id,
                     take_profit=(
@@ -1911,6 +1945,7 @@ class TrailingManager:
                         if stop_to_write is not None
                         else None
                     ),
+                    trigger_basis=state.protection_trigger_basis,
                 )
             except Exception as exc:
                 return await self._rehydrate_degraded(
@@ -2010,10 +2045,11 @@ class TrailingManager:
                         now=now,
                     )
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         base.instrument,
                         base.position_id,
                         stop_loss=TpSlAttachment(trigger_price=first_stop),
+                        trigger_basis=base.protection_trigger_basis,
                     )
                 except Exception as exc:
                     return await self._rehydrate_degraded(
@@ -2089,10 +2125,11 @@ class TrailingManager:
                         reason="gap_start",
                     )
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         base.instrument,
                         base.position_id,
                         stop_loss=TpSlAttachment(trigger_price=candidate),
+                        trigger_basis=base.protection_trigger_basis,
                     )
                 except Exception as exc:
                     if capability.reprice_gap:
@@ -2296,13 +2333,14 @@ class TrailingManager:
                 state, "rate limit budget exhausted: protection not resized"
             )
         try:
-            await self._adapter.modify_position_tpsl(
+            await self._modify_protection(
                 state.instrument,
                 state.position_id,
                 take_profit=(
                     TpSlAttachment(trigger_price=take_profit) if take_profit is not None else None
                 ),
                 stop_loss=(TpSlAttachment(trigger_price=stop) if stop is not None else None),
+                trigger_basis=state.protection_trigger_basis,
             )
         except Exception as exc:
             return await self._degrade_now(state, f"resize: {str(exc) or type(exc).__name__}")
