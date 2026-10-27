@@ -54,6 +54,7 @@ from unified_trading_execution.bybit.events import (
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
+    build_clear_trading_stop_payload,
     build_place_order_payload,
     build_set_trading_stop_payload,
     parse_order_result,
@@ -2126,6 +2127,64 @@ class BybitAdapter(Adapter):
                     translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
                 )
         return None
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named TP/SL sides on an open position via ``set_trading_stop``.
+
+        *position_id* follows the same ``positionIdx`` / ``"{venue_symbol}:{idx}"``
+        convention as ``modify_position_tpsl``.  Only the named sides are
+        cleared; the unnamed side is preserved.  A confirmed flat position
+        returns quietly, since Bybit removes position protection when the
+        position closes.
+
+        Spot has no position concept on Bybit, so this raises
+        ``UnsupportedOrderTypeError`` for spot instruments.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError(
+                "position TP/SL clearing is not supported for spot on Bybit"
+            )
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+        symbol = to_bybit_symbol(instrument)
+
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=symbol,
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        entry = next(
+            (
+                candidate
+                for candidate in entries
+                if int(str(candidate.get("positionIdx") or "0")) == position_idx
+            ),
+            None,
+        )
+        if entry is None or Decimal(str(entry.get("size") or "0")) == 0:
+            return
+
+        payload = build_clear_trading_stop_payload(
+            category=category,
+            symbol=symbol,
+            position_idx=position_idx,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
 
     async def _run_request(
         self,

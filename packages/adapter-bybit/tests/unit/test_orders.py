@@ -14,6 +14,7 @@ from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
     build_cancel_payload,
+    build_clear_trading_stop_payload,
     build_place_order_payload,
     build_set_trading_stop_payload,
     map_order_status,
@@ -641,6 +642,60 @@ class TestBuildSetTradingStopPayload:
 
         assert "tpTriggerBy" not in payload
         assert "slTriggerBy" not in payload
+
+
+class TestBuildClearTradingStopPayload:
+    def test_clear_stop_loss_only(self) -> None:
+        payload = build_clear_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=False,
+            stop_loss=True,
+        )
+
+        assert payload == {
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "positionIdx": 0,
+            "tpslMode": "Full",
+            "stopLoss": "0",
+        }
+
+    def test_clear_take_profit_only(self) -> None:
+        payload = build_clear_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=1,
+            take_profit=True,
+            stop_loss=False,
+        )
+
+        assert payload["takeProfit"] == "0"
+        assert "stopLoss" not in payload
+        assert payload["positionIdx"] == 1
+
+    def test_clear_both_sides(self) -> None:
+        payload = build_clear_trading_stop_payload(
+            category="linear",
+            symbol="BTCUSDT",
+            position_idx=0,
+            take_profit=True,
+            stop_loss=True,
+        )
+
+        assert payload["takeProfit"] == "0"
+        assert payload["stopLoss"] == "0"
+
+    def test_no_sides_raises(self) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            build_clear_trading_stop_payload(
+                category="linear",
+                symbol="BTCUSDT",
+                position_idx=0,
+                take_profit=False,
+                stop_loss=False,
+            )
 
 
 class TestParseOrderResult:

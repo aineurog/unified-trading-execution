@@ -6,11 +6,12 @@ from decimal import Decimal
 from unittest.mock import MagicMock
 
 import pytest
-from pybit.exceptions import FailedRequestError
+from pybit.exceptions import FailedRequestError, InvalidRequestError
 
 from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.errors import (
     PlatformConnectionError,
+    PlatformError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.trailing.types import TrailingBasis
@@ -39,6 +40,28 @@ def _spot_instrument() -> Instrument:
 
 def _ok() -> tuple[dict[str, object], None, dict[str, str]]:
     return {"retCode": 0, "retMsg": "OK", "result": {}}, None, {}
+
+
+def _positions(
+    *,
+    size: str = "1",
+    position_idx: int = 0,
+) -> tuple[dict[str, object], None, dict[str, str]]:
+    return (
+        {
+            "retCode": 0,
+            "result": {
+                "list": [
+                    {
+                        "positionIdx": position_idx,
+                        "size": size,
+                    }
+                ]
+            },
+        },
+        None,
+        {},
+    )
 
 
 class TestModifyPositionTpSlPreservesUnmentionedSide:
@@ -273,4 +296,175 @@ class TestModifyPositionTpSlPreservesUnmentionedSide:
                 _futures_instrument(),
                 "BTCUSDT:0",
                 stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+            )
+
+
+class TestClearPositionTpSl:
+    async def test_clear_stop_loss_preserves_take_profit(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions()
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+
+        await adapter.clear_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:0",
+            stop_loss=True,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=0,
+            tpslMode="Full",
+            stopLoss="0",
+        )
+
+    async def test_clear_take_profit_preserves_stop_loss(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions()
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+
+        await adapter.clear_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:0",
+            take_profit=True,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=0,
+            tpslMode="Full",
+            takeProfit="0",
+        )
+
+    async def test_clear_both_sides(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions(position_idx=1)
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+
+        await adapter.clear_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:1",
+            take_profit=True,
+            stop_loss=True,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_called_once_with(
+            category="linear",
+            symbol="BTCUSDT",
+            positionIdx=1,
+            tpslMode="Full",
+            takeProfit="0",
+            stopLoss="0",
+        )
+
+    async def test_flat_position_returns_quietly(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions(size="0")
+
+        await adapter.clear_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:0",
+            stop_loss=True,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_not_called()
+
+    async def test_missing_position_returns_quietly(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {"retCode": 0, "result": {"list": []}},
+            None,
+            {},
+        )
+
+        await adapter.clear_position_tpsl(
+            _futures_instrument(),
+            "BTCUSDT:0",
+            stop_loss=True,
+        )
+
+        mock_pybit_http.set_trading_stop.assert_not_called()
+
+    async def test_spot_raises_before_network(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        with pytest.raises(UnsupportedOrderTypeError):
+            await adapter.clear_position_tpsl(
+                _spot_instrument(),
+                "0",
+                stop_loss=True,
+            )
+
+        mock_pybit_http.get_positions.assert_not_called()
+        mock_pybit_http.set_trading_stop.assert_not_called()
+
+    async def test_no_sides_raises_before_network(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        with pytest.raises(ValueError, match="at least one"):
+            await adapter.clear_position_tpsl(_futures_instrument(), "BTCUSDT:0")
+
+        mock_pybit_http.get_positions.assert_not_called()
+
+    async def test_api_error_is_translated(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions()
+        mock_pybit_http.set_trading_stop.side_effect = InvalidRequestError(
+            request="POST /v5/position/trading-stop",
+            message="unknown error",
+            status_code=10001,
+            time="12:00:00",
+            resp_headers=None,
+        )
+
+        with pytest.raises(PlatformError):
+            await adapter.clear_position_tpsl(
+                _futures_instrument(),
+                "BTCUSDT:0",
+                stop_loss=True,
+            )
+
+    async def test_transport_error_is_translated(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions()
+        mock_pybit_http.set_trading_stop.side_effect = FailedRequestError(
+            request="POST /v5/position/trading-stop",
+            message="Internal Server Error",
+            status_code=500,
+            time="12:00:00",
+            resp_headers=None,
+        )
+
+        with pytest.raises(PlatformConnectionError):
+            await adapter.clear_position_tpsl(
+                _futures_instrument(),
+                "BTCUSDT:0",
+                stop_loss=True,
             )

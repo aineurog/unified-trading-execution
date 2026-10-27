@@ -342,6 +342,35 @@ def build_set_trading_stop_payload(
     return payload
 
 
+def build_clear_trading_stop_payload(
+    *,
+    category: str,
+    symbol: str,
+    position_idx: int,
+    take_profit: bool,
+    stop_loss: bool,
+) -> dict[str, Any]:
+    """Translate a position protection clear into ``set_trading_stop`` params.
+
+    Bybit clears a side with the ``"0"`` sentinel.  Only the named sides carry
+    the sentinel; an unnamed side is omitted so its existing level survives.
+    """
+    if not take_profit and not stop_loss:
+        raise ValueError("at least one of take_profit or stop_loss must be true")
+
+    payload: dict[str, Any] = {
+        "category": category,
+        "symbol": symbol,
+        "positionIdx": position_idx,
+        "tpslMode": "Full",
+    }
+    if take_profit:
+        payload["takeProfit"] = "0"
+    if stop_loss:
+        payload["stopLoss"] = "0"
+    return payload
+
+
 def build_native_trailing_stop_payload(
     request: NativeTrailingRequest,
     *,
