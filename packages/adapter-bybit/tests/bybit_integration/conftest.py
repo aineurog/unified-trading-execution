@@ -189,6 +189,15 @@ async def spot_instrument(connected_adapter: BybitAdapter) -> Instrument:
     return instrument
 
 
+@pytest.fixture
+async def inverse_instrument(connected_adapter: BybitAdapter) -> Instrument:
+    """A live inverse (coin-margined) instrument, or skip."""
+    instrument = await _discover_instrument(connected_adapter, "inverse")
+    if instrument is None:
+        pytest.skip("No trading inverse symbol available on testnet")
+    return instrument
+
+
 async def _reference_price(
     adapter: BybitAdapter,
     instrument: Instrument,
@@ -228,6 +237,15 @@ async def linear_reference_price(
 ) -> Decimal:
     """Live mid price for the linear instrument (used for resting limit orders)."""
     return await _reference_price(connected_adapter, linear_instrument)
+
+
+@pytest.fixture
+async def inverse_reference_price(
+    connected_adapter: BybitAdapter,
+    inverse_instrument: Instrument,
+) -> Decimal:
+    """Live mid price for the inverse instrument (used for resting limit orders)."""
+    return await _reference_price(connected_adapter, inverse_instrument)
 
 
 async def cleanup_open_orders(adapter: BybitAdapter) -> None:
