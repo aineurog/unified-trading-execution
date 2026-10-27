@@ -15,13 +15,20 @@ from unified_trading_execution.bybit.orders import build_native_trailing_stop_pa
 from unified_trading_execution.errors import (
     PlatformConnectionError,
     PlatformError,
+    TrailingNotSupportedError,
     UnsupportedOrderTypeError,
 )
+from unified_trading_execution.trailing.manager import resolve_routing
+from unified_trading_execution.trailing.math import respects_min_stop_distance
 from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
     NativeTrailingRequest,
     TrailingActivation,
     TrailingBasis,
+    TrailingMode,
     TrailingOffsetType,
+    TrailingRequest,
+    TrailingSpec,
 )
 from unified_trading_execution.types.enums import AssetClass, OptionRight, OrderSide
 from unified_trading_execution.types.instrument import Instrument
@@ -73,13 +80,14 @@ def _request(
     basis: TrailingBasis | None,
     activation_price: Decimal | None = None,
     offset_type: TrailingOffsetType = TrailingOffsetType.PRICE,
+    offset: Decimal = Decimal("500"),
 ) -> NativeTrailingRequest:
     return NativeTrailingRequest(
         instrument=_instrument(),
         position_id="BTCUSDT:0",
         side=OrderSide.BUY,
         quantity=Decimal("1"),
-        offset=Decimal("500"),
+        offset=offset,
         offset_type=offset_type,
         basis=basis,
         activation_price=activation_price,
@@ -93,6 +101,44 @@ def _payload(request: NativeTrailingRequest) -> dict[str, object]:
         category="linear",
         symbol="BTCUSDT",
         position_idx=0,
+    )
+
+
+def _trailing_spec(
+    *,
+    offset_type: TrailingOffsetType = TrailingOffsetType.PRICE,
+    offset: Decimal = Decimal("500"),
+    basis: TrailingBasis | None = None,
+) -> TrailingSpec:
+    if offset_type is TrailingOffsetType.ATR:
+        return TrailingSpec(
+            offset_type=offset_type,
+            offset=offset,
+            basis=basis,
+            atr_period=14,
+            atr_timeframe=CandleTimeframe.H1,
+        )
+    return TrailingSpec(offset_type=offset_type, offset=offset, basis=basis)
+
+
+def _route(
+    adapter: BybitAdapter,
+    *,
+    instrument: Instrument | None = None,
+    spec: TrailingSpec | None = None,
+    mode: TrailingMode = TrailingMode.AUTO,
+) -> tuple[TrailingMode, str]:
+    resolved_instrument = instrument or _instrument()
+    request = TrailingRequest(
+        resolved_instrument,
+        spec or _trailing_spec(),
+        mode=mode,
+    )
+    return resolve_routing(
+        request,
+        protection=adapter.position_protection_capability(resolved_instrument),
+        native=adapter.trailing_capability(resolved_instrument),
+        market_data=adapter.market_data_capability(resolved_instrument),
     )
 
 
@@ -229,11 +275,141 @@ class TestTrailingCapability:
         assert capability.min_reprice_interval_seconds == 0.0
 
 
+_LINEAR_SPEC_RESPONSE: dict[str, object] = {
+    "retCode": 0,
+    "result": {
+        "category": "linear",
+        "list": [
+            {
+                "symbol": "BTCUSDT",
+                "baseCoin": "BTC",
+                "quoteCoin": "USDT",
+                "contractType": "LinearPerpetual",
+                "status": "Trading",
+                "lotSizeFilter": {
+                    "qtyStep": "0.001",
+                    "minOrderQty": "0.001",
+                    "maxOrderQty": "1000",
+                    "minNotionalValue": "5",
+                },
+                "priceFilter": {"tickSize": "0.10"},
+            }
+        ],
+    },
+}
+
+
+class TestMinimumStopDistance:
+    async def test_core_enforces_the_distance_bybit_publishes(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_instruments_info.return_value = (_LINEAR_SPEC_RESPONSE, None, {})
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+        basis = Decimal("50000")
+
+        assert spec.min_stop_distance == spec.tick_size == Decimal("0.10")
+        assert not respects_min_stop_distance(
+            side=OrderSide.BUY,
+            candidate=basis - Decimal("0.05"),
+            basis=basis,
+            min_stop_distance=spec.min_stop_distance,
+        )
+        assert respects_min_stop_distance(
+            side=OrderSide.BUY,
+            candidate=basis - spec.min_stop_distance,
+            basis=basis,
+            min_stop_distance=spec.min_stop_distance,
+        )
+
+
+class TestTrailingRouting:
+    @pytest.mark.parametrize("instrument", [_instrument(), _inverse_instrument()])
+    def test_auto_routes_a_price_offset_native(
+        self,
+        adapter: BybitAdapter,
+        instrument: Instrument,
+    ) -> None:
+        mode, reason = _route(adapter, instrument=instrument)
+
+        assert mode is TrailingMode.NATIVE
+        assert reason == "native_exact"
+
+    @pytest.mark.parametrize(
+        ("basis", "expected_mode"),
+        [
+            (None, TrailingMode.NATIVE),
+            (TrailingBasis.LAST, TrailingMode.NATIVE),
+            (TrailingBasis.MARK, TrailingMode.NATIVE),
+        ],
+    )
+    def test_auto_routes_sampleable_bases_native(
+        self,
+        adapter: BybitAdapter,
+        basis: TrailingBasis | None,
+        expected_mode: TrailingMode,
+    ) -> None:
+        mode, _ = _route(adapter, spec=_trailing_spec(basis=basis))
+
+        assert mode is expected_mode
+
+    def test_percent_offset_routes_synthetic(self, adapter: BybitAdapter) -> None:
+        mode, reason = _route(
+            adapter,
+            spec=_trailing_spec(
+                offset_type=TrailingOffsetType.PERCENT,
+                offset=Decimal("1"),
+            ),
+        )
+
+        assert mode is TrailingMode.SYNTHETIC
+        assert reason == "native_unsupported_offset_type"
+
+    def test_atr_offset_routes_synthetic(self, adapter: BybitAdapter) -> None:
+        mode, reason = _route(
+            adapter,
+            spec=_trailing_spec(offset_type=TrailingOffsetType.ATR, offset=Decimal("2")),
+        )
+
+        assert mode is TrailingMode.SYNTHETIC
+        assert reason == "native_unsupported_atr"
+
+    def test_native_mode_names_percent_as_unsupported(self, adapter: BybitAdapter) -> None:
+        with pytest.raises(TrailingNotSupportedError) as excinfo:
+            _route(
+                adapter,
+                spec=_trailing_spec(
+                    offset_type=TrailingOffsetType.PERCENT,
+                    offset=Decimal("1"),
+                ),
+                mode=TrailingMode.NATIVE,
+            )
+
+        assert "offset" in str(excinfo.value)
+
+    def test_basis_the_adapter_cannot_sample_is_rejected(self, adapter: BybitAdapter) -> None:
+        with pytest.raises(TrailingNotSupportedError) as excinfo:
+            _route(adapter, spec=_trailing_spec(basis=TrailingBasis.MID))
+
+        assert "mid" in str(excinfo.value)
+
+    def test_spot_has_no_supported_mode(self, adapter: BybitAdapter) -> None:
+        with pytest.raises(TrailingNotSupportedError) as excinfo:
+            _route(adapter, instrument=_spot_instrument())
+
+        assert "native" in str(excinfo.value)
+        assert "synthetic" in str(excinfo.value)
+
+
 def _positions_response(
     *,
     trailing_stop: str = "",
     active_price: str = "",
     position_idx: int = 0,
+    take_profit: str = "",
+    stop_loss: str = "",
 ) -> tuple[dict[str, object], None, dict[str, str]]:
     return (
         {
@@ -244,6 +420,8 @@ def _positions_response(
                         "positionIdx": position_idx,
                         "trailingStop": trailing_stop,
                         "activePrice": active_price,
+                        "takeProfit": take_profit,
+                        "stopLoss": stop_loss,
                     }
                 ]
             },
@@ -321,6 +499,56 @@ class TestNativeTrailingMethods:
         assert call.kwargs["category"] == "inverse"
         assert call.kwargs["symbol"] == "BTCUSD"
         assert call.kwargs["positionIdx"] == 2
+
+    async def test_place_leaves_existing_take_profit_and_stop_loss_untouched(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+        mock_pybit_http.get_positions.return_value = _positions_response(
+            take_profit="60000",
+            stop_loss="45000",
+        )
+
+        await adapter.place_trailing_stop(_request(basis=TrailingBasis.LAST))
+
+        call = mock_pybit_http.set_trading_stop.call_args
+        assert "takeProfit" not in call.kwargs
+        assert "stopLoss" not in call.kwargs
+        assert "tpslMode" not in call.kwargs
+        take_profit, stop_loss = await adapter.get_position_tpsl(_instrument(), "BTCUSDT:0")
+        assert take_profit is not None
+        assert take_profit.trigger_price == Decimal("60000")
+        assert stop_loss is not None
+        assert stop_loss.trigger_price == Decimal("45000")
+
+    async def test_place_targets_only_the_requested_hedge_leg(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+        request = NativeTrailingRequest(
+            instrument=_instrument(),
+            position_id="BTCUSDT:2",
+            side=OrderSide.SELL,
+            quantity=Decimal("1"),
+            offset=Decimal("250"),
+            offset_type=TrailingOffsetType.PRICE,
+            basis=TrailingBasis.MARK,
+            activation_price=None,
+            client_id="trail-1",
+        )
+
+        result = await adapter.place_trailing_stop(request)
+
+        assert result.native_id == "BTCUSDT:2:trailing"
+        call = mock_pybit_http.set_trading_stop.call_args
+        assert call.kwargs["positionIdx"] == 2
+        assert call.kwargs["trailingStop"] == "250"
+        assert "takeProfit" not in call.kwargs
+        assert "stopLoss" not in call.kwargs
 
     async def test_place_spot_raises_before_network(
         self,
@@ -430,6 +658,33 @@ class TestNativeTrailingMethods:
         assert result.confirmed_offset == Decimal("125")
         assert result.activated is True
 
+    async def test_position_scoped_read_ignores_the_other_hedge_leg(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = (
+            {
+                "retCode": 0,
+                "result": {
+                    "list": [
+                        {"positionIdx": 1, "trailingStop": "100"},
+                        {"positionIdx": 2, "trailingStop": "200"},
+                    ]
+                },
+            },
+            None,
+            {},
+        )
+
+        first = await adapter.get_position_trailing_stop(_instrument(), "BTCUSDT:1")
+        second = await adapter.get_position_trailing_stop(_instrument(), "BTCUSDT:2")
+
+        assert first is not None
+        assert first.confirmed_offset == Decimal("100")
+        assert second is not None
+        assert second.confirmed_offset == Decimal("200")
+
     async def test_position_scoped_read_returns_none_without_a_trail(
         self,
         adapter: BybitAdapter,
@@ -472,6 +727,26 @@ class TestNativeTrailingMethods:
             "positionIdx": 0,
             "trailingStop": "0",
         }
+
+    async def test_cancel_targets_only_the_named_hedge_leg(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+        mock_pybit_http.get_positions.return_value = _positions_response(position_idx=2)
+
+        await adapter.cancel_trailing_stop("BTCUSDT:2:trailing", _instrument())
+
+        call = mock_pybit_http.set_trading_stop.call_args
+        assert call.kwargs == {
+            "category": "linear",
+            "symbol": "BTCUSDT",
+            "positionIdx": 2,
+            "trailingStop": "0",
+        }
+        assert "takeProfit" not in call.kwargs
+        assert "stopLoss" not in call.kwargs
 
     async def test_cancel_raises_when_the_trail_remains(
         self,
