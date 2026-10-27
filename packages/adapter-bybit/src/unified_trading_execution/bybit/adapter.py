@@ -30,7 +30,11 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    PositionProtectionCapability,
+    RateLimits,
+)
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 from unified_trading_execution.bybit.errors import (
@@ -2468,6 +2472,35 @@ class BybitAdapter(Adapter):
                 OrderType.STOP,
                 OrderType.STOP_LIMIT,
             }
+        )
+
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Declare static position TP/SL support for Bybit.
+
+        Linear and inverse perpetuals support reading, setting, and clearing
+        both sides through ``set_trading_stop``, and a write preserves the side
+        it does not mention.  Spot is deferred.  ``LAST`` and ``MARK`` are the
+        trigger bases this surface can actually express.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().position_protection_capability(instrument)
+        if category not in ("linear", "inverse"):
+            return super().position_protection_capability(instrument)
+
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
+            min_reprice_interval_seconds=0.0,
+            reprice_gap=False,
         )
 
     # ---- Rate limits ----

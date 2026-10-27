@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 from pybit.exceptions import FailedRequestError, InvalidRequestError
 
+from unified_trading_execution.adapter import PositionProtectionCapability
 from unified_trading_execution.bybit import BybitAdapter
 from unified_trading_execution.errors import (
     PlatformConnectionError,
@@ -26,6 +27,16 @@ def _futures_instrument() -> Instrument:
         quote_currency="USDT",
         asset_class=AssetClass.FUTURES,
         currency="USDT",
+        multiplier=1,
+    )
+
+
+def _inverse_instrument() -> Instrument:
+    return Instrument(
+        symbol="BTC",
+        quote_currency="USD",
+        asset_class=AssetClass.FUTURES,
+        currency="BTC",
         multiplier=1,
     )
 
@@ -468,3 +479,117 @@ class TestClearPositionTpSl:
                 "BTCUSDT:0",
                 stop_loss=True,
             )
+
+
+class TestPositionProtectionCapability:
+    def test_linear_perpetual_declares_full_static_protection(
+        self,
+        adapter: BybitAdapter,
+    ) -> None:
+        self._assert_supported(adapter.position_protection_capability(_futures_instrument()))
+
+    def test_inverse_perpetual_declares_full_static_protection(
+        self,
+        adapter: BybitAdapter,
+    ) -> None:
+        self._assert_supported(adapter.position_protection_capability(_inverse_instrument()))
+
+    def test_spot_is_unsupported(self, adapter: BybitAdapter) -> None:
+        self._assert_unsupported(adapter.position_protection_capability(_spot_instrument()))
+
+    def test_unsupported_asset_class_is_unsupported(self, adapter: BybitAdapter) -> None:
+        instrument = Instrument(
+            symbol="EUR",
+            quote_currency="USD",
+            asset_class=AssetClass.MARGIN_FX,
+        )
+
+        self._assert_unsupported(adapter.position_protection_capability(instrument))
+
+    async def test_inverse_protection_methods_use_the_inverse_category(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_positions.return_value = _positions()
+        mock_pybit_http.set_trading_stop.return_value = _ok()
+
+        await adapter.modify_position_tpsl(
+            _inverse_instrument(),
+            "BTCUSD:0",
+            stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+        )
+        assert mock_pybit_http.set_trading_stop.call_args.kwargs["category"] == "inverse"
+        assert mock_pybit_http.set_trading_stop.call_args.kwargs["symbol"] == "BTCUSD"
+
+        result = await adapter.get_position_tpsl(_inverse_instrument(), "BTCUSD:0")
+        assert result == (None, None)
+        assert mock_pybit_http.get_positions.call_args.kwargs["category"] == "inverse"
+
+        await adapter.clear_position_tpsl(_inverse_instrument(), "BTCUSD:0", stop_loss=True)
+        assert mock_pybit_http.set_trading_stop.call_args.kwargs["category"] == "inverse"
+        assert mock_pybit_http.set_trading_stop.call_args.kwargs["stopLoss"] == "0"
+
+    async def test_declared_trigger_bases_are_the_ones_written(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        capability = adapter.position_protection_capability(_futures_instrument())
+        expected = {
+            TrailingBasis.LAST: "LastPrice",
+            TrailingBasis.MARK: "MarkPrice",
+        }
+
+        for basis in capability.trigger_bases:
+            mock_pybit_http.set_trading_stop.reset_mock()
+            mock_pybit_http.set_trading_stop.return_value = _ok()
+            await adapter.modify_position_tpsl(
+                _futures_instrument(),
+                "BTCUSDT:0",
+                stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+                trigger_basis=basis,
+            )
+            assert (
+                mock_pybit_http.set_trading_stop.call_args.kwargs["slTriggerBy"] == expected[basis]
+            )
+
+        for basis in (
+            TrailingBasis.BID,
+            TrailingBasis.ASK,
+            TrailingBasis.MID,
+        ):
+            assert basis not in capability.trigger_bases
+            mock_pybit_http.set_trading_stop.reset_mock()
+            mock_pybit_http.set_trading_stop.return_value = _ok()
+            await adapter.modify_position_tpsl(
+                _futures_instrument(),
+                "BTCUSDT:0",
+                stop_loss=TpSlAttachment(trigger_price=Decimal("90000")),
+                trigger_basis=basis,
+            )
+            assert "slTriggerBy" not in mock_pybit_http.set_trading_stop.call_args.kwargs
+
+    @staticmethod
+    def _assert_supported(capability: PositionProtectionCapability) -> None:
+        assert capability.supported is True
+        assert capability.can_set_stop is True
+        assert capability.can_set_take_profit is True
+        assert capability.can_clear_stop is True
+        assert capability.can_clear_take_profit is True
+        assert capability.preserves_unmentioned_side is True
+        assert capability.trigger_bases == frozenset({TrailingBasis.LAST, TrailingBasis.MARK})
+        assert capability.min_reprice_interval_seconds == 0.0
+        assert capability.reprice_gap is False
+
+    @staticmethod
+    def _assert_unsupported(capability: PositionProtectionCapability) -> None:
+        assert capability.supported is False
+        assert capability.can_set_stop is False
+        assert capability.can_set_take_profit is False
+        assert capability.can_clear_stop is False
+        assert capability.can_clear_take_profit is False
+        assert capability.preserves_unmentioned_side is False
+        assert capability.trigger_bases == frozenset()
+        assert capability.min_reprice_interval_seconds == 0.0
+        assert capability.reprice_gap is False
