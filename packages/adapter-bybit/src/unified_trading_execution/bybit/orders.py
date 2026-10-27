@@ -408,6 +408,26 @@ def build_native_trailing_stop_payload(
     return payload
 
 
+def build_cancel_native_trailing_stop_payload(
+    *,
+    category: str,
+    symbol: str,
+    position_idx: int,
+) -> dict[str, Any]:
+    """Translate a native trailing cancel into ``set_trading_stop`` params.
+
+    Bybit clears position trailing with the ``"0"`` sentinel.  No static TP/SL
+    or ``tpslMode`` fields are emitted, so the cancel cannot disturb existing
+    protection.
+    """
+    return {
+        "category": category,
+        "symbol": symbol,
+        "positionIdx": position_idx,
+        "trailingStop": "0",
+    }
+
+
 def map_order_status(bybit_status: str) -> OrderStatus:
     """Map a Bybit ``orderStatus`` string to the unified ``OrderStatus``.
 

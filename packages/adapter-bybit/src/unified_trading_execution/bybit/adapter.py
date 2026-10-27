@@ -21,7 +21,7 @@ import threading
 import time
 from collections import OrderedDict, defaultdict
 from collections.abc import AsyncGenerator, Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -32,8 +32,10 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import (
     Adapter,
+    MarketDataCapability,
     PositionProtectionCapability,
     RateLimits,
+    TrailingCapability,
 )
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
@@ -57,8 +59,10 @@ from unified_trading_execution.bybit.events import (
 )
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
+    build_cancel_native_trailing_stop_payload,
     build_cancel_payload,
     build_clear_trading_stop_payload,
+    build_native_trailing_stop_payload,
     build_place_order_payload,
     build_set_trading_stop_payload,
     parse_order_result,
@@ -100,7 +104,14 @@ from unified_trading_execution.events import (
 )
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
-from unified_trading_execution.trailing.types import TrailingBasis
+from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
+    TrailingActivation,
+    TrailingBasis,
+    TrailingOffsetType,
+)
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -108,7 +119,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -150,6 +161,27 @@ _TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
         "CreateByTrailingStop",
     }
 )
+_BYBIT_KLINE_INTERVAL: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1",
+    CandleTimeframe.M5: "5",
+    CandleTimeframe.M15: "15",
+    CandleTimeframe.M30: "30",
+    CandleTimeframe.H1: "60",
+    CandleTimeframe.H4: "240",
+    CandleTimeframe.H12: "720",
+    CandleTimeframe.D1: "D",
+}
+_CANDLE_SECONDS: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 60,
+    CandleTimeframe.M5: 300,
+    CandleTimeframe.M15: 900,
+    CandleTimeframe.M30: 1800,
+    CandleTimeframe.H1: 3600,
+    CandleTimeframe.H4: 14400,
+    CandleTimeframe.H12: 43200,
+    CandleTimeframe.D1: 86400,
+}
+_BYBIT_MAX_KLINE_LIMIT = 1000
 
 
 def _api_key_identity(api_key: str) -> str:
@@ -2190,6 +2222,164 @@ class BybitAdapter(Adapter):
         )
         await self._run_request(self._session.set_trading_stop, **payload)
 
+    # ---- Native trailing ----
+
+    @staticmethod
+    def _native_trailing_id(instrument: Instrument, position_idx: int) -> str:
+        return f"{to_bybit_symbol(instrument)}:{position_idx}:trailing"
+
+    @staticmethod
+    def _parse_native_trailing_id(instrument: Instrument, native_id: str) -> int:
+        symbol = to_bybit_symbol(instrument)
+        suffix = ":trailing"
+        if not native_id.endswith(suffix):
+            raise ValueError(f"invalid Bybit native trailing id {native_id!r}")
+        base = native_id[: -len(suffix)]
+        if base.startswith(f"{symbol}:"):
+            idx = base[len(symbol) + 1 :]
+        elif ":" in base:
+            raise ValueError(
+                f"native trailing id venue symbol does not match instrument {symbol}: {native_id!r}"
+            )
+        else:
+            idx = base
+        try:
+            return int(idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Bybit native trailing id {native_id!r}") from exc
+
+    @staticmethod
+    def _trailing_result_from_entry(
+        entry: dict[str, Any],
+        *,
+        native_id: str,
+    ) -> NativeTrailingResult | None:
+        offset = _optional_decimal(entry.get("trailingStop"))
+        active_price = _optional_decimal(entry.get("activePrice"))
+        if offset is None and active_price is None:
+            return None
+        return NativeTrailingResult(
+            native_id=native_id,
+            confirmed_offset=offset,
+            current_stop=None,
+            activated=offset is not None,
+            position_scoped=True,
+        )
+
+    async def place_trailing_stop(
+        self,
+        request: NativeTrailingRequest,
+    ) -> NativeTrailingResult:
+        """Place or replace the native position trailing stop.
+
+        Bybit carries the trail as position state, so the write goes through
+        ``set_trading_stop`` with ``positionIdx`` and no static TP/SL fields.
+        Existing take profit and stop loss levels are preserved.
+        """
+        category = self._instrument_to_category(request.instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError("native trailing is not supported for spot on Bybit")
+
+        position_idx = self._parse_position_idx(request.instrument, request.position_id)
+        payload = build_native_trailing_stop_payload(
+            request,
+            category=category,
+            symbol=to_bybit_symbol(request.instrument),
+            position_idx=position_idx,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+        return NativeTrailingResult(
+            native_id=self._native_trailing_id(request.instrument, position_idx),
+            confirmed_offset=request.offset,
+            current_stop=None,
+            activated=True,
+            position_scoped=True,
+        )
+
+    async def get_trailing_stop(
+        self,
+        native_id: str,
+        instrument: Instrument,
+    ) -> NativeTrailingResult | None:
+        """Read the native position trail named by *native_id*.
+
+        Returns ``None`` only when the position or both venue trailing fields
+        are absent.  Transport failures propagate as translated platform
+        errors.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        position_idx = self._parse_native_trailing_id(instrument, native_id)
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return self._trailing_result_from_entry(entry, native_id=native_id)
+        return None
+
+    async def get_position_trailing_stop(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> NativeTrailingResult | None:
+        """Read the native trail attached to one position leg.
+
+        This is the pre-attach takeover read.  ``position_id`` follows the
+        ``positionIdx`` / ``"{venue_symbol}:{idx}"`` convention used by the
+        other position protection methods.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return self._trailing_result_from_entry(
+                    entry,
+                    native_id=self._native_trailing_id(instrument, position_idx),
+                )
+        return None
+
+    async def cancel_trailing_stop(
+        self,
+        native_id: str,
+        instrument: Instrument,
+    ) -> None:
+        """Clear the native position trail and confirm it is gone.
+
+        Bybit clears position trailing with the ``"0"`` sentinel.  A read-back
+        confirms the venue applied it; a trail that remains raises.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError("native trailing is not supported for spot on Bybit")
+
+        position_idx = self._parse_native_trailing_id(instrument, native_id)
+        payload = build_cancel_native_trailing_stop_payload(
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            position_idx=position_idx,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+        remaining = await self.get_trailing_stop(native_id, instrument)
+        if remaining is not None:
+            raise PlatformError(f"native trailing stop {native_id!r} is still present after cancel")
+
     async def _run_request(
         self,
         method: Callable[..., Any],
@@ -2428,6 +2618,7 @@ class BybitAdapter(Adapter):
             price_precision=-int(tick_size.as_tuple().exponent),
             qty_precision=-int(lot_size.as_tuple().exponent),
             max_leverage=max_leverage,
+            min_stop_distance=tick_size,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
@@ -2461,6 +2652,71 @@ class BybitAdapter(Adapter):
             last=_optional_decimal(entry.get("lastPrice")),
             mark=_optional_decimal(entry.get("markPrice")),
         )
+
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed candles through ``get_kline``, oldest first.
+
+        Bybit returns newest first, so the result is reversed.  A bar whose
+        close time has not passed is still forming and is dropped.  ``limit``
+        is the maximum number of closed candles returned.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        interval = _BYBIT_KLINE_INTERVAL.get(timeframe)
+        if interval is None:
+            raise UnsupportedOrderTypeError(
+                f"Bybit does not support the {timeframe.value} candle timeframe"
+            )
+
+        category = self._instrument_to_category(instrument)
+        symbol = to_bybit_symbol(instrument)
+        data, _ = await self._run_request(
+            self._session.get_kline,
+            category=category,
+            symbol=symbol,
+            interval=interval,
+            limit=min(limit + 1, _BYBIT_MAX_KLINE_LIMIT),
+            read=True,
+        )
+
+        entries = (data.get("result") or {}).get("list") or []
+        now = datetime.now(UTC)
+        candles: list[Candle] = []
+        for entry in reversed(entries):
+            candle = self._parse_candle_entry(entry, timeframe, now)
+            if candle is not None:
+                candles.append(candle)
+        return candles[-limit:]
+
+    @staticmethod
+    def _parse_candle_entry(
+        entry: dict[str, Any],
+        timeframe: CandleTimeframe,
+        now: datetime,
+    ) -> Candle | None:
+        try:
+            start_ms = int(entry["startTime"])
+            open_time = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
+            close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
+            if close_time > now:
+                return None
+            return Candle(
+                open_time=open_time,
+                close_time=close_time,
+                open=Decimal(str(entry["openPrice"])),
+                high=Decimal(str(entry["highPrice"])),
+                low=Decimal(str(entry["lowPrice"])),
+                close=Decimal(str(entry["closePrice"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Skipping malformed Bybit kline entry: %s", entry)
+            return None
 
     # ---- Capability reporting ----
 
@@ -2501,6 +2757,55 @@ class BybitAdapter(Adapter):
             trigger_bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
             min_reprice_interval_seconds=0.0,
             reprice_gap=False,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Declare ticker and candle data available through Bybit market reads.
+
+        ``fetch_ticker`` populates last, bid, and ask for every category and
+        mark for derivatives only.  ``get_kline`` serves every declared
+        timeframe except 8 hours, which Bybit does not publish.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().market_data_capability(instrument)
+
+        bases = {TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}
+        if category in ("linear", "inverse"):
+            bases.add(TrailingBasis.MARK)
+        return MarketDataCapability(
+            ticker_bases=frozenset(bases),
+            min_ticker_interval_seconds=2.0,
+            candle_timeframes=frozenset(_BYBIT_KLINE_INTERVAL),
+            streaming_ticker=False,
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Declare native position trailing support for Bybit.
+
+        ``set_trading_stop`` accepts an absolute price distance on linear and
+        inverse perpetuals.  Only immediate and price activation are native;
+        percent and ATR requests route to synthetic.  Bybit cannot express a
+        native step, initial stop, or atomic take profit.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().trailing_capability(instrument)
+        if category not in ("linear", "inverse"):
+            return super().trailing_capability(instrument)
+
+        return TrailingCapability(
+            supported=True,
+            offset_types=frozenset({TrailingOffsetType.PRICE}),
+            bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
+            activations=frozenset({TrailingActivation.IMMEDIATE, TrailingActivation.PRICE}),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=True,
+            min_reprice_interval_seconds=0.0,
         )
 
     # ---- Rate limits ----
