@@ -57,6 +57,7 @@ from unified_trading_execution.ibkr.orders import (
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
+from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     FillEntry,
     FillReason,
@@ -1104,8 +1105,12 @@ class IBKRAdapter(Adapter):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         """Replace the TP/SL on an existing open position.
+
+        ``trigger_basis`` is accepted for the adapter contract and ignored:
+        IBKR evaluates TP/SL against its own bid/ask execution feed.
 
         The position's protective OCA pair is replaced, never stacked. The
         existing ``<conId>-tp-``/``<conId>-sl-`` orders are cancelled and
