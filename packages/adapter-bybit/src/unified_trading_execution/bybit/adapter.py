@@ -171,6 +171,30 @@ _TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
         "CreateByTrailingStop",
     }
 )
+# ``createType`` is absent on some venue-created protection entries (spot does
+# not publish it, and a trailing close may report an origin the adapter does not
+# know).  ``stopOrderType`` is the reliable signal for a futures TP/SL or
+# trailing child, so both fields are checked before treating an order as a user
+# order.  Plain conditional orders report ``Stop`` and stay included.
+_TP_SL_STOP_ORDER_TYPES: frozenset[str] = frozenset(
+    {
+        "TakeProfit",
+        "StopLoss",
+        "PartialTakeProfit",
+        "PartialStopLoss",
+        "TrailingStop",
+    }
+)
+
+
+def _is_protection_entry(entry: dict[str, Any]) -> bool:
+    """Return ``True`` for a venue-created TP/SL or trailing child entry."""
+    return (
+        entry.get("createType") in _TP_SL_CREATE_TYPES
+        or entry.get("stopOrderType") in _TP_SL_STOP_ORDER_TYPES
+    )
+
+
 _BYBIT_KLINE_INTERVAL: dict[CandleTimeframe, str] = {
     CandleTimeframe.M1: "1",
     CandleTimeframe.M5: "5",
@@ -220,7 +244,7 @@ def _execution_client_key(entry: dict[str, Any]) -> str | None:
     order_id = entry.get("orderId") or ""
     if not order_id:
         return None
-    if entry.get("createType") in _TP_SL_CREATE_TYPES:
+    if _is_protection_entry(entry):
         return f"bybit-tpsl-{order_id}"
     return order_id
 
@@ -1844,7 +1868,7 @@ class BybitAdapter(Adapter):
         for entry in message.get("data") or []:
             # Native TP/SL children are not user orders — skip so they never
             # surface as phantom user orders in the mirror.
-            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+            if _is_protection_entry(entry):
                 continue
             try:
                 instrument = self._resolve_instrument(
@@ -3022,7 +3046,7 @@ class BybitAdapter(Adapter):
         def _collect(entry: dict[str, Any], category: str) -> None:
             # Native TP/SL children are not user orders — exclude them so they
             # are never reconciled as phantom orphan orders.
-            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+            if _is_protection_entry(entry):
                 return
             try:
                 instrument = self._resolve_instrument(entry.get("symbol") or "", category)

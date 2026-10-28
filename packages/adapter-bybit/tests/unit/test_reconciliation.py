@@ -346,6 +346,37 @@ class TestFetchOpenOrders:
         # reconciled/imported as a phantom orphan.
         assert list(result) == ["client-1"]
 
+    async def test_filters_trailing_close_by_stop_order_create_type(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        trailing = _open_order(
+            orderLinkId="",
+            orderId="cffa-trail",
+            createType="CreateByStopOrder",
+            stopOrderType="TrailingStop",
+            orderType="Market",
+        )
+        user_order = _open_order(orderLinkId="client-1", orderId="order-1")
+        mock_pybit_http.get_open_orders.side_effect = [
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            (
+                {"result": {"list": [trailing, user_order], "nextPageCursor": ""}},
+                None,
+                {},
+            ),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
+        ]
+
+        result = await adapter.fetch_open_orders()
+
+        # stopOrderType identifies the protection close even when createType is
+        # absent or reports an origin the adapter does not know.
+        assert list(result) == ["client-1"]
+
 
 class TestFetchFills:
     async def test_filters_trade_and_groups_by_client_order_id(
@@ -451,6 +482,43 @@ class TestFetchFills:
 
         # A trailing-triggered close is a real fill — kept under the synthesized
         # key rather than dropped for lack of a client order id.
+        assert set(result) == {"bybit-tpsl-cffa-trail"}
+        fill = result["bybit-tpsl-cffa-trail"][0]
+        assert fill.reason == FillReason.TRAILING_STOP
+        assert fill.entry == FillEntry.OUT
+
+    async def test_trailing_close_fill_by_stop_order_create_type(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        mock_pybit_http.get_executions.side_effect = [
+            _EMPTY,
+            (
+                {
+                    "result": {
+                        "list": [
+                            _execution(
+                                orderLinkId="",
+                                orderId="cffa-trail",
+                                createType="CreateByStopOrder",
+                                stopOrderType="TrailingStop",
+                            ),
+                        ],
+                        "nextPageCursor": "",
+                    }
+                },
+                None,
+                {},
+            ),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_fills()
+
+        # stopOrderType keeps a trailing close on the synthesized key and
+        # classifies it even when createType is not one the adapter knows.
         assert set(result) == {"bybit-tpsl-cffa-trail"}
         fill = result["bybit-tpsl-cffa-trail"][0]
         assert fill.reason == FillReason.TRAILING_STOP

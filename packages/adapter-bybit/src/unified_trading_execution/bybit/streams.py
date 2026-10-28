@@ -69,6 +69,17 @@ _CREATE_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
     "CreateByTrailingStop": FillReason.TRAILING_STOP,
 }
 
+# Some venues omit ``createType`` (or report an origin the adapter does not
+# know) on an execution; ``stopOrderType`` still identifies a protection close,
+# so it is the fallback used to classify the fill.
+_STOP_ORDER_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
+    "TakeProfit": FillReason.TAKE_PROFIT,
+    "PartialTakeProfit": FillReason.TAKE_PROFIT,
+    "StopLoss": FillReason.STOP_LOSS,
+    "PartialStopLoss": FillReason.STOP_LOSS,
+    "TrailingStop": FillReason.TRAILING_STOP,
+}
+
 # Terminal states that free the order from the live order set and may be
 # echoed by the exchange (Bybit can repeat a ``Filled`` status when a cancel
 # races an execution, and may resend terminal states on reconnect).
@@ -148,6 +159,13 @@ def translate_fill(
     """
     create_type = entry.get("createType")
     reason = _CREATE_TYPE_TO_FILL_REASON.get(create_type) if isinstance(create_type, str) else None
+    if reason is None:
+        stop_order_type = entry.get("stopOrderType")
+        reason = (
+            _STOP_ORDER_TYPE_TO_FILL_REASON.get(stop_order_type)
+            if isinstance(stop_order_type, str)
+            else None
+        )
     position_idx = entry.get("positionIdx")
     return FillRecord(
         client_order_id=client_order_id,
