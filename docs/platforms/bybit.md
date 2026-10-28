@@ -434,7 +434,10 @@ attached to. Rehydration never creates a second active state for the same leg.
   position leg.
 - **Triggered trails are not mirror orders.** Bybit's `CreateByTrailingStop`
   close is excluded from `fetch_open_orders` and the order stream, so it never
-  appears as a phantom mirror order. Its execution still keys by order id.
+  appears as a phantom mirror order. Its execution still keys by order id and
+  is classified as `TRAILING_STOP`. A synthetic trail writes a normal position
+  stop, so core reclassifies its `STOP_LOSS` execution as `TRAILING_STOP` when
+  it matches the owned trailing state.
 - **One extra position read per native attach.** The pre-attach takeover check
   reads the position; this is the same read-to-place race window as static
   TP/SL takeover.
