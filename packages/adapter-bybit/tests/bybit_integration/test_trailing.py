@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from unified_trading_execution.bybit import BybitAdapter
+from unified_trading_execution.bybit.symbols import to_bybit_symbol
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import (
     PlatformError,
@@ -40,10 +41,18 @@ from unified_trading_execution.trailing import (
     TrailingPhase,
     TrailingRequest,
     TrailingSpec,
+    TrailingState,
 )
-from unified_trading_execution.types.enums import AssetClass, OrderSide, OrderType
+from unified_trading_execution.trailing.manager import TrailingManager
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    FillEntry,
+    FillReason,
+    OrderSide,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import Instrument
-from unified_trading_execution.types.order import TpSlAttachment
+from unified_trading_execution.types.order import FillRecord, TpSlAttachment
 from unified_trading_execution.types.position import Position
 
 from .conftest import cleanup_open_orders
@@ -227,6 +236,55 @@ async def _audit_payloads(
         for event in await store.query_audit_events(limit=200)
         if event.event_type == event_type
     ]
+
+
+async def _wait_for_trailing_exit_fills(
+    store: SQLiteStateStore,
+    instrument: Instrument,
+    *,
+    exclude: frozenset[str],
+    expected_quantity: Decimal,
+    timeout: float = 30.0,
+) -> list[FillRecord]:
+    """Poll the persisted fills until the whole leg is closed by the trail."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        fills = [
+            fill
+            for fill in await store.query_fills(instrument=instrument, limit=1000)
+            if fill.reason is FillReason.TRAILING_STOP
+            and fill.entry is FillEntry.OUT
+            and fill.platform_fill_id not in exclude
+        ]
+        covered = sum((fill.fill_quantity for fill in fills), Decimal("0"))
+        if covered >= expected_quantity:
+            return fills
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(
+                f"trailing exit fills for {instrument.symbol} covered {covered} "
+                f"of {expected_quantity}"
+            )
+        await asyncio.sleep(0.5)
+
+
+async def _wait_for_trailing_phase(
+    manager: TrailingManager,
+    trailing_id: str,
+    phase: TrailingPhase,
+    *,
+    timeout: float = 15.0,
+) -> TrailingState:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        state = await manager.get(trailing_id)
+        if state is not None and state.phase is phase:
+            return state
+        if asyncio.get_running_loop().time() >= deadline:
+            current = state.phase.value if state is not None else "missing"
+            raise AssertionError(
+                f"trailing state {trailing_id} stayed {current}, expected {phase.value}"
+            )
+        await asyncio.sleep(0.25)
 
 
 @dataclass(frozen=True)
@@ -715,6 +773,94 @@ async def test_native_attach_arms_a_position_scoped_trail(
     assert [
         active.trailing_id for active in await harness.engine.trailing.list(active_only=True)
     ] == [state.trailing_id]
+
+
+async def test_native_trailing_trigger_closes_the_leg_without_an_orphan(
+    trailing_engine: TrailingHarness,
+) -> None:
+    """A triggered native trail closes the leg and leaves nothing behind.
+
+    The trail watches the mark price, which moves in real time on testnet, so a
+    small retrace from the armed high watermark fires the venue's own close.
+    The close must reach the store as a trailing exit fill and must not leak a
+    phantom order into the mirror or leave a live order on the venue.
+    """
+    harness = trailing_engine
+    adapter = harness.adapter
+    instrument = harness.instrument
+    position = harness.position
+    assert position.position_id is not None
+
+    spec = await adapter.fetch_instrument_spec(instrument)
+    ticker = await adapter.fetch_ticker(instrument)
+    assert ticker is not None and ticker.mark is not None
+
+    before_order_ids = {
+        order.client_order_id for order in await harness.store.query_orders(limit=1000)
+    }
+    before_fill_ids = frozenset(
+        fill.platform_fill_id
+        for fill in await harness.store.query_fills(instrument=instrument, limit=1000)
+    )
+    before_open_orders = set((await adapter.fetch_open_orders()).keys())
+
+    offset = align_to_tick(spec.tick_size * 5, spec.tick_size)
+    state = await harness.engine.trailing.attach(
+        TrailingRequest(
+            instrument,
+            TrailingSpec(
+                offset_type=TrailingOffsetType.PRICE,
+                offset=offset,
+                basis=TrailingBasis.MARK,
+            ),
+            position_id=position.position_id,
+        )
+    )
+
+    assert state.mode is TrailingMode.NATIVE
+    assert state.phase is TrailingPhase.ARMED
+    await _wait_for_native_trail(adapter, instrument, position.position_id)
+
+    await _wait_for_flat(adapter, instrument, timeout=120.0)
+
+    exit_fills = await _wait_for_trailing_exit_fills(
+        harness.store,
+        instrument,
+        exclude=before_fill_ids,
+        expected_quantity=state.quantity,
+    )
+    # The venue's trailing close omits ``positionIdx``; the manager treats a
+    # missing fill leg id as an unclaimed-leg match.  Any id it does carry must
+    # address this leg (full ``{venue_symbol}:{idx}`` or bare ``idx``).
+    leg_idx = position.position_id.rsplit(":", 1)[-1]
+    assert all(fill.position_id in (None, position.position_id, leg_idx) for fill in exit_fills)
+
+    done = await _wait_for_trailing_phase(
+        harness.engine.trailing,
+        state.trailing_id,
+        TrailingPhase.DONE,
+    )
+    assert done.quantity == 0
+    assert await adapter.get_position_trailing_stop(instrument, position.position_id) is None
+
+    after_order_ids = {
+        order.client_order_id for order in await harness.store.query_orders(limit=1000)
+    }
+    assert after_order_ids == before_order_ids
+    assert set((await adapter.fetch_open_orders()).keys()) <= before_open_orders
+
+    category = adapter._instrument_to_category(instrument)
+    raw, _ = await adapter._run_request(
+        adapter._session.get_open_orders,
+        category=category,
+        symbol=to_bybit_symbol(instrument),
+    )
+    venue_orders = (raw.get("result") or {}).get("list") or []
+    assert not any(
+        entry.get("stopOrderType") == "TrailingStop"
+        or entry.get("createType") == "CreateByTrailingStop"
+        for entry in venue_orders
+    )
 
 
 @pytest.mark.parametrize("clear_protection", [True, False])
