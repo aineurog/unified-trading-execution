@@ -370,3 +370,59 @@ class TestOptionalMethodDefaults:
     ):
         with pytest.raises(NotImplementedError, match="by position"):
             await abc.get_position_trailing_stop(adapter, instrument, "leg-1")
+
+
+class TestModifyPositionTpslTriggerBasis:
+    """``modify_position_tpsl`` carries an optional venue trigger basis."""
+
+    def test_trigger_basis_keyword_defaults_to_none(self):
+        from unified_trading_execution.adapter import Adapter
+
+        signature = inspect.signature(Adapter.modify_position_tpsl)
+        parameter = signature.parameters["trigger_basis"]
+
+        assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        assert parameter.default is None
+
+    def test_trigger_basis_is_typed_as_optional_trailing_basis(self):
+        import typing
+
+        from unified_trading_execution.adapter import Adapter
+        from unified_trading_execution.trailing.types import TrailingBasis
+
+        hints = typing.get_type_hints(Adapter.modify_position_tpsl)
+
+        assert hints["trigger_basis"] == TrailingBasis | None
+
+    async def test_mock_adapter_records_the_trigger_basis(self):
+        from datetime import UTC, datetime
+        from decimal import Decimal
+
+        from unified_trading_execution.events import EventBus
+        from unified_trading_execution.testing import MockAdapter
+        from unified_trading_execution.trailing.types import TrailingBasis
+        from unified_trading_execution.types.enums import AssetClass
+        from unified_trading_execution.types.instrument import Instrument
+        from unified_trading_execution.types.order import TpSlAttachment
+        from unified_trading_execution.types.position import Position
+
+        adapter = MockAdapter(event_bus=EventBus())
+        instrument = Instrument(symbol="BTC", quote_currency="USDT", asset_class=AssetClass.SPOT)
+        adapter.seed_position(
+            Position(
+                instrument=instrument,
+                quantity=Decimal("1"),
+                average_entry_price=Decimal("100"),
+                updated_at=datetime.now(tz=UTC),
+                position_id="leg-1",
+            )
+        )
+        stop = TpSlAttachment(trigger_price=Decimal("90"))
+
+        await adapter.modify_position_tpsl(
+            instrument, "leg-1", stop_loss=stop, trigger_basis=TrailingBasis.MARK
+        )
+        await adapter.modify_position_tpsl(instrument, "leg-1", stop_loss=stop)
+
+        assert adapter.protection_writes[-2].trigger_basis is TrailingBasis.MARK
+        assert adapter.protection_writes[-1].trigger_basis is None

@@ -131,6 +131,25 @@ class TestStreamsTranslation:
         assert fill.reason == FillReason.STOP_LOSS
         assert fill.entry == FillEntry.OUT
 
+    def test_translate_fill_classifies_by_stop_order_type(self) -> None:
+        fill = streams.translate_fill(
+            {
+                "symbol": "BTCUSDT",
+                "execId": "exec-4",
+                "orderLinkId": "",
+                "orderId": "cffa-trail",
+                "createType": "CreateByStopOrder",
+                "stopOrderType": "TrailingStop",
+                "execQty": "0.5",
+                "execPrice": "95900.1",
+                "execTime": "1746270400353",
+            },
+            instrument=_BTCUSDT,
+            client_order_id="bybit-tpsl-cffa-trail",
+        )
+        assert fill.reason == FillReason.TRAILING_STOP
+        assert fill.entry == FillEntry.OUT
+
     def test_translate_fill_plain_fill_is_unclassified(self) -> None:
         fill = streams.translate_fill(
             {
@@ -156,12 +175,14 @@ class TestStreamsTranslation:
                 "size": "0.5",
                 "entryPrice": "95900.1",
                 "updatedTime": "1700000000000",
+                "createdTime": "1690000000000",
             },
             instrument=_BTCUSDT,
         )
         assert pos.quantity == Decimal("0.5")
         assert pos.average_entry_price == Decimal("95900.1")
         assert pos.updated_at.tzinfo is not None
+        assert pos.opened_at == datetime.fromtimestamp(1690000000, tz=UTC)
 
     def test_translate_position_short_is_negative(self) -> None:
         pos = streams.translate_position(
@@ -190,6 +211,51 @@ class TestStreamsTranslation:
             instrument=_BTCUSDT,
         )
         assert pos.quantity == Decimal("0")
+
+    def test_translate_position_rest_uses_avg_price(self) -> None:
+        # REST ``/v5/position/list`` reports the entry price as ``avgPrice``.
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("80982.1")
+
+    def test_translate_position_treats_zero_entry_price_as_absent(self) -> None:
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "entryPrice": "0",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("80982.1")
+
+    def test_translate_position_prefers_entry_price(self) -> None:
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "entryPrice": "95900.1",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("95900.1")
 
     def test_translate_wallet_preserves_invariant(self) -> None:
         member = {
@@ -460,6 +526,39 @@ class TestStreamEmission:
         # synthesized venue key, not dropped for lack of a client order id.
         assert len(captured) == 1
         assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-trail"
+        assert captured[0].fill.reason == FillReason.TRAILING_STOP
+        assert captured[0].fill.entry == FillEntry.OUT
+
+    def test_execution_records_trailing_close_by_stop_order_type(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        captured: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, captured.append)
+        adapter._on_execution_message(
+            {
+                "data": [
+                    {
+                        "symbol": "BTCUSDT",
+                        "category": "linear",
+                        "execId": "exec-1",
+                        "orderLinkId": "",
+                        "orderId": "cffa-trail",
+                        "stopOrderType": "TrailingStop",
+                        "execType": "Trade",
+                        "execQty": "0.5",
+                        "execPrice": "95900.1",
+                        "execTime": "1706270400353",
+                    }
+                ]
+            }
+        )
+        # Without ``createType`` the stop order type still identifies the
+        # venue-created trailing close, so it keeps the synthesized key.
+        assert len(captured) == 1
+        assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-trail"
+        assert captured[0].fill.reason == FillReason.TRAILING_STOP
+        assert captured[0].fill.entry == FillEntry.OUT
 
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)
@@ -622,6 +721,30 @@ class TestStreamEmission:
         )
 
         # A venue-created trailing close is position state, not a user order.
+        assert placed == []
+
+    def test_order_skips_trailing_close_by_stop_order_type(
+        self, adapter: BybitAdapter, event_bus: EventBus
+    ) -> None:
+        adapter = self._wired_adapter(adapter)
+        placed: list[OrderPlacedEvent] = []
+        event_bus.subscribe(OrderPlacedEvent, placed.append)
+
+        adapter._on_order_message(
+            {
+                "data": [
+                    _base_order_entry(
+                        orderLinkId="",
+                        orderId="cffa-trail",
+                        createType="CreateByStopOrder",
+                        stopOrderType="TrailingStop",
+                    )
+                ]
+            }
+        )
+
+        # A conditional createType must not let a trailing close through when
+        # stopOrderType identifies it as protection state.
         assert placed == []
 
     def test_order_terminal_echo_not_replaced(

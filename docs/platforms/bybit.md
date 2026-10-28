@@ -313,6 +313,135 @@ is `Partial` (some legs are limit orders). When both are market (no
 **Spot restrictions:** TP/SL on spot is only available for `LIMIT` orders.
 Using it with any other order type raises `UnsupportedOrderTypeError`.
 
+### Trailing stops
+
+`engine.trailing` attaches a protective stop to one position leg and keeps it
+tightening as the market moves in the position's favour. `AUTO` mode uses
+Bybit's native position trailing stop only for an exact request match; every
+other request is executed synthetically as a stop loss on the same position
+leg.
+
+```python
+from decimal import Decimal
+
+from unified_trading_execution.trailing import (
+    TrailingOffsetType,
+    TrailingRequest,
+    TrailingSpec,
+)
+
+state = await engine.trailing.attach(
+    TrailingRequest(
+        btc,
+        TrailingSpec(
+            offset_type=TrailingOffsetType.PRICE,
+            offset=Decimal("500"),
+        ),
+        position_id="BTCUSDT:1",
+    )
+)
+print(state.mode.value, state.phase.value)  # native armed
+
+await engine.trailing.cancel(state.trailing_id, clear_protection=True)
+
+active = await engine.trailing.list(active_only=True)
+current = await engine.trailing.get(state.trailing_id)
+```
+
+The sync `SyncBybitEngine` exposes the same `trailing` surface without `await`.
+
+#### Position leg ids
+
+Bybit trails are position state, not standalone orders. Pass the exact leg id
+as `position_id` whenever a symbol can have more than one leg:
+
+| Mode | `positionIdx` | Example `position_id` |
+|---|---|---|
+| One-way | `0` | `BTCUSDT:0` |
+| Hedge long | `1` | `BTCUSDT:1` |
+| Hedge short | `2` | `BTCUSDT:2` |
+
+The id format is `{venue_symbol}:{positionIdx}`. Omitting it is allowed only
+when the symbol has a single open leg; an ambiguous request fails instead of
+guessing.
+
+#### Native versus synthetic
+
+| Request | Execution |
+|---|---|
+| Absolute `PRICE` offset, `LAST` or `MARK` basis, immediate or price activation | Native `trailingStop` on the leg |
+| `PERCENT` or `ATR` offset | Synthetic stop loss, repriced by the engine |
+| `MID`/`BID`/`ASK` basis, step, initial stop, static take profit | Synthetic |
+| Spot, options, dated futures | Unsupported |
+
+Native support covers linear **and inverse** perpetuals (verified on testnet).
+Only an absolute price distance is sent to Bybit; percent and ATR distances are
+never sent as native trailing stops. Native requests also leave existing static
+take-profit and stop-loss levels untouched: Bybit writes only the fields the
+request names.
+
+Synthetic trailing keeps a normal position stop loss on the target leg. The
+engine's polling worker samples the resolved basis, tightens the stop on
+favourable moves, never loosens it on adverse moves, carries it through partial
+closes, and clears it when the position reaches zero. `cancel` with
+`clear_protection=True` removes the stop levels this state owns; a native trail
+is cancelled in either case because Bybit always attaches it to the position.
+
+#### Trigger basis
+
+The resolved trailing basis is mapped to Bybit's `slTriggerBy` field:
+
+| Basis | Bybit value |
+|---|---|
+| `LAST` | `LastPrice` |
+| `MARK` | `MarkPrice` |
+| `BID`, `ASK`, `MID`, or unset | Venue default |
+
+The same mapping is used for native trailing writes and synthetic stop writes.
+Bybit cannot express `BID`, `ASK`, `MID`, or `INDEX` as a trigger basis, so
+those requests either route synthetic or fail with a named blocker; the adapter
+never claims a basis it cannot set.
+
+#### Existing protection and takeover
+
+Before a native attach writes anything, the adapter reads the position-scoped
+trail (`trailingStop`/`activePrice`). If a trail already exists,
+`take_over_existing_protection=True` is required; otherwise attach raises and
+leaves the venue unchanged. With takeover enabled the new offset replaces the
+old one and a `trailing.takeover` audit record captures the previous native
+offset and stop. Existing static TP/SL is preserved and reported in the same
+audit trail.
+
+The same takeover rule applies to a pre-existing static stop loss or competing
+take profit on the target leg.
+
+#### Restart and recovery
+
+Trailing state is persisted in the engine's state store. On reconnect the
+engine rehydrates active states from a direct position snapshot, restores
+synthetic protection, and re-arms a native trail the venue no longer reports.
+Bybit position `createdTime` is carried as `opened_at`, so a genuine reopen of
+a reused `positionIdx` is distinguished from the position the state was
+attached to. Rehydration never creates a second active state for the same leg.
+
+#### Bybit trailing caveats
+
+- **No native percent or ATR.** Bybit's position trail accepts an absolute price
+  distance only.
+- **No native step, initial stop, or take profit.** Those combinations route
+  synthetic; a static take profit in the spec is written as normal position TP.
+- **Spot and options are unsupported.** Trailing requires a derivatives
+  position leg.
+- **Triggered trails are not mirror orders.** Bybit's `CreateByTrailingStop`
+  close is excluded from `fetch_open_orders` and the order stream, so it never
+  appears as a phantom mirror order. Its execution still keys by order id and
+  is classified as `TRAILING_STOP`. A synthetic trail writes a normal position
+  stop, so core reclassifies its `STOP_LOSS` execution as `TRAILING_STOP` when
+  it matches the owned trailing state.
+- **One extra position read per native attach.** The pre-attach takeover check
+  reads the position; this is the same read-to-place race window as static
+  TP/SL takeover.
+
 ### Reduce-only orders
 
 Set `reduce_only=True` to place an order that only reduces an existing position:

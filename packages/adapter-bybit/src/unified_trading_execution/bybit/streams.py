@@ -66,6 +66,18 @@ _CREATE_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
     "CreateByPartialTakeProfit": FillReason.TAKE_PROFIT,
     "CreateByStopLoss": FillReason.STOP_LOSS,
     "CreateByPartialStopLoss": FillReason.STOP_LOSS,
+    "CreateByTrailingStop": FillReason.TRAILING_STOP,
+}
+
+# Some venues omit ``createType`` (or report an origin the adapter does not
+# know) on an execution; ``stopOrderType`` still identifies a protection close,
+# so it is the fallback used to classify the fill.
+_STOP_ORDER_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
+    "TakeProfit": FillReason.TAKE_PROFIT,
+    "PartialTakeProfit": FillReason.TAKE_PROFIT,
+    "StopLoss": FillReason.STOP_LOSS,
+    "PartialStopLoss": FillReason.STOP_LOSS,
+    "TrailingStop": FillReason.TRAILING_STOP,
 }
 
 # Terminal states that free the order from the live order set and may be
@@ -114,6 +126,13 @@ def _parse_ms(raw: object, field: str) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
+def _parse_optional_ms(raw: object) -> datetime | None:
+    """Parse an optional millisecond timestamp, returning ``None`` when absent."""
+    if raw is None or raw == "":
+        return None
+    return _parse_ms(raw, "createdTime")
+
+
 def _parse_fee(raw: object) -> Decimal | None:
     """Parse the ``execFee`` field — zero fee is distinct from missing data."""
     if raw is None or raw == "":
@@ -140,6 +159,13 @@ def translate_fill(
     """
     create_type = entry.get("createType")
     reason = _CREATE_TYPE_TO_FILL_REASON.get(create_type) if isinstance(create_type, str) else None
+    if reason is None:
+        stop_order_type = entry.get("stopOrderType")
+        reason = (
+            _STOP_ORDER_TYPE_TO_FILL_REASON.get(stop_order_type)
+            if isinstance(stop_order_type, str)
+            else None
+        )
     position_idx = entry.get("positionIdx")
     return FillRecord(
         client_order_id=client_order_id,
@@ -158,12 +184,19 @@ def translate_fill(
 
 
 def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Position:
-    """Build a ``Position`` from one ``position`` stream entry.
+    """Build a ``Position`` from one position entry (WebSocket or REST).
+
+    The WebSocket stream reports the average entry price as ``entryPrice``
+    while ``GET /v5/position/list`` reports it as ``avgPrice``; accept either so
+    a REST snapshot (for example the one seeded after a fill) never stores a
+    zero entry price.
 
     ``quantity`` follows the core convention: positive = long (``Buy``),
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
     ``position_id`` is ``{venue_symbol}:{positionIdx}`` (e.g. ``BTCUSDT:0``)
     — ``positionIdx`` alone collides across symbols (BTCUSDT 0 vs BTCUSD 0).
+    ``opened_at`` is the venue's ``createdTime`` when present; the position
+    update stream does not always carry it, so it may be ``None``.
     """
     side = entry.get("side")
     size = _decimal(entry.get("size"), "size")
@@ -178,12 +211,16 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
 
     venue_symbol = to_bybit_symbol(instrument)
     position_id = f"{venue_symbol}:{idx}"
+    entry_price = _optional_decimal(entry.get("entryPrice"))
+    if entry_price is None:
+        entry_price = _optional_decimal(entry.get("avgPrice"))
     return Position(
         instrument=instrument,
         quantity=quantity,
-        average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
+        average_entry_price=entry_price if entry_price is not None else Decimal("0"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
         position_id=position_id,
+        opened_at=_parse_optional_ms(entry.get("createdTime")),
     )
 
 

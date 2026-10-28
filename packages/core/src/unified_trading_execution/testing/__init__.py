@@ -36,6 +36,7 @@ from unified_trading_execution.trailing.types import (
     CandleTimeframe,
     NativeTrailingRequest,
     NativeTrailingResult,
+    TrailingBasis,
     TrailingOffsetType,
 )
 from unified_trading_execution.types.enums import (
@@ -72,6 +73,8 @@ class ProtectionWrite:
     ``take_profit`` and ``stop_loss`` are the levels the adapter would send
     after merging an update: a side omitted from the call keeps its previous
     value.  The ``cleared_*`` flags identify sides explicitly removed.
+    ``trigger_basis`` echoes the venue trigger feed the caller requested, or
+    ``None`` when the venue default applies.
     """
 
     instrument: Instrument
@@ -81,6 +84,7 @@ class ProtectionWrite:
     stop_loss: TpSlAttachment | None
     cleared_take_profit: bool = False
     cleared_stop_loss: bool = False
+    trigger_basis: TrailingBasis | None = None
 
 
 class MockAdapter(Adapter):
@@ -672,6 +676,7 @@ class MockAdapter(Adapter):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         if (err := self._consume_error()) is not None:
             raise err
@@ -694,6 +699,7 @@ class MockAdapter(Adapter):
                 side=OrderSide.BUY if position.quantity > 0 else OrderSide.SELL,
                 take_profit=resolved_tp,
                 stop_loss=resolved_sl,
+                trigger_basis=trigger_basis,
             )
         )
 

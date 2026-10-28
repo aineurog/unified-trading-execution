@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import inspect
 
-import pytest
-
 from unified_trading_execution.adapter import Adapter
 from unified_trading_execution.bybit import BybitAdapter, BybitConfig, BybitEngine, SyncBybitEngine
 from unified_trading_execution.engine import Engine

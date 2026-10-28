@@ -122,6 +122,30 @@ class TestFetchPositions:
         assert by_symbol["ETH"].quantity == Decimal("-2")
         assert by_symbol["ETH"].position_id == "ETHUSDT:0"
 
+    async def test_rest_position_reads_avg_price(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        rest_position = {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "size": "0.001",
+            "avgPrice": "80982.1",
+            "updatedTime": "1700000000000",
+        }
+        mock_pybit_http.get_positions.side_effect = [
+            _EMPTY,
+            ({"result": {"list": [rest_position], "category": "linear"}}, None, {}),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_positions()
+
+        assert len(result) == 1
+        assert result[0].average_entry_price == Decimal("80982.1")
+
     async def test_paginates_across_cursor(
         self,
         adapter: BybitAdapter,
@@ -322,6 +346,37 @@ class TestFetchOpenOrders:
         # reconciled/imported as a phantom orphan.
         assert list(result) == ["client-1"]
 
+    async def test_filters_trailing_close_by_stop_order_create_type(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        trailing = _open_order(
+            orderLinkId="",
+            orderId="cffa-trail",
+            createType="CreateByStopOrder",
+            stopOrderType="TrailingStop",
+            orderType="Market",
+        )
+        user_order = _open_order(orderLinkId="client-1", orderId="order-1")
+        mock_pybit_http.get_open_orders.side_effect = [
+            _EMPTY,  # spot
+            _EMPTY,  # inverse
+            (
+                {"result": {"list": [trailing, user_order], "nextPageCursor": ""}},
+                None,
+                {},
+            ),  # linear (USDT)
+            _EMPTY,  # linear (USDC)
+        ]
+
+        result = await adapter.fetch_open_orders()
+
+        # stopOrderType identifies the protection close even when createType is
+        # absent or reports an origin the adapter does not know.
+        assert list(result) == ["client-1"]
+
 
 class TestFetchFills:
     async def test_filters_trade_and_groups_by_client_order_id(
@@ -428,6 +483,46 @@ class TestFetchFills:
         # A trailing-triggered close is a real fill — kept under the synthesized
         # key rather than dropped for lack of a client order id.
         assert set(result) == {"bybit-tpsl-cffa-trail"}
+        fill = result["bybit-tpsl-cffa-trail"][0]
+        assert fill.reason == FillReason.TRAILING_STOP
+        assert fill.entry == FillEntry.OUT
+
+    async def test_trailing_close_fill_by_stop_order_create_type(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        mock_pybit_http.get_executions.side_effect = [
+            _EMPTY,
+            (
+                {
+                    "result": {
+                        "list": [
+                            _execution(
+                                orderLinkId="",
+                                orderId="cffa-trail",
+                                createType="CreateByStopOrder",
+                                stopOrderType="TrailingStop",
+                            ),
+                        ],
+                        "nextPageCursor": "",
+                    }
+                },
+                None,
+                {},
+            ),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_fills()
+
+        # stopOrderType keeps a trailing close on the synthesized key and
+        # classifies it even when createType is not one the adapter knows.
+        assert set(result) == {"bybit-tpsl-cffa-trail"}
+        fill = result["bybit-tpsl-cffa-trail"][0]
+        assert fill.reason == FillReason.TRAILING_STOP
+        assert fill.entry == FillEntry.OUT
 
 
 class TestErrorTranslation:
@@ -475,13 +570,13 @@ class TestRateLimits:
             None,
             {
                 "X-Bapi-Limit": "100",
-                "X-Bapi-Remaining": "42",
-                "X-Bapi-Reset-Timestamp": "1700000000000",
+                "X-Bapi-Limit-Status": "42",
+                "X-Bapi-Limit-Reset-Timestamp": "1700000000000",
             },
         )
 
         await adapter.fetch_positions()
 
         limits = await adapter.get_rate_limits()
-        assert limits.remaining == 42
+        assert limits.remaining == 10
         assert limits.requests_per_interval == 100

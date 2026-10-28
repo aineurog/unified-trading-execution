@@ -148,6 +148,7 @@ class TestFetchInstrumentSpec:
         assert spec.price_precision == 1
         assert spec.qty_precision == 6
         assert spec.max_leverage is None
+        assert spec.min_stop_distance == spec.tick_size
 
     async def test_linear_perpetual(
         self,
@@ -179,6 +180,7 @@ class TestFetchInstrumentSpec:
         assert spec.price_precision == 2
         assert spec.qty_precision == 3
         assert spec.max_leverage == Decimal("100.00")
+        assert spec.min_stop_distance == spec.tick_size
 
     async def test_inverse_perpetual(
         self,
@@ -213,6 +215,28 @@ class TestFetchInstrumentSpec:
         assert spec.price_precision == 1
         assert spec.qty_precision == 0
         assert spec.max_leverage == Decimal("125")
+        assert spec.min_stop_distance == spec.tick_size
+
+    async def test_min_stop_distance_falls_back_to_tick_size(
+        self,
+        adapter,
+        mock_pybit_http: MagicMock,
+    ) -> None:
+        mock_pybit_http.get_instruments_info.return_value = (_LINEAR_RESPONSE, None, {})
+
+        spec = await adapter.fetch_instrument_spec(
+            Instrument(
+                symbol="BTC",
+                quote_currency="USDT",
+                asset_class=AssetClass.FUTURES,
+                currency="USDT",
+                multiplier=1,
+            )
+        )
+
+        assert isinstance(spec.min_stop_distance, Decimal)
+        assert spec.min_stop_distance == Decimal("0.10")
+        assert spec.min_stop_distance == spec.tick_size
 
     async def test_unsupported_asset_class(
         self,

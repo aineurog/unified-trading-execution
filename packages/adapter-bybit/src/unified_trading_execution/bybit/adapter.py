@@ -20,8 +20,8 @@ import logging
 import threading
 import time
 from collections import OrderedDict, defaultdict
-from collections.abc import AsyncGenerator, Callable
-from datetime import UTC, datetime
+from collections.abc import AsyncGenerator, Callable, Mapping, Sequence
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
@@ -30,7 +30,13 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from pybit.unified_trading import HTTP
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+    TrailingCapability,
+)
 from unified_trading_execution.bybit.config import BybitConfig
 from unified_trading_execution.bybit.enums import MarginMode, PositionMode
 from unified_trading_execution.bybit.errors import (
@@ -53,7 +59,10 @@ from unified_trading_execution.bybit.events import (
 )
 from unified_trading_execution.bybit.orders import (
     build_amend_payload,
+    build_cancel_native_trailing_stop_payload,
     build_cancel_payload,
+    build_clear_trading_stop_payload,
+    build_native_trailing_stop_payload,
     build_place_order_payload,
     build_set_trading_stop_payload,
     parse_order_result,
@@ -95,6 +104,14 @@ from unified_trading_execution.events import (
 )
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
+from unified_trading_execution.trailing.types import (
+    CandleTimeframe,
+    NativeTrailingRequest,
+    NativeTrailingResult,
+    TrailingActivation,
+    TrailingBasis,
+    TrailingOffsetType,
+)
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -102,7 +119,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -115,8 +132,18 @@ from unified_trading_execution.types.position import Balance, Position
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_REQUESTS_PER_INTERVAL = 120
-_DEFAULT_INTERVAL_SECONDS = 60
+# Bybit rate limits are per-endpoint and reset every second.  Core tracks one
+# shared budget, so the adapter reports a conservative global window: the
+# remaining count is capped at the lowest write bucket Bybit publishes
+# (trading-stop / order create / cancel are 10/s) and the window is one second.
+# A read on a 50/s endpoint therefore never authorizes a 50-write burst.
+_RATE_LIMIT_INTERVAL_SECONDS = 1.0
+_MAX_GLOBAL_RESERVE = 10
+_RATE_LIMIT_HEADERS = (
+    "X-Bapi-Limit",
+    "X-Bapi-Limit-Status",
+    "X-Bapi-Limit-Reset-Timestamp",
+)
 _CONNECTION_MONITOR_INTERVAL_SECONDS = 5.0
 _ORDER_CATEGORIES: tuple[str, ...] = ("spot", "linear", "inverse")
 # The wallet is a Bybit unified-account concept; v1 targets that single
@@ -144,6 +171,51 @@ _TP_SL_CREATE_TYPES: frozenset[str] = frozenset(
         "CreateByTrailingStop",
     }
 )
+# ``createType`` is absent on some venue-created protection entries (spot does
+# not publish it, and a trailing close may report an origin the adapter does not
+# know).  ``stopOrderType`` is the reliable signal for a futures TP/SL or
+# trailing child, so both fields are checked before treating an order as a user
+# order.  Plain conditional orders report ``Stop`` and stay included.
+_TP_SL_STOP_ORDER_TYPES: frozenset[str] = frozenset(
+    {
+        "TakeProfit",
+        "StopLoss",
+        "PartialTakeProfit",
+        "PartialStopLoss",
+        "TrailingStop",
+    }
+)
+
+
+def _is_protection_entry(entry: dict[str, Any]) -> bool:
+    """Return ``True`` for a venue-created TP/SL or trailing child entry."""
+    return (
+        entry.get("createType") in _TP_SL_CREATE_TYPES
+        or entry.get("stopOrderType") in _TP_SL_STOP_ORDER_TYPES
+    )
+
+
+_BYBIT_KLINE_INTERVAL: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1",
+    CandleTimeframe.M5: "5",
+    CandleTimeframe.M15: "15",
+    CandleTimeframe.M30: "30",
+    CandleTimeframe.H1: "60",
+    CandleTimeframe.H4: "240",
+    CandleTimeframe.H12: "720",
+    CandleTimeframe.D1: "D",
+}
+_CANDLE_SECONDS: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 60,
+    CandleTimeframe.M5: 300,
+    CandleTimeframe.M15: 900,
+    CandleTimeframe.M30: 1800,
+    CandleTimeframe.H1: 3600,
+    CandleTimeframe.H4: 14400,
+    CandleTimeframe.H12: 43200,
+    CandleTimeframe.D1: 86400,
+}
+_BYBIT_MAX_KLINE_LIMIT = 1000
 
 
 def _api_key_identity(api_key: str) -> str:
@@ -172,7 +244,7 @@ def _execution_client_key(entry: dict[str, Any]) -> str | None:
     order_id = entry.get("orderId") or ""
     if not order_id:
         return None
-    if entry.get("createType") in _TP_SL_CREATE_TYPES:
+    if _is_protection_entry(entry):
         return f"bybit-tpsl-{order_id}"
     return order_id
 
@@ -236,8 +308,20 @@ def _parse_stream_ms(raw: object) -> datetime:
     return datetime.fromtimestamp(seconds, tz=UTC).replace(microsecond=millis * 1000)
 
 
-def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
-    raw = headers.get(key)
+def _header_value(headers: Mapping[str, str], key: str) -> str | None:
+    """Return a header by name, tolerating plain dicts and case differences."""
+    value = headers.get(key)
+    if value is not None:
+        return value
+    lowered = key.lower()
+    for name, candidate in headers.items():
+        if name.lower() == lowered:
+            return candidate
+    return None
+
+
+def _safe_header_int(headers: Mapping[str, str], key: str, default: int) -> int:
+    raw = _header_value(headers, key)
     if raw is None:
         return default
     try:
@@ -246,23 +330,46 @@ def _safe_header_int(headers: dict[str, str], key: str, default: int) -> int:
         return default
 
 
-def _parse_rate_limits(headers: dict[str, str]) -> RateLimits:
-    raw_limit = _safe_header_int(headers, "X-Bapi-Limit", _DEFAULT_REQUESTS_PER_INTERVAL)
+def _has_rate_limit_headers(headers: Mapping[str, str]) -> bool:
+    """Whether a response carries Bybit rate-limit headers.
+
+    Public market-data endpoints omit all three headers.  Those responses must
+    not overwrite the last authenticated observation with defaults.
+    """
+    return any(_header_value(headers, key) is not None for key in _RATE_LIMIT_HEADERS)
+
+
+def _parse_rate_limits(headers: Mapping[str, str], *, now: datetime | None = None) -> RateLimits:
+    """Translate Bybit rate-limit headers into the core's one-bucket model.
+
+    ``X-Bapi-Limit-Status`` is the remaining count for the endpoint just
+    called and ``X-Bapi-Limit-Reset-Timestamp`` is the reset time *only* when
+    the limit was exceeded; otherwise it is approximately the current time.
+    Core expects a future window, so a reset at or before ``now`` is replaced
+    with ``now + interval``.  The remaining count is capped so a high-limit
+    read cannot authorize a burst against a lower-limit write endpoint.
+    """
+    moment = now or datetime.now(UTC)
+
+    raw_limit = _safe_header_int(headers, "X-Bapi-Limit", _MAX_GLOBAL_RESERVE)
     limit = max(raw_limit, 1)
 
-    raw_remaining = _safe_header_int(headers, "X-Bapi-Remaining", _DEFAULT_REQUESTS_PER_INTERVAL)
-    remaining = max(raw_remaining, 0)
+    raw_remaining = _safe_header_int(headers, "X-Bapi-Limit-Status", limit)
+    remaining = min(max(raw_remaining, 0), _MAX_GLOBAL_RESERVE)
 
-    raw_reset_ts = _safe_header_int(headers, "X-Bapi-Reset-Timestamp", 0)
+    raw_reset_ts = _safe_header_int(headers, "X-Bapi-Limit-Reset-Timestamp", 0)
+    observed_reset = (
+        datetime.fromtimestamp(raw_reset_ts / 1000, tz=UTC) if raw_reset_ts > 0 else moment
+    )
     reset_at = (
-        datetime.fromtimestamp(raw_reset_ts / 1000, tz=UTC)
-        if raw_reset_ts > 0
-        else datetime.now(UTC)
+        observed_reset
+        if observed_reset > moment
+        else moment + timedelta(seconds=_RATE_LIMIT_INTERVAL_SECONDS)
     )
 
     return RateLimits(
         requests_per_interval=limit,
-        interval_seconds=_DEFAULT_INTERVAL_SECONDS,
+        interval_seconds=_RATE_LIMIT_INTERVAL_SECONDS,
         remaining=remaining,
         reset_at=reset_at,
     )
@@ -347,7 +454,9 @@ class BybitAdapter(Adapter):
             return_response_headers=True,
         )
 
-    def _update_rate_limits(self, headers: dict[str, str]) -> None:
+    def _update_rate_limits(self, headers: Mapping[str, str]) -> None:
+        if not _has_rate_limit_headers(headers):
+            return
         self._last_rate_limits = _parse_rate_limits(headers)
 
     @staticmethod
@@ -1759,7 +1868,7 @@ class BybitAdapter(Adapter):
         for entry in message.get("data") or []:
             # Native TP/SL children are not user orders — skip so they never
             # surface as phantom user orders in the mirror.
-            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+            if _is_protection_entry(entry):
                 continue
             try:
                 instrument = self._resolve_instrument(
@@ -2052,6 +2161,7 @@ class BybitAdapter(Adapter):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         """Modify TP/SL on an open position via ``set_trading_stop``.
 
@@ -2060,6 +2170,9 @@ class BybitAdapter(Adapter):
         ``"{venue_symbol}:{idx}"`` form returned by ``fetch_positions``/
         ``translate_position`` — Bybit reuses the same ``positionIdx`` across
         every symbol, so *instrument* is required to address the correct leg.
+
+        *trigger_basis* sets the venue trigger feed for the sides being
+        written; ``None`` leaves Bybit's default untouched.
 
         Spot has no position concept on Bybit, so this raises
         ``UnsupportedOrderTypeError`` for spot instruments.
@@ -2081,6 +2194,7 @@ class BybitAdapter(Adapter):
             position_idx=position_idx,
             take_profit=take_profit,
             stop_loss=stop_loss,
+            trigger_basis=trigger_basis,
         )
         await self._run_request(self._session.set_trading_stop, **payload)
 
@@ -2120,6 +2234,222 @@ class BybitAdapter(Adapter):
                     translate_tp_sl(entry.get("stopLoss"), entry.get("slLimitPrice")),
                 )
         return None
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named TP/SL sides on an open position via ``set_trading_stop``.
+
+        *position_id* follows the same ``positionIdx`` / ``"{venue_symbol}:{idx}"``
+        convention as ``modify_position_tpsl``.  Only the named sides are
+        cleared; the unnamed side is preserved.  A confirmed flat position
+        returns quietly, since Bybit removes position protection when the
+        position closes.
+
+        Spot has no position concept on Bybit, so this raises
+        ``UnsupportedOrderTypeError`` for spot instruments.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError(
+                "position TP/SL clearing is not supported for spot on Bybit"
+            )
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+        symbol = to_bybit_symbol(instrument)
+
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=symbol,
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        entry = next(
+            (
+                candidate
+                for candidate in entries
+                if int(str(candidate.get("positionIdx") or "0")) == position_idx
+            ),
+            None,
+        )
+        if entry is None or Decimal(str(entry.get("size") or "0")) == 0:
+            return
+
+        payload = build_clear_trading_stop_payload(
+            category=category,
+            symbol=symbol,
+            position_idx=position_idx,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+
+    # ---- Native trailing ----
+
+    @staticmethod
+    def _native_trailing_id(instrument: Instrument, position_idx: int) -> str:
+        return f"{to_bybit_symbol(instrument)}:{position_idx}:trailing"
+
+    @staticmethod
+    def _parse_native_trailing_id(instrument: Instrument, native_id: str) -> int:
+        symbol = to_bybit_symbol(instrument)
+        suffix = ":trailing"
+        if not native_id.endswith(suffix):
+            raise ValueError(f"invalid Bybit native trailing id {native_id!r}")
+        base = native_id[: -len(suffix)]
+        if base.startswith(f"{symbol}:"):
+            idx = base[len(symbol) + 1 :]
+        elif ":" in base:
+            raise ValueError(
+                f"native trailing id venue symbol does not match instrument {symbol}: {native_id!r}"
+            )
+        else:
+            idx = base
+        try:
+            return int(idx)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"invalid Bybit native trailing id {native_id!r}") from exc
+
+    @staticmethod
+    def _trailing_result_from_entry(
+        entry: dict[str, Any],
+        *,
+        native_id: str,
+    ) -> NativeTrailingResult | None:
+        offset = _optional_decimal(entry.get("trailingStop"))
+        active_price = _optional_decimal(entry.get("activePrice"))
+        if offset is None and active_price is None:
+            return None
+        return NativeTrailingResult(
+            native_id=native_id,
+            confirmed_offset=offset,
+            current_stop=None,
+            activated=offset is not None,
+            position_scoped=True,
+        )
+
+    async def place_trailing_stop(
+        self,
+        request: NativeTrailingRequest,
+    ) -> NativeTrailingResult:
+        """Place or replace the native position trailing stop.
+
+        Bybit carries the trail as position state, so the write goes through
+        ``set_trading_stop`` with ``positionIdx`` and no static TP/SL fields.
+        Existing take profit and stop loss levels are preserved.
+        """
+        category = self._instrument_to_category(request.instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError("native trailing is not supported for spot on Bybit")
+
+        position_idx = self._parse_position_idx(request.instrument, request.position_id)
+        payload = build_native_trailing_stop_payload(
+            request,
+            category=category,
+            symbol=to_bybit_symbol(request.instrument),
+            position_idx=position_idx,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+        return NativeTrailingResult(
+            native_id=self._native_trailing_id(request.instrument, position_idx),
+            confirmed_offset=request.offset,
+            current_stop=None,
+            activated=True,
+            position_scoped=True,
+        )
+
+    async def get_trailing_stop(
+        self,
+        native_id: str,
+        instrument: Instrument,
+    ) -> NativeTrailingResult | None:
+        """Read the native position trail named by *native_id*.
+
+        Returns ``None`` only when the position or both venue trailing fields
+        are absent.  Transport failures propagate as translated platform
+        errors.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        position_idx = self._parse_native_trailing_id(instrument, native_id)
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return self._trailing_result_from_entry(entry, native_id=native_id)
+        return None
+
+    async def get_position_trailing_stop(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> NativeTrailingResult | None:
+        """Read the native trail attached to one position leg.
+
+        This is the pre-attach takeover read.  ``position_id`` follows the
+        ``positionIdx`` / ``"{venue_symbol}:{idx}"`` convention used by the
+        other position protection methods.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            return None
+
+        position_idx = self._parse_position_idx(instrument, position_id)
+        data, _ = await self._run_request(
+            self._session.get_positions,
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            read=True,
+        )
+        entries = (data.get("result") or {}).get("list") or []
+        for entry in entries:
+            if int(str(entry.get("positionIdx") or "0")) == position_idx:
+                return self._trailing_result_from_entry(
+                    entry,
+                    native_id=self._native_trailing_id(instrument, position_idx),
+                )
+        return None
+
+    async def cancel_trailing_stop(
+        self,
+        native_id: str,
+        instrument: Instrument,
+    ) -> None:
+        """Clear the native position trail and confirm it is gone.
+
+        Bybit clears position trailing with the ``"0"`` sentinel.  A read-back
+        confirms the venue applied it; a trail that remains raises.
+        """
+        category = self._instrument_to_category(instrument)
+        if category == "spot":
+            raise UnsupportedOrderTypeError("native trailing is not supported for spot on Bybit")
+
+        position_idx = self._parse_native_trailing_id(instrument, native_id)
+        payload = build_cancel_native_trailing_stop_payload(
+            category=category,
+            symbol=to_bybit_symbol(instrument),
+            position_idx=position_idx,
+        )
+        await self._run_request(self._session.set_trading_stop, **payload)
+        remaining = await self.get_trailing_stop(native_id, instrument)
+        if remaining is not None:
+            raise PlatformError(f"native trailing stop {native_id!r} is still present after cancel")
 
     async def _run_request(
         self,
@@ -2359,6 +2689,7 @@ class BybitAdapter(Adapter):
             price_precision=-int(tick_size.as_tuple().exponent),
             qty_precision=-int(lot_size.as_tuple().exponent),
             max_leverage=max_leverage,
+            min_stop_distance=tick_size,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
@@ -2393,6 +2724,82 @@ class BybitAdapter(Adapter):
             mark=_optional_decimal(entry.get("markPrice")),
         )
 
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed candles through ``get_kline``, oldest first.
+
+        Bybit returns newest first, so the result is reversed.  A bar whose
+        close time has not passed is still forming and is dropped.  ``limit``
+        is the maximum number of closed candles returned.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        interval = _BYBIT_KLINE_INTERVAL.get(timeframe)
+        if interval is None:
+            raise UnsupportedOrderTypeError(
+                f"Bybit does not support the {timeframe.value} candle timeframe"
+            )
+
+        category = self._instrument_to_category(instrument)
+        symbol = to_bybit_symbol(instrument)
+        data, _ = await self._run_request(
+            self._session.get_kline,
+            category=category,
+            symbol=symbol,
+            interval=interval,
+            limit=min(limit + 1, _BYBIT_MAX_KLINE_LIMIT),
+            read=True,
+        )
+
+        entries = (data.get("result") or {}).get("list") or []
+        now = datetime.now(UTC)
+        candles: list[Candle] = []
+        for entry in reversed(entries):
+            candle = self._parse_candle_entry(entry, timeframe, now)
+            if candle is not None:
+                candles.append(candle)
+        return candles[-limit:]
+
+    @staticmethod
+    def _parse_candle_entry(
+        entry: Mapping[str, Any] | Sequence[Any],
+        timeframe: CandleTimeframe,
+        now: datetime,
+    ) -> Candle | None:
+        try:
+            if isinstance(entry, Mapping):
+                start_ms = int(entry["startTime"])
+                open_value = entry["openPrice"]
+                high_value = entry["highPrice"]
+                low_value = entry["lowPrice"]
+                close_value = entry["closePrice"]
+            else:
+                start_ms = int(entry[0])
+                open_value = entry[1]
+                high_value = entry[2]
+                low_value = entry[3]
+                close_value = entry[4]
+            open_time = datetime.fromtimestamp(start_ms / 1000, tz=UTC)
+            close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
+            if close_time > now:
+                return None
+            return Candle(
+                open_time=open_time,
+                close_time=close_time,
+                open=Decimal(str(open_value)),
+                high=Decimal(str(high_value)),
+                low=Decimal(str(low_value)),
+                close=Decimal(str(close_value)),
+            )
+        except (KeyError, IndexError, TypeError, ValueError):
+            logger.warning("Skipping malformed Bybit kline entry: %s", entry)
+            return None
+
     # ---- Capability reporting ----
 
     def supported_order_types(self) -> frozenset[OrderType]:
@@ -2405,10 +2812,104 @@ class BybitAdapter(Adapter):
             }
         )
 
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Declare static position TP/SL support for Bybit.
+
+        Linear and inverse perpetuals support reading, setting, and clearing
+        both sides through ``set_trading_stop``, and a write preserves the side
+        it does not mention.  Spot is deferred.  ``LAST`` and ``MARK`` are the
+        trigger bases this surface can actually express.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().position_protection_capability(instrument)
+        if category not in ("linear", "inverse"):
+            return super().position_protection_capability(instrument)
+
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
+            min_reprice_interval_seconds=0.0,
+            reprice_gap=False,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Declare ticker and candle data available through Bybit market reads.
+
+        ``fetch_ticker`` populates last, bid, and ask for every category and
+        mark for derivatives only.  ``get_kline`` serves every declared
+        timeframe except 8 hours, which Bybit does not publish.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().market_data_capability(instrument)
+
+        bases = {TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}
+        if category in ("linear", "inverse"):
+            bases.add(TrailingBasis.MARK)
+        return MarketDataCapability(
+            ticker_bases=frozenset(bases),
+            min_ticker_interval_seconds=2.0,
+            candle_timeframes=frozenset(_BYBIT_KLINE_INTERVAL),
+            streaming_ticker=False,
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Declare native position trailing support for Bybit.
+
+        ``set_trading_stop`` accepts an absolute price distance on linear and
+        inverse perpetuals.  Only immediate and price activation are native;
+        percent and ATR requests route to synthetic.  Bybit cannot express a
+        native step, initial stop, or atomic take profit.
+        """
+        try:
+            category = self._instrument_to_category(instrument)
+        except InvalidSymbolError:
+            return super().trailing_capability(instrument)
+        if category not in ("linear", "inverse"):
+            return super().trailing_capability(instrument)
+
+        return TrailingCapability(
+            supported=True,
+            offset_types=frozenset({TrailingOffsetType.PRICE}),
+            bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
+            activations=frozenset({TrailingActivation.IMMEDIATE, TrailingActivation.PRICE}),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=True,
+            min_reprice_interval_seconds=0.0,
+        )
+
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
-        return self._last_rate_limits
+        """Return a usable global view of Bybit's per-endpoint limits.
+
+        The last authenticated response describes one endpoint.  Once its
+        one-second window has elapsed the bucket refills, so report a fresh
+        window instead of a past reset time (which core would interpret as
+        "always expired" and refuse every reservation).
+        """
+        now = datetime.now(UTC)
+        current = self._last_rate_limits
+        if now < current.reset_at:
+            return current
+        return RateLimits(
+            requests_per_interval=current.requests_per_interval,
+            interval_seconds=current.interval_seconds,
+            remaining=min(current.requests_per_interval, _MAX_GLOBAL_RESERVE),
+            reset_at=now + timedelta(seconds=current.interval_seconds),
+        )
 
     # ---- Reconciliation data (Section 6.1, Section 6.3) ----
 
@@ -2545,7 +3046,7 @@ class BybitAdapter(Adapter):
         def _collect(entry: dict[str, Any], category: str) -> None:
             # Native TP/SL children are not user orders — exclude them so they
             # are never reconciled as phantom orphan orders.
-            if entry.get("createType") in _TP_SL_CREATE_TYPES:
+            if _is_protection_entry(entry):
                 return
             try:
                 instrument = self._resolve_instrument(entry.get("symbol") or "", category)

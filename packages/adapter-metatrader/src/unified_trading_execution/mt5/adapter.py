@@ -70,6 +70,7 @@ from unified_trading_execution.mt5.orders import (
     parse_order_record,
 )
 from unified_trading_execution.mt5.symbols import to_mt5_symbol
+from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     FillEntry,
@@ -830,6 +831,7 @@ class MT5Adapter(Adapter):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         """Modify the take-profit and/or stop-loss levels of an open position.
 
@@ -837,6 +839,9 @@ class MT5Adapter(Adapter):
         position ticket (as a string); *instrument* resolves the broker symbol
         the request also requires.  At least one of *take_profit* or
         *stop_loss* must be provided.
+
+        ``trigger_basis`` is accepted for the adapter contract and ignored:
+        MT5 evaluates TP/SL against its own bid/ask execution feed.
 
         A level that is not supplied keeps its current value: it is read from
         the position and sent back unchanged, so a partial update changes only

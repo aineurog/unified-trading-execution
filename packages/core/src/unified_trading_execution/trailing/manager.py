@@ -76,13 +76,18 @@ from unified_trading_execution.trailing.types import (
     TrailingSpec,
     TrailingState,
 )
-from unified_trading_execution.types.enums import OrderSide
+from unified_trading_execution.types.enums import FillEntry, FillReason, OrderSide
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Ticker
-from unified_trading_execution.types.order import TpSlAttachment
+from unified_trading_execution.types.order import FillRecord, TpSlAttachment
 from unified_trading_execution.types.position import Position
 
 logger = logging.getLogger(__name__)
+
+# A synthetic trailing stop is a venue position stop, so the venue reports the
+# trigger as a stop-loss.  A terminal state is matched to its fill only while
+# the close is recent; an active state owns the leg's stop for its whole life.
+_TRAILING_FILL_MATCH_SECONDS = 120.0
 
 # Every lifecycle edge the manager may take.  Terminal phases have no exits.
 ALLOWED_TRAILING_TRANSITIONS: dict[TrailingPhase, frozenset[TrailingPhase]] = {
@@ -459,6 +464,21 @@ def _recovery_identity(
     return "position_identity_unverified", False
 
 
+def _fill_matches_position(fill_position_id: str | None, state_position_id: str) -> bool:
+    """Match a fill's leg id to a trailing state's ``{symbol}:{idx}`` id.
+
+    Adapters may report only ``positionIdx`` (for example ``"0"``) while a
+    trailing state stores ``"ETHUSDT:0"``; compare the suffix in that case.
+    A missing fill position id cannot disambiguate hedge legs, so the newest
+    matching state wins.
+    """
+    if fill_position_id is None:
+        return True
+    if fill_position_id == state_position_id:
+        return True
+    return state_position_id.rsplit(":", 1)[-1] == fill_position_id
+
+
 class TrailingManager:
     """Lifecycle and persistence for trailing states.
 
@@ -638,7 +658,7 @@ class TrailingManager:
 
         if will_write:
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     instrument,
                     position_id,
                     take_profit=(
@@ -647,6 +667,7 @@ class TrailingManager:
                         else None
                     ),
                     stop_loss=TpSlAttachment(trigger_price=stop) if stop is not None else None,
+                    trigger_basis=trigger_basis,
                 )
             except Exception as exc:
                 await self._attach_failed(arming, exc)
@@ -835,10 +856,11 @@ class TrailingManager:
                 await self._degrade_attach(armed, f"protection: native take profit: {error}")
                 raise error
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     instrument,
                     position_id,
                     take_profit=TpSlAttachment(trigger_price=take_profit),
+                    trigger_basis=armed.protection_trigger_basis,
                 )
             except Exception as exc:
                 reason = str(exc) or type(exc).__name__
@@ -985,6 +1007,36 @@ class TrailingManager:
             side=side, role="take_profit", level_price=price, reference_price=entry
         )
         return price
+
+    async def _modify_protection(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: TpSlAttachment | None = None,
+        stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
+    ) -> None:
+        """Write protection, passing the trigger basis only when resolved.
+
+        Omitting the keyword when the venue default applies keeps adapters that
+        predate the ``trigger_basis`` parameter working unchanged.
+        """
+        if trigger_basis is None:
+            await self._adapter.modify_position_tpsl(
+                instrument,
+                position_id,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+            )
+            return
+        await self._adapter.modify_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            trigger_basis=trigger_basis,
+        )
 
     async def _confirm_protection(
         self,
@@ -1176,10 +1228,11 @@ class TrailingManager:
                     reason="gap_start",
                 )
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     state.instrument,
                     state.position_id,
                     stop_loss=TpSlAttachment(trigger_price=candidate),
+                    trigger_basis=state.protection_trigger_basis,
                 )
             except Exception as exc:
                 if capability.reprice_gap:
@@ -1489,7 +1542,7 @@ class TrailingManager:
                 if not self._reserve_rate_limit():
                     return state
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         state.instrument,
                         state.position_id,
                         take_profit=(
@@ -1502,6 +1555,7 @@ class TrailingManager:
                             if write_stop is not None
                             else None
                         ),
+                        trigger_basis=state.protection_trigger_basis,
                     )
                 except Exception as exc:
                     return await self._record_protection_failure(
@@ -1898,7 +1952,7 @@ class TrailingManager:
                     state, "rate limit budget exhausted: rehydrate protection", now=now
                 )
             try:
-                await self._adapter.modify_position_tpsl(
+                await self._modify_protection(
                     state.instrument,
                     state.position_id,
                     take_profit=(
@@ -1911,6 +1965,7 @@ class TrailingManager:
                         if stop_to_write is not None
                         else None
                     ),
+                    trigger_basis=state.protection_trigger_basis,
                 )
             except Exception as exc:
                 return await self._rehydrate_degraded(
@@ -2010,10 +2065,11 @@ class TrailingManager:
                         now=now,
                     )
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         base.instrument,
                         base.position_id,
                         stop_loss=TpSlAttachment(trigger_price=first_stop),
+                        trigger_basis=base.protection_trigger_basis,
                     )
                 except Exception as exc:
                     return await self._rehydrate_degraded(
@@ -2089,10 +2145,11 @@ class TrailingManager:
                         reason="gap_start",
                     )
                 try:
-                    await self._adapter.modify_position_tpsl(
+                    await self._modify_protection(
                         base.instrument,
                         base.position_id,
                         stop_loss=TpSlAttachment(trigger_price=candidate),
+                        trigger_basis=base.protection_trigger_basis,
                     )
                 except Exception as exc:
                     if capability.reprice_gap:
@@ -2296,13 +2353,14 @@ class TrailingManager:
                 state, "rate limit budget exhausted: protection not resized"
             )
         try:
-            await self._adapter.modify_position_tpsl(
+            await self._modify_protection(
                 state.instrument,
                 state.position_id,
                 take_profit=(
                     TpSlAttachment(trigger_price=take_profit) if take_profit is not None else None
                 ),
                 stop_loss=(TpSlAttachment(trigger_price=stop) if stop is not None else None),
+                trigger_basis=state.protection_trigger_basis,
             )
         except Exception as exc:
             return await self._degrade_now(state, f"resize: {str(exc) or type(exc).__name__}")
@@ -2771,6 +2829,37 @@ class TrailingManager:
         self._require_ready()
         phases = tuple(ACTIVE_TRAILING_PHASES) if active_only else None
         return await self._state_store.list_trailing_states(instrument=instrument, phases=phases)
+
+    async def classify_fill(self, fill: FillRecord) -> FillRecord:
+        """Reclassify a synthetic trailing exit as ``TRAILING_STOP``.
+
+        Synthetic execution writes a normal venue position stop, so the venue
+        reports its trigger as a stop-loss.  When an owned synthetic state
+        covers the fill's leg and time, the stop that fired was the trailing
+        stop and the fill is not a plain stop loss.  Native trailing exits are
+        classified by the adapter and are left untouched.
+        """
+        if fill.reason is not FillReason.STOP_LOSS or fill.entry is not FillEntry.OUT:
+            return fill
+
+        phases = tuple(ACTIVE_TRAILING_PHASES | {TrailingPhase.DONE})
+        states = await self._state_store.list_trailing_states(
+            instrument=fill.instrument,
+            phases=phases,
+        )
+        for state in states:
+            if state.mode is not TrailingMode.SYNTHETIC or not state.stop_owned:
+                continue
+            if not _fill_matches_position(fill.position_id, state.position_id):
+                continue
+            if fill.fill_timestamp < state.created_at:
+                continue
+            if state.phase is TrailingPhase.DONE:
+                age = abs((fill.fill_timestamp - state.updated_at).total_seconds())
+                if age > _TRAILING_FILL_MATCH_SECONDS:
+                    continue
+            return replace(fill, reason=FillReason.TRAILING_STOP)
+        return fill
 
     def _require_ready(self) -> None:
         if not self._adapter.is_connected:

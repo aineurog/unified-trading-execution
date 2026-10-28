@@ -80,6 +80,7 @@ class FillReason(StrEnum):
     DEALER = "DEALER"  # dealer / desk
     STOP_LOSS = "STOP_LOSS"  # stop-loss triggered
     TAKE_PROFIT = "TAKE_PROFIT"  # take-profit triggered
+    TRAILING_STOP = "TRAILING_STOP"  # trailing stop triggered
     STOP_OUT = "STOP_OUT"  # margin stop-out
     ROLLOVER = "ROLLOVER"  # swap / rollover
     MARGIN = "MARGIN"  # variation-margin call

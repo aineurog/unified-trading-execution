@@ -321,6 +321,7 @@ class Adapter(ABC):
         *,
         take_profit: TpSlAttachment | None = None,
         stop_loss: TpSlAttachment | None = None,
+        trigger_basis: TrailingBasis | None = None,
     ) -> None:
         """Modify TP/SL on an existing open position.
 
@@ -332,6 +333,13 @@ class Adapter(ABC):
         Every side the caller does not mention is preserved.  An implementation
         that cannot guarantee that must not report
         ``PositionProtectionCapability.preserves_unmentioned_side``.
+
+        *trigger_basis* is the price feed the venue should watch to fire the
+        stop, resolved by the caller.  ``None`` means "use the venue default",
+        preserving the behavior of adapters and callers that predate this
+        keyword.  An adapter must only honor a basis it declares in
+        ``PositionProtectionCapability.trigger_bases`` and must never map one
+        it cannot express; ignore the keyword when the venue cannot set it.
 
         *position_id* is the platform-assigned position identifier (MT5 ticket,
         Bybit ``positionIdx``, IBKR ``conId``, ...).  It is scoped by
