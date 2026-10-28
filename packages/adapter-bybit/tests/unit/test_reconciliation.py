@@ -122,6 +122,30 @@ class TestFetchPositions:
         assert by_symbol["ETH"].quantity == Decimal("-2")
         assert by_symbol["ETH"].position_id == "ETHUSDT:0"
 
+    async def test_rest_position_reads_avg_price(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        rest_position = {
+            "symbol": "BTCUSDT",
+            "side": "Buy",
+            "size": "0.001",
+            "avgPrice": "80982.1",
+            "updatedTime": "1700000000000",
+        }
+        mock_pybit_http.get_positions.side_effect = [
+            _EMPTY,
+            ({"result": {"list": [rest_position], "category": "linear"}}, None, {}),
+            _EMPTY,
+        ]
+
+        result = await adapter.fetch_positions()
+
+        assert len(result) == 1
+        assert result[0].average_entry_price == Decimal("80982.1")
+
     async def test_paginates_across_cursor(
         self,
         adapter: BybitAdapter,

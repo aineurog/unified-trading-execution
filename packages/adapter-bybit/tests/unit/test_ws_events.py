@@ -193,6 +193,36 @@ class TestStreamsTranslation:
         )
         assert pos.quantity == Decimal("0")
 
+    def test_translate_position_rest_uses_avg_price(self) -> None:
+        # REST ``/v5/position/list`` reports the entry price as ``avgPrice``.
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("80982.1")
+
+    def test_translate_position_prefers_entry_price(self) -> None:
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "entryPrice": "95900.1",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("95900.1")
+
     def test_translate_wallet_preserves_invariant(self) -> None:
         member = {
             "accountType": "UNIFIED",

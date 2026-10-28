@@ -165,7 +165,12 @@ def translate_fill(
 
 
 def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Position:
-    """Build a ``Position`` from one ``position`` stream entry.
+    """Build a ``Position`` from one position entry (WebSocket or REST).
+
+    The WebSocket stream reports the average entry price as ``entryPrice``
+    while ``GET /v5/position/list`` reports it as ``avgPrice``; accept either so
+    a REST snapshot (for example the one seeded after a fill) never stores a
+    zero entry price.
 
     ``quantity`` follows the core convention: positive = long (``Buy``),
     negative = short (``Sell``), zero for a flat position (``side`` is empty).
@@ -190,7 +195,9 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
     return Position(
         instrument=instrument,
         quantity=quantity,
-        average_entry_price=_decimal(entry.get("entryPrice") or "0", "entryPrice"),
+        average_entry_price=_decimal(
+            entry.get("entryPrice") or entry.get("avgPrice") or "0", "entryPrice"
+        ),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
         position_id=position_id,
         opened_at=_parse_optional_ms(entry.get("createdTime")),
