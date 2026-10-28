@@ -492,6 +492,8 @@ class TestStreamEmission:
         # synthesized venue key, not dropped for lack of a client order id.
         assert len(captured) == 1
         assert captured[0].fill.client_order_id == "bybit-tpsl-cffa-trail"
+        assert captured[0].fill.reason == FillReason.TRAILING_STOP
+        assert captured[0].fill.entry == FillEntry.OUT
 
     def test_position_emits_update(self, adapter: BybitAdapter, event_bus: EventBus) -> None:
         adapter = self._wired_adapter(adapter)

@@ -66,6 +66,7 @@ _CREATE_TYPE_TO_FILL_REASON: dict[str, FillReason] = {
     "CreateByPartialTakeProfit": FillReason.TAKE_PROFIT,
     "CreateByStopLoss": FillReason.STOP_LOSS,
     "CreateByPartialStopLoss": FillReason.STOP_LOSS,
+    "CreateByTrailingStop": FillReason.TRAILING_STOP,
 }
 
 # Terminal states that free the order from the live order set and may be

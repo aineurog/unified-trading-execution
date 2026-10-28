@@ -452,6 +452,9 @@ class TestFetchFills:
         # A trailing-triggered close is a real fill — kept under the synthesized
         # key rather than dropped for lack of a client order id.
         assert set(result) == {"bybit-tpsl-cffa-trail"}
+        fill = result["bybit-tpsl-cffa-trail"][0]
+        assert fill.reason == FillReason.TRAILING_STOP
+        assert fill.entry == FillEntry.OUT
 
 
 class TestErrorTranslation:

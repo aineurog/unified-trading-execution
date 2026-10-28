@@ -1529,18 +1529,31 @@ class Engine:
         so it cannot know the dispatch-time ``correlation_id``.  The engine
         resolves it here from the persisted order snapshot.  Unknown tickets
         (empty ``client_order_id``, or no local order) keep the adapter's
-        ``client_order_id`` fallback.
+        ``client_order_id`` fallback.  The fill is then offered to the trailing
+        manager so a synthetic trailing exit is not recorded as a plain stop.
         """
-        if not fill.client_order_id:
+        stamped = fill
+        if fill.client_order_id:
+            try:
+                order = await self._store.get_order(fill.client_order_id)
+            except Exception:
+                logger.exception(
+                    "Failed to resolve correlation_id for fill %s", fill.platform_fill_id
+                )
+            else:
+                if order is not None:
+                    stamped = replace(fill, correlation_id=order.correlation_id)
+        return await self._classify_trailing_fill(stamped)
+
+    async def _classify_trailing_fill(self, fill: FillRecord) -> FillRecord:
+        manager = self._trailing_manager
+        if manager is None or not self._trailing_ready:
             return fill
         try:
-            order = await self._store.get_order(fill.client_order_id)
+            return await manager.classify_fill(fill)
         except Exception:
-            logger.exception("Failed to resolve correlation_id for fill %s", fill.platform_fill_id)
+            logger.exception("Failed to classify fill %s", fill.platform_fill_id)
             return fill
-        if order is None:
-            return fill
-        return replace(fill, correlation_id=order.correlation_id)
 
     async def _persist_fill(self, event: FillEvent) -> None:
         try:

@@ -49,10 +49,15 @@ from unified_trading_execution.trailing.types import (
     TrailingSpec,
 )
 from unified_trading_execution.trailing.worker import TrailingWorker
-from unified_trading_execution.types.enums import AssetClass, OrderSide
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    FillEntry,
+    FillReason,
+    OrderSide,
+)
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
-from unified_trading_execution.types.order import TpSlAttachment
+from unified_trading_execution.types.order import FillRecord, TpSlAttachment
 from unified_trading_execution.types.position import Position
 
 NOW = datetime(2026, 7, 28, 12, 0, 0, tzinfo=UTC)
@@ -685,6 +690,74 @@ class TestSyntheticAttach:
         with pytest.raises(TrailingStateError, match="already attached"):
             await manager.attach(TrailingRequest(make_inst(), make_spec()))
         assert len(await manager.list(active_only=True)) == 1
+
+
+class TestFillClassification:
+    @staticmethod
+    def make_fill(
+        *,
+        reason: FillReason = FillReason.STOP_LOSS,
+        entry: FillEntry = FillEntry.OUT,
+        position_id: str | None = "1",
+        timestamp: datetime = NOW,
+    ) -> FillRecord:
+        return FillRecord(
+            client_order_id="bybit-tpsl-close",
+            platform_fill_id="fill-close",
+            instrument=make_inst(),
+            fill_quantity=Decimal("1"),
+            fill_price=Decimal("49900"),
+            fill_timestamp=timestamp,
+            fee_currency="USDT",
+            fee_amount=Decimal("0"),
+            correlation_id="bybit-tpsl-close",
+            position_id=position_id,
+            reason=reason,
+            entry=entry,
+        )
+
+    async def test_synthetic_stop_loss_becomes_a_trailing_stop(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        classified = await manager.classify_fill(self.make_fill())
+
+        assert classified.reason is FillReason.TRAILING_STOP
+        assert classified.entry is FillEntry.OUT
+
+    async def test_done_synthetic_state_still_classifies_its_close(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        await manager.on_position_update(make_position(quantity="0"))
+
+        classified = await manager.classify_fill(self.make_fill())
+
+        assert classified.reason is FillReason.TRAILING_STOP
+
+    async def test_unowned_or_unrelated_stop_loss_is_unchanged(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store)
+        await manager.attach(TrailingRequest(make_inst(), make_spec()))
+
+        other_leg = await manager.classify_fill(self.make_fill(position_id="2"))
+        take_profit = await manager.classify_fill(
+            self.make_fill(reason=FillReason.TAKE_PROFIT, entry=FillEntry.OUT)
+        )
+
+        assert other_leg.reason is FillReason.STOP_LOSS
+        assert take_profit.reason is FillReason.TAKE_PROFIT
+
+    async def test_native_state_does_not_reclassify_a_stop_loss(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.mode is TrailingMode.NATIVE
+
+        classified = await manager.classify_fill(self.make_fill())
+
+        assert classified.reason is FillReason.STOP_LOSS
 
 
 class TestLifecycle:
