@@ -227,6 +227,21 @@ class TestStreamsTranslation:
         )
         assert pos.average_entry_price == Decimal("80982.1")
 
+    def test_translate_position_treats_zero_entry_price_as_absent(self) -> None:
+        pos = streams.translate_position(
+            {
+                "symbol": "BTCUSDT",
+                "category": "linear",
+                "side": "Buy",
+                "size": "0.5",
+                "entryPrice": "0",
+                "avgPrice": "80982.1",
+                "updatedTime": "1700000000000",
+            },
+            instrument=_BTCUSDT,
+        )
+        assert pos.average_entry_price == Decimal("80982.1")
+
     def test_translate_position_prefers_entry_price(self) -> None:
         pos = streams.translate_position(
             {

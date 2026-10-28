@@ -211,12 +211,13 @@ def translate_position(entry: dict[str, Any], *, instrument: Instrument) -> Posi
 
     venue_symbol = to_bybit_symbol(instrument)
     position_id = f"{venue_symbol}:{idx}"
+    entry_price = _optional_decimal(entry.get("entryPrice"))
+    if entry_price is None:
+        entry_price = _optional_decimal(entry.get("avgPrice"))
     return Position(
         instrument=instrument,
         quantity=quantity,
-        average_entry_price=_decimal(
-            entry.get("entryPrice") or entry.get("avgPrice") or "0", "entryPrice"
-        ),
+        average_entry_price=entry_price if entry_price is not None else Decimal("0"),
         updated_at=_parse_ms(entry.get("updatedTime"), "updatedTime"),
         position_id=position_id,
         opened_at=_parse_optional_ms(entry.get("createdTime")),

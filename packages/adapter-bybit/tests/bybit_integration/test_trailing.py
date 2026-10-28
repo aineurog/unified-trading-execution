@@ -33,6 +33,7 @@ from unified_trading_execution.state.store import SQLiteStateStore
 from unified_trading_execution.trailing import (
     CandleTimeframe,
     NativeTrailingRequest,
+    NativeTrailingResult,
     TrailingBasis,
     TrailingMode,
     TrailingOffsetType,
@@ -134,6 +135,84 @@ async def _open_long_position(
     return position, quantity
 
 
+_POSITION_MODE_ERROR = "position idx not match position mode"
+
+
+async def _reconcile_position_mode(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    store: SQLiteStateStore,
+) -> None:
+    """Attach a store and seed it with the venue's per-symbol position mode.
+
+    The adapter resolves ``positionIdx`` from stored intent, not from the
+    venue, so an order placed before any mode intent is stored defaults to
+    one-way and is rejected on a hedge-mode symbol.
+    """
+    await store.initialize()
+    adapter.attach_state_store(store)
+    mode_key = adapter._position_mode_key(instrument)
+    mode = await adapter.get_position_mode(instrument)
+    if mode is not None:
+        await store.set_adapter_config(mode_key, mode.value)
+
+
+async def _open_position_reconciling_mode(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    reference_price: Decimal,
+    store: SQLiteStateStore,
+) -> tuple[Position, Decimal]:
+    """Open one long leg, retrying in hedge mode when the venue disagrees."""
+    await _reconcile_position_mode(adapter, instrument, store)
+    try:
+        return await _open_long_position(adapter, instrument, reference_price)
+    except PlatformError as exc:
+        if _POSITION_MODE_ERROR not in str(exc):
+            raise
+        await store.set_adapter_config(adapter._position_mode_key(instrument), "hedge")
+        return await _open_long_position(adapter, instrument, reference_price)
+
+
+async def _wait_for_native_trail(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    position_id: str,
+    *,
+    timeout: float = 5.0,
+) -> NativeTrailingResult:
+    """Poll the position snapshot until the just-written trail is visible.
+
+    Testnet's ``get_positions`` snapshot lags a ``set_trading_stop`` that has
+    already been accepted, so a one-shot read-back is racy.
+    """
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        result = await adapter.get_position_trailing_stop(instrument, position_id)
+        if result is not None:
+            return result
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"native trail for {instrument.symbol} did not appear")
+        await asyncio.sleep(0.25)
+
+
+async def _wait_for_no_native_trail(
+    adapter: BybitAdapter,
+    instrument: Instrument,
+    position_id: str,
+    *,
+    timeout: float = 5.0,
+) -> None:
+    """Poll until the venue snapshot no longer reports a native trail."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if await adapter.get_position_trailing_stop(instrument, position_id) is None:
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError(f"native trail for {instrument.symbol} did not clear")
+        await asyncio.sleep(0.25)
+
+
 def _native_id(position: Position) -> str:
     assert position.position_id is not None
     return f"{position.position_id}:trailing"
@@ -165,13 +244,15 @@ async def linear_position(
     connected_adapter: BybitAdapter,
     linear_instrument: Instrument,
     linear_reference_price: Decimal,
+    tmp_path: Path,
 ) -> AsyncIterator[tuple[Position, Decimal]]:
     """Open a minimal long position and always flatten it afterwards."""
     if linear_instrument.asset_class is not AssetClass.FUTURES:
         pytest.skip("trailing positions exist only on derivatives")
 
-    position, quantity = await _open_long_position(
-        connected_adapter, linear_instrument, linear_reference_price
+    store = SQLiteStateStore(str(tmp_path / "linear-position.db"))
+    position, quantity = await _open_position_reconciling_mode(
+        connected_adapter, linear_instrument, linear_reference_price, store
     )
     try:
         yield position, quantity
@@ -205,24 +286,9 @@ async def inverse_position(
         pytest.skip("trailing positions exist only on derivatives")
 
     store = SQLiteStateStore(str(tmp_path / "inverse-position.db"))
-    await store.initialize()
-    connected_adapter.attach_state_store(store)
-    mode_key = connected_adapter._position_mode_key(inverse_instrument)
-    mode = await connected_adapter.get_position_mode(inverse_instrument)
-    if mode is not None:
-        await store.set_adapter_config(mode_key, mode.value)
-
-    try:
-        position, quantity = await _open_long_position(
-            connected_adapter, inverse_instrument, inverse_reference_price
-        )
-    except PlatformError as exc:
-        if "position idx not match position mode" not in str(exc):
-            raise
-        await store.set_adapter_config(mode_key, "hedge")
-        position, quantity = await _open_long_position(
-            connected_adapter, inverse_instrument, inverse_reference_price
-        )
+    position, quantity = await _open_position_reconciling_mode(
+        connected_adapter, inverse_instrument, inverse_reference_price, store
+    )
 
     try:
         yield position, quantity
@@ -250,10 +316,10 @@ async def trailing_engine(
         pytest.skip("trailing positions exist only on derivatives")
 
     await cleanup_open_orders(connected_adapter)
-    position, quantity = await _open_long_position(
-        connected_adapter, linear_instrument, linear_reference_price
-    )
     store = SQLiteStateStore(str(tmp_path / "trailing-engine.db"))
+    position, quantity = await _open_position_reconciling_mode(
+        connected_adapter, linear_instrument, linear_reference_price, store
+    )
     engine = Engine(
         adapter=connected_adapter,
         state_store=store,
@@ -322,10 +388,9 @@ async def test_native_trailing_place_replace_and_cancel(
     )
     assert placed.position_scoped
     assert placed.confirmed_offset is not None
-    stored = await connected_adapter.get_position_trailing_stop(
-        linear_instrument, position.position_id
+    stored = await _wait_for_native_trail(
+        connected_adapter, linear_instrument, position.position_id
     )
-    assert stored is not None
     assert stored.confirmed_offset == initial
 
     replaced = await connected_adapter.place_trailing_stop(
@@ -333,20 +398,16 @@ async def test_native_trailing_place_replace_and_cancel(
     )
     assert replaced.confirmed_offset is not None
     assert replaced.confirmed_offset <= initial
-    stored_after = await connected_adapter.get_position_trailing_stop(
-        linear_instrument, position.position_id
+    stored_after = await _wait_for_native_trail(
+        connected_adapter, linear_instrument, position.position_id
     )
-    assert stored_after is not None
     assert stored_after.confirmed_offset == tightened
 
     await connected_adapter.cancel_trailing_stop(
         replaced.native_id,
         linear_instrument,
     )
-    assert (
-        await connected_adapter.get_position_trailing_stop(linear_instrument, position.position_id)
-        is None
-    )
+    await _wait_for_no_native_trail(connected_adapter, linear_instrument, position.position_id)
 
 
 async def test_native_trailing_preserves_static_take_profit(
@@ -374,10 +435,7 @@ async def test_native_trailing_preserves_static_take_profit(
         await connected_adapter.place_trailing_stop(
             _request(linear_instrument, position, quantity, offset)
         )
-        stored = await connected_adapter.get_position_trailing_stop(
-            linear_instrument, position.position_id
-        )
-        assert stored is not None
+        await _wait_for_native_trail(connected_adapter, linear_instrument, position.position_id)
         after = await connected_adapter.get_position_tpsl(linear_instrument, position.position_id)
         assert after is not None
         assert after[0] is not None
@@ -393,6 +451,67 @@ async def test_native_trailing_preserves_static_take_profit(
                 linear_instrument,
                 position.position_id,
                 take_profit=True,
+            )
+
+
+async def test_static_protection_writes_preserve_the_unmentioned_side(
+    connected_adapter: BybitAdapter,
+    linear_instrument: Instrument,
+    linear_position: tuple[Position, Decimal],
+) -> None:
+    """Verify the venue merges one-sided writes and one-sided clears."""
+    position, _ = linear_position
+    assert position.position_id is not None
+    spec = await connected_adapter.fetch_instrument_spec(linear_instrument)
+    last = await connected_adapter.fetch_ticker(linear_instrument)
+    assert last is not None and last.last is not None
+
+    take_profit_price = align_to_tick(last.last * Decimal("1.3"), spec.tick_size)
+    stop_loss_price = align_to_tick(last.last * Decimal("0.9"), spec.tick_size)
+    await connected_adapter.modify_position_tpsl(
+        linear_instrument,
+        position.position_id,
+        take_profit=TpSlAttachment(trigger_price=take_profit_price),
+        stop_loss=TpSlAttachment(trigger_price=stop_loss_price),
+    )
+    try:
+        both = await connected_adapter.get_position_tpsl(linear_instrument, position.position_id)
+        assert both is not None
+        assert both[0] is not None
+        assert both[0].trigger_price == take_profit_price
+        assert both[1] is not None
+        assert both[1].trigger_price == stop_loss_price
+
+        tightened_tp = align_to_tick(last.last * Decimal("1.25"), spec.tick_size)
+        await connected_adapter.modify_position_tpsl(
+            linear_instrument,
+            position.position_id,
+            take_profit=TpSlAttachment(trigger_price=tightened_tp),
+        )
+        updated = await connected_adapter.get_position_tpsl(linear_instrument, position.position_id)
+        assert updated is not None
+        assert updated[0] is not None
+        assert updated[0].trigger_price == tightened_tp
+        assert updated[1] is not None
+        assert updated[1].trigger_price == stop_loss_price
+
+        await connected_adapter.clear_position_tpsl(
+            linear_instrument,
+            position.position_id,
+            take_profit=True,
+        )
+        cleared = await connected_adapter.get_position_tpsl(linear_instrument, position.position_id)
+        assert cleared is not None
+        assert cleared[0] is None
+        assert cleared[1] is not None
+        assert cleared[1].trigger_price == stop_loss_price
+    finally:
+        with contextlib.suppress(Exception):
+            await connected_adapter.clear_position_tpsl(
+                linear_instrument,
+                position.position_id,
+                take_profit=True,
+                stop_loss=True,
             )
 
 
@@ -465,10 +584,9 @@ async def test_native_trailing_works_on_inverse_perpetuals(
     try:
         assert placed.position_scoped
         assert placed.native_id == _native_id(position)
-        stored = await connected_adapter.get_position_trailing_stop(
-            inverse_instrument, position.position_id
+        stored = await _wait_for_native_trail(
+            connected_adapter, inverse_instrument, position.position_id
         )
-        assert stored is not None
         assert stored.confirmed_offset == offset
         assert stored.current_stop is None
 
@@ -482,22 +600,16 @@ async def test_native_trailing_works_on_inverse_perpetuals(
             )
         )
         assert replaced.confirmed_offset == tightened
-        stored_after = await connected_adapter.get_position_trailing_stop(
-            inverse_instrument, position.position_id
+        stored_after = await _wait_for_native_trail(
+            connected_adapter, inverse_instrument, position.position_id
         )
-        assert stored_after is not None
         assert stored_after.confirmed_offset == tightened
 
         await connected_adapter.cancel_trailing_stop(
             replaced.native_id,
             inverse_instrument,
         )
-        assert (
-            await connected_adapter.get_position_trailing_stop(
-                inverse_instrument, position.position_id
-            )
-            is None
-        )
+        await _wait_for_no_native_trail(connected_adapter, inverse_instrument, position.position_id)
     finally:
         with contextlib.suppress(Exception):
             await connected_adapter.cancel_trailing_stop(
@@ -590,8 +702,7 @@ async def test_native_attach_arms_a_position_scoped_trail(
     assert state.native_id == _native_id(position)
     assert state.current_stop is None
 
-    stored = await adapter.get_position_trailing_stop(instrument, position.position_id)
-    assert stored is not None
+    stored = await _wait_for_native_trail(adapter, instrument, position.position_id)
     assert stored.native_id == _native_id(position)
     assert stored.confirmed_offset == offset
     assert stored.current_stop is None
@@ -643,7 +754,7 @@ async def test_native_cancel_always_removes_the_trail(
     )
 
     assert cancelled.phase is TrailingPhase.CANCELLED
-    assert await adapter.get_position_trailing_stop(instrument, position.position_id) is None
+    await _wait_for_no_native_trail(adapter, instrument, position.position_id)
     after = await adapter.get_position_tpsl(instrument, position.position_id)
     assert after is not None
     assert after[0] is not None
@@ -670,8 +781,7 @@ async def test_native_attach_requires_takeover_for_an_existing_native_trail(
     await adapter.place_trailing_stop(
         _request(instrument, position, harness.quantity, previous_offset)
     )
-    previous = await adapter.get_position_trailing_stop(instrument, position.position_id)
-    assert previous is not None
+    previous = await _wait_for_native_trail(adapter, instrument, position.position_id)
     assert previous.confirmed_offset == previous_offset
 
     new_offset = align_to_tick(ticker.last * Decimal("0.01"), spec.tick_size)
@@ -685,8 +795,7 @@ async def test_native_attach_requires_takeover_for_an_existing_native_trail(
         await harness.engine.trailing.attach(request)
 
     assert await harness.engine.trailing.list(active_only=True) == []
-    unchanged = await adapter.get_position_trailing_stop(instrument, position.position_id)
-    assert unchanged is not None
+    unchanged = await _wait_for_native_trail(adapter, instrument, position.position_id)
     assert unchanged.confirmed_offset == previous_offset
 
     state = await harness.engine.trailing.attach(
@@ -700,8 +809,7 @@ async def test_native_attach_requires_takeover_for_an_existing_native_trail(
 
     assert state.mode is TrailingMode.NATIVE
     assert state.phase is TrailingPhase.ARMED
-    replaced = await adapter.get_position_trailing_stop(instrument, position.position_id)
-    assert replaced is not None
+    replaced = await _wait_for_native_trail(adapter, instrument, position.position_id)
     assert replaced.confirmed_offset == new_offset
 
     takeovers = await _audit_payloads(harness.store, "trailing.takeover")
