@@ -6,7 +6,7 @@ Tests cases:
     - fetch_positions: one Position per terminal leg, skips unknown symbols
     - fetch_positions: ``positions_get()`` failure raises PlatformError
     - fetch_balances: free is derived as total - used (invariant preserved)
-    - get_rate_limits: returns the conservative fixed estimate
+    - get_rate_limits: returns the configured client-side pacing budget
     - fetch_open_orders: builds OrderRecords for LIMIT/STOP/STOP_LIMIT
     - fetch_open_orders: unknown ticket keys by platform id, bad symbols skipped
     - fetch_open_orders: unknown type/state raises PlatformError
@@ -27,7 +27,10 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.mt5 import MT5Adapter
-from unified_trading_execution.mt5.adapter import _DEAL_QUERY_BACKLOG_SECONDS
+from unified_trading_execution.mt5.adapter import (
+    _DEAL_QUERY_BACKLOG_SECONDS,
+    _RATE_LIMIT_REQUESTS_PER_SECOND,
+)
 from unified_trading_execution.mt5.comments import encode_client_order_id
 from unified_trading_execution.types.enums import (
     AssetClass,
@@ -273,15 +276,15 @@ class TestFetchAccountLeverage:
 
 
 class TestGetRateLimits:
-    """get_rate_limits — the conservative fixed estimate."""
+    """get_rate_limits — the client-side pacing budget."""
 
-    async def test_returns_conservative_estimate(self, adapter: MT5Adapter) -> None:
-        """MT5 has no rate-limit endpoint; a fixed 1 req/sec is reported."""
+    async def test_reports_the_adapter_pacing_budget(self, adapter: MT5Adapter) -> None:
+        """MT5 has no rate-limit endpoint; the adapter's own budget is reported."""
         limits = await adapter.get_rate_limits()
 
-        assert limits.requests_per_interval == 1
+        assert limits.requests_per_interval == _RATE_LIMIT_REQUESTS_PER_SECOND
         assert limits.interval_seconds == 1.0
-        assert limits.remaining == 1
+        assert limits.remaining == _RATE_LIMIT_REQUESTS_PER_SECOND
         assert isinstance(limits.reset_at, datetime)
 
 

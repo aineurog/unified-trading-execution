@@ -13,3 +13,6 @@ All notable changes to the Unified Trading Execution project will be documented 
 - uv workspace configuration, linting (ruff), type checking (mypy), and layering enforcement (import-linter).
 - Bybit trailing stops: native position trailing on linear and inverse perpetuals,
   synthetic fallback for percent/ATR, takeover audits, and market data support.
+- MT5 synthetic trailing stops: ticket-specific protection, bid/ask trigger
+  behavior, ATR candle support, and persisted restart recovery; native trailing
+  is unsupported.

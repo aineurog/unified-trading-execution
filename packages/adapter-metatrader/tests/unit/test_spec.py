@@ -35,6 +35,9 @@ def _spec_info(**overrides: object) -> MagicMock:
         "digits": 5,
         "trade_mode": 4,  # SYMBOL_TRADE_MODE_FULL
         "trade_tick_size": 0.00001,
+        "point": 0.00001,
+        "trade_stops_level": 20,
+        "spread": 10,
         "volume_min": 0.01,
         "volume_max": 100.0,
         "volume_step": 0.01,
@@ -63,6 +66,65 @@ class TestFetchInstrumentSpec:
         assert spec.price_precision == 5
         assert spec.qty_precision == 2
         assert spec.max_leverage is None
+        assert spec.min_stop_distance == Decimal("0.0002")
+
+    async def test_min_stop_distance_uses_stops_level(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """The broker's stops level wins when it exceeds the current spread."""
+        mock_mt5_module.symbol_info.return_value = _spec_info(
+            point=0.00001, trade_stops_level=25, spread=5
+        )
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+
+        assert spec.min_stop_distance == Decimal("0.00025")
+
+    async def test_min_stop_distance_uses_spread_as_floor(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A spread wider than the stops level becomes the effective minimum."""
+        mock_mt5_module.symbol_info.return_value = _spec_info(
+            point=0.00001, trade_stops_level=10, spread=30
+        )
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+
+        assert spec.min_stop_distance == Decimal("0.0003")
+
+    async def test_min_stop_distance_none_without_a_broker_rule(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """No stops level and no spread means the broker publishes no rule."""
+        mock_mt5_module.symbol_info.return_value = _spec_info(
+            point=0.00001, trade_stops_level=0, spread=0
+        )
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+
+        assert spec.min_stop_distance is None
+
+    async def test_min_stop_distance_falls_back_to_tick_size(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A zero ``point`` uses ``trade_tick_size`` as the point size."""
+        mock_mt5_module.symbol_info.return_value = _spec_info(
+            point=0, trade_tick_size=0.00001, trade_stops_level=20, spread=0
+        )
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+
+        assert spec.min_stop_distance == Decimal("0.0002")
+
+    async def test_min_stop_distance_is_decimal(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """The distance is exact decimal math, not a float."""
+        mock_mt5_module.symbol_info.return_value = _spec_info()
+
+        spec = await adapter.fetch_instrument_spec(_instrument())
+
+        assert isinstance(spec.min_stop_distance, Decimal)
 
     async def test_selects_symbol_before_fetch(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter

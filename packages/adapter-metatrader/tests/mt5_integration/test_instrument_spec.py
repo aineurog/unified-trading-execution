@@ -12,6 +12,7 @@ Broker symbols default to ``EURUSD`` / ``XAUUSD`` and can be overridden via
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -77,3 +78,22 @@ async def test_spec_cached_across_calls(connected_adapter: MT5Adapter) -> None:
     first = await connected_adapter.fetch_instrument_spec(_EURUSD)
     second = await connected_adapter.fetch_instrument_spec(_EURUSD)
     assert first is second
+
+
+async def test_min_stop_distance_follows_the_terminal_rule(
+    connected_adapter: MT5Adapter,
+) -> None:
+    """A published broker rule yields a live, positive decimal distance."""
+    import MetaTrader5 as mt5
+
+    spec = await connected_adapter.fetch_instrument_spec(_EURUSD)
+
+    info = mt5.symbol_info(_BROKER_SYMBOL)
+    assert info is not None
+    publishes_rule = info.trade_stops_level > 0 or info.spread > 0
+
+    if publishes_rule:
+        assert isinstance(spec.min_stop_distance, Decimal)
+        assert spec.min_stop_distance > 0
+    else:
+        assert spec.min_stop_distance is None

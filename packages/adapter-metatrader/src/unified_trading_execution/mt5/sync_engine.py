@@ -35,6 +35,7 @@ from unified_trading_execution.mt5.config import MT5Config
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
 from unified_trading_execution.sync import SyncEngine
+from unified_trading_execution.trailing import TrailingConfig
 from unified_trading_execution.types.instrument import Instrument
 
 
@@ -57,6 +58,7 @@ class SyncMT5Engine(SyncEngine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        trailing_config: TrailingConfig | None = None,
         reconcile_interval_seconds: float | None = DEFAULT_RECONCILE_INTERVAL_SECONDS,
         fill_settle_lag_seconds: float = DEFAULT_FILL_SETTLE_LAG_SECONDS,
     ) -> None:
@@ -68,6 +70,7 @@ class SyncMT5Engine(SyncEngine):
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            trailing_config=trailing_config,
             reconcile_interval_seconds=reconcile_interval_seconds,
             fill_settle_lag_seconds=fill_settle_lag_seconds,
         )

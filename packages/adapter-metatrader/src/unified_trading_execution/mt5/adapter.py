@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING, Any
 
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+)
 from unified_trading_execution.errors import (
     AccountChangedError,
     InvalidSymbolError,
@@ -70,7 +75,7 @@ from unified_trading_execution.mt5.orders import (
     parse_order_record,
 )
 from unified_trading_execution.mt5.symbols import to_mt5_symbol
-from unified_trading_execution.trailing.types import TrailingBasis
+from unified_trading_execution.trailing.types import CandleTimeframe, TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     FillEntry,
@@ -83,7 +88,7 @@ from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
 )
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -108,6 +113,32 @@ _RECOVERY_DEAL_LOOKBACK_SECONDS = 24 * 60 * 60
 _MAX_OFFSET_PROBE_SYMBOLS = 20
 _MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
 
+# MT5 timeframe constants.  The terminal publishes H8 and H12 in addition to
+# the usual intraday set, so every core timeframe is native.
+_MT5_CANDLE_TIMEFRAMES: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 1,
+    CandleTimeframe.M5: 5,
+    CandleTimeframe.M15: 15,
+    CandleTimeframe.M30: 30,
+    CandleTimeframe.H1: 16385,
+    CandleTimeframe.H4: 16388,
+    CandleTimeframe.H8: 16392,
+    CandleTimeframe.H12: 16396,
+    CandleTimeframe.D1: 16408,
+}
+
+_CANDLE_SECONDS: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 60,
+    CandleTimeframe.M5: 5 * 60,
+    CandleTimeframe.M15: 15 * 60,
+    CandleTimeframe.M30: 30 * 60,
+    CandleTimeframe.H1: 60 * 60,
+    CandleTimeframe.H4: 4 * 60 * 60,
+    CandleTimeframe.H8: 8 * 60 * 60,
+    CandleTimeframe.H12: 12 * 60 * 60,
+    CandleTimeframe.D1: 24 * 60 * 60,
+}
+
 # After symbol_select() the terminal subscribes to quotes asynchronously —
 # symbol_info_tick() can briefly return None.  MARKET orders retry the fetch.
 _MARKET_TICK_RETRIES = 3
@@ -118,6 +149,11 @@ _MARKET_TICK_RETRY_DELAY_SECONDS = 0.1
 # balance instead of aborting reconciliation.
 _BALANCE_FETCH_RETRIES = 3
 _BALANCE_RETRY_DELAY_SECONDS = 0.1
+
+# Client-side pacing reported to the engine's rate limiter.  MT5 publishes no
+# numeric limit and brokers enforce their own server-side flood control, so
+# this is a heuristic, not broker truth; the engine can override it.
+_RATE_LIMIT_REQUESTS_PER_SECOND = 10
 
 # MT5 DEAL_REASON → FillReason.  The three client-side channels (manual,
 # mobile, web) collapse into CLIENT; there is no MT5 analogue of DEALER.
@@ -210,6 +246,42 @@ def _decimal_places(value: Decimal) -> int:
     if not isinstance(exponent, int):
         return 0
     return max(0, -exponent)
+
+
+def _points_value(raw: object) -> Decimal:
+    """Coerce an MT5 point count to ``Decimal``; unknown values become zero."""
+    try:
+        return Decimal(str(raw))
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _bar_value(bar: Any, name: str) -> Any:
+    """Read one field from a ``copy_rates_from_pos`` bar (array or named tuple)."""
+    try:
+        return bar[name]
+    except (IndexError, KeyError, TypeError):
+        return getattr(bar, name)
+
+
+def _min_stop_distance(info: Any) -> Decimal | None:
+    """Return the broker's minimum stop distance as a price, or ``None``.
+
+    MT5 publishes the rule in points: ``trade_stops_level`` is the broker's
+    minimum and the current spread can be the effective floor, so the distance
+    is ``max(trade_stops_level, spread) * point``.  Some builds report a zero
+    ``point``, in which case ``trade_tick_size`` is the point size.  A broker
+    that publishes neither a stops level nor a spread imposes no rule, so the
+    field stays ``None`` instead of inventing a distance.
+    """
+    point = _points_value(getattr(info, "point", 0))
+    if point <= 0:
+        point = _points_value(getattr(info, "trade_tick_size", 0))
+    stops_level = _points_value(getattr(info, "trade_stops_level", 0))
+    spread = _points_value(getattr(info, "spread", 0))
+    if point <= 0 or (stops_level <= 0 and spread <= 0):
+        return None
+    return max(stops_level, spread) * point
 
 
 # MT5 symbol market-path segment → canonical AssetClass.  This is a *thesaurus*
@@ -380,7 +452,10 @@ class MT5Adapter(Adapter):
 
         # Server-as-epoch minus real-UTC epoch (seconds); measured from a live
         # tick and refreshed each poll cycle — see _server_time_offset_seconds.
+        # ``_measured`` distinguishes a genuine UTC+0 broker from "no tick yet":
+        # an unmeasured offset must never be used to invent an open time.
         self._server_time_offset: int = 0
+        self._server_time_offset_measured: bool = False
 
         # Broker symbol → canonical Instrument cache for inbound reconstruction.
         # Seeded at connect from the state store, extended on every outbound
@@ -943,6 +1018,51 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_read)
 
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named TP/SL sides on an open MT5 position.
+
+        *position_id* is the MT5 position ticket (as a string); *instrument*
+        resolves the broker symbol the request also requires.  MT5 has no
+        removal request for position protection, so both sides are always sent:
+        a cleared side is ``0.0`` and a preserved side is read back and sent
+        unchanged.  At least one flag must be true.
+
+        A confirmed flat position has no protection to clear and returns
+        quietly.  A read failure raises the mapped transport error and never
+        sends a blind ``TRADE_ACTION_SLTP`` request.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+        mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
+
+        def _clear() -> None:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
+            current = self._read_position_tpsl_sync(mt5, position_id)
+            if current is None:
+                return
+            current_tp, current_sl = current
+            resolved_tp = None if take_profit else current_tp
+            resolved_sl = None if stop_loss else current_sl
+            request = build_mt5_sltp_request(
+                position_id,
+                mt5_symbol,
+                take_profit=float(resolved_tp) if resolved_tp is not None else 0.0,
+                stop_loss=float(resolved_sl) if resolved_sl is not None else 0.0,
+                mt5_module=mt5,
+            )
+            result = mt5.order_send(request)
+            parse_mt5_result(result, position_id, mt5_module=mt5)
+
+        await asyncio.to_thread(_clear)
+
     # ------------------------------------------------------------------
     # Instrument metadata
     # ------------------------------------------------------------------
@@ -993,6 +1113,7 @@ class MT5Adapter(Adapter):
             min_notional=Decimal("0"),
             price_precision=int(info.digits),
             qty_precision=_decimal_places(volume_step),
+            min_stop_distance=_min_stop_distance(info),
         )
         self._spec_cache[instrument] = (spec, _utcnow())
         return spec
@@ -1023,6 +1144,60 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_read)
 
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles through ``copy_rates_from_pos``.
+
+        MT5 returns bars present-to-past, so the result is reversed to oldest
+        first.  Bar times are server-as-epoch and the measured server offset is
+        applied before a bar whose close has not passed is rejected.  ``limit``
+        is the maximum number of closed candles returned.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        mt5_timeframe = _MT5_CANDLE_TIMEFRAMES.get(timeframe)
+        if mt5_timeframe is None:
+            raise UnsupportedOrderTypeError(
+                f"MT5 does not support the {timeframe.value} candle timeframe"
+            )
+        mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
+
+        def _fetch() -> list[Candle]:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
+            rates = mt5.copy_rates_from_pos(mt5_symbol, mt5_timeframe, 0, limit + 1)
+            if rates is None:
+                code, desc = mt5.last_error()
+                raise map_mt5_error(
+                    code, desc or f"copy_rates_from_pos({mt5_symbol!r}) returned None"
+                )
+            offset = self._server_time_offset_seconds(mt5, candidates=(mt5_symbol,))
+            now = _utcnow()
+            candles: list[Candle] = []
+            for bar in reversed(rates):
+                open_time = from_mt5_epoch(_bar_value(bar, "time"), offset)
+                close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
+                if close_time > now:
+                    continue
+                candles.append(
+                    Candle(
+                        open_time=open_time,
+                        close_time=close_time,
+                        open=Decimal(str(_bar_value(bar, "open"))),
+                        high=Decimal(str(_bar_value(bar, "high"))),
+                        low=Decimal(str(_bar_value(bar, "low"))),
+                        close=Decimal(str(_bar_value(bar, "close"))),
+                    )
+                )
+            return candles[-limit:]
+
+        return await asyncio.to_thread(_fetch)
+
     # ------------------------------------------------------------------
     # Capability reporting
     # ------------------------------------------------------------------
@@ -1038,6 +1213,61 @@ class MT5Adapter(Adapter):
             }
         )
 
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Declare static position TP/SL support for MT5.
+
+        MT5 carries take profit and stop loss as price levels on the position
+        ticket.  Both sides can be set, read, and cleared; a partial write
+        preserves the side it does not mention.  The terminal triggers a long
+        stop on the bid and a short stop on the ask, so ``BID`` and ``ASK`` are
+        the trigger bases this surface can express.
+
+        The declaration is pure and performs no terminal read.  An instrument
+        without a usable ``platform_symbol`` cannot be addressed by MT5, so it
+        gets the base class's unsupported default instead of raising.
+        """
+        try:
+            mt5_symbol = to_mt5_symbol(instrument)
+        except (InvalidSymbolError, ValueError):
+            return super().position_protection_capability(instrument)
+        if not mt5_symbol.strip():
+            return super().position_protection_capability(instrument)
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.BID, TrailingBasis.ASK}),
+            min_reprice_interval_seconds=1.0,
+            reprice_gap=False,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Declare the ticker and candle data MT5 can serve for *instrument*.
+
+        ``fetch_ticker`` populates bid, ask, and last (when the symbol has
+        traded) and never a mark price.  The terminal publishes every core
+        candle timeframe, including H8 and H12.  An instrument without a usable
+        ``platform_symbol`` cannot be addressed, so it gets the unsupported
+        default instead of raising.
+        """
+        try:
+            mt5_symbol = to_mt5_symbol(instrument)
+        except (InvalidSymbolError, ValueError):
+            return super().market_data_capability(instrument)
+        if not mt5_symbol.strip():
+            return super().market_data_capability(instrument)
+        return MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
+            min_ticker_interval_seconds=1.0,
+            candle_timeframes=frozenset(_MT5_CANDLE_TIMEFRAMES),
+            streaming_ticker=False,
+        )
+
     # ------------------------------------------------------------------
     # Rate limits
     # ------------------------------------------------------------------
@@ -1045,15 +1275,18 @@ class MT5Adapter(Adapter):
     async def get_rate_limits(self) -> RateLimits:
         """Return MT5 rate-limit state.
 
-        MT5 has no explicit rate-limit endpoint.  The adapter reports a
-        conservative estimate based on known MT5 broker limits
-        (typically ~1 request per second per symbol for order operations).
-        Configurable in a future revision.
+        MT5 has no rate-limit endpoint, and no numeric limit is published:
+        reads go over local terminal IPC, while trade requests are subject to
+        each broker's own server-side flood control (rejected with
+        ``10024 TRADE_RETCODE_TOO_MANY_REQUESTS``).  The adapter therefore
+        reports a client-side pacing budget, not a broker-reported figure;
+        tune the engine's budget with ``RiskConfig.rate_limit_budget_override``.
         """
+        budget = _RATE_LIMIT_REQUESTS_PER_SECOND
         return RateLimits(
-            requests_per_interval=1,
+            requests_per_interval=budget,
             interval_seconds=1.0,
-            remaining=1,
+            remaining=budget,
             reset_at=_utcnow() + timedelta(seconds=1.0),
         )
 
@@ -1073,6 +1306,11 @@ class MT5Adapter(Adapter):
         def _fetch() -> list[Position]:
             positions = mt5.positions_get()
             self._check_call_result("positions_get", positions)
+            # Rehydration trusts this direct snapshot, so measure the offset
+            # here rather than relying on a previous poll cycle.
+            probes = tuple({position.symbol for position in positions or ()})
+            if probes:
+                self._server_time_offset_seconds(mt5, candidates=probes)
             instruments = self._resolve_poll_instruments(mt5, positions, ())
             return list(self._position_legs(positions, instruments, _utcnow()).values())
 
@@ -1365,6 +1603,8 @@ class MT5Adapter(Adapter):
         self._failed_symbols = set()
         self._selected_symbols = set()
         self._spec_cache = {}
+        self._server_time_offset = 0
+        self._server_time_offset_measured = False
         self._order_id_to_ticket = {}
         self._ticket_to_order_id = {}
 
@@ -1440,12 +1680,18 @@ class MT5Adapter(Adapter):
                 continue
             volume = Decimal(str(leg.volume))
             quantity = volume if leg.type == 0 else -volume
+            opened_at = (
+                from_mt5_epoch(leg.time, self._server_time_offset)
+                if leg.time and self._server_time_offset_measured
+                else None
+            )
             result[(instrument, str(leg.ticket))] = Position(
                 instrument=instrument,
                 quantity=quantity,
                 average_entry_price=Decimal(str(leg.price_open)),
                 updated_at=now,
                 position_id=str(leg.ticket),
+                opened_at=opened_at,
             )
         return result
 
@@ -1590,13 +1836,18 @@ class MT5Adapter(Adapter):
         by ``place_order``: a pending order's deal references its order
         ticket (``deal.order``); a market order's deal has ``deal.order == 0``
         and is instead keyed by the deal ticket itself (``deal.ticket``).
-        An unknown ticket (order placed from the terminal) yields an empty
-        ``client_order_id``.
+        A venue-triggered stop-loss/take-profit close has neither — it is
+        generated by the server, not by an order — but its position ticket
+        is the opening market order's ticket, so the position is the last
+        fallback and the exit is attributed to the order that opened the
+        leg.  An unknown ticket (position opened from the terminal) yields
+        an empty ``client_order_id``.
         """
         client_order_id = (
             decode_comment(deal.comment)
             or self._ticket_to_order_id.get(deal.order)
-            or self._ticket_to_order_id.get(deal.ticket, "")
+            or self._ticket_to_order_id.get(deal.ticket)
+            or self._ticket_to_order_id.get(deal.position_id, "")
         )
         fee = Decimal(str(deal.commission)) + Decimal(str(deal.fee))
         # ``reason``/``entry`` are absent on older terminal builds and on test
@@ -1671,6 +1922,7 @@ class MT5Adapter(Adapter):
                 best = (time_msc, offset)
         if best is not None:
             self._server_time_offset = best[1]
+            self._server_time_offset_measured = True
         return self._server_time_offset
 
     def _server_deal_window(
