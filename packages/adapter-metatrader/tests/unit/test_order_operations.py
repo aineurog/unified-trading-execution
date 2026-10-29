@@ -21,6 +21,9 @@ Tests cases:
     - modify_position_tpsl: TRADE_ACTION_SLTP always sends both tp and sl
     - modify_position_tpsl: unmentioned side is preserved; missing position raises
     - modify_position_tpsl: limit_price raises UnsupportedOrderTypeError
+    - clear_position_tpsl: only named sides are zeroed, the other is preserved
+    - clear_position_tpsl: no flags raises, flat position is a no-op, read failure aborts
+    - clear_position_tpsl: a rejected order_send raises the mapped error
 """
 
 from __future__ import annotations
@@ -876,6 +879,113 @@ class TestGetPositionTpSl:
 
         with pytest.raises(PlatformError):
             await adapter.get_position_tpsl(_instrument(), "789")
+
+
+class TestClearPositionTpsl:
+    """clear_position_tpsl — zero only the named side, preserve the other."""
+
+    async def test_clears_both_sides(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """Both cleared sides are sent as zero on the position ticket."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
+
+        await adapter.clear_position_tpsl(_instrument(), "789", take_profit=True, stop_loss=True)
+
+        request = _request(mock_mt5_module)
+        assert request["action"] == mock_mt5_module.TRADE_ACTION_SLTP
+        assert request["symbol"] == "EURUSD.m"
+        assert request["position"] == 789
+        assert request["tp"] == 0.0
+        assert request["sl"] == 0.0
+        mock_mt5_module.positions_get.assert_called_once_with(ticket=789)
+
+    async def test_clears_stop_preserves_take_profit(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """Clearing the stop reads and re-sends the take profit unchanged."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
+
+        await adapter.clear_position_tpsl(_instrument(), "789", stop_loss=True)
+
+        request = _request(mock_mt5_module)
+        assert request["tp"] == 1.3
+        assert request["sl"] == 0.0
+
+    async def test_clears_take_profit_preserves_stop(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """Clearing the take profit reads and re-sends the stop unchanged."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
+
+        await adapter.clear_position_tpsl(_instrument(), "789", take_profit=True)
+
+        request = _request(mock_mt5_module)
+        assert request["tp"] == 0.0
+        assert request["sl"] == 1.0
+
+    async def test_preserved_unset_side_stays_unset(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A preserved side that was already unset is sent as zero, not invented."""
+        _send_success(mock_mt5_module)
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=0.0),)
+
+        await adapter.clear_position_tpsl(_instrument(), "789", take_profit=True)
+
+        request = _request(mock_mt5_module)
+        assert request["tp"] == 0.0
+        assert request["sl"] == 0.0
+
+    async def test_no_flags_raises_without_read(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """At least one side must be named; no venue call is made otherwise."""
+        with pytest.raises(ValueError):
+            await adapter.clear_position_tpsl(_instrument(), "789")
+
+        mock_mt5_module.positions_get.assert_not_called()
+        mock_mt5_module.order_send.assert_not_called()
+
+    async def test_flat_position_is_a_noop(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A confirmed flat position has no protection to clear."""
+        mock_mt5_module.positions_get.return_value = ()
+
+        await adapter.clear_position_tpsl(_instrument(), "789", stop_loss=True)
+
+        mock_mt5_module.order_send.assert_not_called()
+
+    async def test_read_failure_does_not_send(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A read failure aborts before order_send — never clear blind."""
+        mock_mt5_module.positions_get.return_value = None
+        mock_mt5_module.last_error.return_value = (-2, "invalid params")
+
+        with pytest.raises(PlatformError):
+            await adapter.clear_position_tpsl(_instrument(), "789", stop_loss=True)
+
+        mock_mt5_module.order_send.assert_not_called()
+
+    async def test_rejected_send_raises(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, mt5_constants
+    ) -> None:
+        """A venue rejection is translated and never reported as success."""
+        mock_mt5_module.positions_get.return_value = (SimpleNamespace(ticket=789, tp=1.3, sl=1.0),)
+        mock_mt5_module.last_error.return_value = (10006, "rejected")
+        mock_mt5_module.order_send.return_value = _send_result(
+            retcode=mock_mt5_module.TRADE_RETCODE_REJECT, comment="rejected"
+        )
+
+        with pytest.raises(PlatformError):
+            await adapter.clear_position_tpsl(_instrument(), "789", stop_loss=True)
+
+        assert _request(mock_mt5_module)["sl"] == 0.0
 
 
 class TestFetchTicker:

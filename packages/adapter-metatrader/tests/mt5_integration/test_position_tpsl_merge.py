@@ -1,9 +1,10 @@
 """Position TP/SL merge integration tests.
 
 MT5 treats an omitted ``tp``/``sl`` field on ``TRADE_ACTION_SLTP`` as zero,
-and zero means "no level".  These tests prove that modifying one side through
-``modify_position_tpsl`` leaves the other side untouched on a live demo
-account — the regression guarded by the unit tests.
+and zero means "no level".  These tests prove that modifying or clearing one
+side through ``modify_position_tpsl`` / ``clear_position_tpsl`` leaves the other
+side untouched on a live demo account — the regression guarded by the unit
+tests.
 
 Requires the ``MT5_LOGIN`` / ``MT5_PASSWORD`` / ``MT5_SERVER`` env vars.
 The instrument under test is EUR/USD; the broker symbol defaults to
@@ -129,5 +130,46 @@ async def test_modify_one_side_preserves_the_other(connected_adapter: MT5Adapter
         assert after_tp_tp.trigger_price == new_tp
         assert after_tp_sl is not None
         assert after_tp_sl.trigger_price == new_sl
+    finally:
+        await cleanup_adapter(connected_adapter)
+
+
+async def test_clear_one_side_preserves_the_other(connected_adapter: MT5Adapter) -> None:
+    """Clearing SL leaves TP, and clearing TP leaves SL unset on the venue."""
+    _, ask = await _live_quotes(connected_adapter)
+    qty = await spec_qty(connected_adapter, _INSTRUMENT)
+    take_profit = await spec_price(connected_adapter, _INSTRUMENT, ask * Decimal("1.002"))
+    stop_loss = await spec_price(connected_adapter, _INSTRUMENT, ask * Decimal("0.998"))
+    try:
+        result = await connected_adapter.place_order(
+            build_unified_order(
+                _INSTRUMENT,
+                OrderType.MARKET,
+                OrderSide.BUY,
+                qty,
+                client_order_id=random_client_id("clear"),
+                take_profit=TpSlAttachment(trigger_price=take_profit),
+                stop_loss=TpSlAttachment(trigger_price=stop_loss),
+            )
+        )
+        assert result.status == OrderStatus.FILLED
+
+        position = await _wait_for_position(connected_adapter, _INSTRUMENT)
+        assert position.position_id is not None
+        position_id = position.position_id
+
+        await connected_adapter.clear_position_tpsl(_INSTRUMENT, position_id, stop_loss=True)
+
+        after_sl = await connected_adapter.get_position_tpsl(_INSTRUMENT, position_id)
+        assert after_sl is not None
+        after_sl_tp, after_sl_sl = after_sl
+        assert after_sl_tp is not None
+        assert after_sl_tp.trigger_price == take_profit
+        assert after_sl_sl is None
+
+        await connected_adapter.clear_position_tpsl(_INSTRUMENT, position_id, take_profit=True)
+
+        after_both = await connected_adapter.get_position_tpsl(_INSTRUMENT, position_id)
+        assert after_both == (None, None)
     finally:
         await cleanup_adapter(connected_adapter)

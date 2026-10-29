@@ -943,6 +943,51 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_read)
 
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named TP/SL sides on an open MT5 position.
+
+        *position_id* is the MT5 position ticket (as a string); *instrument*
+        resolves the broker symbol the request also requires.  MT5 has no
+        removal request for position protection, so both sides are always sent:
+        a cleared side is ``0.0`` and a preserved side is read back and sent
+        unchanged.  At least one flag must be true.
+
+        A confirmed flat position has no protection to clear and returns
+        quietly.  A read failure raises the mapped transport error and never
+        sends a blind ``TRADE_ACTION_SLTP`` request.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+        mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
+
+        def _clear() -> None:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
+            current = self._read_position_tpsl_sync(mt5, position_id)
+            if current is None:
+                return
+            current_tp, current_sl = current
+            resolved_tp = None if take_profit else current_tp
+            resolved_sl = None if stop_loss else current_sl
+            request = build_mt5_sltp_request(
+                position_id,
+                mt5_symbol,
+                take_profit=float(resolved_tp) if resolved_tp is not None else 0.0,
+                stop_loss=float(resolved_sl) if resolved_sl is not None else 0.0,
+                mt5_module=mt5,
+            )
+            result = mt5.order_send(request)
+            parse_mt5_result(result, position_id, mt5_module=mt5)
+
+        await asyncio.to_thread(_clear)
+
     # ------------------------------------------------------------------
     # Instrument metadata
     # ------------------------------------------------------------------
