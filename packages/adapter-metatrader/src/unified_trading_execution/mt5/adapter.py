@@ -212,6 +212,34 @@ def _decimal_places(value: Decimal) -> int:
     return max(0, -exponent)
 
 
+def _points_value(raw: object) -> Decimal:
+    """Coerce an MT5 point count to ``Decimal``; unknown values become zero."""
+    try:
+        return Decimal(str(raw))
+    except (ArithmeticError, TypeError, ValueError):
+        return Decimal("0")
+
+
+def _min_stop_distance(info: Any) -> Decimal | None:
+    """Return the broker's minimum stop distance as a price, or ``None``.
+
+    MT5 publishes the rule in points: ``trade_stops_level`` is the broker's
+    minimum and the current spread can be the effective floor, so the distance
+    is ``max(trade_stops_level, spread) * point``.  Some builds report a zero
+    ``point``, in which case ``trade_tick_size`` is the point size.  A broker
+    that publishes neither a stops level nor a spread imposes no rule, so the
+    field stays ``None`` instead of inventing a distance.
+    """
+    point = _points_value(getattr(info, "point", 0))
+    if point <= 0:
+        point = _points_value(getattr(info, "trade_tick_size", 0))
+    stops_level = _points_value(getattr(info, "trade_stops_level", 0))
+    spread = _points_value(getattr(info, "spread", 0))
+    if point <= 0 or (stops_level <= 0 and spread <= 0):
+        return None
+    return max(stops_level, spread) * point
+
+
 # MT5 symbol market-path segment → canonical AssetClass.  This is a *thesaurus*
 # of the standard market-tree folder names, matched case-insensitively against
 # ANY segment of ``symbol_info().path`` (not just the first), so a broker's
@@ -1038,6 +1066,7 @@ class MT5Adapter(Adapter):
             min_notional=Decimal("0"),
             price_precision=int(info.digits),
             qty_precision=_decimal_places(volume_step),
+            min_stop_distance=_min_stop_distance(info),
         )
         self._spec_cache[instrument] = (spec, _utcnow())
         return spec
