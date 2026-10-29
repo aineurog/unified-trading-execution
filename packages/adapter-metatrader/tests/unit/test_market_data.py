@@ -157,6 +157,39 @@ class TestFetchCandles:
         assert len(candles) == 1
         assert candles[0].open_time == closed
 
+    async def test_unmeasured_offset_excludes_the_current_bar_by_position(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """No tick means no offset; the clock must not discard recent bars."""
+        mock_mt5_module.symbol_info_tick.return_value = None
+        server_now = int(_NOW.timestamp()) + _OFFSET
+
+        def rate(seconds_ago: int, index: int) -> Mt5Rate:
+            return Mt5Rate(
+                time=server_now - seconds_ago,
+                open=1.0 + index,
+                high=2.0 + index,
+                low=0.5 + index,
+                close=1.0 + index,
+            )
+
+        mock_mt5_module.copy_rates_from_pos.return_value = (
+            rate(0, 3),
+            rate(60, 2),
+            rate(120, 1),
+            rate(180, 0),
+        )
+
+        with patch("unified_trading_execution.mt5.adapter._utcnow", return_value=_NOW):
+            candles = await adapter.fetch_candles(_instrument(), CandleTimeframe.M1, limit=3)
+
+        assert adapter._server_time_offset_measured is False
+        assert [int(candle.open_time.timestamp()) for candle in candles] == [
+            server_now - 180,
+            server_now - 120,
+            server_now - 60,
+        ]
+
     async def test_limit_keeps_the_most_recent_closed_bars(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
     ) -> None:

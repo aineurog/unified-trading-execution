@@ -1155,7 +1155,11 @@ class MT5Adapter(Adapter):
 
         MT5 returns bars present-to-past, so the result is reversed to oldest
         first.  Bar times are server-as-epoch and the measured server offset is
-        applied before a bar whose close has not passed is rejected.  ``limit``
+        subtracted.  When an offset has been measured, a bar whose close has
+        not passed is rejected.  With no tick yet (for example a closed
+        market) the offset is unknown and the clock cannot be trusted, so the
+        current bar is excluded by position instead — MT5 always reports it at
+        index 0 — and the remaining times stay in the server basis.  ``limit``
         is the maximum number of closed candles returned.
         """
         if limit < 1:
@@ -1177,12 +1181,13 @@ class MT5Adapter(Adapter):
                     code, desc or f"copy_rates_from_pos({mt5_symbol!r}) returned None"
                 )
             offset = self._server_time_offset_seconds(mt5, candidates=(mt5_symbol,))
+            measured = self._server_time_offset_measured
             now = _utcnow()
             candles: list[Candle] = []
             for bar in reversed(rates):
                 open_time = from_mt5_epoch(_bar_value(bar, "time"), offset)
                 close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
-                if close_time > now:
+                if measured and close_time > now:
                     continue
                 candles.append(
                     Candle(
@@ -1194,6 +1199,10 @@ class MT5Adapter(Adapter):
                         close=Decimal(str(_bar_value(bar, "close"))),
                     )
                 )
+            if not measured and candles:
+                # The offset is unknown, so every bar may look like it closes
+                # in the future.  Drop the current bar by position instead.
+                candles.pop()
             return candles[-limit:]
 
         return await asyncio.to_thread(_fetch)
