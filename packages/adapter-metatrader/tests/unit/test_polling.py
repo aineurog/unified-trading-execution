@@ -356,6 +356,167 @@ class TestPollOnce:
         assert positions[0].position.quantity == Decimal("0.2")
         assert positions[0].position.average_entry_price == Decimal("1.11")
 
+    async def test_position_update_carries_opened_at(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """A position update carries a timezone-aware open time in real UTC."""
+        offset = 10800  # UTC+3 broker
+        mock_mt5_module.orders_get.return_value = ()
+        mock_mt5_module.account_info.return_value = _account()
+        mock_mt5_module.history_deals_get.return_value = ()
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        mock_mt5_module.symbol_info_tick.return_value = MagicMock(
+            time_msc=(_DEAL_TIME + offset) * 1000
+        )
+        mock_mt5_module.positions_get.return_value = (
+            Mt5Position(
+                ticket=2001,
+                time=_DEAL_TIME + offset,
+                time_update=_DEAL_TIME + offset,
+                type=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price_open=1.1000,
+            ),
+        )
+        adapter._last_deal_time = int(_PAST.timestamp())
+
+        positions: list[PositionUpdateEvent] = []
+        event_bus.subscribe(PositionUpdateEvent, positions.append)
+        with patch("time.time", return_value=float(_DEAL_TIME)):
+            await adapter._poll_once()
+
+        assert len(positions) == 1
+        opened_at = positions[0].position.opened_at
+        assert opened_at is not None
+        assert opened_at.tzinfo is not None
+        assert opened_at == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+
+    def test_position_opened_at_uses_measured_offset(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """The same server stamp maps to the same UTC instant under any offset."""
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        leg = Mt5Position(
+            ticket=2001,
+            time=_DEAL_TIME,
+            time_update=_DEAL_TIME,
+            type=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price_open=1.1000,
+        )
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (leg,), ())
+        expected = datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+
+        for offset in (7200, 10800):  # UTC+2 and UTC+3
+            adapter._server_time_offset = offset
+            adapter._server_time_offset_measured = True
+            stamped = leg._replace(time=_DEAL_TIME + offset)
+
+            legs = adapter._position_legs((stamped,), instruments, _PAST)
+
+            assert next(iter(legs.values())).opened_at == expected
+
+    def test_position_opened_at_none_for_zero_time(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A zero terminal time yields no open time instead of the epoch."""
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        leg = Mt5Position(
+            ticket=2001,
+            time=0,
+            time_update=0,
+            type=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price_open=1.1000,
+        )
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (leg,), ())
+        adapter._server_time_offset = 10800
+        adapter._server_time_offset_measured = True
+
+        legs = adapter._position_legs((leg,), instruments, _PAST)
+
+        assert next(iter(legs.values())).opened_at is None
+
+    def test_position_opened_at_none_when_offset_unmeasured(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """An unmeasured offset must not be treated as UTC+0."""
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        leg = Mt5Position(
+            ticket=2001,
+            time=_DEAL_TIME,
+            time_update=_DEAL_TIME,
+            type=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price_open=1.1000,
+        )
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (leg,), ())
+        adapter._server_time_offset_measured = False
+
+        legs = adapter._position_legs((leg,), instruments, _PAST)
+
+        assert next(iter(legs.values())).opened_at is None
+
+    def test_zero_quantity_close_event_has_no_opened_at(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
+    ) -> None:
+        """The synthetic close signal carries no open time."""
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        leg = Mt5Position(
+            ticket=2001,
+            time=_DEAL_TIME + 10800,
+            time_update=_DEAL_TIME + 10800,
+            type=0,
+            symbol="EURUSD.m",
+            volume=0.1,
+            price_open=1.1000,
+        )
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (leg,), ())
+        adapter._server_time_offset = 10800
+        adapter._server_time_offset_measured = True
+        adapter._process_positions((leg,), instruments, _PAST)
+
+        closes: list[PositionUpdateEvent] = []
+        event_bus.subscribe(PositionUpdateEvent, closes.append)
+        adapter._process_positions((), instruments, _PAST)
+
+        assert len(closes) == 1
+        assert closes[0].position.quantity == Decimal("0")
+        assert closes[0].position.opened_at is None
+
+    async def test_fetch_positions_carries_opened_at(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """The direct snapshot applies the same offset as the poll path."""
+        offset = 7200
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        mock_mt5_module.symbol_info_tick.return_value = MagicMock(
+            time_msc=(_DEAL_TIME + offset) * 1000
+        )
+        mock_mt5_module.positions_get.return_value = (
+            Mt5Position(
+                ticket=2001,
+                time=_DEAL_TIME + offset,
+                time_update=_DEAL_TIME + offset,
+                type=0,
+                symbol="EURUSD.m",
+                volume=0.1,
+                price_open=1.1000,
+            ),
+        )
+
+        with patch("time.time", return_value=float(_DEAL_TIME)):
+            positions = await adapter.fetch_positions()
+
+        assert adapter._server_time_offset == offset
+        assert adapter._server_time_offset_measured is True
+        assert len(positions) == 1
+        assert positions[0].opened_at == datetime.fromtimestamp(_DEAL_TIME, tz=UTC)
+
     async def test_detects_balance_change(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter, event_bus: EventBus
     ) -> None:

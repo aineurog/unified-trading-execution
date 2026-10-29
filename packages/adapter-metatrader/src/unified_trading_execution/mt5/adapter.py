@@ -408,7 +408,10 @@ class MT5Adapter(Adapter):
 
         # Server-as-epoch minus real-UTC epoch (seconds); measured from a live
         # tick and refreshed each poll cycle — see _server_time_offset_seconds.
+        # ``_measured`` distinguishes a genuine UTC+0 broker from "no tick yet":
+        # an unmeasured offset must never be used to invent an open time.
         self._server_time_offset: int = 0
+        self._server_time_offset_measured: bool = False
 
         # Broker symbol → canonical Instrument cache for inbound reconstruction.
         # Seeded at connect from the state store, extended on every outbound
@@ -1180,6 +1183,11 @@ class MT5Adapter(Adapter):
         def _fetch() -> list[Position]:
             positions = mt5.positions_get()
             self._check_call_result("positions_get", positions)
+            # Rehydration trusts this direct snapshot, so measure the offset
+            # here rather than relying on a previous poll cycle.
+            probes = tuple({position.symbol for position in positions or ()})
+            if probes:
+                self._server_time_offset_seconds(mt5, candidates=probes)
             instruments = self._resolve_poll_instruments(mt5, positions, ())
             return list(self._position_legs(positions, instruments, _utcnow()).values())
 
@@ -1472,6 +1480,8 @@ class MT5Adapter(Adapter):
         self._failed_symbols = set()
         self._selected_symbols = set()
         self._spec_cache = {}
+        self._server_time_offset = 0
+        self._server_time_offset_measured = False
         self._order_id_to_ticket = {}
         self._ticket_to_order_id = {}
 
@@ -1547,12 +1557,18 @@ class MT5Adapter(Adapter):
                 continue
             volume = Decimal(str(leg.volume))
             quantity = volume if leg.type == 0 else -volume
+            opened_at = (
+                from_mt5_epoch(leg.time, self._server_time_offset)
+                if leg.time and self._server_time_offset_measured
+                else None
+            )
             result[(instrument, str(leg.ticket))] = Position(
                 instrument=instrument,
                 quantity=quantity,
                 average_entry_price=Decimal(str(leg.price_open)),
                 updated_at=now,
                 position_id=str(leg.ticket),
+                opened_at=opened_at,
             )
         return result
 
@@ -1778,6 +1794,7 @@ class MT5Adapter(Adapter):
                 best = (time_msc, offset)
         if best is not None:
             self._server_time_offset = best[1]
+            self._server_time_offset_measured = True
         return self._server_time_offset
 
     def _server_deal_window(
