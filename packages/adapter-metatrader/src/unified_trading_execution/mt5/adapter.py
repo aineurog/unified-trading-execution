@@ -34,7 +34,12 @@ from typing import TYPE_CHECKING, Any
 
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, PositionProtectionCapability, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+)
 from unified_trading_execution.errors import (
     AccountChangedError,
     InvalidSymbolError,
@@ -70,7 +75,7 @@ from unified_trading_execution.mt5.orders import (
     parse_order_record,
 )
 from unified_trading_execution.mt5.symbols import to_mt5_symbol
-from unified_trading_execution.trailing.types import TrailingBasis
+from unified_trading_execution.trailing.types import CandleTimeframe, TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     FillEntry,
@@ -83,7 +88,7 @@ from unified_trading_execution.types.instrument import (
     Instrument,
     InstrumentSpec,
 )
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -107,6 +112,32 @@ _RECOVERY_DEAL_LOOKBACK_SECONDS = 24 * 60 * 60
 # Offset probe: bounded symbol scan; reject impossible offsets (>±24h).
 _MAX_OFFSET_PROBE_SYMBOLS = 20
 _MAX_SERVER_TIME_OFFSET_SECONDS = 24 * 60 * 60
+
+# MT5 timeframe constants.  The terminal publishes H8 and H12 in addition to
+# the usual intraday set, so every core timeframe is native.
+_MT5_CANDLE_TIMEFRAMES: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 1,
+    CandleTimeframe.M5: 5,
+    CandleTimeframe.M15: 15,
+    CandleTimeframe.M30: 30,
+    CandleTimeframe.H1: 16385,
+    CandleTimeframe.H4: 16388,
+    CandleTimeframe.H8: 16392,
+    CandleTimeframe.H12: 16396,
+    CandleTimeframe.D1: 16408,
+}
+
+_CANDLE_SECONDS: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 60,
+    CandleTimeframe.M5: 5 * 60,
+    CandleTimeframe.M15: 15 * 60,
+    CandleTimeframe.M30: 30 * 60,
+    CandleTimeframe.H1: 60 * 60,
+    CandleTimeframe.H4: 4 * 60 * 60,
+    CandleTimeframe.H8: 8 * 60 * 60,
+    CandleTimeframe.H12: 12 * 60 * 60,
+    CandleTimeframe.D1: 24 * 60 * 60,
+}
 
 # After symbol_select() the terminal subscribes to quotes asynchronously —
 # symbol_info_tick() can briefly return None.  MARKET orders retry the fetch.
@@ -218,6 +249,14 @@ def _points_value(raw: object) -> Decimal:
         return Decimal(str(raw))
     except (ArithmeticError, TypeError, ValueError):
         return Decimal("0")
+
+
+def _bar_value(bar: Any, name: str) -> Any:
+    """Read one field from a ``copy_rates_from_pos`` bar (array or named tuple)."""
+    try:
+        return bar[name]
+    except (IndexError, KeyError, TypeError):
+        return getattr(bar, name)
 
 
 def _min_stop_distance(info: Any) -> Decimal | None:
@@ -1100,6 +1139,60 @@ class MT5Adapter(Adapter):
 
         return await asyncio.to_thread(_read)
 
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles through ``copy_rates_from_pos``.
+
+        MT5 returns bars present-to-past, so the result is reversed to oldest
+        first.  Bar times are server-as-epoch and the measured server offset is
+        applied before a bar whose close has not passed is rejected.  ``limit``
+        is the maximum number of closed candles returned.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        mt5_timeframe = _MT5_CANDLE_TIMEFRAMES.get(timeframe)
+        if mt5_timeframe is None:
+            raise UnsupportedOrderTypeError(
+                f"MT5 does not support the {timeframe.value} candle timeframe"
+            )
+        mt5 = _get_mt5()
+        mt5_symbol = self._resolve_mt5_symbol(instrument)
+
+        def _fetch() -> list[Candle]:
+            self._ensure_symbol_selected(mt5_symbol, mt5)
+            rates = mt5.copy_rates_from_pos(mt5_symbol, mt5_timeframe, 0, limit + 1)
+            if rates is None:
+                code, desc = mt5.last_error()
+                raise map_mt5_error(
+                    code, desc or f"copy_rates_from_pos({mt5_symbol!r}) returned None"
+                )
+            offset = self._server_time_offset_seconds(mt5, candidates=(mt5_symbol,))
+            now = _utcnow()
+            candles: list[Candle] = []
+            for bar in reversed(rates):
+                open_time = from_mt5_epoch(_bar_value(bar, "time"), offset)
+                close_time = open_time + timedelta(seconds=_CANDLE_SECONDS[timeframe])
+                if close_time > now:
+                    continue
+                candles.append(
+                    Candle(
+                        open_time=open_time,
+                        close_time=close_time,
+                        open=Decimal(str(_bar_value(bar, "open"))),
+                        high=Decimal(str(_bar_value(bar, "high"))),
+                        low=Decimal(str(_bar_value(bar, "low"))),
+                        close=Decimal(str(_bar_value(bar, "close"))),
+                    )
+                )
+            return candles[-limit:]
+
+        return await asyncio.to_thread(_fetch)
+
     # ------------------------------------------------------------------
     # Capability reporting
     # ------------------------------------------------------------------
@@ -1146,6 +1239,28 @@ class MT5Adapter(Adapter):
             trigger_bases=frozenset({TrailingBasis.BID, TrailingBasis.ASK}),
             min_reprice_interval_seconds=1.0,
             reprice_gap=False,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Declare the ticker and candle data MT5 can serve for *instrument*.
+
+        ``fetch_ticker`` populates bid, ask, and last (when the symbol has
+        traded) and never a mark price.  The terminal publishes every core
+        candle timeframe, including H8 and H12.  An instrument without a usable
+        ``platform_symbol`` cannot be addressed, so it gets the unsupported
+        default instead of raising.
+        """
+        try:
+            mt5_symbol = to_mt5_symbol(instrument)
+        except (InvalidSymbolError, ValueError):
+            return super().market_data_capability(instrument)
+        if not mt5_symbol.strip():
+            return super().market_data_capability(instrument)
+        return MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
+            min_ticker_interval_seconds=1.0,
+            candle_timeframes=frozenset(_MT5_CANDLE_TIMEFRAMES),
+            streaming_ticker=False,
         )
 
     # ------------------------------------------------------------------
