@@ -4,8 +4,8 @@ These drive the real core ``Engine``/``TrailingManager``/``TrailingWorker`` with
 an ``MT5Adapter`` connected to the scripted terminal in
 ``_scripted_terminal.py``.  They cover the MT5-specific acceptance gates:
 exact-ticket writes, ticket isolation, ratcheting with the terminal minimum
-stop distance, position updates, restart identity, integrity, and failure
-policy.
+stop distance, position updates, restart identity, reconnect rearm policy,
+integrity, and failure policy.
 """
 
 from __future__ import annotations
@@ -78,6 +78,10 @@ async def _never() -> None:
     await asyncio.Event().wait()
 
 
+async def _noop() -> None:
+    return None
+
+
 async def _make_engine(
     store: SQLiteStateStore,
     terminal: ScriptedTerminal,
@@ -85,6 +89,7 @@ async def _make_engine(
     monkeypatch: pytest.MonkeyPatch,
     *,
     config: TrailingConfig | None = None,
+    start_worker: bool = True,
 ) -> MT5Engine:
     terminal.install(mt5)
     adapter = MT5Adapter(MT5Config(login=12345678, password="test-password", server="Test-Demo"))
@@ -97,6 +102,10 @@ async def _make_engine(
         reconcile_interval_seconds=None,
         fill_settle_lag_seconds=0,
     )
+    if not start_worker:
+        # The worker's first cycle is immediate and would clear a DEGRADED
+        # state on a live tick before the rehydration outcome can be asserted.
+        monkeypatch.setattr(engine, "_sync_trailing_worker", _noop)
     await engine.connect()
     return engine
 
@@ -672,6 +681,99 @@ class TestRestart:
             assert "position_replaced" in replaced.last_error
             active = await restarted.trailing.list(active_only=True)
             assert [item.position_id for item in active] == ["1001"]
+        finally:
+            await restarted.ashutdown()
+
+
+class TestReconnect:
+    async def test_restart_with_rearm_disabled_degrades_without_touching_the_stop(
+        self,
+        persistent_store: SQLiteStateStore,
+        mock_mt5_module: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = ScriptedTerminal(legs=[_leg(1001)])
+        first = await _make_engine(persistent_store, terminal, mock_mt5_module, monkeypatch)
+        state = await _attach(first)
+        assert terminal.legs[1001].stop_loss == 1.08
+        await first.ashutdown()
+
+        restarted = await _make_engine(
+            persistent_store,
+            terminal,
+            mock_mt5_module,
+            monkeypatch,
+            config=TrailingConfig(rearm_on_reconnect=False),
+            start_worker=False,
+        )
+        try:
+            degraded = await restarted.trailing.get(state.trailing_id)
+            assert degraded is not None
+            assert degraded.phase is TrailingPhase.DEGRADED
+            assert degraded.last_error == "rearm_disabled"
+            assert degraded.failure_count == 1
+            assert degraded.current_stop == Decimal("1.0800")
+            assert terminal.legs[1001].stop_loss == 1.08
+            active = await restarted.trailing.list(active_only=True)
+            assert [item.trailing_id for item in active] == [state.trailing_id]
+        finally:
+            await restarted.ashutdown()
+
+    async def test_restart_does_not_rearm_a_done_state(
+        self,
+        persistent_store: SQLiteStateStore,
+        mock_mt5_module: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = ScriptedTerminal(legs=[_leg(1001, take_profit=1.2000)])
+        first = await _make_engine(persistent_store, terminal, mock_mt5_module, monkeypatch)
+        state = await _attach(first)
+        await _publish_position(first, _position(quantity="0"))
+        done = await first.trailing.get(state.trailing_id)
+        assert done is not None
+        assert done.phase is TrailingPhase.DONE
+        sends_before = len(terminal.sends)
+        await first.ashutdown()
+
+        restarted = await _make_engine(persistent_store, terminal, mock_mt5_module, monkeypatch)
+        try:
+            active = await restarted.trailing.list(active_only=True)
+            assert active == []
+            restored = await restarted.trailing.get(state.trailing_id)
+            assert restored is not None
+            assert restored.phase is TrailingPhase.DONE
+            assert len(terminal.sends) == sends_before
+            assert terminal.legs[1001].stop_loss == 0.0
+            assert terminal.legs[1001].take_profit == 1.20
+        finally:
+            await restarted.ashutdown()
+
+    async def test_restart_does_not_rearm_a_cancelled_state(
+        self,
+        persistent_store: SQLiteStateStore,
+        mock_mt5_module: MagicMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        terminal = ScriptedTerminal(legs=[_leg(1001)])
+        first = await _make_engine(persistent_store, terminal, mock_mt5_module, monkeypatch)
+        state = await _attach(first)
+        assert terminal.legs[1001].stop_loss == 1.08
+
+        cancelled = await first.trailing.cancel(state.trailing_id, clear_protection=True)
+        assert cancelled.phase is TrailingPhase.CANCELLED
+        assert terminal.legs[1001].stop_loss == 0.0
+        sends_before = len(terminal.sends)
+        await first.ashutdown()
+
+        restarted = await _make_engine(persistent_store, terminal, mock_mt5_module, monkeypatch)
+        try:
+            active = await restarted.trailing.list(active_only=True)
+            assert active == []
+            restored = await restarted.trailing.get(state.trailing_id)
+            assert restored is not None
+            assert restored.phase is TrailingPhase.CANCELLED
+            assert len(terminal.sends) == sends_before
+            assert terminal.legs[1001].stop_loss == 0.0
         finally:
             await restarted.ashutdown()
 
