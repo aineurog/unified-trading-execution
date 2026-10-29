@@ -89,7 +89,6 @@ async def test_min_stop_distance_follows_the_terminal_rule(
     spec = await connected_adapter.fetch_instrument_spec(_EURUSD)
 
     info = mt5.symbol_info(_BROKER_SYMBOL)
-    print(info)
     assert info is not None
     publishes_rule = info.trade_stops_level > 0 or info.spread > 0
 
