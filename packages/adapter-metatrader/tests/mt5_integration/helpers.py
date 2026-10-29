@@ -175,8 +175,6 @@ async def cleanup_adapter(adapter: MT5Adapter) -> None:
     remaining = await adapter.fetch_positions()
     if remaining:
         tickets = ", ".join(
-            position.position_id
-            for position in remaining
-            if position.position_id is not None
+            position.position_id for position in remaining if position.position_id is not None
         )
         raise RuntimeError(f"MT5 positions remain after cleanup: {tickets}")
