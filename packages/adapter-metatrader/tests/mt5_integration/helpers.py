@@ -16,7 +16,7 @@ from decimal import Decimal
 from typing import Any
 
 from unified_trading_execution.mt5 import MT5Adapter
-from unified_trading_execution.types.enums import OrderSide, OrderType, TimeInForce
+from unified_trading_execution.types.enums import OrderSide, OrderStatus, OrderType, TimeInForce
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.order import TpSlAttachment, UnifiedOrder
 from unified_trading_execution.types.position import Position
@@ -121,31 +121,36 @@ def position_for_symbol(
 
 
 async def cleanup_adapter(adapter: MT5Adapter) -> None:
-    """Best-effort: cancel every open order and flatten every raw position leg.
+    """Cancel every open order and flatten every raw position leg.
 
-    ``fetch_positions()`` nets opposing hedging legs (so a flat result can
-    still hide two open legs), so cleanup reads the raw ``positions_get()``
-    legs per symbol and closes each one by ticket — the netted view alone
-    would silently leave positions open.
+    Read raw positions once per symbol because the adapter snapshot can contain
+    multiple legs for that symbol. Close each ticket only once per pass; an
+    un-targeted opposite order after a failed close could open new exposure.
     """
     import MetaTrader5 as mt5
 
     for client_order_id in await adapter.fetch_open_orders():
         with contextlib.suppress(Exception):
             await adapter.cancel_order(client_order_id)
+
     for _ in range(5):
         positions = await adapter.fetch_positions()
-        legs: list[tuple[Instrument, Any]] = []
-        for position in positions:
-            instrument = position.instrument
-            broker_symbol = instrument.platform_symbol
-            if not broker_symbol:
-                continue
+        instruments = {
+            position.instrument.platform_symbol: position.instrument
+            for position in positions
+            if position.instrument.platform_symbol
+        }
+        legs: dict[int, tuple[Instrument, Any]] = {}
+        for broker_symbol, instrument in instruments.items():
             raw = await asyncio.to_thread(mt5.positions_get, symbol=broker_symbol)
-            legs.extend((instrument, leg) for leg in (raw or ()))
+            for leg in raw or ():
+                legs[int(leg.ticket)] = (instrument, leg)
+
         if not legs:
             return
-        for instrument, leg in legs:
+
+        failures: list[str] = []
+        for ticket, (instrument, leg) in legs.items():
             side = OrderSide.SELL if leg.type == 0 else OrderSide.BUY
             order = build_unified_order(
                 instrument,
@@ -153,20 +158,25 @@ async def cleanup_adapter(adapter: MT5Adapter) -> None:
                 side,
                 Decimal(str(leg.volume)),
                 client_order_id=random_client_id("clean"),
-                position_id=str(leg.ticket),
+                position_id=str(ticket),
             )
             try:
-                await adapter.place_order(order)
-            except Exception:
-                # Netting accounts ignore the position field — retry plain.
-                with contextlib.suppress(Exception):
-                    await adapter.place_order(
-                        build_unified_order(
-                            instrument,
-                            OrderType.MARKET,
-                            side,
-                            Decimal(str(leg.volume)),
-                            client_order_id=random_client_id("clean"),
-                        )
-                    )
+                result = await adapter.place_order(order)
+            except Exception as exc:
+                failures.append(f"ticket {ticket}: {exc}")
+                continue
+            if result.status is not OrderStatus.FILLED:
+                failures.append(f"ticket {ticket}: close returned {result.status.value}")
+
+        if failures:
+            raise RuntimeError("Failed to flatten MT5 positions: " + "; ".join(failures))
         await asyncio.sleep(1.0)
+
+    remaining = await adapter.fetch_positions()
+    if remaining:
+        tickets = ", ".join(
+            position.position_id
+            for position in remaining
+            if position.position_id is not None
+        )
+        raise RuntimeError(f"MT5 positions remain after cleanup: {tickets}")
