@@ -41,7 +41,7 @@ from unified_trading_execution.mt5.adapter import (
     _connected_lock,
 )
 from unified_trading_execution.mt5.comments import encode_client_order_id
-from unified_trading_execution.types.enums import AssetClass
+from unified_trading_execution.types.enums import AssetClass, FillEntry
 
 # Fixed timestamps for deterministic deal/position diffs — deal times are
 # second-granular and _last_deal_time (a raw server-as-epoch int) is advanced
@@ -281,6 +281,36 @@ class TestPollOnce:
 
         assert fill.client_order_id == "client-1"
         assert fill.correlation_id == "client-1"
+
+    def test_stop_triggered_fill_attributed_by_position_ticket(
+        self, mock_mt5_module: MagicMock, adapter: MT5Adapter
+    ) -> None:
+        """A venue-triggered stop-loss/take-profit close carries no order
+        ticket and a deal ticket created at trigger time, so neither is in
+        the map.  The position ticket is the opening market order's ticket,
+        which attributes the exit to the order that opened the leg."""
+        adapter._ticket_to_order_id = {2001: "client-1"}  # position == opening order
+        mock_mt5_module.symbol_info.return_value = _eurusd_symbol_info()
+        deal = Mt5Deal(
+            ticket=3001,
+            order=0,  # server-generated deal, no order ticket
+            time=_DEAL_TIME,
+            type=1,
+            entry=1,  # close
+            symbol="EURUSD.m",
+            volume=0.1,
+            price=1.0990,
+            commission=0.0,
+            fee=0.0,
+            position_id=2001,
+        )
+
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (), (deal,))
+        fill = adapter._build_fill(deal, instruments, _account())
+
+        assert fill.client_order_id == "client-1"
+        assert fill.correlation_id == "client-1"
+        assert fill.entry is FillEntry.OUT
 
     def test_fill_comment_attributed_before_ticket_maps(
         self, mock_mt5_module: MagicMock, adapter: MT5Adapter
