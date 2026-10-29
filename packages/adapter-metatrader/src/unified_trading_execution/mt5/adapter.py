@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING, Any
 
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import Adapter, PositionProtectionCapability, RateLimits
 from unified_trading_execution.errors import (
     AccountChangedError,
     InvalidSymbolError,
@@ -1081,6 +1081,39 @@ class MT5Adapter(Adapter):
                 OrderType.STOP,
                 OrderType.STOP_LIMIT,
             }
+        )
+
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Declare static position TP/SL support for MT5.
+
+        MT5 carries take profit and stop loss as price levels on the position
+        ticket.  Both sides can be set, read, and cleared; a partial write
+        preserves the side it does not mention.  The terminal triggers a long
+        stop on the bid and a short stop on the ask, so ``BID`` and ``ASK`` are
+        the trigger bases this surface can express.
+
+        The declaration is pure and performs no terminal read.  An instrument
+        without a usable ``platform_symbol`` cannot be addressed by MT5, so it
+        gets the base class's unsupported default instead of raising.
+        """
+        try:
+            mt5_symbol = to_mt5_symbol(instrument)
+        except (InvalidSymbolError, ValueError):
+            return super().position_protection_capability(instrument)
+        if not mt5_symbol.strip():
+            return super().position_protection_capability(instrument)
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.BID, TrailingBasis.ASK}),
+            min_reprice_interval_seconds=1.0,
+            reprice_gap=False,
         )
 
     # ------------------------------------------------------------------
