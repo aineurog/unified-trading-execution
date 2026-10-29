@@ -380,6 +380,76 @@ result = engine.place_order(UnifiedOrder(
 `TpSlAttachment.limit_price` raises `UnsupportedOrderTypeError` — the trigger
 price *is* the execution price.
 
+### Trailing stops
+
+MT5 has no native trailing-stop order. The engine implements trailing
+synthetically: it polls quotes and tightens a normal stop loss on the target
+position ticket. `AUTO` therefore resolves to `SYNTHETIC`; requesting
+`NATIVE` explicitly raises `TrailingNotSupportedError` rather than silently
+changing modes.
+
+Attach a trail to an open position:
+
+```python
+from decimal import Decimal
+
+from unified_trading_execution.trailing import (
+    TrailingMode,
+    TrailingOffsetType,
+    TrailingRequest,
+    TrailingSpec,
+)
+
+state = await engine.trailing.attach(
+    TrailingRequest(
+        eurusd,
+        TrailingSpec(
+            offset_type=TrailingOffsetType.PRICE,
+            offset=Decimal("0.00200"),
+        ),
+        position_id="12345678",  # MT5 position ticket
+        mode=TrailingMode.AUTO,
+    )
+)
+print(state.mode.value, state.phase.value)  # synthetic armed
+
+await engine.trailing.cancel(state.trailing_id, clear_protection=True)
+```
+
+`SyncMT5Engine` exposes the same `trailing` API without `await`. The engine
+must be connected, and the position must already be open. The optional
+`position_id` is the MT5 position ticket; it is required when the instrument
+has multiple open legs. If omitted, the engine accepts the request only when
+there is exactly one eligible leg rather than guessing.
+
+Synthetic trailing supports `PRICE`, `PERCENT`, and `ATR` distances, optional
+activation, step thresholds, an initial stop, and a static take profit. MT5's
+terminal quote fields provide `LAST`, `BID`, and `ASK` for sampling; by default
+the trail samples `BID` for a long position and `ASK` for a short position.
+Regardless of the sampling basis, MT5 triggers a long position's stop on the
+bid and a short position's stop on the ask.
+
+The worker polls rather than receiving streaming quotes. Its default polling
+interval is one second, and the adapter enforces a one-second minimum interval
+between protection reprices. The adapter reports the broker's minimum stop
+distance, when available, from the larger of the published stops level and
+spread multiplied by the point size. Candidate stops that violate that
+distance are not written.
+
+ATR-based trailing and ATR initial-stop/take-profit levels use closed MT5
+candles. The adapter supports `M1`, `M5`, `M15`, `M30`, `H1`, `H4`, `H8`,
+`H12`, and `D1`; the current forming candle is excluded. Candle refresh uses
+the configured `TrailingConfig` settle delay and stale-candle threshold.
+
+Active trailing state is persisted in the engine's state store. On reconnect,
+the engine reads the open position snapshot, checks the saved leg identity,
+and by default restores missing synthetic protection and resumes polling.
+MT5's position open time is recorded when the server-time offset is available;
+if identity cannot be verified confidently, the state is degraded instead of
+being attached to a potentially different position. Set
+`TrailingConfig(rearm_on_reconnect=False)` to disable automatic rearming.
+Disconnect and shutdown stop the worker but leave venue protection in place.
+
 ### Closing a specific position leg (`position_id`)
 
 On a **hedging** account you can hold multiple independent positions on the
