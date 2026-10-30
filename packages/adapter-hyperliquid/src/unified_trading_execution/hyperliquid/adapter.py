@@ -30,9 +30,12 @@ from unified_trading_execution.adapter import (
     Adapter,
     CandleTimeframe,
     MarketDataCapability,
+    NativeTrailingRequest,
+    NativeTrailingResult,
     PositionProtectionCapability,
     RateLimits,
     TrailingActivation,
+    TrailingBasis,
     TrailingCapability,
     TrailingOffsetType,
 )
@@ -116,7 +119,6 @@ from unified_trading_execution.hyperliquid.symbols import (
 from unified_trading_execution.hyperliquid.websocket import HyperliquidWebSocket
 from unified_trading_execution.state.halt import HaltStateMachine
 from unified_trading_execution.state.store import StateStore
-from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
     FillEntry,
@@ -2416,6 +2418,149 @@ class HyperliquidAdapter(Adapter):
             side = "take_profit" if suffix == TP_CLOID_SUFFIX else "stop_loss"
             found[side] = TpSlAttachment(trigger_price=trigger_price, limit_price=limit_price)
         return found.get("take_profit"), found.get("stop_loss")
+
+    # ---- Native trailing stops ----
+
+    async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
+        """Place a native trailing stop via raw ``trailingStop`` action.
+
+        The SDK has no trailing stop helper, so this constructs the raw action
+        payload manually, signs via ``sign_l1_action``, and posts via
+        ``_post_action``.  Only perpetual markets support native trailing;
+        spot raises ``InvalidSymbolError``.
+        """
+        if request.instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(
+                f"Spot instrument {request.instrument.symbol} does not support native trailing"
+            )
+
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(request.instrument)
+
+        # Get asset index from SDK
+        try:
+            asset = exchange.info.coin_to_asset[coin]
+        except KeyError as exc:
+            raise InvalidSymbolError(f"Unknown coin {coin!r}") from exc
+
+        # Map core parameters to venue format
+        if request.offset_type == TrailingOffsetType.PERCENT:
+            retracement = {"pct": f"{request.offset:.6f}%"}
+        elif request.offset_type == TrailingOffsetType.PRICE:
+            retracement = {"px": str(request.offset)}
+        else:
+            raise ValueError(f"Unsupported trailing offset type: {request.offset_type}")
+
+        activation_px = (
+            str(request.activation_price) if request.activation_price is not None else None
+        )
+
+        # Construct the raw trailingStop action
+        action = {
+            "type": "trailingStop",
+            "asset": asset,
+            "isBuy": request.side == OrderSide.BUY,
+            "sz": str(request.quantity),
+            "reduceOnly": True,
+            "retracement": retracement,
+            "activationPx": activation_px,
+        }
+
+        # Sign and post
+        from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
+
+        timestamp = get_timestamp_ms()
+        signature = sign_l1_action(
+            exchange.wallet,
+            action,
+            exchange.vault_address,
+            timestamp,
+            exchange.expires_after,
+            exchange.base_url == "https://api.hyperliquid.xyz",
+        )
+
+        response = await self._run_exchange(exchange._post_action, action, signature, timestamp)
+
+        # Extract order id from response
+        try:
+            data = response.get("response", {})
+            oid = data.get("data", {}).get("oid")
+            if oid is None:
+                raise PlatformError(f"Trailing stop response missing oid: {response!r}")
+            native_id = str(oid)
+        except (KeyError, TypeError) as exc:
+            raise PlatformError(f"Unexpected trailing stop response shape {response!r}") from exc
+
+        return NativeTrailingResult(
+            native_id=native_id,
+            confirmed_offset=request.offset,
+            current_stop=None,  # Not returned by placement response
+            activated=request.activation_price is None,  # Immediate if no activation price
+            position_scoped=True,  # Hyperliquid trailing is position-scoped
+        )
+
+    async def cancel_trailing_stop(self, native_id: str, instrument: Instrument) -> None:
+        """Cancel a native trailing stop by venue identifier.
+
+        Uses the existing cancel_by_oid method.
+        """
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+
+        await self._run_exchange(exchange.cancel, coin, int(native_id))
+
+    async def get_trailing_stop(
+        self, native_id: str, instrument: Instrument
+    ) -> NativeTrailingResult | None:
+        """Read a native trailing stop by venue identifier.
+
+        Queries the order by oid and parses the trailing stop parameters.
+        """
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+
+        # Query order by oid
+        response = await self._run_exchange(
+            exchange.info.query_order_by_oid,
+            coin,
+            int(native_id),
+        )
+
+        if not isinstance(response, dict) or response.get("status") == "unknownOid":
+            return None
+
+        try:
+            order = response.get("order", {})
+            order_type = order.get("orderType", "")
+
+            # Check if this is a trailing stop order
+            if not isinstance(order_type, str) or "Trailing" not in order_type:
+                return None
+
+            # Extract trailing stop parameters
+            raw_retracement = order.get("retracement", {})
+            if isinstance(raw_retracement, dict):
+                if "pct" in raw_retracement:
+                    offset = Decimal(str(raw_retracement["pct"]).rstrip("%"))
+                elif "px" in raw_retracement:
+                    offset = Decimal(str(raw_retracement["px"]))
+                else:
+                    return None
+            else:
+                return None
+
+            activation_px = order.get("activationPx")
+            activated = activation_px is None
+
+            return NativeTrailingResult(
+                native_id=native_id,
+                confirmed_offset=offset,
+                current_stop=None,  # Not returned by order query
+                activated=activated,
+                position_scoped=True,
+            )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            raise PlatformError(f"Unexpected trailing stop order shape {response!r}") from exc
 
     # ---- Reconciliation data ----
 
