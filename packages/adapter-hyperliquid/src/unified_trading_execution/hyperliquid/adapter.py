@@ -2419,6 +2419,51 @@ class HyperliquidAdapter(Adapter):
             found[side] = TpSlAttachment(trigger_price=trigger_price, limit_price=limit_price)
         return found.get("take_profit"), found.get("stop_loss")
 
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named protection sides on an open position leg.
+
+        Cancels legs by oid through ``_position_tpsl_entries`` and confirms
+        disappearance.  Only the named sides are cleared; unmentioned legs
+        stay working.  A flat position returns quietly because protection is
+        attached to the position.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+        if instrument.asset_class == AssetClass.SPOT:
+            raise InvalidSymbolError(f"Spot instrument {instrument.symbol} has no position TP/SL")
+
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+
+        # Check if position exists - if flat, return quietly
+        leg = await self._open_leg(instrument, position_id)
+        if leg is None or leg.quantity == 0:
+            return
+
+        # Get existing TP/SL entries
+        existing = await self._position_tpsl_entries(position_id)
+
+        # Cancel the requested sides
+        for side, should_clear in (("take_profit", take_profit), ("stop_loss", stop_loss)):
+            if not should_clear:
+                continue
+            for entry in existing.get(side, []):
+                oid = entry.get("oid")
+                if oid is None or oid == "":
+                    continue
+                try:
+                    response = await self._run_exchange(exchange.cancel, coin, int(oid))
+                    self._check_action_ok(response, context=f"clearing position {side} for {coin}")
+                except OrderNotFoundError:
+                    continue  # leg vanished concurrently
+
     # ---- Native trailing stops ----
 
     async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
