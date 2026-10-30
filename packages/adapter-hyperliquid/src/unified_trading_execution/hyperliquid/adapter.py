@@ -1826,13 +1826,13 @@ class HyperliquidAdapter(Adapter):
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
         """Fetch (or return a cached) ``InstrumentSpec`` for ``instrument``.
 
-        Perps read ``meta.universe`` (``szDecimals``/``maxLeverage``);
-        spot reads ``spotMeta`` (base-token ``szDecimals``).  Tick is
-        ``10^-(MAX_DECIMALS - szDecimals)`` with the 5-sig-fig rule enforced
-        at placement, not here; lot is ``10^-szDecimals``; minimums are the
-        venue $10 floors; maximum quantity is the tier-implied non-binding
-        upper bound (real caps enforce at placement); delisted entries
-        raise ``InvalidSymbolError``.
+        Perps read ``meta_and_asset_ctxs`` (``szDecimals``/``maxLeverage``); spot
+        reads ``spot_meta_and_asset_ctxs``.  Tick size is derived from the mark
+        to satisfy the 5-significant-figure rule (stop-safe tick).  ``min_stop_distance``
+        is set to the stop-safe tick.  ``max_qty`` uses the decimal tick to preserve
+        order-tier semantics.  Lot is ``10^-szDecimals``; minimums are the venue $10
+        floors; maximum quantity is the tier-imposed non-binding upper bound (real caps
+        enforce at placement); delisted entries raise ``InvalidSymbolError``.
         """
         cached = self._cached_spec(instrument)
         if cached is not None:
@@ -1840,12 +1840,15 @@ class HyperliquidAdapter(Adapter):
         exchange = self._require_exchange()
         coin = to_hyperliquid_coin(instrument)
         is_spot = instrument.asset_class == AssetClass.SPOT
+
+        # Fetch metadata with mark price for stop-safe tick calculation
         if not is_spot:
-            meta = await self._run_exchange(exchange.info.meta)
+            meta_ctx = await self._run_exchange(exchange.info.meta_and_asset_ctxs)
+            meta, ctxs = meta_ctx[0]["universe"], meta_ctx[1]
             entry = next(
                 (
                     e
-                    for e in meta.get("universe") or []
+                    for e in meta
                     if isinstance(e, dict) and e.get("name") == coin
                 ),
                 None,
@@ -1855,13 +1858,25 @@ class HyperliquidAdapter(Adapter):
             sz_decimals = int(entry.get("szDecimals", 0))
             max_leverage = entry.get("maxLeverage")
             decimals_cap = MAX_DECIMALS_PERPS
+
+            # Get mark price for stop-safe tick calculation
+            try:
+                index = next(
+                    i
+                    for i, e in enumerate(meta)
+                    if isinstance(e, dict) and e.get("name") == coin
+                )
+                mark_px = Decimal(str(ctxs[index].get("markPx", 0)))
+            except (StopIteration, KeyError, TypeError, ValueError):
+                mark_px = Decimal("0")
         else:
-            spot_meta = await self._run_exchange(exchange.info.spot_meta)
+            spot_meta_ctx = await self._run_exchange(exchange.info.spot_meta_and_asset_ctxs)
+            spot_meta, ctxs = spot_meta_ctx[0]["universe"], spot_meta_ctx[1]
             alias = exchange.info.name_to_coin.get(coin, coin)
             entry = next(
                 (
                     e
-                    for e in spot_meta.get("universe") or []
+                    for e in spot_meta
                     if isinstance(e, dict) and e.get("name") == alias
                 ),
                 None,
@@ -1878,18 +1893,44 @@ class HyperliquidAdapter(Adapter):
             sz_decimals = int(base_row["szDecimals"])
             max_leverage = None
             decimals_cap = MAX_DECIMALS_SPOT
-        tick_size = Decimal(1).scaleb(-(decimals_cap - sz_decimals))
+
+            # Get mark price for stop-safe tick calculation
+            try:
+                ctx = next(c for c in ctxs if isinstance(c, dict) and c.get("coin") == alias)
+                mark_px = Decimal(str(ctx.get("markPx", 0)))
+            except (StopIteration, KeyError, TypeError, ValueError):
+                mark_px = Decimal("0")
+
+        # Decimal tick (for max_qty and fallback)
+        decimal_tick = Decimal(1).scaleb(-(decimals_cap - sz_decimals))
+
+        # Stop-safe tick from mark: max(10^(mark.adjusted() - 3), decimal_tick)
+        # This is legal across the current decade and the next, so the cached spec
+        # does not go stale on ordinary moves.
+        if mark_px > 0:
+            # Conservative decade: mark / 1000 gives 3 significant figures of padding
+            stop_safe_tick = max(mark_px / Decimal("1000"), decimal_tick)
+        else:
+            # No mark available, fall back to decimal tick
+            stop_safe_tick = decimal_tick
+
         lot_size = Decimal(1).scaleb(-sz_decimals)
         tier = max_limit_notional(int(max_leverage) if max_leverage is not None else 1)
+
+        # Calculate price_precision from stop-safe tick exponent
+        exponent = stop_safe_tick.as_tuple().exponent
+        price_prec = -exponent if isinstance(exponent, int) else decimals_cap - sz_decimals
+
         spec = InstrumentSpec(
-            tick_size=tick_size,
+            tick_size=stop_safe_tick,
             lot_size=lot_size,
             min_qty=lot_size,
-            max_qty=tier / tick_size,
+            max_qty=tier / decimal_tick,  # max_qty uses decimal tick, not stop-safe
             min_notional=Decimal("10"),
-            price_precision=decimals_cap - sz_decimals,
+            price_precision=price_prec,
             qty_precision=sz_decimals,
             max_leverage=Decimal(str(max_leverage)) if max_leverage is not None else None,
+            min_stop_distance=stop_safe_tick,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
