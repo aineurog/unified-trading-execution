@@ -26,7 +26,14 @@ from hyperliquid.utils.error import ClientError, ServerError
 from hyperliquid.utils.types import Cloid
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    PositionProtectionCapability,
+    RateLimits,
+    TrailingActivation,
+    TrailingCapability,
+    TrailingOffsetType,
+)
 from unified_trading_execution.errors import (
     InvalidOrderError,
     InvalidSymbolError,
@@ -1896,6 +1903,54 @@ class HyperliquidAdapter(Adapter):
                 OrderType.STOP,
                 OrderType.STOP_LIMIT,
             }
+        )
+
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Declare static position TP/SL support for Hyperliquid perps.
+
+        Hyperliquid perp markets support reading, setting, and clearing both
+        take profit and stop loss through position-scoped reduce-only orders.
+        A write preserves the side it does not mention.  The venue triggers on
+        mark price.  Spot has no position leg and is unsupported.
+        """
+        if instrument.asset_class != AssetClass.FUTURES:
+            return super().position_protection_capability(instrument)
+
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.MARK}),
+            min_reprice_interval_seconds=15.0,
+            reprice_gap=False,
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Declare native trailing support for Hyperliquid perps.
+
+        Hyperliquid perp markets support native trailing stops with percent or
+        price distance retracement and optional activation price.  Step, initial
+        stop, and atomic take profit are not native and route to synthetic.
+        Spot has no position leg and is unsupported.
+        """
+        if instrument.asset_class != AssetClass.FUTURES:
+            return super().trailing_capability(instrument)
+
+        return TrailingCapability(
+            supported=True,
+            offset_types=frozenset({TrailingOffsetType.PERCENT, TrailingOffsetType.PRICE}),
+            bases=frozenset({TrailingBasis.MARK}),
+            activations=frozenset({TrailingActivation.IMMEDIATE, TrailingActivation.PRICE}),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=False,
+            min_reprice_interval_seconds=0.0,
         )
 
     # ---- Rate limits ----
