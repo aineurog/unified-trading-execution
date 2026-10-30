@@ -37,6 +37,24 @@ def _instrument(**kwargs: object) -> Instrument:
     return Instrument(**defaults)
 
 
+def _candle(
+    timestamp_ms: int,
+    open_px: str = "50000",
+    high_px: str = "51000",
+    low_px: str = "49000",
+    close_px: str = "50500",
+    volume: str = "100",
+) -> dict[str, int | str]:
+    return {
+        "T": timestamp_ms,
+        "o": open_px,
+        "h": high_px,
+        "l": low_px,
+        "c": close_px,
+        "v": volume,
+    }
+
+
 class TestMarketDataCapability:
     def test_declares_all_supported_timeframes(self):
         """Capability reports the nine core timeframes."""
@@ -98,8 +116,8 @@ class TestFetchCandles:
         # Set up a mock exchange so _require_exchange doesn't fail
         adapter._exchange = MagicMock()
         candles_data = [
-            [1700000000000, "50000", "51000", "49000", "50500", "100"],
-            [1700000060000, "50500", "51500", "49500", "51000", "150"],
+            _candle(1700000000000),
+            _candle(1700000060000, "50500", "51500", "49500", "51000", "150"),
         ]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
@@ -114,8 +132,8 @@ class TestFetchCandles:
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
         candles_data = [
-            [1700000000000, "50000", "51000", "49000", "50500", "100"],
-            [1700000060000, "50500", "51500", "49500", "51000", "150"],
+            _candle(1700000000000),
+            _candle(1700000060000, "50500", "51500", "49500", "51000", "150"),
         ]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
@@ -132,8 +150,8 @@ class TestFetchCandles:
         past_timestamp = int((now - timedelta(hours=1)).timestamp() * 1000)
 
         candles_data = [
-            [past_timestamp, "50000", "51000", "49000", "50500", "100"],
-            [future_timestamp, "50500", "51500", "49500", "51000", "150"],
+            _candle(past_timestamp),
+            _candle(future_timestamp, "50500", "51500", "49500", "51000", "150"),
         ]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
@@ -146,10 +164,7 @@ class TestFetchCandles:
         """Returns at most the requested number of candles."""
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
-        candles_data = [
-            [1700000000000 + i * 60000, "50000", "51000", "49000", "50500", "100"]
-            for i in range(10)
-        ]
+        candles_data = [_candle(1700000000000 + i * 60000) for i in range(10)]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
         candles = await adapter.fetch_candles(_instrument(), "1m", 5)
@@ -170,7 +185,7 @@ class TestFetchCandles:
         """Timestamps are converted to timezone-aware UTC."""
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
-        candles_data = [[1700000000000, "50000", "51000", "49000", "50500", "100"]]
+        candles_data = [_candle(1700000000000)]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
         candles = await adapter.fetch_candles(_instrument(), "1h", 10)
@@ -182,7 +197,9 @@ class TestFetchCandles:
         """OHLC values are returned as Decimal."""
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
-        candles_data = [[1700000000000, "50000.5", "51000.7", "49000.3", "50500.1", "100.25"]]
+        candles_data = [
+            _candle(1700000000000, "50000.5", "51000.7", "49000.3", "50500.1", "100.25")
+        ]
         adapter._run_exchange = AsyncMock(return_value=candles_data)
 
         candles = await adapter.fetch_candles(_instrument(), "1h", 10)

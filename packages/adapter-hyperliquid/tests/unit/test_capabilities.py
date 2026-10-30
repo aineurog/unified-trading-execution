@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from unified_trading_execution.adapter import (
-    TrailingActivation,
-    TrailingBasis,
-    TrailingOffsetType,
-)
+from unified_trading_execution.adapter import TrailingBasis
 from unified_trading_execution.hyperliquid import HyperliquidAdapter, HyperliquidConfig
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
@@ -92,19 +88,15 @@ class TestPositionProtectionCapability:
 
 
 class TestTrailingCapability:
-    def test_declares_native_trailing_for_perps(self):
-        """Perp markets report native trailing with percent/price offset and MARK basis."""
+    def test_perps_use_synthetic_trailing(self):
+        """Perp markets do not advertise native trailing-stop support."""
         adapter = HyperliquidAdapter(_config())
         capability = adapter.trailing_capability(_instrument())
 
-        assert capability.supported is True
-        assert capability.offset_types == frozenset(
-            {TrailingOffsetType.PERCENT, TrailingOffsetType.PRICE}
-        )
-        assert capability.bases == frozenset({TrailingBasis.MARK})
-        assert capability.activations == frozenset(
-            {TrailingActivation.IMMEDIATE, TrailingActivation.PRICE}
-        )
+        assert capability.supported is False
+        assert capability.offset_types == frozenset()
+        assert capability.bases == frozenset()
+        assert capability.activations == frozenset()
         assert capability.supports_step is False
         assert capability.supports_initial_stop is False
         assert capability.supports_take_profit is False
@@ -114,9 +106,7 @@ class TestTrailingCapability:
     def test_spot_is_unsupported(self):
         """Spot markets have no position leg and report unsupported."""
         adapter = HyperliquidAdapter(_config())
-        capability = adapter.trailing_capability(
-            _instrument(asset_class=AssetClass.SPOT)
-        )
+        capability = adapter.trailing_capability(_instrument(asset_class=AssetClass.SPOT))
 
         assert capability.supported is False
         assert capability.offset_types == frozenset()

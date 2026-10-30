@@ -37,28 +37,36 @@ def _connected(adapter: HyperliquidAdapter) -> MagicMock:
 
 async def test_fetch_instrument_spec_perp_caches(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
-    exchange.info.meta.return_value = {
-        "universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]
-    }
+    exchange.info.meta_and_asset_ctxs.return_value = (
+        {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
+        [{"markPx": "50000"}],
+    )
     first = await adapter.fetch_instrument_spec(_perp())
-    assert first.tick_size == Decimal("0.1")
+    assert first.tick_size == Decimal("1")
     assert first.lot_size == Decimal("0.00001")
     assert first.min_qty == Decimal("0.00001")
     assert first.min_notional == Decimal("10")
     assert first.max_leverage == Decimal("40")
-    assert (first.price_precision, first.qty_precision) == (1, 5)
+    assert first.min_stop_distance == Decimal("50")
+    assert (first.price_precision, first.qty_precision) == (0, 5)
     second = await adapter.fetch_instrument_spec(_perp())
     assert second == first
-    assert exchange.info.meta.call_count == 1
+    assert exchange.info.meta_and_asset_ctxs.call_count == 1
 
 
 async def test_fetch_instrument_spec_spot(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
     exchange.info.name_to_coin = {"HYPE/USDC": "@107", "@107": "@107"}
-    exchange.info.spot_meta.return_value = {
-        "universe": [{"name": "@107", "index": 107, "tokens": [150, 0]}],
-        "tokens": [{"index": 0, "name": "USDC"}, {"index": 150, "name": "HYPE", "szDecimals": 3}],
-    }
+    exchange.info.spot_meta_and_asset_ctxs.return_value = (
+        {
+            "universe": [{"name": "@107", "index": 107, "tokens": [150, 0]}],
+            "tokens": [
+                {"index": 0, "name": "USDC"},
+                {"index": 150, "name": "HYPE", "szDecimals": 3},
+            ],
+        },
+        [],
+    )
     spec = await adapter.fetch_instrument_spec(_spot())
     assert spec.lot_size == Decimal("0.001")
     assert spec.max_leverage is None
@@ -66,7 +74,7 @@ async def test_fetch_instrument_spec_spot(adapter: HyperliquidAdapter) -> None:
 
 async def test_fetch_instrument_spec_unknown(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
-    exchange.info.meta.return_value = {"universe": []}
+    exchange.info.meta_and_asset_ctxs.return_value = ({"universe": []}, [])
 
     with pytest.raises(InvalidSymbolError):
         await adapter.fetch_instrument_spec(_perp())
@@ -339,13 +347,14 @@ async def test_fetch_fills_keeps_zero_tid(adapter: HyperliquidAdapter) -> None:
 
 async def test_spec_cache_ttl_expiry(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
-    exchange.info.meta.return_value = {
-        "universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]
-    }
+    exchange.info.meta_and_asset_ctxs.return_value = (
+        {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
+        [{"markPx": "50000"}],
+    )
     adapter._spec_ttl = 0.0
     await adapter.fetch_instrument_spec(_perp())
     await adapter.fetch_instrument_spec(_perp())
-    assert exchange.info.meta.call_count == 2
+    assert exchange.info.meta_and_asset_ctxs.call_count == 2
 
 
 def _rest_fill(*, oid: object = 77, tid: int = 9) -> dict[str, object]:

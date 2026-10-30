@@ -1429,10 +1429,10 @@ class HyperliquidAdapter(Adapter):
         )
         return translate_order_entry(entry, instrument=instrument)
 
-    async def _market_band_price(
+    async def _market_ioc_price(
         self, coin: str, side: OrderSide, *, is_spot: bool, sz_decimals: int
     ) -> Decimal:
-        """Touch-derived aggressive price for MARKET orders (up buys, down sells)."""
+        """Return the current executable touch as the IOC cap for MARKET orders."""
         exchange = self._require_exchange()
         book = await self._run_exchange(exchange.info.l2_snapshot, coin)
         try:
@@ -1441,9 +1441,8 @@ class HyperliquidAdapter(Adapter):
             touch_px = Decimal(str(touch["px"]))
         except (KeyError, IndexError, TypeError) as exc:
             raise map_hyperliquid_error(message="No liquidity available for market order.") from exc
-        band = touch_px * (Decimal("1.01") if side == OrderSide.BUY else Decimal("0.99"))
         return round_price_to_tick(
-            band,
+            touch_px,
             sz_decimals,
             is_spot=is_spot,
             direction="up" if side == OrderSide.BUY else "down",
@@ -1567,7 +1566,7 @@ class HyperliquidAdapter(Adapter):
 
         market_limit_price: Decimal | None = None
         if order.order_type == OrderType.MARKET:
-            market_limit_price = await self._market_band_price(
+            market_limit_price = await self._market_ioc_price(
                 coin, order.side, is_spot=is_spot, sz_decimals=sz_decimals
             )
             if not is_spot and spec.max_leverage is not None:
@@ -1865,10 +1864,11 @@ class HyperliquidAdapter(Adapter):
                 mark_px = Decimal("0")
         else:
             spot_meta_ctx = await self._run_exchange(exchange.info.spot_meta_and_asset_ctxs)
-            spot_meta, ctxs = spot_meta_ctx[0]["universe"], spot_meta_ctx[1]
+            spot_meta, ctxs = spot_meta_ctx
+            universe = spot_meta["universe"]
             alias = exchange.info.name_to_coin.get(coin, coin)
             entry = next(
-                (e for e in spot_meta if isinstance(e, dict) and e.get("name") == alias),
+                (e for e in universe if isinstance(e, dict) and e.get("name") == alias),
                 None,
             )
             if entry is None:

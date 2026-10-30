@@ -107,7 +107,7 @@ def is_cancelled_outcome(*, message: str = "") -> bool:
     filling.  Callers translate these to a CANCELLED outcome instead of
     raising.
     """
-    return message.startswith(_POST_ONLY_CANCEL_PREFIX) or message == _IOC_NO_MATCH_MESSAGE
+    return message.startswith(_POST_ONLY_CANCEL_PREFIX) or message.startswith(_IOC_NO_MATCH_MESSAGE)
 
 
 def map_hyperliquid_error(*, message: str = "") -> UteError:
