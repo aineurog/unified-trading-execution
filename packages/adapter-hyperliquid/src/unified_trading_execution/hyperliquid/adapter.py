@@ -28,6 +28,8 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import (
     Adapter,
+    CandleTimeframe,
+    MarketDataCapability,
     PositionProtectionCapability,
     RateLimits,
     TrailingActivation,
@@ -124,7 +126,7 @@ from unified_trading_execution.types.enums import (
     OrderType,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
     FillRecord,
     OrderModification,
@@ -1953,6 +1955,32 @@ class HyperliquidAdapter(Adapter):
             min_reprice_interval_seconds=0.0,
         )
 
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Declare ticker and candle data available through Hyperliquid market reads.
+
+        ``fetch_ticker`` populates bid, ask, and mark for both spot and perps.
+        ``fetch_candles`` serves the nine core timeframes via the SDK's
+        ``candles_snapshot`` endpoint.
+        """
+        return MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.BID, TrailingBasis.ASK, TrailingBasis.MARK}),
+            min_ticker_interval_seconds=1.0,
+            candle_timeframes=frozenset(
+                {
+                    CandleTimeframe.M1,
+                    CandleTimeframe.M5,
+                    CandleTimeframe.M15,
+                    CandleTimeframe.M30,
+                    CandleTimeframe.H1,
+                    CandleTimeframe.H4,
+                    CandleTimeframe.H8,
+                    CandleTimeframe.H12,
+                    CandleTimeframe.D1,
+                }
+            ),
+            streaming_ticker=False,
+        )
+
     # ---- Rate limits ----
 
     async def get_rate_limits(self) -> RateLimits:
@@ -2016,6 +2044,103 @@ class HyperliquidAdapter(Adapter):
             except (StopIteration, KeyError, IndexError, TypeError) as exc:
                 raise PlatformError(f"Unexpected spot ctx shape for {coin}") from exc
         return translate_ticker(None, best_bid=best_bid, best_ask=best_ask, mark=mark)
+
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: str,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch historical candles via ``candles_snapshot``.
+
+        Returns up to ``limit`` closed candles, oldest first.  Forming bars
+        (close time in the future) are excluded.  Raises ``InvalidSymbolError``
+        for unknown symbols and ``ValueError`` for unsupported timeframes or
+        invalid limits.  The call is recorded via ``_run_exchange`` so the
+        candle surcharge applies.
+        """
+        if limit < 1:
+            raise ValueError(f"limit must be >= 1, got {limit}")
+
+        # Map core timeframes to Hyperliquid interval strings
+        interval_map = {
+            "1m": "1m",
+            "5m": "5m",
+            "15m": "15m",
+            "30m": "30m",
+            "1h": "1h",
+            "4h": "4h",
+            "8h": "8h",
+            "12h": "12h",
+            "1d": "1d",
+        }
+
+        if timeframe not in interval_map:
+            raise ValueError(f"Unsupported timeframe: {timeframe}")
+
+        exchange = self._require_exchange()
+        coin = to_hyperliquid_coin(instrument)
+        interval = interval_map[timeframe]
+
+        # Request limit + 1 to drop the forming bar if present
+        response = await self._run_exchange(
+            exchange.info.candles_snapshot, coin, interval, limit + 1, self._config.wallet_address
+        )
+
+        try:
+            raw_candles = response if isinstance(response, list) else []
+        except (TypeError, AttributeError) as exc:
+            raise PlatformError(f"Unexpected candles response shape for {coin}") from exc
+
+        candles: list[Candle] = []
+        now = _utcnow()
+
+        for raw in raw_candles:
+            try:
+                # Hyperliquid returns [timestamp_ms, open, high, low, close, volume]
+                timestamp_ms = raw[0]
+                open_px = Decimal(str(raw[1]))
+                high_px = Decimal(str(raw[2]))
+                low_px = Decimal(str(raw[3]))
+                close_px = Decimal(str(raw[4]))
+                # Volume is not used in the Candle type
+            except (IndexError, TypeError, ValueError) as exc:
+                raise PlatformError(f"Malformed candle entry for {coin}") from exc
+
+            # Convert timestamp to aware UTC
+            open_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+
+            # Calculate close time based on timeframe
+            timeframe_seconds = {
+                "1m": 60,
+                "5m": 300,
+                "15m": 900,
+                "30m": 1800,
+                "1h": 3600,
+                "4h": 14400,
+                "8h": 28800,
+                "12h": 43200,
+                "1d": 86400,
+            }[timeframe]
+            close_time = open_time + timedelta(seconds=timeframe_seconds)
+
+            # Drop forming bars (close time in the future)
+            if close_time > now:
+                continue
+
+            candles.append(
+                Candle(
+                    open_time=open_time,
+                    close_time=close_time,
+                    open=open_px,
+                    high=high_px,
+                    low=low_px,
+                    close=close_px,
+                )
+            )
+
+        # Cap to requested limit after dropping forming bars
+        return candles[:limit]
 
     # ---- Position TP/SL modification ----
 
