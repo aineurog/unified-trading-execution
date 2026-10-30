@@ -133,15 +133,28 @@ def venue_price(raw: Decimal, tick: Decimal, *, direction: str = "down") -> Deci
     """
     if tick <= 0:
         raise ValueError("tick must be positive")
-    quantum = Decimal(1).scaleb(raw.adjusted() - 4)
-    truncated = (raw // quantum) * quantum
-    steps = truncated / tick
+
+    if raw == 0:
+        return Decimal("0")
+
+    # Use string formatting to round to 5 significant figures
+    sign = 1 if raw > 0 else -1
+    abs_raw = abs(raw)
+
+    # Convert to scientific notation with 5 significant figures
+    # For 100180.6 -> 1.0018E+5 -> 100180
+    # For 75444.677 -> 7.5445E+4 -> 75445
+    format_str = f"{abs_raw:.5g}"
+    rounded = Decimal(format_str)
+
+    # Then align to tick
+    steps = rounded / tick
     rounded = (
         steps.to_integral_value(rounding="ROUND_FLOOR")
         if direction == "down"
         else steps.to_integral_value(rounding="ROUND_CEILING")
     )
-    return rounded * tick
+    return rounded * tick * sign
 
 
 def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:
@@ -150,6 +163,14 @@ def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:
         return value
     steps = (value / lot_size).to_integral_value(rounding="ROUND_CEILING")
     return steps * lot_size
+
+
+def quantize_price(value: Decimal, tick_size: Decimal) -> Decimal:
+    """Align ``value`` to ``tick_size`` using standard rounding."""
+    if tick_size <= 0:
+        return value
+    steps = (value / tick_size).to_integral_value(rounding="ROUND_HALF_EVEN")
+    return steps * tick_size
 
 
 async def wait_for_status(

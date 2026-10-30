@@ -82,15 +82,15 @@ class TestCapabilityWiring:
         assert capability.trigger_bases is not None
 
     def test_trailing_capability(self) -> None:
-        """Adapter declares trailing capability for perps."""
+        """Adapter declares no native trailing capability for perps."""
         adapter = HyperliquidAdapter(_config())
         capability = adapter.trailing_capability(_instrument())
 
         assert capability is not None
-        assert capability.supported is True
-        assert capability.offset_types is not None
-        assert capability.bases is not None
-        assert capability.activations is not None
+        assert capability.supported is False
+        assert capability.offset_types == frozenset()
+        assert capability.bases == frozenset()
+        assert capability.activations == frozenset()
         assert capability.supports_step is False
         assert capability.supports_initial_stop is False
         assert capability.supports_take_profit is False

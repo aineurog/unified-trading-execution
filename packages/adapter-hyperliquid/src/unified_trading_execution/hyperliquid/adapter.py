@@ -30,14 +30,11 @@ from unified_trading_execution.adapter import (
     Adapter,
     CandleTimeframe,
     MarketDataCapability,
-    NativeTrailingRequest,
     NativeTrailingResult,
     PositionProtectionCapability,
     RateLimits,
-    TrailingActivation,
     TrailingBasis,
     TrailingCapability,
-    TrailingOffsetType,
 )
 from unified_trading_execution.errors import (
     InvalidOrderError,
@@ -75,6 +72,7 @@ from unified_trading_execution.hyperliquid.events import (
 from unified_trading_execution.hyperliquid.orders import (
     MAX_DECIMALS_PERPS,
     MAX_DECIMALS_SPOT,
+    MAX_PRICE_SIGNIFICANT_FIGURES,
     SL_CLOID_SUFFIX,
     TP_CLOID_SUFFIX,
     build_cancel_action,
@@ -1848,11 +1846,7 @@ class HyperliquidAdapter(Adapter):
             meta_ctx = await self._run_exchange(exchange.info.meta_and_asset_ctxs)
             meta, ctxs = meta_ctx[0]["universe"], meta_ctx[1]
             entry = next(
-                (
-                    e
-                    for e in meta
-                    if isinstance(e, dict) and e.get("name") == coin
-                ),
+                (e for e in meta if isinstance(e, dict) and e.get("name") == coin),
                 None,
             )
             if entry is None or entry.get("isDelisted"):
@@ -1864,9 +1858,7 @@ class HyperliquidAdapter(Adapter):
             # Get mark price for stop-safe tick calculation
             try:
                 index = next(
-                    i
-                    for i, e in enumerate(meta)
-                    if isinstance(e, dict) and e.get("name") == coin
+                    i for i, e in enumerate(meta) if isinstance(e, dict) and e.get("name") == coin
                 )
                 mark_px = Decimal(str(ctxs[index].get("markPx", 0)))
             except (StopIteration, KeyError, TypeError, ValueError):
@@ -1876,11 +1868,7 @@ class HyperliquidAdapter(Adapter):
             spot_meta, ctxs = spot_meta_ctx[0]["universe"], spot_meta_ctx[1]
             alias = exchange.info.name_to_coin.get(coin, coin)
             entry = next(
-                (
-                    e
-                    for e in spot_meta
-                    if isinstance(e, dict) and e.get("name") == alias
-                ),
+                (e for e in spot_meta if isinstance(e, dict) and e.get("name") == alias),
                 None,
             )
             if entry is None:
@@ -1906,25 +1894,28 @@ class HyperliquidAdapter(Adapter):
         # Decimal tick (for max_qty and fallback)
         decimal_tick = Decimal(1).scaleb(-(decimals_cap - sz_decimals))
 
-        # Stop-safe tick from mark: max(10^(mark.adjusted() - 3), decimal_tick)
-        # This is legal across the current decade and the next, so the cached spec
-        # does not go stale on ordinary moves.
+        # Price quantum must be a power of ten: a fractional mark-derived tick
+        # can produce multiples that violate Hyperliquid's five-significant-
+        # figure price rule.
         if mark_px > 0:
-            # Conservative decade: mark / 1000 gives 3 significant figures of padding
-            stop_safe_tick = max(mark_px / Decimal("1000"), decimal_tick)
+            price_tick = max(
+                Decimal(1).scaleb(mark_px.adjusted() - (MAX_PRICE_SIGNIFICANT_FIGURES - 1)),
+                decimal_tick,
+            )
+            min_stop_distance = max(mark_px / Decimal("1000"), decimal_tick)
         else:
-            # No mark available, fall back to decimal tick
-            stop_safe_tick = decimal_tick
+            price_tick = decimal_tick
+            min_stop_distance = decimal_tick
 
         lot_size = Decimal(1).scaleb(-sz_decimals)
         tier = max_limit_notional(int(max_leverage) if max_leverage is not None else 1)
 
-        # Calculate price_precision from stop-safe tick exponent
-        exponent = stop_safe_tick.as_tuple().exponent
+        # Calculate price_precision from the legal price quantum.
+        exponent = price_tick.as_tuple().exponent
         price_prec = -exponent if isinstance(exponent, int) else decimals_cap - sz_decimals
 
         spec = InstrumentSpec(
-            tick_size=stop_safe_tick,
+            tick_size=price_tick,
             lot_size=lot_size,
             min_qty=lot_size,
             max_qty=tier / decimal_tick,  # max_qty uses decimal tick, not stop-safe
@@ -1932,7 +1923,7 @@ class HyperliquidAdapter(Adapter):
             price_precision=price_prec,
             qty_precision=sz_decimals,
             max_leverage=Decimal(str(max_leverage)) if max_leverage is not None else None,
-            min_stop_distance=stop_safe_tick,
+            min_stop_distance=min_stop_distance,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
@@ -1978,19 +1969,17 @@ class HyperliquidAdapter(Adapter):
     def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
         """Declare native trailing support for Hyperliquid perps.
 
-        Hyperliquid perp markets support native trailing stops with percent or
-        price distance retracement and optional activation price.  Step, initial
-        stop, and atomic take profit are not native and route to synthetic.
-        Spot has no position leg and is unsupported.
+        Hyperliquid does not support native trailing stops due to lack of
+        position-scoped reads. All trailing is synthetic via position protection.
         """
         if instrument.asset_class != AssetClass.FUTURES:
             return super().trailing_capability(instrument)
 
         return TrailingCapability(
-            supported=True,
-            offset_types=frozenset({TrailingOffsetType.PERCENT, TrailingOffsetType.PRICE}),
-            bases=frozenset({TrailingBasis.MARK}),
-            activations=frozenset({TrailingActivation.IMMEDIATE, TrailingActivation.PRICE}),
+            supported=False,
+            offset_types=frozenset(),
+            bases=frozenset(),
+            activations=frozenset(),
             supports_step=False,
             supports_initial_stop=False,
             supports_take_profit=False,
@@ -2125,9 +2114,26 @@ class HyperliquidAdapter(Adapter):
         coin = to_hyperliquid_coin(instrument)
         interval = interval_map[timeframe]
 
-        # Request limit + 1 to drop the forming bar if present
+        # Calculate start and end timestamps based on timeframe and limit
+        # Timeframe in seconds
+        timeframe_seconds = {
+            "1m": 60,
+            "5m": 300,
+            "15m": 900,
+            "30m": 1800,
+            "1h": 3600,
+            "4h": 14400,
+            "8h": 28800,
+            "12h": 43200,
+            "1d": 86400,
+        }[timeframe]
+
+        now = int(_utcnow().timestamp() * 1000)  # milliseconds
+        start_time = now - (limit + 1) * timeframe_seconds * 1000  # +1 to account for forming bar
+
+        # Request candles with time range
         response = await self._run_exchange(
-            exchange.info.candles_snapshot, coin, interval, limit + 1, self._config.wallet_address
+            exchange.info.candles_snapshot, coin, interval, start_time, now
         )
 
         try:
@@ -2140,15 +2146,16 @@ class HyperliquidAdapter(Adapter):
 
         for raw in raw_candles:
             try:
-                # Hyperliquid returns [timestamp_ms, open, high, low, close, volume]
-                timestamp_ms = raw[0]
-                open_px = Decimal(str(raw[1]))
-                high_px = Decimal(str(raw[2]))
-                low_px = Decimal(str(raw[3]))
-                close_px = Decimal(str(raw[4]))
+                # Hyperliquid returns dict with keys: T (timestamp), o (open),
+                # h (high), l (low), c (close), v (volume)
+                timestamp_ms = raw["T"]
+                open_px = Decimal(str(raw["o"]))
+                high_px = Decimal(str(raw["h"]))
+                low_px = Decimal(str(raw["l"]))
+                close_px = Decimal(str(raw["c"]))
                 # Volume is not used in the Candle type
-            except (IndexError, TypeError, ValueError) as exc:
-                raise PlatformError(f"Malformed candle entry for {coin}") from exc
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PlatformError(f"Malformed candle entry for {coin}: {raw}") from exc
 
             # Convert timestamp to aware UTC
             open_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
@@ -2464,148 +2471,17 @@ class HyperliquidAdapter(Adapter):
                 except OrderNotFoundError:
                     continue  # leg vanished concurrently
 
-    # ---- Native trailing stops ----
-
-    async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
-        """Place a native trailing stop via raw ``trailingStop`` action.
-
-        The SDK has no trailing stop helper, so this constructs the raw action
-        payload manually, signs via ``sign_l1_action``, and posts via
-        ``_post_action``.  Only perpetual markets support native trailing;
-        spot raises ``InvalidSymbolError``.
-        """
-        if request.instrument.asset_class == AssetClass.SPOT:
-            raise InvalidSymbolError(
-                f"Spot instrument {request.instrument.symbol} does not support native trailing"
-            )
-
-        exchange = self._require_exchange()
-        coin = to_hyperliquid_coin(request.instrument)
-
-        # Get asset index from SDK
-        try:
-            asset = exchange.info.coin_to_asset[coin]
-        except KeyError as exc:
-            raise InvalidSymbolError(f"Unknown coin {coin!r}") from exc
-
-        # Map core parameters to venue format
-        if request.offset_type == TrailingOffsetType.PERCENT:
-            retracement = {"pct": f"{request.offset:.6f}%"}
-        elif request.offset_type == TrailingOffsetType.PRICE:
-            retracement = {"px": str(request.offset)}
-        else:
-            raise ValueError(f"Unsupported trailing offset type: {request.offset_type}")
-
-        activation_px = (
-            str(request.activation_price) if request.activation_price is not None else None
-        )
-
-        # Construct the raw trailingStop action
-        action = {
-            "type": "trailingStop",
-            "asset": asset,
-            "isBuy": request.side == OrderSide.BUY,
-            "sz": str(request.quantity),
-            "reduceOnly": True,
-            "retracement": retracement,
-            "activationPx": activation_px,
-        }
-
-        # Sign and post
-        from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
-
-        timestamp = get_timestamp_ms()
-        signature = sign_l1_action(
-            exchange.wallet,
-            action,
-            exchange.vault_address,
-            timestamp,
-            exchange.expires_after,
-            exchange.base_url == "https://api.hyperliquid.xyz",
-        )
-
-        response = await self._run_exchange(exchange._post_action, action, signature, timestamp)
-
-        # Extract order id from response
-        try:
-            data = response.get("response", {})
-            oid = data.get("data", {}).get("oid")
-            if oid is None:
-                raise PlatformError(f"Trailing stop response missing oid: {response!r}")
-            native_id = str(oid)
-        except (KeyError, TypeError) as exc:
-            raise PlatformError(f"Unexpected trailing stop response shape {response!r}") from exc
-
-        return NativeTrailingResult(
-            native_id=native_id,
-            confirmed_offset=request.offset,
-            current_stop=None,  # Not returned by placement response
-            activated=request.activation_price is None,  # Immediate if no activation price
-            position_scoped=True,  # Hyperliquid trailing is position-scoped
-        )
-
-    async def cancel_trailing_stop(self, native_id: str, instrument: Instrument) -> None:
-        """Cancel a native trailing stop by venue identifier.
-
-        Uses the existing cancel_by_oid method.
-        """
-        exchange = self._require_exchange()
-        coin = to_hyperliquid_coin(instrument)
-
-        await self._run_exchange(exchange.cancel, coin, int(native_id))
-
-    async def get_trailing_stop(
-        self, native_id: str, instrument: Instrument
+    async def get_position_trailing_stop(
+        self,
+        instrument: Instrument,
+        position_id: str,
     ) -> NativeTrailingResult | None:
-        """Read a native trailing stop by venue identifier.
+        """Read the native trail attached to one position leg, keyed by position.
 
-        Queries the order by oid and parses the trailing stop parameters.
+        Return None only when the venue confirms no trail exists. Raise on
+        transport errors. position_id follows modify_position_tpsl conventions.
         """
-        exchange = self._require_exchange()
-        coin = to_hyperliquid_coin(instrument)
-
-        # Query order by oid
-        response = await self._run_exchange(
-            exchange.info.query_order_by_oid,
-            coin,
-            int(native_id),
-        )
-
-        if not isinstance(response, dict) or response.get("status") == "unknownOid":
-            return None
-
-        try:
-            order = response.get("order", {})
-            order_type = order.get("orderType", "")
-
-            # Check if this is a trailing stop order
-            if not isinstance(order_type, str) or "Trailing" not in order_type:
-                return None
-
-            # Extract trailing stop parameters
-            raw_retracement = order.get("retracement", {})
-            if isinstance(raw_retracement, dict):
-                if "pct" in raw_retracement:
-                    offset = Decimal(str(raw_retracement["pct"]).rstrip("%"))
-                elif "px" in raw_retracement:
-                    offset = Decimal(str(raw_retracement["px"]))
-                else:
-                    return None
-            else:
-                return None
-
-            activation_px = order.get("activationPx")
-            activated = activation_px is None
-
-            return NativeTrailingResult(
-                native_id=native_id,
-                confirmed_offset=offset,
-                current_stop=None,  # Not returned by order query
-                activated=activated,
-                position_scoped=True,
-            )
-        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
-            raise PlatformError(f"Unexpected trailing stop order shape {response!r}") from exc
+        raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
 
     # ---- Reconciliation data ----
 
