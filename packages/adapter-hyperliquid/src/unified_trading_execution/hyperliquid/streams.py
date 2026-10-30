@@ -159,6 +159,9 @@ def translate_position(
     ``"<coin>:oneWay"`` — unique per coin by construction.  Legs carry no
     timestamp, so the caller passes the state's time.  Zero-size legs are
     skipped by the caller not here (the WS emits them on close).
+
+    Hyperliquid does not provide a position open time in clearinghouseState,
+    so ``opened_at`` is None (best-effort).
     """
     if entry.get("type") != "oneWay":
         raise PlatformError(f"Unexpected position type {entry.get('type')!r} (expected 'oneWay')")
@@ -172,6 +175,7 @@ def translate_position(
         average_entry_price=_decimal(leg.get("entryPx") or "0", "entryPx"),
         updated_at=timestamp,
         position_id=f"{coin}:oneWay",
+        opened_at=None,  # Hyperliquid does not provide position open time
     )
 
 
