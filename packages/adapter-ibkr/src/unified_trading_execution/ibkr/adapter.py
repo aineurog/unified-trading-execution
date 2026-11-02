@@ -1655,6 +1655,7 @@ class IBKRAdapter(Adapter):
                         average_entry_price=avg_price,
                         updated_at=now,
                         position_id=position_id,
+                        opened_at=None,  # IBKR has no reliable position open time field
                     )
                 )
             except Exception as exc:
@@ -2063,6 +2064,7 @@ class IBKRAdapter(Adapter):
                 average_entry_price=avg_cost,
                 updated_at=_utcnow(),
                 position_id=pos_id,
+                opened_at=None,  # IBKR has no reliable position open time field
             )
             self._publish(
                 PositionUpdateEvent(
