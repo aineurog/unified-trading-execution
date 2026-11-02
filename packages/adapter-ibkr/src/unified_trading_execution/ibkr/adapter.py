@@ -24,7 +24,7 @@ import logging
 import math
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -33,6 +33,8 @@ from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import (
     Adapter,
+    Candle,
+    CandleTimeframe,
     MarketDataCapability,
     PositionProtectionCapability,
     RateLimits,
@@ -1067,6 +1069,135 @@ class IBKRAdapter(Adapter):
             return None
         return Ticker(bid=bid, ask=ask, last=last, mark=None)
 
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles for ATR, oldest first and most recent last.
+
+        Uses ``ib.reqHistoricalData`` with ``keepUpToDate=False``. Drops the
+        forming bar (close time in the future). Maps 7 core timeframes to IBKR bar
+        size strings. Returns empty list when the symbol is unknown or on permission
+        failure.
+
+        Args:
+            instrument: The instrument to fetch candles for.
+            timeframe: CandleTimeframe (one of M1, M5, M15, M30, H1, H4, D1).
+            limit: Maximum number of candles to return (minimum 1).
+
+        Returns:
+            List of Candle objects, oldest first. Empty list on error or when no
+            candles are available.
+
+        Raises:
+            InvalidSymbolError: when the contract is unknown.
+            PlatformError: on permission failure or other IBKR errors.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        # Map core timeframes to IBKR bar size strings
+        timeframe_map = {
+            CandleTimeframe.M1: "1 min",
+            CandleTimeframe.M5: "5 mins",
+            CandleTimeframe.M15: "15 mins",
+            CandleTimeframe.M30: "30 mins",
+            CandleTimeframe.H1: "1 hour",
+            CandleTimeframe.H4: "4 hours",
+            CandleTimeframe.D1: "1 day",
+        }
+        bar_size = timeframe_map.get(timeframe)
+        if bar_size is None:
+            raise ValueError(f"unsupported timeframe: {timeframe}")
+
+        ib = self._require_ib()
+        contract = to_ibkr_contract(instrument)
+
+        # Calculate end time: now minus a small buffer to exclude forming bar
+        now = _utcnow()
+        end_time = now - timedelta(seconds=60)
+
+        try:
+            bars = await ib.reqHistoricalDataAsync(
+                contract,
+                endDateTime=end_time.strftime("%Y%m%d %H:%M:%S"),
+                durationStr=bar_size,
+                barSizeSetting=bar_size,
+                whatToShow="TRADES",
+                useRTH=False,
+                formatDate=2,  # YYYYMMDD HH:mm:ss
+                keepUpToDate=False,
+            )
+        except Exception as exc:
+            # IBKR permission errors or unknown contracts surface here
+            raise PlatformError(
+                f"failed to fetch historical data for {instrument.symbol!r}: {exc}"
+            ) from exc
+
+        if not bars:
+            return []
+
+        candles: list[Candle] = []
+        now_utc = _utcnow()
+
+        for bar in bars:
+            try:
+                # IBKR BarData returns date as datetime when formatDate=2
+                bar_dt = bar.date
+                if isinstance(bar_dt, datetime):
+                    close_time = bar_dt.replace(tzinfo=UTC)
+                else:
+                    # Fallback: parse as string if it's not already a datetime
+                    close_time = datetime.strptime(
+                        str(bar_dt), "%Y%m%d %H:%M:%S"
+                    ).replace(tzinfo=UTC)
+                # Open time is close_time minus the bar duration
+                open_time = close_time - self._bar_duration(bar_size)
+
+                open_px = Decimal(str(bar.open))
+                high_px = Decimal(str(bar.high))
+                low_px = Decimal(str(bar.low))
+                close_px = Decimal(str(bar.close))
+            except (ValueError, AttributeError, TypeError) as exc:
+                raise PlatformError(
+                    f"malformed candle data for {instrument.symbol!r}: {exc}"
+                ) from exc
+
+            # Drop forming bars (close time in the future)
+            if close_time > now_utc:
+                continue
+
+            candles.append(
+                Candle(
+                    open_time=open_time,
+                    close_time=close_time,
+                    open=open_px,
+                    high=high_px,
+                    low=low_px,
+                    close=close_px,
+                )
+            )
+
+        # Return at most `limit` candles, oldest first
+        return candles[-limit:] if len(candles) > limit else candles
+
+    def _bar_duration(self, bar_size: str) -> timedelta:
+        """Return the duration of a bar size string as a timedelta."""
+        if "min" in bar_size:
+            minutes = int(bar_size.split()[0])
+            return timedelta(minutes=minutes)
+        elif "hour" in bar_size:
+            hours = int(bar_size.split()[0])
+            return timedelta(hours=hours)
+        elif "day" in bar_size:
+            days = int(bar_size.split()[0])
+            return timedelta(days=days)
+        else:
+            return timedelta(minutes=1)  # Fallback
+
     # ------------------------------------------------------------------
     # Capability reporting
     # ------------------------------------------------------------------
@@ -1139,13 +1270,21 @@ class IBKRAdapter(Adapter):
     def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
         """Return IBKR market data support.
 
-        Ticker provides LAST, BID, ASK via the IB snapshot. Candles will be
-        added in a later commit (fetch_candles via reqHistoricalData).
+        Ticker provides LAST, BID, ASK via the IB snapshot. Candles are
+        available via reqHistoricalData for the 7 core timeframes.
         """
         return MarketDataCapability(
             ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
             min_ticker_interval_seconds=2.0,
-            candle_timeframes=frozenset(),  # fetch_candles not yet implemented
+            candle_timeframes=frozenset({
+                CandleTimeframe.M1,
+                CandleTimeframe.M5,
+                CandleTimeframe.M15,
+                CandleTimeframe.M30,
+                CandleTimeframe.H1,
+                CandleTimeframe.H4,
+                CandleTimeframe.D1,
+            }),
             streaming_ticker=True,
         )
 
@@ -1259,7 +1398,6 @@ class IBKRAdapter(Adapter):
             order_contract.exchange = self._config.default_exchange or "SMART"
         orders: list[Order] = []
         # Use GTC for protective orders (IBKR default for held orders)
-        tif_kwargs: dict[str, object] = {"tif": "GTC"}
         if effective_tp is not None:
             tp = Order(
                 action=action,
@@ -1267,22 +1405,30 @@ class IBKRAdapter(Adapter):
                 orderType="LMT",
                 lmtPrice=effective_tp.trigger_price,
                 orderRef=f"{position_id}-tp-{_protection_ref_suffix()}",
-                **tif_kwargs,  # type: ignore[arg-type]
+                tif="GTC",
             )
             orders.append(tp)
         if effective_sl is not None:
             sl_type = "STP LMT" if effective_sl.limit_price is not None else "STP"
-            sl_kwargs: dict[str, object] = {
-                "action": action,
-                "totalQuantity": abs_qty,
-                "orderType": sl_type,
-                "auxPrice": effective_sl.trigger_price,
-                "orderRef": f"{position_id}-sl-{_protection_ref_suffix()}",
-                **tif_kwargs,
-            }
             if effective_sl.limit_price is not None:
-                sl_kwargs["lmtPrice"] = effective_sl.limit_price
-            sl = Order(**sl_kwargs)  # type: ignore[arg-type]
+                sl = Order(
+                    action=action,
+                    totalQuantity=abs_qty,
+                    orderType=sl_type,
+                    auxPrice=effective_sl.trigger_price,
+                    lmtPrice=effective_sl.limit_price,
+                    orderRef=f"{position_id}-sl-{_protection_ref_suffix()}",
+                    tif="GTC",
+                )
+            else:
+                sl = Order(
+                    action=action,
+                    totalQuantity=abs_qty,
+                    orderType=sl_type,
+                    auxPrice=effective_sl.trigger_price,
+                    orderRef=f"{position_id}-sl-{_protection_ref_suffix()}",
+                    tif="GTC",
+                )
             orders.append(sl)
         if len(orders) == 2:
             oca = f"pos-tpsl-{position_id}"
