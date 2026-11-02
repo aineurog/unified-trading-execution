@@ -70,7 +70,10 @@ from decimal import Decimal
 
 from unified_trading_execution.hyperliquid import HyperliquidEngine, HyperliquidConfig
 from unified_trading_execution.types.enums import (
-    AssetClass, OrderSide, OrderType, TimeInForce,
+    AssetClass,
+    OrderSide,
+    OrderType,
+    TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder

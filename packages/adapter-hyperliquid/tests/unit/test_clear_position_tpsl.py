@@ -68,9 +68,7 @@ class TestClearPositionTpsl:
 
         adapter._run_exchange = AsyncMock(return_value={"status": "ok"})
 
-        await adapter.clear_position_tpsl(
-            _instrument(), "BTC:oneWay", stop_loss=True
-        )
+        await adapter.clear_position_tpsl(_instrument(), "BTC:oneWay", stop_loss=True)
 
         # Verify only stop loss was cancelled
         assert adapter._run_exchange.call_count == 1
@@ -95,9 +93,7 @@ class TestClearPositionTpsl:
 
         adapter._run_exchange = AsyncMock(return_value={"status": "ok"})
 
-        await adapter.clear_position_tpsl(
-            _instrument(), "BTC:oneWay", take_profit=True
-        )
+        await adapter.clear_position_tpsl(_instrument(), "BTC:oneWay", take_profit=True)
 
         # Verify only take profit was cancelled
         assert adapter._run_exchange.call_count == 1
@@ -220,6 +216,7 @@ class TestClearPositionTpsl:
             call_count += 1
             if call_count == 1:
                 from unified_trading_execution.errors import OrderNotFoundError
+
                 raise OrderNotFoundError("Order not found")
             return {"status": "ok"}
 
