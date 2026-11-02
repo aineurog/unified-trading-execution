@@ -1,5 +1,8 @@
 """Test IBKR capability declarations for trailing and position protection."""
 
+import asyncio
+
+import pytest
 
 from unified_trading_execution.adapter import TrailingBasis
 from unified_trading_execution.ibkr import IBKRAdapter, IBKRConfig
@@ -33,7 +36,7 @@ class TestPositionProtectionCapability:
     def test_unspecified_sec_type_defaults_to_supported(self):
         """When sec_type is not specified, default to supported."""
         adapter = IBKRAdapter(_config())
-        instrument = _instrument()  # No sec_type attribute
+        instrument = _instrument()
         capability = adapter.position_protection_capability(instrument)
 
         assert capability.supported is True
@@ -94,13 +97,75 @@ class TestCapabilityNoNetworkCalls:
     def test_capabilities_no_network(self):
         """Reading capabilities should not require IB connection."""
         adapter = IBKRAdapter(_config())
-        # Adapter is not connected
         assert adapter._ib is None
 
-        # All capability methods should work without network
         _ = adapter.position_protection_capability(_instrument())
         _ = adapter.trailing_capability(_instrument())
         _ = adapter.market_data_capability(_instrument())
 
-        # IB instance still None (no connection attempt)
         assert adapter._ib is None
+
+
+class TestClearPositionTpsl:
+    """Test clear_position_tpsl flag validation."""
+
+    def test_at_least_one_flag_required(self):
+        """Both flags False raises ValueError."""
+        adapter = IBKRAdapter(_config())
+        instrument = _instrument()
+
+        async def test():
+            with pytest.raises(ValueError, match="at least one"):
+                await adapter.clear_position_tpsl(
+                    instrument, "12345", take_profit=False, stop_loss=False
+                )
+
+        asyncio.run(test())
+
+    def test_clear_tp_only_flag(self):
+        """Clearing only take profit is accepted."""
+        adapter = IBKRAdapter(_config())
+        instrument = _instrument()
+
+        async def test():
+            try:
+                await adapter.clear_position_tpsl(
+                    instrument, "12345", take_profit=True, stop_loss=False
+                )
+            except Exception as exc:
+                if "at least one" in str(exc):
+                    raise
+
+        asyncio.run(test())
+
+    def test_clear_sl_only_flag(self):
+        """Clearing only stop loss is accepted."""
+        adapter = IBKRAdapter(_config())
+        instrument = _instrument()
+
+        async def test():
+            try:
+                await adapter.clear_position_tpsl(
+                    instrument, "12345", take_profit=False, stop_loss=True
+                )
+            except Exception as exc:
+                if "at least one" in str(exc):
+                    raise
+
+        asyncio.run(test())
+
+    def test_clear_both_flags(self):
+        """Clearing both sides is accepted."""
+        adapter = IBKRAdapter(_config())
+        instrument = _instrument()
+
+        async def test():
+            try:
+                await adapter.clear_position_tpsl(
+                    instrument, "12345", take_profit=True, stop_loss=True
+                )
+            except Exception as exc:
+                if "at least one" in str(exc):
+                    raise
+
+        asyncio.run(test())

@@ -1303,6 +1303,24 @@ class IBKRAdapter(Adapter):
         bounded wait, so the caller never places a replacement pair on top of
         one it could not clear.
         """
+        await self._cancel_protection_by_side(position_id, cancel_tp=True, cancel_sl=True)
+
+    async def _cancel_protection_by_side(
+        self, position_id: str, *, cancel_tp: bool, cancel_sl: bool
+    ) -> None:
+        """Cancel only the named protective sides and confirm they left.
+
+        Args:
+            position_id: The contract conId string.
+            cancel_tp: Whether to cancel take-profit orders.
+            cancel_sl: Whether to cancel stop-loss orders.
+
+        Best-effort and idempotent: a no-op when no matching orders exist.
+        Raises ``PlatformError`` when orders are still live after the bounded wait.
+        """
+        if not cancel_tp and not cancel_sl:
+            raise ValueError("at least one of cancel_tp or cancel_sl must be True")
+
         ib = self._require_ib()
         tp_prefix, sl_prefix = _protection_ref_prefixes(position_id)
 
@@ -1315,13 +1333,14 @@ class IBKRAdapter(Adapter):
                 raise PlatformConnectionError(
                     f"failed to list IBKR open orders while replacing protection: {exc}"
                 ) from exc
-            return [
-                trade
-                for trade in trades
-                if str(getattr(trade.order, "orderRef", "") or "").startswith(
-                    (tp_prefix, sl_prefix)
-                )
-            ]
+            matching = []
+            for trade in trades:
+                ref = str(getattr(trade.order, "orderRef", "") or "")
+                if cancel_tp and ref.startswith(tp_prefix):
+                    matching.append(trade)
+                if cancel_sl and ref.startswith(sl_prefix):
+                    matching.append(trade)
+            return matching
 
         for trade in _matching():
             ref = str(getattr(trade.order, "orderRef", "") or "")
@@ -1343,6 +1362,40 @@ class IBKRAdapter(Adapter):
         raise PlatformError(
             f"protective orders for conId {position_id!r} did not cancel within "
             f"{_PROTECTION_CANCEL_TIMEOUT_SECONDS:.0f}s; refusing to stack a new pair"
+        )
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named protection sides on an open position leg.
+
+        IBKR protective orders are separate from the position and can open a new
+        opposite position if left live, so this cancels them even when the
+        position is flat. At least one of *take_profit* or *stop_loss* must be
+        true. Cancels only the named sides and returns quietly when no matching
+        orders remain.
+
+        Args:
+            instrument: The instrument (accepted for interface uniformity;
+                position_id is globally unique for IBKR).
+            position_id: The contract conId string.
+            take_profit: Whether to cancel take-profit orders.
+            stop_loss: Whether to cancel stop-loss orders.
+
+        Raises:
+            ValueError: neither side given.
+            PlatformError: orders could not be confirmed cancelled.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+
+        await self._cancel_protection_by_side(
+            position_id, cancel_tp=take_profit, cancel_sl=stop_loss
         )
 
     async def get_position_tpsl(
