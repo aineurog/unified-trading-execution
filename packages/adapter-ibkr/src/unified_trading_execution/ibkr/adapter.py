@@ -31,7 +31,14 @@ from typing import TYPE_CHECKING, Any
 from ib_async import IB, ExecutionFilter, Order, Trade
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+    TrailingBasis,
+    TrailingCapability,
+)
 from unified_trading_execution.errors import (
     InvalidSymbolError,
     OrderNotFoundError,
@@ -57,7 +64,6 @@ from unified_trading_execution.ibkr.orders import (
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
-from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     FillEntry,
     FillReason,
@@ -1074,6 +1080,73 @@ class IBKRAdapter(Adapter):
                 OrderType.STOP,
                 OrderType.STOP_LIMIT,
             }
+        )
+
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Return IBKR position-protection support.
+
+        IBKR supports static TP/SL via OCA-pair orders on the position contract.
+        Every write is cancel-and-replace (gap), and the adapter already
+        preserves the unmentioned side via merge semantics in modify_position_tpsl.
+        """
+        # Position-bearing secTypes: STK (stock), FUT (futures), OPT (options),
+        # FX/CASH (forex), CFD (contracts for difference)
+        position_bearing_classes = {
+            "STK",
+            "FUT",
+            "OPT",
+            "CASH",
+            "CFD",
+        }
+        # Extract secType from the instrument's raw contract if available
+        # Default to supported (most IBKR instruments are position-bearing)
+        sec_type = getattr(instrument, "sec_type", None)
+        supported = sec_type is None or sec_type in position_bearing_classes
+
+        return PositionProtectionCapability(
+            supported=supported,
+            can_set_stop=supported,
+            can_set_take_profit=supported,
+            can_clear_stop=supported,
+            can_clear_take_profit=supported,
+            preserves_unmentioned_side=True,  # Already handled by modify_position_tpsl merge
+            trigger_bases=frozenset(),  # IBKR uses its own feed, no settable trigger basis
+            min_reprice_interval_seconds=2.0,  # Pacing for cancel-replace
+            reprice_gap=True,  # Every write is cancel-and-replace
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Return IBKR native trailing support.
+
+        IBKR has a TRAIL / TRAIL LIMIT order type, but it is order-scoped
+        (not position-scoped) and requires separate protection order bookkeeping
+        that is out of scope for this version. Synthetic trailing is used instead.
+        """
+        return TrailingCapability(
+            supported=False,  # Native TRAIL out of scope
+            offset_types=frozenset(),
+            bases=frozenset(),
+            activations=frozenset(),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=False,
+            min_reprice_interval_seconds=2.0,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Return IBKR market data support.
+
+        Ticker provides LAST, BID, ASK via the IB snapshot. Candles will be
+        added in a later commit (fetch_candles via reqHistoricalData).
+        """
+        return MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
+            min_ticker_interval_seconds=2.0,
+            candle_timeframes=frozenset(),  # fetch_candles not yet implemented
+            streaming_ticker=True,
         )
 
     # ------------------------------------------------------------------
