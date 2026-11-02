@@ -87,7 +87,6 @@ from unified_trading_execution.hyperliquid.orders import (
     position_tpsl_cloid,
     quantize_price,
     raise_on_status_errors,
-    round_price_to_tick,
     validate_size,
 )
 from unified_trading_execution.hyperliquid.rates import (
@@ -1429,24 +1428,28 @@ class HyperliquidAdapter(Adapter):
         )
         return translate_order_entry(entry, instrument=instrument)
 
-    async def _market_ioc_price(
-        self, coin: str, side: OrderSide, *, is_spot: bool, sz_decimals: int
-    ) -> Decimal:
-        """Return the current executable touch as the IOC cap for MARKET orders."""
+    async def _market_ioc_price(self, coin: str, side: OrderSide) -> Decimal:
+        """Return the SDK-default slippage price for a MARKET-order IOC."""
         exchange = self._require_exchange()
-        book = await self._run_exchange(exchange.info.l2_snapshot, coin)
+        venue_coin = exchange.info.name_to_coin.get(coin, coin)
+        dex = venue_coin.partition(":")[0] if ":" in venue_coin else ""
+        mids = await self._run_exchange(exchange.info.all_mids, dex)
         try:
-            levels = book["levels"]
-            touch = levels[1][0] if side == OrderSide.BUY else levels[0][0]
-            touch_px = Decimal(str(touch["px"]))
-        except (KeyError, IndexError, TypeError) as exc:
-            raise map_hyperliquid_error(message="No liquidity available for market order.") from exc
-        return round_price_to_tick(
-            touch_px,
-            sz_decimals,
-            is_spot=is_spot,
-            direction="up" if side == OrderSide.BUY else "down",
+            mid = Decimal(str(mids[venue_coin]))
+            if not mid.is_finite() or mid <= 0:
+                raise ValueError(f"invalid mid price {mid}")
+        except (KeyError, TypeError, InvalidOperation, ValueError) as exc:
+            raise PlatformError(f"No valid mid price available for market order on {coin}") from exc
+
+        # Fetch mids through _run_exchange for rate accounting; passing the
+        # price prevents the SDK helper from making a second all_mids request.
+        sdk_price = exchange._slippage_price(
+            coin,
+            side == OrderSide.BUY,
+            Exchange.DEFAULT_SLIPPAGE,
+            px=float(mid),
         )
+        return Decimal(str(sdk_price))
 
     @staticmethod
     def _position_leg_cloids_from_legs(legs: Any) -> set[str]:
@@ -1566,9 +1569,7 @@ class HyperliquidAdapter(Adapter):
 
         market_limit_price: Decimal | None = None
         if order.order_type == OrderType.MARKET:
-            market_limit_price = await self._market_ioc_price(
-                coin, order.side, is_spot=is_spot, sz_decimals=sz_decimals
-            )
+            market_limit_price = await self._market_ioc_price(coin, order.side)
             if not is_spot and spec.max_leverage is not None:
                 cap = max_market_notional(int(spec.max_leverage))
                 if market_limit_price * order.quantity > cap:

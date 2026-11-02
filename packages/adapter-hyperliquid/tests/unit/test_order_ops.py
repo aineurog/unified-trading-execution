@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from hyperliquid.exchange import Exchange
 from hyperliquid.utils.types import Cloid
 
 from unified_trading_execution.errors import (
@@ -60,7 +61,12 @@ def _connected(adapter: HyperliquidAdapter) -> MagicMock:
     exchange = MagicMock()
     exchange.info.name_to_asset.side_effect = lambda coin: {"BTC": 0}[coin]
     exchange.info.asset_to_sz_decimals = {0: 5}
-    exchange.info.name_to_coin = {}
+    exchange.info.name_to_coin = {"BTC": "BTC"}
+    exchange.info.coin_to_asset = {"BTC": 0}
+    exchange.info.all_mids.return_value = {"BTC": "100"}
+    exchange._slippage_price.side_effect = lambda name, is_buy, slippage, px=None: (
+        Exchange._slippage_price(exchange, name, is_buy, slippage, px)
+    )
     exchange.info.meta_and_asset_ctxs.return_value = (
         {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]},
         [{"markPx": "50000"}],
@@ -164,27 +170,42 @@ async def test_place_rejects_top_level_err(adapter: HyperliquidAdapter) -> None:
 
 @pytest.mark.parametrize(
     ("side", "expected_price"),
-    [(OrderSide.BUY, Decimal("101.1")), (OrderSide.SELL, Decimal("100.0"))],
+    [(OrderSide.BUY, Decimal("105.0")), (OrderSide.SELL, Decimal("95.0"))],
 )
-async def test_market_ioc_price_uses_executable_touch(
+async def test_market_ioc_price_uses_sdk_default_slippage(
     adapter: HyperliquidAdapter, side: OrderSide, expected_price: Decimal
 ) -> None:
     exchange = _connected(adapter)
-    exchange.info.l2_snapshot.return_value = {
-        "levels": [
-            [{"px": "100.09", "sz": "1", "n": 1}],
-            [{"px": "101.01", "sz": "1", "n": 1}],
-        ]
-    }
-    price = await adapter._market_ioc_price("BTC", side, is_spot=False, sz_decimals=5)
+    exchange.info.all_mids.return_value = {"BTC": "100"}
+
+    price = await adapter._market_ioc_price("BTC", side)
+
     assert price == expected_price
+    exchange.info.all_mids.assert_called_once_with("")
+    exchange._slippage_price.assert_called_once_with(
+        "BTC",
+        side == OrderSide.BUY,
+        Exchange.DEFAULT_SLIPPAGE,
+        px=100.0,
+    )
+
+
+async def test_place_market_sends_sdk_price_as_ioc(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.bulk_orders.return_value = _ok_statuses(
+        [{"filled": {"totalSz": "0.01", "avgPx": "105", "oid": 1}}]
+    )
+
+    await adapter.place_order(_order(order_type=OrderType.MARKET, price=None))
+
+    (requests,), _ = exchange.bulk_orders.call_args
+    assert requests[0]["limit_px"] == 105.0
+    assert requests[0]["order_type"] == {"limit": {"tif": "Ioc"}}
+    exchange.info.l2_snapshot.assert_not_called()
 
 
 async def test_place_market_tier_breach_rejects(adapter: HyperliquidAdapter) -> None:
     exchange = _connected(adapter)
-    exchange.info.l2_snapshot.return_value = {
-        "levels": [[{"px": "100", "sz": "1", "n": 1}], [{"px": "101", "sz": "1", "n": 1}]]
-    }
     exchange.info.meta_and_asset_ctxs.return_value = (
         {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 1}]},
         [{"markPx": "50000"}],

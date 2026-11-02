@@ -416,8 +416,9 @@ def build_place_order_action(
     Returns ``(requests, grouping)`` for ``bulk_orders``: the parent
     request plus any TP/SL child legs (``normalTpsl`` OCO when children
     exist, else ``na``).  MARKET has no native type — it is an IOC limit at
-    ``market_limit_price``, which the adapter derives from the executable
-    touch.  STOP is a market-on-trigger leg (``limit_px`` carries the trigger price, which
+    ``market_limit_price``, which the adapter derives using the SDK default
+    slippage from the mid price.  STOP is a market-on-trigger leg
+    (``limit_px`` carries the trigger price, which
     the wire requires but execution ignores); STOP_LIMIT is a limit leg at
     ``price`` triggered at ``stop_price``.  Triggers reference mark price.
     Cloid strings travel raw here — the adapter wraps them in ``Cloid`` at
