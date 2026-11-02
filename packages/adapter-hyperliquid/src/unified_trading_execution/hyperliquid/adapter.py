@@ -2143,7 +2143,7 @@ class HyperliquidAdapter(Adapter):
             raise PlatformError(f"Unexpected candles response shape for {coin}") from exc
 
         candles: list[Candle] = []
-        now = _utcnow()
+        current_time: datetime = _utcnow()
 
         for raw in raw_candles:
             try:
@@ -2176,7 +2176,7 @@ class HyperliquidAdapter(Adapter):
             close_time = open_time + timedelta(seconds=timeframe_seconds)
 
             # Drop forming bars (close time in the future)
-            if close_time > now:
+            if close_time > current_time:
                 continue
 
             candles.append(
