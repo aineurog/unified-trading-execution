@@ -41,9 +41,7 @@ class TestFetchCandles:
 
         async def test():
             with pytest.raises(ValueError, match="limit must be at least 1"):
-                await adapter.fetch_candles(
-                    instrument, CandleTimeframe.M1, limit=0
-                )
+                await adapter.fetch_candles(instrument, CandleTimeframe.M1, limit=0)
 
         asyncio.run(test())
 
@@ -54,9 +52,7 @@ class TestFetchCandles:
 
         async def test():
             with pytest.raises(ValueError, match="unsupported timeframe"):
-                await adapter.fetch_candles(
-                    instrument, CandleTimeframe.H8, limit=10
-                )
+                await adapter.fetch_candles(instrument, CandleTimeframe.H8, limit=10)
 
         asyncio.run(test())
 

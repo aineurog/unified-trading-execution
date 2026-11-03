@@ -42,18 +42,24 @@ import asyncio
 
 from unified_trading_execution.ibkr import IBKREngine, IBKRConfig
 from unified_trading_execution.types.enums import (
-    AssetClass, OrderSide, OrderType, TimeInForce,
+    AssetClass,
+    OrderSide,
+    OrderType,
+    TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
+
 async def main():
-    engine = IBKREngine(IBKRConfig(
-        host="127.0.0.1",
-        port=7497,
-        client_id=1,
-        account="DU123456",
-    ))
+    engine = IBKREngine(
+        IBKRConfig(
+            host="127.0.0.1",
+            port=7497,
+            client_id=1,
+            account="DU123456",
+        )
+    )
     await engine.connect()
 
     aapl = Instrument(
@@ -63,16 +69,19 @@ async def main():
     )
     await engine.fetch_instrument_spec(aapl)
 
-    result = await engine.place_order(UnifiedOrder(
-        instrument=aapl,
-        order_type=OrderType.MARKET,
-        side=OrderSide.BUY,
-        quantity=100,
-        time_in_force=TimeInForce.GTC,
-    ))
+    result = await engine.place_order(
+        UnifiedOrder(
+            instrument=aapl,
+            order_type=OrderType.MARKET,
+            side=OrderSide.BUY,
+            quantity=100,
+            time_in_force=TimeInForce.GTC,
+        )
+    )
     print(f"Order {result.client_order_id} -> {result.status.value}")
 
     await engine.ashutdown()
+
 
 asyncio.run(main())
 ```
@@ -80,17 +89,22 @@ asyncio.run(main())
 ```python
 from unified_trading_execution.ibkr import SyncIBKREngine, IBKRConfig
 from unified_trading_execution.types.enums import (
-    AssetClass, OrderSide, OrderType, TimeInForce,
+    AssetClass,
+    OrderSide,
+    OrderType,
+    TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import UnifiedOrder
 
-engine = SyncIBKREngine(IBKRConfig(
-    host="127.0.0.1",
-    port=7497,
-    client_id=1,
-    account="DU123456",
-))
+engine = SyncIBKREngine(
+    IBKRConfig(
+        host="127.0.0.1",
+        port=7497,
+        client_id=1,
+        account="DU123456",
+    )
+)
 engine.connect()
 
 aapl = Instrument(
@@ -100,13 +114,15 @@ aapl = Instrument(
 )
 engine.fetch_instrument_spec(aapl)
 
-result = engine.place_order(UnifiedOrder(
-    instrument=aapl,
-    order_type=OrderType.MARKET,
-    side=OrderSide.BUY,
-    quantity=100,
-    time_in_force=TimeInForce.GTC,
-))
+result = engine.place_order(
+    UnifiedOrder(
+        instrument=aapl,
+        order_type=OrderType.MARKET,
+        side=OrderSide.BUY,
+        quantity=100,
+        time_in_force=TimeInForce.GTC,
+    )
+)
 print(f"Order {result.client_order_id} -> {result.status.value}")
 
 engine.shutdown()
@@ -253,33 +269,39 @@ candles = await engine.fetch_candles(
 
 ```python
 # Market buy
-result = await engine.place_order(UnifiedOrder(
-    instrument=aapl,
-    order_type=OrderType.MARKET,
-    side=OrderSide.BUY,
-    quantity=100,
-    time_in_force=TimeInForce.GTC,
-))
+result = await engine.place_order(
+    UnifiedOrder(
+        instrument=aapl,
+        order_type=OrderType.MARKET,
+        side=OrderSide.BUY,
+        quantity=100,
+        time_in_force=TimeInForce.GTC,
+    )
+)
 
 # Limit sell
-result = await engine.place_order(UnifiedOrder(
-    instrument=aapl,
-    order_type=OrderType.LIMIT,
-    side=OrderSide.SELL,
-    quantity=100,
-    price=175.50,
-    time_in_force=TimeInForce.GTC,
-))
+result = await engine.place_order(
+    UnifiedOrder(
+        instrument=aapl,
+        order_type=OrderType.LIMIT,
+        side=OrderSide.SELL,
+        quantity=100,
+        price=175.50,
+        time_in_force=TimeInForce.GTC,
+    )
+)
 
 # Stop-loss
-result = await engine.place_order(UnifiedOrder(
-    instrument=aapl,
-    order_type=OrderType.STOP,
-    side=OrderSide.SELL,
-    quantity=100,
-    stop_price=170.00,
-    time_in_force=TimeInForce.GTC,
-))
+result = await engine.place_order(
+    UnifiedOrder(
+        instrument=aapl,
+        order_type=OrderType.STOP,
+        side=OrderSide.SELL,
+        quantity=100,
+        stop_price=170.00,
+        time_in_force=TimeInForce.GTC,
+    )
+)
 ```
 
 The engine generates a UUID7 `client_order_id` if you do not supply one.
@@ -289,11 +311,13 @@ The engine generates a UUID7 `client_order_id` if you do not supply one.
 ```python
 from unified_trading_execution.types.order import OrderModification
 
-updated = await engine.modify_order(OrderModification(
-    client_order_id=result.client_order_id,
-    price=176.00,
-    quantity=150,
-))
+updated = await engine.modify_order(
+    OrderModification(
+        client_order_id=result.client_order_id,
+        price=176.00,
+        quantity=150,
+    )
+)
 ```
 
 IBKR supports modifying quantity and price for open orders. Time-in-force changes are not supported.
@@ -380,12 +404,14 @@ For direct access to the IBKR adapter without the engine:
 ```python
 from unified_trading_execution.ibkr import IBKRAdapter, IBKRConfig
 
-adapter = IBKRAdapter(IBKRConfig(
-    host="127.0.0.1",
-    port=7497,
-    client_id=1,
-    account="DU123456",
-))
+adapter = IBKRAdapter(
+    IBKRConfig(
+        host="127.0.0.1",
+        port=7497,
+        client_id=1,
+        account="DU123456",
+    )
+)
 await adapter.connect()
 # Use adapter methods directly
 await adapter.disconnect()
@@ -412,6 +438,7 @@ Provide a custom reference price for risk checks:
 def get_reference_price(instrument):
     # Custom logic to fetch reference price
     return Decimal("100.0")
+
 
 engine = IBKREngine(config, get_reference_price=get_reference_price)
 ```

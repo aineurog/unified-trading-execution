@@ -135,6 +135,5 @@ def test_sync_position_tpsl_forwards() -> None:
         _instrument(), "12345", take_profit=tp, stop_loss=None
     )
     assert (
-        engine.get_position_tpsl(_instrument(), "12345")
-        is adapter.get_position_tpsl.return_value
+        engine.get_position_tpsl(_instrument(), "12345") is adapter.get_position_tpsl.return_value
     )

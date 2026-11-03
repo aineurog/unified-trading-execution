@@ -102,9 +102,7 @@ class SyncIBKREngine(SyncEngine):
         position_id: str,
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
         """Read the current TP/SL on an open IBKR position as ``(take_profit, stop_loss)``."""
-        return self._run(
-            self._ibkr_adapter.get_position_tpsl(instrument, position_id)
-        )
+        return self._run(self._ibkr_adapter.get_position_tpsl(instrument, position_id))
 
     def clear_position_tpsl(
         self,
@@ -134,6 +132,4 @@ class SyncIBKREngine(SyncEngine):
         limit: int,
     ) -> list[Candle]:
         """Fetch closed OHLC candles for ATR."""
-        return self._run(
-            self._ibkr_adapter.fetch_candles(instrument, timeframe, limit=limit)
-        )
+        return self._run(self._ibkr_adapter.fetch_candles(instrument, timeframe, limit=limit))

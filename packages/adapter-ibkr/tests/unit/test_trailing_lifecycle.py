@@ -20,14 +20,14 @@ def _config() -> IBKRConfig:
 
 
 def _instrument(**kwargs: object) -> Instrument:
-    defaults = {
+    defaults: dict[str, object] = {
         "symbol": "AAPL",
         "quote_currency": "USD",
         "asset_class": AssetClass.STOCK,
         "multiplier": 1,
     }
     defaults.update(kwargs)
-    return Instrument(**defaults)
+    return Instrument(**defaults)  # type: ignore[arg-type]
 
 
 def test_clear_position_tpsl_selective():
@@ -48,6 +48,7 @@ def test_clear_position_tpsl_selective():
         )
 
     import asyncio
+
     asyncio.run(test())
 
 
@@ -66,6 +67,7 @@ def test_position_id_is_conid():
             assert positions[0].position_id == "12345"
 
     import asyncio
+
     asyncio.run(test())
 
 
@@ -95,4 +97,5 @@ def test_cancel_protection_by_side_no_op():
         assert not adapter._ib.cancelOrder.called  # type: ignore[attr-defined]
 
     import asyncio
+
     asyncio.run(test())

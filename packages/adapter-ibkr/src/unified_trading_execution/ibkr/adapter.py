@@ -1170,9 +1170,9 @@ class IBKRAdapter(Adapter):
                     close_time = bar_dt.replace(tzinfo=UTC)
                 else:
                     # Fallback: parse as string if it's not already a datetime
-                    close_time = datetime.strptime(
-                        str(bar_dt), "%Y%m%d %H:%M:%S"
-                    ).replace(tzinfo=UTC)
+                    close_time = datetime.strptime(str(bar_dt), "%Y%m%d %H:%M:%S").replace(
+                        tzinfo=UTC
+                    )
                 # Open time is close_time minus the bar duration
                 open_time = close_time - self._bar_duration(bar_size)
 
@@ -1295,15 +1295,17 @@ class IBKRAdapter(Adapter):
         return MarketDataCapability(
             ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
             min_ticker_interval_seconds=2.0,
-            candle_timeframes=frozenset({
-                CandleTimeframe.M1,
-                CandleTimeframe.M5,
-                CandleTimeframe.M15,
-                CandleTimeframe.M30,
-                CandleTimeframe.H1,
-                CandleTimeframe.H4,
-                CandleTimeframe.D1,
-            }),
+            candle_timeframes=frozenset(
+                {
+                    CandleTimeframe.M1,
+                    CandleTimeframe.M5,
+                    CandleTimeframe.M15,
+                    CandleTimeframe.M30,
+                    CandleTimeframe.H1,
+                    CandleTimeframe.H4,
+                    CandleTimeframe.D1,
+                }
+            ),
             streaming_ticker=True,
         )
 
