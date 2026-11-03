@@ -24,7 +24,7 @@ import logging
 import math
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +46,7 @@ from unified_trading_execution.errors import (
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
+    UnsupportedOrderTypeError,
     UteError,
 )
 from unified_trading_execution.events import (
@@ -67,6 +68,7 @@ from unified_trading_execution.ibkr.orders import (
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
 from unified_trading_execution.types.enums import (
+    AssetClass,
     FillEntry,
     FillReason,
     OrderSide,
@@ -151,6 +153,25 @@ _CANDLE_DURATION_MAP: dict[CandleTimeframe, str] = {
     CandleTimeframe.H4: "1 M",  # 1 month of 4-hour bars
     CandleTimeframe.D1: "1 Y",  # 1 year of daily bars
 }
+
+# Historical series differ by asset class: forex has no trade prints and crypto
+# rejects TRADES. Everything else uses trade prices.
+_CANDLE_WHAT_TO_SHOW: dict[AssetClass, str] = {
+    AssetClass.MARGIN_FX: "MIDPOINT",
+    AssetClass.SPOT: "AGGTRADES",
+}
+
+#: Asset classes the adapter can address as IBKR contracts at all.
+_SUPPORTED_ASSET_CLASSES: frozenset[AssetClass] = frozenset(
+    {
+        AssetClass.SPOT,
+        AssetClass.MARGIN_FX,
+        AssetClass.CFD,
+        AssetClass.FUTURES,
+        AssetClass.OPTION,
+        AssetClass.STOCK,
+    }
+)
 
 
 def _is_position_protection_ref(client_order_id: str) -> bool:
@@ -1101,57 +1122,88 @@ class IBKRAdapter(Adapter):
     ) -> list[Candle]:
         """Fetch closed OHLC candles for ATR, oldest first and most recent last.
 
-        Uses ``ib.reqHistoricalData`` with ``keepUpToDate=False``. Drops the
-        forming bar (close time in the future). Maps 7 core timeframes to IBKR bar
-        size strings. Returns empty list when the symbol is unknown or on permission
-        failure.
+        Uses ``ib.reqHistoricalData`` with ``keepUpToDate=False``. IB dates a
+        bar by its start, so the close time is the start plus the bar width and
+        the candle whose close is still in the future is dropped. Supports the
+        seven core timeframes the adapter advertises. The series requested
+        matches the asset class: ``TRADES`` for stocks, futures, options, and
+        CFDs, ``MIDPOINT`` for forex (which has no trade prints), and
+        ``AGGTRADES`` for crypto.
 
         Args:
             instrument: The instrument to fetch candles for.
-            timeframe: CandleTimeframe (one of M1, M5, M15, M30, H1, H4, D1).
+            timeframe: One of M1, M5, M15, M30, H1, H4, D1.
             limit: Maximum number of candles to return (minimum 1).
 
         Returns:
-            List of Candle objects, oldest first. Empty list on error or when no
-            candles are available.
+            Up to ``limit`` closed candles, oldest first. Empty only when the
+            venue returns no bars for the requested window.
 
         Raises:
-            InvalidSymbolError: when the contract is unknown.
-            PlatformError: on permission failure or other IBKR errors.
+            ValueError: ``limit`` is below 1.
+            UnsupportedOrderTypeError: the timeframe is not one of the seven.
+            InvalidSymbolError: the contract is unknown on this gateway.
+            PlatformConnectionError: the request timed out or the gateway failed.
+            PlatformError: IBKR returned an error or malformed bar data.
         """
         if limit < 1:
             raise ValueError("limit must be at least 1")
 
         bar_size = _CANDLE_TIMEFRAME_MAP.get(timeframe)
         if bar_size is None:
-            raise ValueError(f"unsupported timeframe: {timeframe}")
+            raise UnsupportedOrderTypeError(
+                f"IBKR does not support the {timeframe} candle timeframe"
+            )
 
-        duration_str = _CANDLE_DURATION_MAP.get(timeframe, "1 D")
+        duration_str = _CANDLE_DURATION_MAP[timeframe]
 
         ib = self._require_ib()
-        contract = to_ibkr_contract(instrument)
+        contract = to_ibkr_contract(instrument, self._config)
 
-        # Ensure contract has exchange for historical data (required by IBKR)
-        if not contract.exchange:
-            contract.exchange = "SMART"  # Default if not set
-
-        # Calculate end time: now minus a small buffer to exclude forming bar
-        now = _utcnow()
-        end_time = now - timedelta(seconds=60)
-
+        # Qualify first: an unknown symbol must raise InvalidSymbolError rather
+        # than return as an empty bar list.
         try:
-            bars = await ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime=end_time.strftime("%Y%m%d-%H:%M:%S"),  # UTC format with dash
-                durationStr=duration_str,  # Duration in "integer unit" format
-                barSizeSetting=bar_size,  # Bar size for the candles
-                whatToShow="TRADES",
-                useRTH=False,
-                formatDate=2,  # YYYYMMDD HH:mm:ss
-                keepUpToDate=False,
-            )
+            details_list = await ib.reqContractDetailsAsync(contract)
+        except UteError:
+            raise
         except Exception as exc:
-            # IBKR permission errors or unknown contracts surface here
+            raise PlatformConnectionError(
+                f"failed to qualify {instrument.symbol!r} for candles: {exc}"
+            ) from exc
+        if not details_list:
+            raise InvalidSymbolError(
+                f"IBKR symbol {instrument.symbol!r} is not available: no contract details"
+            )
+        qualified = getattr(details_list[0], "contract", None) or contract
+
+        what_to_show = _CANDLE_WHAT_TO_SHOW.get(instrument.asset_class, "TRADES")
+        bar_duration = self._bar_duration(bar_size)
+        now = _utcnow()
+
+        # ``timeout=0`` disables ib_async's internal wait, which would swallow
+        # a timeout into an empty bar list. The outer wait surfaces it instead.
+        try:
+            bars = await asyncio.wait_for(
+                ib.reqHistoricalDataAsync(
+                    qualified,
+                    endDateTime=now,
+                    durationStr=duration_str,
+                    barSizeSetting=bar_size,
+                    whatToShow=what_to_show,
+                    useRTH=False,
+                    formatDate=2,
+                    keepUpToDate=False,
+                    timeout=0,
+                ),
+                timeout=self._config.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise PlatformConnectionError(
+                f"IBKR historical data request for {instrument.symbol!r} timed out"
+            ) from exc
+        except UteError:
+            raise
+        except Exception as exc:
             raise PlatformError(
                 f"failed to fetch historical data for {instrument.symbol!r}: {exc}"
             ) from exc
@@ -1160,48 +1212,38 @@ class IBKRAdapter(Adapter):
             return []
 
         candles: list[Candle] = []
-        now_utc = _utcnow()
-
         for bar in bars:
             try:
-                # IBKR BarData returns date as datetime when formatDate=2
-                bar_dt = bar.date
-                if isinstance(bar_dt, datetime):
-                    close_time = bar_dt.replace(tzinfo=UTC)
-                else:
-                    # Fallback: parse as string if it's not already a datetime
-                    close_time = datetime.strptime(str(bar_dt), "%Y%m%d %H:%M:%S").replace(
-                        tzinfo=UTC
+                raw_time = bar.date
+                if isinstance(raw_time, datetime):
+                    open_time = (
+                        raw_time if raw_time.tzinfo is not None else raw_time.replace(tzinfo=UTC)
                     )
-                # Open time is close_time minus the bar duration
-                open_time = close_time - self._bar_duration(bar_size)
+                elif isinstance(raw_time, date):
+                    # Daily bars are returned as yyyyMMdd even with formatDate=2.
+                    open_time = datetime(raw_time.year, raw_time.month, raw_time.day, tzinfo=UTC)
+                else:
+                    raise TypeError(f"unexpected bar date {raw_time!r}")
 
-                open_px = Decimal(str(bar.open))
-                high_px = Decimal(str(bar.high))
-                low_px = Decimal(str(bar.low))
-                close_px = Decimal(str(bar.close))
-            except (ValueError, AttributeError, TypeError) as exc:
+                candle = Candle(
+                    open_time=open_time,
+                    close_time=open_time + bar_duration,
+                    open=Decimal(str(bar.open)),
+                    high=Decimal(str(bar.high)),
+                    low=Decimal(str(bar.low)),
+                    close=Decimal(str(bar.close)),
+                )
+            except (ArithmeticError, ValueError, AttributeError, TypeError) as exc:
                 raise PlatformError(
                     f"malformed candle data for {instrument.symbol!r}: {exc}"
                 ) from exc
 
-            # Drop forming bars (close time in the future)
-            if close_time > now_utc:
+            if candle.close_time > now:
                 continue
+            candles.append(candle)
 
-            candles.append(
-                Candle(
-                    open_time=open_time,
-                    close_time=close_time,
-                    open=open_px,
-                    high=high_px,
-                    low=low_px,
-                    close=close_px,
-                )
-            )
-
-        # Return at most `limit` candles, oldest first
-        return candles[-limit:] if len(candles) > limit else candles
+        candles.sort(key=lambda candle: candle.open_time)
+        return candles[-limit:]
 
     def _bar_duration(self, bar_size: str) -> timedelta:
         """Return the duration of a bar size string as a timedelta."""
@@ -1238,22 +1280,11 @@ class IBKRAdapter(Adapter):
         """Return IBKR position-protection support.
 
         IBKR supports static TP/SL via OCA-pair orders on the position contract.
-        Every write is cancel-and-replace (gap), and the adapter already
-        preserves the unmentioned side via merge semantics in modify_position_tpsl.
+        Every supported asset class carries positions. Every write is cancel and
+        replace (gap), and ``modify_position_tpsl`` reads the unmentioned side
+        back before the replace, so the merge is preserved.
         """
-        # Position-bearing secTypes: STK (stock), FUT (futures), OPT (options),
-        # FX/CASH (forex), CFD (contracts for difference)
-        position_bearing_classes = {
-            "STK",
-            "FUT",
-            "OPT",
-            "CASH",
-            "CFD",
-        }
-        # Extract secType from the instrument's raw contract if available
-        # Default to supported (most IBKR instruments are position-bearing)
-        sec_type = getattr(instrument, "sec_type", None)
-        supported = sec_type is None or sec_type in position_bearing_classes
+        supported = instrument.asset_class in _SUPPORTED_ASSET_CLASSES
 
         return PositionProtectionCapability(
             supported=supported,
@@ -1290,8 +1321,18 @@ class IBKRAdapter(Adapter):
         """Return IBKR market data support.
 
         Ticker provides LAST, BID, ASK via the IB snapshot. Candles are
-        available via reqHistoricalData for the 7 core timeframes.
+        available via reqHistoricalData for seven of the nine core timeframes
+        (H8 and H12 have no IBKR bar size). The adapter serves no data for asset
+        classes it cannot address as contracts.
         """
+        if instrument.asset_class not in _SUPPORTED_ASSET_CLASSES:
+            return MarketDataCapability(
+                ticker_bases=frozenset(),
+                min_ticker_interval_seconds=0.0,
+                candle_timeframes=frozenset(),
+                streaming_ticker=False,
+            )
+
         return MarketDataCapability(
             ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
             min_ticker_interval_seconds=2.0,
@@ -1306,7 +1347,7 @@ class IBKRAdapter(Adapter):
                     CandleTimeframe.D1,
                 }
             ),
-            streaming_ticker=True,
+            streaming_ticker=False,
         )
 
     # ------------------------------------------------------------------

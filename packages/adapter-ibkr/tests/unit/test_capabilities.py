@@ -1,6 +1,7 @@
 """Test IBKR capability declarations for trailing and position protection."""
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -33,8 +34,8 @@ def _instrument(**kwargs: object) -> Instrument:
 class TestPositionProtectionCapability:
     """Test position-protection capability reporting."""
 
-    def test_unspecified_sec_type_defaults_to_supported(self):
-        """When sec_type is not specified, default to supported."""
+    def test_supported_asset_class_is_supported(self):
+        """Supported asset classes carry positions and accept protection."""
         adapter = IBKRAdapter(_config())
         instrument = _instrument()
         capability = adapter.position_protection_capability(instrument)
@@ -48,6 +49,17 @@ class TestPositionProtectionCapability:
         assert capability.trigger_bases == frozenset()
         assert capability.min_reprice_interval_seconds == 2.0
         assert capability.reprice_gap is True
+
+    def test_unsupported_asset_class_is_unsupported(self):
+        """Bonds and funds cannot be addressed as IBKR contracts here."""
+        adapter = IBKRAdapter(_config())
+        instrument = _instrument(asset_class=AssetClass.BOND)
+
+        capability = adapter.position_protection_capability(instrument)
+
+        assert capability.supported is False
+        assert capability.can_set_stop is False
+        assert capability.can_set_take_profit is False
 
 
 class TestTrailingCapability:
@@ -81,10 +93,10 @@ class TestMarketDataCapability:
             {TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}
         )
         assert capability.min_ticker_interval_seconds == 2.0
-        assert capability.streaming_ticker is True
+        assert capability.streaming_ticker is False
 
-    def test_candle_timeframes_now_implemented(self):
-        """Candles now implemented with 7 core timeframes."""
+    def test_candle_timeframes_seven_of_nine(self):
+        """Candles cover seven core timeframes; H8 and H12 have no IBKR bar size."""
         from unified_trading_execution.adapter import CandleTimeframe
 
         adapter = IBKRAdapter(_config())
@@ -102,6 +114,17 @@ class TestMarketDataCapability:
             }
         )
         assert capability.candle_timeframes == expected
+        assert CandleTimeframe.H8 not in capability.candle_timeframes
+        assert CandleTimeframe.H12 not in capability.candle_timeframes
+
+    def test_unsupported_asset_class_declares_no_data(self):
+        """Bonds and funds cannot be addressed, so no ticker or candles."""
+        adapter = IBKRAdapter(_config())
+        capability = adapter.market_data_capability(_instrument(asset_class=AssetClass.BOND))
+
+        assert capability.ticker_bases == frozenset()
+        assert capability.candle_timeframes == frozenset()
+        assert capability.min_ticker_interval_seconds == 0.0
 
 
 class TestCapabilityNoNetworkCalls:
@@ -135,50 +158,25 @@ class TestClearPositionTpsl:
 
         asyncio.run(test())
 
-    def test_clear_tp_only_flag(self):
-        """Clearing only take profit is accepted."""
+    @pytest.mark.parametrize(
+        ("take_profit", "stop_loss"),
+        [(True, False), (False, True), (True, True)],
+    )
+    def test_named_sides_are_forwarded(self, take_profit: bool, stop_loss: bool):
+        """Each accepted flag combination cancels exactly the named sides."""
         adapter = IBKRAdapter(_config())
+        adapter._cancel_protection_by_side = AsyncMock()  # type: ignore[method-assign]
         instrument = _instrument()
 
         async def test():
-            try:
-                await adapter.clear_position_tpsl(
-                    instrument, "12345", take_profit=True, stop_loss=False
-                )
-            except Exception as exc:
-                if "at least one" in str(exc):
-                    raise
-
-        asyncio.run(test())
-
-    def test_clear_sl_only_flag(self):
-        """Clearing only stop loss is accepted."""
-        adapter = IBKRAdapter(_config())
-        instrument = _instrument()
-
-        async def test():
-            try:
-                await adapter.clear_position_tpsl(
-                    instrument, "12345", take_profit=False, stop_loss=True
-                )
-            except Exception as exc:
-                if "at least one" in str(exc):
-                    raise
-
-        asyncio.run(test())
-
-    def test_clear_both_flags(self):
-        """Clearing both sides is accepted."""
-        adapter = IBKRAdapter(_config())
-        instrument = _instrument()
-
-        async def test():
-            try:
-                await adapter.clear_position_tpsl(
-                    instrument, "12345", take_profit=True, stop_loss=True
-                )
-            except Exception as exc:
-                if "at least one" in str(exc):
-                    raise
+            await adapter.clear_position_tpsl(
+                instrument,
+                "12345",
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+            )
+            adapter._cancel_protection_by_side.assert_awaited_once_with(  # type: ignore[attr-defined]
+                "12345", cancel_tp=take_profit, cancel_sl=stop_loss
+            )
 
         asyncio.run(test())

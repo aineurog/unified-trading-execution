@@ -52,33 +52,45 @@ def test_clear_position_tpsl_selective():
     asyncio.run(test())
 
 
+def _stock_contract() -> MagicMock:
+    contract = MagicMock()
+    contract.secType = "STK"
+    contract.symbol = "AAPL"
+    contract.currency = "USD"
+    contract.exchange = "SMART"
+    contract.conId = 12345
+    contract.localSymbol = ""
+    contract.lastTradeDateOrContractMonth = ""
+    contract.strike = 0.0
+    contract.right = ""
+    contract.multiplier = "1"
+    return contract
+
+
 def test_position_id_is_conid():
     """IBKR position_id is str(contract.conId) as documented."""
     adapter = IBKRAdapter(_config())
     adapter._ib = MagicMock()
     adapter._require_ib = lambda: adapter._ib  # type: ignore[assignment]
     adapter._ib.positions.return_value = [
-        MagicMock(contract=MagicMock(conId=12345), position=100, avgCost=Decimal("100"))
+        MagicMock(contract=_stock_contract(), position=100, avgCost=Decimal("100"))
     ]
 
     async def test():
         positions = await adapter.fetch_positions()
-        if positions:
-            assert positions[0].position_id == "12345"
+        assert len(positions) == 1
+        assert positions[0].position_id == "12345"
 
     import asyncio
 
     asyncio.run(test())
 
 
-def test_protection_order_ref_format():
+def test_protection_order_ref_prefixes():
     """Protection orders use deterministic orderRef prefixes."""
-    from unified_trading_execution.ibkr.adapter import _protection_ref_suffix
+    from unified_trading_execution.ibkr.adapter import _protection_ref_prefixes
 
-    # Verify the suffix generator exists and returns a string
-    suffix = _protection_ref_suffix()
-    assert isinstance(suffix, str)
-    assert len(suffix) > 0
+    assert _protection_ref_prefixes("12345") == ("12345-tp-", "12345-sl-")
 
 
 def test_cancel_protection_by_side_no_op():
