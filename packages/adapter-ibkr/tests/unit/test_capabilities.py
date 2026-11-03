@@ -83,12 +83,25 @@ class TestMarketDataCapability:
         assert capability.min_ticker_interval_seconds == 2.0
         assert capability.streaming_ticker is True
 
-    def test_candle_timeframes_empty_until_implementation(self):
-        """Candles not yet implemented, so timeframe set is empty."""
+    def test_candle_timeframes_now_implemented(self):
+        """Candles now implemented with 7 core timeframes."""
+        from unified_trading_execution.adapter import CandleTimeframe
+
         adapter = IBKRAdapter(_config())
         capability = adapter.market_data_capability(_instrument())
 
-        assert capability.candle_timeframes == frozenset()
+        expected = frozenset(
+            {
+                CandleTimeframe.M1,
+                CandleTimeframe.M5,
+                CandleTimeframe.M15,
+                CandleTimeframe.M30,
+                CandleTimeframe.H1,
+                CandleTimeframe.H4,
+                CandleTimeframe.D1,
+            }
+        )
+        assert capability.candle_timeframes == expected
 
 
 class TestCapabilityNoNetworkCalls:
