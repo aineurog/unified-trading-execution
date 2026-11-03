@@ -11,18 +11,19 @@ The IBKR adapter provides a unified interface for trading on Interactive Brokers
 | Options | `OPT` | AAPL 20250120 C150 |
 | Forex | `CASH` | EURUSD, GBPUSD |
 | CFDs | `CFD` | Indices, commodities |
+| Crypto | `CRYPTO` | BTC, ETH |
 
 **Note:** This adapter works with IBKR's paper trading accounts for development. Production use requires a live IBKR account with appropriate permissions.
 
 ## Credentials and setup
 
-You need an IBKR paper trading account for development:
+You need an IBKR paper trading account for development. IBKR does not issue API keys — access is granted through TWS or IB Gateway:
 
-1. Log in to your IBKR account on the website.
-2. Navigate to **Settings → Account Settings → Configure API → Access Management**.
-3. Create a new API key with read/write permissions.
-4. Enable API access for your paper trading account.
-5. Install TWS or IB Gateway and enable ActiveX/Socket connections.
+1. Install TWS or IB Gateway and log in with your paper trading account.
+2. Open **Global Configuration → API → Settings**.
+3. Enable **Enable ActiveX and Socket Clients** and note the socket port.
+4. Add your machine to the trusted IP list if the connection is rejected.
+5. Keep TWS or IB Gateway running while the adapter is connected.
 
 ### The `IBKRConfig` dataclass
 
@@ -42,12 +43,14 @@ config = IBKRConfig(
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `host` | `str` | `"127.0.0.1"` | TWS/Gateway host |
-| `port` | `int` | `7497` | Paper trading port (7497 for TWS, 4002 for Gateway) |
-| `client_id` | `int` | *(required)* | Unique client ID per connection |
-| `account` | `str` | *(required)* | IBKR account ID (e.g., "DU123456") |
-| `read_only` | `bool` | `False` | If True, prevents order placement/modification |
-| `default_exchange` | `str \| None` | `None` | Default exchange for orders (e.g., "SMART", "IDEALPRO") |
-| `platform_name` | `str` | `"ibkr"` | Human-readable label for logs and events |
+| `port` | `int` | `4002` | Paper Gateway port (7497 for paper TWS, 4001 live Gateway, 7496 live TWS) |
+| `client_id` | `int` | `1` | Unique client ID per connection |
+| `account` | `str \| None` | `None` | IBKR account ID (e.g., "DU123456"); `None` uses the Gateway default |
+| `default_exchange` | `str` | `"SMART"` | Fallback routing exchange (e.g., "SMART", "IDEALPRO") |
+| `default_currency` | `str` | `"USD"` | Fallback contract currency when the instrument omits it |
+| `timeout_seconds` | `float` | `10.0` | Connection and blocking request timeout |
+| `readonly` | `bool` | `False` | Connects in read only mode and blocks order placement |
+| `instrument_spec_cache_ttl` | `float \| None` | `86400.0` | Seconds a cached spec is trusted; `None` caches indefinitely |
 
 ### Quickstart
 
@@ -214,7 +217,7 @@ Orders go through the engine's risk-check pipeline (symbol validity, quantity bo
 | `STOP` | Stop orders |
 | `STOP_LIMIT` | Stop-limit orders |
 
-`TimeInForce.DAY` is not supported by IBKR and raises `UnsupportedOrderTypeError`. IBKR does not support IOC (Immediate-or-Cancel) or FOK (Fill-or-Kill) through the standard API without additional market data subscriptions.
+Supported time-in-force values are `GTC`, `DAY`, `IOC`, `FOK` and `GTD`. A `GTD` order must carry `expire_at`. `MARKET` orders on crypto are forced to `IOC`; every other asset class uses the requested value.
 
 ### Placing an order
 
@@ -269,7 +272,7 @@ updated = engine.modify_order(OrderModification(
 ))
 ```
 
-The adapter locates the order by `client_order_id` (sent as IBKR's `orderRef`). IBKR supports modifying quantity and price for open orders. Time-in-force changes are not supported by IBKR's API and will raise `UnsupportedOrderTypeError`.
+The adapter locates the order by `client_order_id` (sent as IBKR's `orderRef`). It supports modifying `price`, `stop_price` and `quantity` on open orders. `OrderModification` has no field for time in force, so a modification cannot change it.
 
 ### Cancelling an order
 
@@ -296,7 +299,6 @@ The adapter maintains a mirror of order states from IBKR callbacks.
 IBKR trailing is **synthetic-only**. The adapter reports:
 
 - `trailing_capability.supported = False`
-- `trailing_capability.native = False`
 - Native TRAIL orders are not supported
 - All trailing uses position protection via `modify_position_tpsl`
 
@@ -353,8 +355,8 @@ Synthetic trailing keeps a normal position stop loss on the target leg. The engi
 
 - **No native trailing.** IBKR has a TRAIL order type, but it is order-scoped (not position-scoped) and requires separate bookkeeping that is out of scope.
 - **Cancel-and-replace gaps.** Every reprice cancels the old order and places a new one, creating a brief gap where no protection exists.
-- **Minimum reprice interval.** 2.0 seconds minimum between reprice operations to respect IBKR pacing limits.
-- **No trigger basis selection.** IBKR uses its own feed for trigger basis; the adapter cannot specify LAST, MARK, BID, ASK, or MID.
+- **Minimum reprice interval.** The adapter declares a 2.0 second floor between reprice operations. The engine respects the value each adapter reports.
+- **No trigger basis selection.** The adapter declares no trigger bases, so stops fire on the venue default feed. It cannot select LAST, BID or ASK.
 - **Position open time unavailable.** IBKR has no reliable venue field for position open time, so `opened_at` is `None` for all positions.
 
 ## Instrument metadata
@@ -367,17 +369,18 @@ spec = engine.fetch_instrument_spec(aapl)
 #     tick_size=0.01,
 #     lot_size=1,
 #     min_qty=1,
-#     max_qty=1000000,
-#     min_notional=1,
+#     max_qty=1000000000,
+#     min_notional=0,
 #     price_precision=2,
 #     qty_precision=0,
-#     max_leverage=None,  # None for stocks
 # )
 ```
 
-Results are cached in memory for the lifetime of the adapter instance. The cache is invalidated on contract events.
+`tick_size`, `lot_size` and `min_qty` come from IBKR contract details. IBKR publishes no explicit maximum order size, so the adapter reports a large cap (`1e9`), and it reports `min_notional=0` because IBKR has no minimum notional rule.
 
-`max_leverage` is only present for derivatives — stock instruments return `None` for this field.
+Specs are cached per instrument for `instrument_spec_cache_ttl` seconds (default one day). The cache entry is dropped when IBKR rejects an order because the contract's rules changed, forcing the next fetch to re-query.
+
+The adapter does not populate `max_leverage`: IBKR leverage is implied by per instrument margin requirements, not a single account setting.
 
 ## Leverage management
 
@@ -475,17 +478,17 @@ The adapter translates IBKR errors into the common exception hierarchy:
 
 ## Rate limits
 
-IBKR does not have explicit API rate limits like crypto exchanges. The adapter uses a 2.0-second minimum interval for ticker polling and reprice operations to respect IBKR's fair usage guidelines.
+The adapter declares a 2.0 second minimum interval for ticker polling and reprice operations. The engine schedules trailing work no faster than the interval each adapter reports, so this floor is enforced centrally rather than by the adapter itself.
 
 ## Testing
 
 Unit tests are located in `packages/adapter-ibkr/tests/unit/`:
 
-- `test_capabilities.py`: Capability declarations
-- `test_clear_position_tpsl.py`: Clear protection behavior
-- `test_fetch_candles.py`: Candle fetching
+- `test_capabilities.py`: Capability declarations, including clear protection flags
+- `test_fetch_candles.py`: Candle fetching, bar timestamps, series selection
+- `test_orders.py`: Order translation and TP/SL protection orders
 - `test_engine.py`: Engine wiring and method forwarding
-- `test_trailing_lifecycle.py`: Synthetic trailing lifecycle
+- `test_trailing_lifecycle.py`: Synthetic trailing lifecycle and position leg ids
 
 Run unit tests:
 ```bash
@@ -533,11 +536,11 @@ await adapter.disconnect()
 Provide a custom state store path:
 
 ```python
-from unified_trading_execution.state import StateStore
+from unified_trading_execution.state import SQLiteStateStore
 
 engine = IBKREngine(
     config,
-    state_store=StateStore(path="./custom/state.db"),
+    state_store=SQLiteStateStore("./custom/state.db"),
 )
 ```
 

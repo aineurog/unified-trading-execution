@@ -11,13 +11,15 @@ Unified Trading Execution adapter for Interactive Brokers (IBKR) via TWS/Gateway
 | Options | `OPT` | AAPL 20250120 C150 |
 | Forex | `CASH` | EURUSD, GBPUSD |
 | CFDs | `CFD` | Indices, commodities |
+| Crypto | `CRYPTO` | BTC, ETH |
 
 **Note:** Works with IBKR paper trading accounts for development. Production use requires a live IBKR account with appropriate permissions.
 
 ## Installation
 
 ```bash
-pip install unified-trading-execution[ibkr]
+uv pip install -e packages/core
+uv pip install -e packages/adapter-ibkr
 ```
 
 ## Configuration
@@ -25,12 +27,14 @@ pip install unified-trading-execution[ibkr]
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `host` | `str` | `"127.0.0.1"` | TWS/Gateway host |
-| `port` | `int` | `7497` | Paper trading port (7497 for TWS, 4002 for Gateway) |
-| `client_id` | `int` | *(required)* | Unique client ID per connection |
-| `account` | `str` | *(required)* | IBKR account ID (e.g., "DU123456") |
-| `read_only` | `bool` | `False` | Prevents order placement if True |
-| `default_exchange` | `str \| None` | `None` | Default exchange for orders (e.g., "SMART", "IDEALPRO") |
-| `platform_name` | `str` | `"ibkr"` | Human-readable label for logs and events |
+| `port` | `int` | `4002` | Paper Gateway port (7497 for paper TWS, 4001 live Gateway, 7496 live TWS) |
+| `client_id` | `int` | `1` | Unique client ID per connection |
+| `account` | `str \| None` | `None` | IBKR account ID (e.g., "DU123456"); `None` uses the Gateway default |
+| `default_exchange` | `str` | `"SMART"` | Fallback routing exchange (e.g., "SMART", "IDEALPRO") |
+| `default_currency` | `str` | `"USD"` | Fallback contract currency when the instrument omits it |
+| `timeout_seconds` | `float` | `10.0` | Connection and blocking request timeout |
+| `readonly` | `bool` | `False` | Connects in read only mode and blocks order placement |
+| `instrument_spec_cache_ttl` | `float \| None` | `86400.0` | Seconds a cached spec is trusted; `None` caches indefinitely |
 
 ## Quickstart
 
@@ -240,7 +244,7 @@ await engine.clear_position_tpsl(
 # Fetch ticker
 ticker = await engine.fetch_ticker(instrument)
 
-# Fetch candles (7 core timeframes supported)
+# Fetch candles (seven of the nine core timeframes)
 from unified_trading_execution.adapter import CandleTimeframe
 
 candles = await engine.fetch_candles(
@@ -250,7 +254,7 @@ candles = await engine.fetch_candles(
 )
 ```
 
-**Supported timeframes:** M1, M5, M15, M30, H1, H4, D1
+**Supported timeframes:** M1, M5, M15, M30, H1, H4, D1. H8 and H12 have no matching IBKR bar size and raise `UnsupportedOrderTypeError`.
 
 ## Order operations
 
@@ -263,7 +267,7 @@ candles = await engine.fetch_candles(
 | `STOP` | Stop orders |
 | `STOP_LIMIT` | Stop-limit orders |
 
-`TimeInForce.DAY` is not supported by IBKR and raises `UnsupportedOrderTypeError`.
+Supported time-in-force values are `GTC`, `DAY`, `IOC`, `FOK` and `GTD`.
 
 ### Placing an order
 
@@ -320,7 +324,7 @@ updated = await engine.modify_order(
 )
 ```
 
-IBKR supports modifying quantity and price for open orders. Time-in-force changes are not supported.
+IBKR supports modifying `price`, `stop_price` and `quantity` for open orders. `OrderModification` has no field for time in force, so a modification cannot change it.
 
 ### Cancelling an order
 
@@ -348,15 +352,14 @@ spec = await engine.fetch_instrument_spec(aapl)
 #     tick_size=0.01,
 #     lot_size=1,
 #     min_qty=1,
-#     max_qty=1000000,
-#     min_notional=1,
+#     max_qty=1000000000,
+#     min_notional=0,
 #     price_precision=2,
 #     qty_precision=0,
-#     max_leverage=None,  # None for stocks
 # )
 ```
 
-Results are cached in memory and invalidated on contract events.
+IBKR publishes no explicit maximum order size, so the adapter reports `1e9`; it reports `min_notional=0` because IBKR has no minimum notional rule. Specs are cached per instrument for `instrument_spec_cache_ttl` seconds and dropped when IBKR rejects an order because the contract's rules changed.
 
 ## Error handling
 
@@ -369,7 +372,7 @@ The adapter translates IBKR errors into the common exception hierarchy:
 
 ## Rate limits
 
-IBKR does not have explicit API rate limits like crypto exchanges. The adapter uses a 2.0-second minimum interval for ticker polling and reprice operations to respect IBKR's fair usage guidelines.
+The adapter declares a 2.0 second minimum interval for ticker polling and reprice operations; the engine schedules trailing work no faster than the interval each adapter reports.
 
 ## Testing
 
@@ -422,11 +425,11 @@ await adapter.disconnect()
 Provide a custom state store path:
 
 ```python
-from unified_trading_execution.state import StateStore
+from unified_trading_execution.state import SQLiteStateStore
 
 engine = IBKREngine(
     config,
-    state_store=StateStore(path="./custom/state.db"),
+    state_store=SQLiteStateStore("./custom/state.db"),
 )
 ```
 
