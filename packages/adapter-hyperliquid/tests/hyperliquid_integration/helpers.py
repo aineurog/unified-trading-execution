@@ -129,19 +129,26 @@ def valid_price_from_spec(spec: InstrumentSpec, reference: Decimal) -> Decimal:
 def venue_price(raw: Decimal, tick: Decimal, *, direction: str = "down") -> Decimal:
     """A venue-legal price: <= 5 significant figures, floored/ceiled to tick.
 
-    ``direction`` is ``"down"`` (resting below market, TP math) or ``"up"``.
+    ``direction`` is ``"down"`` (a level at or below ``raw``) or ``"up"`` (at or
+    above).  Alignment and the significant-figure cap are both applied in the
+    requested direction, so rounding never crosses the requested side.
     """
     if tick <= 0:
         raise ValueError("tick must be positive")
-    quantum = Decimal(1).scaleb(raw.adjusted() - 4)
-    truncated = (raw // quantum) * quantum
-    steps = truncated / tick
-    rounded = (
-        steps.to_integral_value(rounding="ROUND_FLOOR")
-        if direction == "down"
-        else steps.to_integral_value(rounding="ROUND_CEILING")
-    )
-    return rounded * tick
+    if raw == 0:
+        return Decimal("0")
+
+    sign = 1 if raw > 0 else -1
+    abs_raw = abs(raw)
+
+    step_rounding = "ROUND_FLOOR" if direction == "down" else "ROUND_CEILING"
+    steps = (abs_raw / tick).to_integral_value(rounding=step_rounding)
+    aligned = steps * tick
+
+    # Cap at five significant figures without crossing the requested side.
+    quantum = Decimal(1).scaleb(aligned.adjusted() - 4)
+    aligned = (aligned / quantum).to_integral_value(rounding=step_rounding) * quantum
+    return aligned * sign
 
 
 def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:
@@ -150,6 +157,14 @@ def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:
         return value
     steps = (value / lot_size).to_integral_value(rounding="ROUND_CEILING")
     return steps * lot_size
+
+
+def quantize_price(value: Decimal, tick_size: Decimal) -> Decimal:
+    """Align ``value`` to ``tick_size`` using standard rounding."""
+    if tick_size <= 0:
+        return value
+    steps = (value / tick_size).to_integral_value(rounding="ROUND_HALF_EVEN")
+    return steps * tick_size
 
 
 async def wait_for_status(

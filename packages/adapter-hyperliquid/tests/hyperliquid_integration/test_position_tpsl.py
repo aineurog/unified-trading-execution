@@ -64,8 +64,9 @@ async def test_attach_read_detach_roundtrip(
     flattened_book: None,
 ) -> None:
     await _open_long(connected_adapter, btc_perp, reference_price, unique_cid("tpsl-long"))
-    tp = venue_price(reference_price * Decimal("1.5"), Decimal("0.1"), direction="up")
-    sl = venue_price(reference_price * Decimal("0.5"), Decimal("0.1"), direction="down")
+    spec = await connected_adapter.fetch_instrument_spec(btc_perp)
+    tp = venue_price(reference_price * Decimal("1.5"), spec.tick_size, direction="up")
+    sl = venue_price(reference_price * Decimal("0.5"), spec.tick_size, direction="down")
 
     await connected_adapter.modify_position_tpsl(
         btc_perp,
@@ -102,8 +103,9 @@ async def test_construction_is_one_leg_per_side(
 ) -> None:
     """OPEN_ISSUES #5: assert OUR construction, not venue invariants."""
     await _open_long(connected_adapter, btc_perp, reference_price, unique_cid("tpsl-oneleg"))
-    tp = venue_price(reference_price * Decimal("1.5"), Decimal("0.1"), direction="up")
-    sl = venue_price(reference_price * Decimal("0.5"), Decimal("0.1"), direction="down")
+    spec = await connected_adapter.fetch_instrument_spec(btc_perp)
+    tp = venue_price(reference_price * Decimal("1.5"), spec.tick_size, direction="up")
+    sl = venue_price(reference_price * Decimal("0.5"), spec.tick_size, direction="down")
     await connected_adapter.modify_position_tpsl(
         btc_perp,
         "BTC:oneWay",
@@ -149,7 +151,8 @@ async def test_recover_rested_legs_after_restart(
     event_bus: EventBus,
 ) -> None:
     await _open_long(connected_adapter, btc_perp, reference_price, unique_cid("tpsl-restart"))
-    tp = venue_price(reference_price * Decimal("1.5"), Decimal("0.1"), direction="up")
+    spec = await connected_adapter.fetch_instrument_spec(btc_perp)
+    tp = venue_price(reference_price * Decimal("1.5"), spec.tick_size, direction="up")
     await connected_adapter.modify_position_tpsl(
         btc_perp, "BTC:oneWay", take_profit=TpSlAttachment(trigger_price=tp)
     )
