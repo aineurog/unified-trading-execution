@@ -33,7 +33,7 @@ def _instrument(**kwargs: object) -> Instrument:
 
 class TestStopSafeTick:
     async def test_derives_tick_from_mark_for_btc_range(self):
-        """Price steps remain valid while minimum distance stays conservative."""
+        """Five significant figures allow unit price steps at this magnitude."""
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
 
@@ -44,9 +44,9 @@ class TestStopSafeTick:
 
         spec = await adapter.fetch_instrument_spec(_instrument())
 
-        # Five significant figures allow unit price steps at this magnitude.
         assert spec.tick_size == Decimal("1")
-        assert spec.min_stop_distance == Decimal("63")
+        assert spec.price_precision == 0
+        assert spec.min_stop_distance is None
 
     async def test_derives_tick_from_mark_at_100k_boundary(self):
         """Price precision becomes coarser at the 100,000 boundary."""
@@ -60,7 +60,9 @@ class TestStopSafeTick:
         spec = await adapter.fetch_instrument_spec(_instrument())
 
         assert spec.tick_size == Decimal("10")
-        assert spec.min_stop_distance == Decimal("100")
+        # A 10-unit quantum allows no decimals; precision must not go negative.
+        assert spec.price_precision == 0
+        assert spec.min_stop_distance is None
 
     async def test_derives_tick_from_mark_at_1m_boundary(self):
         """Price precision becomes coarser at the 1,000,000 boundary."""
@@ -74,7 +76,8 @@ class TestStopSafeTick:
         spec = await adapter.fetch_instrument_spec(_instrument())
 
         assert spec.tick_size == Decimal("100")
-        assert spec.min_stop_distance == Decimal("1000")
+        assert spec.price_precision == 0
+        assert spec.min_stop_distance is None
 
     async def test_derives_tick_from_mark_for_eth_range(self):
         """Lower price magnitudes retain five significant figures."""
@@ -88,10 +91,11 @@ class TestStopSafeTick:
         spec = await adapter.fetch_instrument_spec(_instrument(symbol="ETH"))
 
         assert spec.tick_size == Decimal("0.1")
-        assert spec.min_stop_distance == Decimal("3")
+        assert spec.price_precision == 1
+        assert spec.min_stop_distance is None
 
     async def test_falls_back_to_decimal_tick_for_low_price(self):
-        """Low-priced coins use decimal tick when mark/1000 is smaller."""
+        """Low-priced coins use the decimal precision floor."""
         adapter = HyperliquidAdapter(_config())
         adapter._exchange = MagicMock()
 
@@ -101,9 +105,8 @@ class TestStopSafeTick:
 
         spec = await adapter.fetch_instrument_spec(_instrument(symbol="DOGE"))
 
-        # Both values use the decimal precision floor.
         assert spec.tick_size == Decimal("0.001")
-        assert spec.min_stop_distance == Decimal("0.001")
+        assert spec.min_stop_distance is None
 
     async def test_falls_back_to_decimal_tick_when_mark_missing(self):
         """Missing mark price falls back to decimal tick."""
@@ -118,7 +121,7 @@ class TestStopSafeTick:
 
         # Should fall back to decimal tick (10^-(6-1) = 0.00001)
         assert spec.tick_size == Decimal("0.00001")
-        assert spec.min_stop_distance == Decimal("0.00001")
+        assert spec.min_stop_distance is None
 
     async def test_max_qty_uses_decimal_tick_not_stop_safe(self):
         """max_qty preserves order-tier semantics by using decimal tick."""
@@ -161,7 +164,7 @@ class TestStopSafeTick:
         rounded = (Decimal("75584.088") / spec.tick_size).to_integral_value() * spec.tick_size
 
         assert spec.tick_size == Decimal("1")
-        assert spec.min_stop_distance == Decimal("75.584088")
+        assert spec.min_stop_distance is None
         assert quantize_price(rounded, 2, is_spot=False) == rounded
 
     async def test_spec_caches_stop_safe_tick(self):

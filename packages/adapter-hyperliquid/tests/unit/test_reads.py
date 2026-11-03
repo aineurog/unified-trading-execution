@@ -8,7 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from unified_trading_execution.errors import InvalidSymbolError
+from unified_trading_execution.errors import InvalidSymbolError, PlatformError
 from unified_trading_execution.hyperliquid import HyperliquidAdapter
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
@@ -47,7 +47,7 @@ async def test_fetch_instrument_spec_perp_caches(adapter: HyperliquidAdapter) ->
     assert first.min_qty == Decimal("0.00001")
     assert first.min_notional == Decimal("10")
     assert first.max_leverage == Decimal("40")
-    assert first.min_stop_distance == Decimal("50")
+    assert first.min_stop_distance is None
     assert (first.price_precision, first.qty_precision) == (0, 5)
     second = await adapter.fetch_instrument_spec(_perp())
     assert second == first
@@ -78,6 +78,23 @@ async def test_fetch_instrument_spec_unknown(adapter: HyperliquidAdapter) -> Non
 
     with pytest.raises(InvalidSymbolError):
         await adapter.fetch_instrument_spec(_perp())
+
+
+async def test_fetch_instrument_spec_malformed_perp_metadata(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.info.meta_and_asset_ctxs.return_value = {"unexpected": True}
+
+    with pytest.raises(PlatformError, match="Unexpected perp metadata shape"):
+        await adapter.fetch_instrument_spec(_perp())
+
+
+async def test_fetch_instrument_spec_malformed_spot_metadata(adapter: HyperliquidAdapter) -> None:
+    exchange = _connected(adapter)
+    exchange.info.name_to_coin = {"HYPE/USDC": "@107", "@107": "@107"}
+    exchange.info.spot_meta_and_asset_ctxs.return_value = {"unexpected": True}
+
+    with pytest.raises(PlatformError, match="Unexpected spot metadata shape"):
+        await adapter.fetch_instrument_spec(_spot())
 
 
 async def test_fetch_ticker(adapter: HyperliquidAdapter) -> None:

@@ -129,32 +129,26 @@ def valid_price_from_spec(spec: InstrumentSpec, reference: Decimal) -> Decimal:
 def venue_price(raw: Decimal, tick: Decimal, *, direction: str = "down") -> Decimal:
     """A venue-legal price: <= 5 significant figures, floored/ceiled to tick.
 
-    ``direction`` is ``"down"`` (resting below market, TP math) or ``"up"``.
+    ``direction`` is ``"down"`` (a level at or below ``raw``) or ``"up"`` (at or
+    above).  Alignment and the significant-figure cap are both applied in the
+    requested direction, so rounding never crosses the requested side.
     """
     if tick <= 0:
         raise ValueError("tick must be positive")
-
     if raw == 0:
         return Decimal("0")
 
-    # Use string formatting to round to 5 significant figures
     sign = 1 if raw > 0 else -1
     abs_raw = abs(raw)
 
-    # Convert to scientific notation with 5 significant figures
-    # For 100180.6 -> 1.0018E+5 -> 100180
-    # For 75444.677 -> 7.5445E+4 -> 75445
-    format_str = f"{abs_raw:.5g}"
-    rounded = Decimal(format_str)
+    step_rounding = "ROUND_FLOOR" if direction == "down" else "ROUND_CEILING"
+    steps = (abs_raw / tick).to_integral_value(rounding=step_rounding)
+    aligned = steps * tick
 
-    # Then align to tick
-    steps = rounded / tick
-    rounded = (
-        steps.to_integral_value(rounding="ROUND_FLOOR")
-        if direction == "down"
-        else steps.to_integral_value(rounding="ROUND_CEILING")
-    )
-    return rounded * tick * sign
+    # Cap at five significant figures without crossing the requested side.
+    quantum = Decimal(1).scaleb(aligned.adjusted() - 4)
+    aligned = (aligned / quantum).to_integral_value(rounding=step_rounding) * quantum
+    return aligned * sign
 
 
 def align_up_to_lot(value: Decimal, lot_size: Decimal) -> Decimal:

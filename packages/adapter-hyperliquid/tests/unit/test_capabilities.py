@@ -59,7 +59,7 @@ class TestPositionProtectionCapability:
         assert capability.preserves_unmentioned_side is True
         assert capability.trigger_bases == frozenset({TrailingBasis.MARK})
         assert capability.min_reprice_interval_seconds == 15.0
-        assert capability.reprice_gap is False
+        assert capability.reprice_gap is True
 
     def test_spot_is_unsupported(self):
         """Spot markets have no position leg and report unsupported."""

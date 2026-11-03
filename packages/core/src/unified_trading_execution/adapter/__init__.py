@@ -41,15 +41,15 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Adapter",
-    "RateLimits",
-    "PositionProtectionCapability",
-    "TrailingCapability",
-    "MarketDataCapability",
     "CandleTimeframe",
+    "MarketDataCapability",
     "NativeTrailingRequest",
     "NativeTrailingResult",
+    "PositionProtectionCapability",
+    "RateLimits",
     "TrailingActivation",
     "TrailingBasis",
+    "TrailingCapability",
     "TrailingOffsetType",
 ]
 

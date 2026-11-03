@@ -1,7 +1,7 @@
 """Live testnet coverage for synthetic trailing stops.
 
-Hyperliquid does not support native trailing stops due to lack of position-scoped
-reads. All trailing is synthetic via position protection methods.
+Hyperliquid has no native trailing-stop order type. All trailing is synthetic
+via position protection methods.
 
 These tests are skipped unless testnet credentials are configured. They open
 tiny derivative positions, exercise synthetic trailing via position protection,

@@ -1,7 +1,7 @@
 # Hyperliquid Adapter
 
 The Hyperliquid adapter provides a unified interface for trading on Hyperliquid —
-perpetual derivatives markets. It implements the `Adapter` ABC, translating every
+perpetual derivatives plus spot. It implements the `Adapter` ABC, translating every
 platform-specific detail (REST payloads, WebSocket streams, error codes, symbol
 naming) into the engine's canonical types so your trading logic never needs to
 know it is talking to Hyperliquid.
@@ -11,9 +11,11 @@ know it is talking to Hyperliquid.
 | Market | Asset class | Example symbols |
 |---|---|---|
 | Perpetuals | `FUTURES` | BTC, ETH, SOL |
+| Spot | `SPOT` | HYPE/USDC, PURR/USDC |
 
-Spot markets are not currently supported. Hyperliquid uses one-way position mode
-only — hedge mode is not available.
+Hyperliquid uses one-way position mode only — hedge mode is not available.
+Spot markets support order placement and market data. They have no position
+leg, so position protection and trailing stops are perpetual-only.
 
 ## Credentials and setup
 
@@ -35,18 +37,19 @@ config = HyperliquidConfig(
     private_key="your-private-key",
     testnet=True,
     platform_name="hyperliquid",
-    account_id="hyperliquid-account",
 )
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `wallet_address` | `str` | *(required)* | Hyperliquid wallet address |
+| `wallet_address` | `str` | *(required)* | Hyperliquid wallet address; also the canonical account identity |
 | `private_key` | `str` | *(required)* | Wallet private key for signing |
-| `testnet` | `bool` | `True` | `False` connects to mainnet |
+| `testnet` | `bool` | `False` | `True` connects to the testnet |
+| `default_margin_mode` | `MarginMode \| str` | `"cross"` | Margin mode seeded per traded asset on connect |
+| `default_leverage` | `int` | `1` | Leverage seeded per traded asset with no explicit intent |
 | `platform_name` | `str` | `"hyperliquid"` | Human-readable label for logs and events |
-| `account_id` | `str` | `"hyperliquid-account"` | Unique account label in logs, events, and the state store filename |
 | `instrument_spec_cache_ttl` | `float \| None` | `86400.0` | Seconds before a cached `InstrumentSpec` is re-fetched. `None` disables TTL-based expiry, relying solely on event-driven invalidation |
+| `request_timeout_seconds` | `float` | `10.0` | Timeout for each blocking SDK call |
 
 ### Quickstart
 
@@ -309,11 +312,10 @@ market orders on trigger.
 
 ### Trailing stops
 
-Hyperliquid uses **synthetic trailing stops only** via position protection. Native
-trailing is not supported because Hyperliquid's API does not provide
-position-scoped trailing stop reads (required for takeover detection, integrity
-verification, and restart recovery). The `get_position_trailing_stop` method raises
-`NotImplementedError`.
+Hyperliquid uses **synthetic trailing stops only** via position protection.
+The venue offers no native trailing-stop order type, so the stop is placed and
+repriced on the specific position leg. The `get_position_trailing_stop` method
+raises `NotImplementedError`.
 
 ```python
 from decimal import Decimal
@@ -402,13 +404,14 @@ state for the same leg.
 
 #### Hyperliquid trailing caveats
 
-- **No native trailing.** The venue API cannot provide position-scoped trailing
-  stop reads, so native trailing is not supported.
+- **No native trailing.** The venue offers no native trailing-stop order type,
+  so native trailing is not supported.
 - **Position open time is None.** Neither REST nor WebSocket position responses
   include a position open timestamp, so identity verification on restart is
   limited to side and entry price.
 - **5 significant figures.** Hyperliquid enforces a 5-significant-figure limit
-  on prices. The adapter rounds prices accordingly before sending to the venue.
+  on prices. The adapter derives a stop-safe tick from the mark and quantizes
+  prices to it before sending.
 
 ### Reduce-only orders
 
@@ -468,15 +471,15 @@ a single instrument:
 ```python
 spec = engine.fetch_instrument_spec(btc)
 # InstrumentSpec(
-#     tick_size=0.1,
+#     tick_size=1,
 #     lot_size=0.00001,
 #     min_qty=0.00001,
-#     max_qty=1000,
+#     max_qty=3000000000,
 #     min_notional=10,
 #     price_precision=0,
 #     qty_precision=5,
-#     max_leverage=50,
-#     min_stop_distance=50,
+#     max_leverage=40,
+#     min_stop_distance=None,
 # )
 ```
 

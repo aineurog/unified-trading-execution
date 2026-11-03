@@ -43,6 +43,7 @@ from unified_trading_execution.errors import (
     PlatformConnectionError,
     PlatformError,
     RateLimitError,
+    UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
     BalanceUpdateEvent,
@@ -158,6 +159,18 @@ _PENDING_FILL_CAP = 1000
 #: long session cannot grow without limit; an evicted order degrades to
 #: the bounded orphan re-query, never to a silent drop.
 _ORDER_SNAPSHOT_CAP = 10000
+#: Candle widths in seconds.  The venue interval string equals the enum value.
+_CANDLE_SECONDS: dict[CandleTimeframe, int] = {
+    CandleTimeframe.M1: 60,
+    CandleTimeframe.M5: 300,
+    CandleTimeframe.M15: 900,
+    CandleTimeframe.M30: 1800,
+    CandleTimeframe.H1: 3600,
+    CandleTimeframe.H4: 14400,
+    CandleTimeframe.H8: 28800,
+    CandleTimeframe.H12: 43200,
+    CandleTimeframe.D1: 86400,
+}
 
 
 def _new_id() -> str:
@@ -1828,11 +1841,12 @@ class HyperliquidAdapter(Adapter):
 
         Perps read ``meta_and_asset_ctxs`` (``szDecimals``/``maxLeverage``); spot
         reads ``spot_meta_and_asset_ctxs``.  Tick size is derived from the mark
-        to satisfy the 5-significant-figure rule (stop-safe tick).  ``min_stop_distance``
-        is set to the stop-safe tick.  ``max_qty`` uses the decimal tick to preserve
-        order-tier semantics.  Lot is ``10^-szDecimals``; minimums are the venue $10
-        floors; maximum quantity is the tier-imposed non-binding upper bound (real caps
-        enforce at placement); delisted entries raise ``InvalidSymbolError``.
+        to satisfy the 5-significant-figure rule (stop-safe tick).  The venue
+        states no minimum stop distance, so ``min_stop_distance`` is ``None``.
+        ``max_qty`` uses the decimal tick to preserve order-tier semantics.  Lot
+        is ``10^-szDecimals``; minimums are the venue $10 floors; maximum quantity
+        is the tier-imposed non-binding upper bound (real caps enforce at
+        placement); delisted entries raise ``InvalidSymbolError``.
         """
         cached = self._cached_spec(instrument)
         if cached is not None:
@@ -1844,7 +1858,10 @@ class HyperliquidAdapter(Adapter):
         # Fetch metadata with mark price for stop-safe tick calculation
         if not is_spot:
             meta_ctx = await self._run_exchange(exchange.info.meta_and_asset_ctxs)
-            meta, ctxs = meta_ctx[0]["universe"], meta_ctx[1]
+            try:
+                meta, ctxs = meta_ctx[0]["universe"], meta_ctx[1]
+            except (KeyError, IndexError, TypeError) as exc:
+                raise PlatformError(f"Unexpected perp metadata shape for {coin}") from exc
             entry = next(
                 (e for e in meta if isinstance(e, dict) and e.get("name") == coin),
                 None,
@@ -1861,12 +1878,15 @@ class HyperliquidAdapter(Adapter):
                     i for i, e in enumerate(meta) if isinstance(e, dict) and e.get("name") == coin
                 )
                 mark_px = Decimal(str(ctxs[index].get("markPx", 0)))
-            except (StopIteration, KeyError, TypeError, ValueError):
+            except (StopIteration, KeyError, IndexError, TypeError, ValueError):
                 mark_px = Decimal("0")
         else:
             spot_meta_ctx = await self._run_exchange(exchange.info.spot_meta_and_asset_ctxs)
-            spot_meta, ctxs = spot_meta_ctx
-            universe = spot_meta["universe"]
+            try:
+                spot_meta, ctxs = spot_meta_ctx
+                universe = spot_meta["universe"]
+            except (KeyError, TypeError, ValueError) as exc:
+                raise PlatformError(f"Unexpected spot metadata shape for {coin}") from exc
             alias = exchange.info.name_to_coin.get(coin, coin)
             entry = next(
                 (e for e in universe if isinstance(e, dict) and e.get("name") == alias),
@@ -1889,7 +1909,7 @@ class HyperliquidAdapter(Adapter):
             try:
                 ctx = next(c for c in ctxs if isinstance(c, dict) and c.get("coin") == alias)
                 mark_px = Decimal(str(ctx.get("markPx", 0)))
-            except (StopIteration, KeyError, TypeError, ValueError):
+            except (StopIteration, KeyError, IndexError, TypeError, ValueError):
                 mark_px = Decimal("0")
 
         # Decimal tick (for max_qty and fallback)
@@ -1903,17 +1923,16 @@ class HyperliquidAdapter(Adapter):
                 Decimal(1).scaleb(mark_px.adjusted() - (MAX_PRICE_SIGNIFICANT_FIGURES - 1)),
                 decimal_tick,
             )
-            min_stop_distance = max(mark_px / Decimal("1000"), decimal_tick)
         else:
             price_tick = decimal_tick
-            min_stop_distance = decimal_tick
 
         lot_size = Decimal(1).scaleb(-sz_decimals)
         tier = max_limit_notional(int(max_leverage) if max_leverage is not None else 1)
 
-        # Calculate price_precision from the legal price quantum.
+        # Decimal places implied by the legal price quantum.  A quantum of
+        # 10 or more allows no decimals; never report a negative precision.
         exponent = price_tick.as_tuple().exponent
-        price_prec = -exponent if isinstance(exponent, int) else decimals_cap - sz_decimals
+        price_prec = max(0, -exponent) if isinstance(exponent, int) else decimals_cap - sz_decimals
 
         spec = InstrumentSpec(
             tick_size=price_tick,
@@ -1924,7 +1943,7 @@ class HyperliquidAdapter(Adapter):
             price_precision=price_prec,
             qty_precision=sz_decimals,
             max_leverage=Decimal(str(max_leverage)) if max_leverage is not None else None,
-            min_stop_distance=min_stop_distance,
+            min_stop_distance=None,
         )
         self._instrument_specs[instrument] = (spec, time.monotonic())
         return spec
@@ -1950,7 +1969,10 @@ class HyperliquidAdapter(Adapter):
         Hyperliquid perp markets support reading, setting, and clearing both
         take profit and stop loss through position-scoped reduce-only orders.
         A write preserves the side it does not mention.  The venue triggers on
-        mark price.  Spot has no position leg and is unsupported.
+        mark price.  Spot has no position leg and is unsupported.  A replace
+        cancels the old leg before placing the new one (fixed-size legs cannot
+        be amended in place), so writes are not atomic and ``reprice_gap`` is
+        true.
         """
         if instrument.asset_class != AssetClass.FUTURES:
             return super().position_protection_capability(instrument)
@@ -1964,14 +1986,14 @@ class HyperliquidAdapter(Adapter):
             preserves_unmentioned_side=True,
             trigger_bases=frozenset({TrailingBasis.MARK}),
             min_reprice_interval_seconds=15.0,
-            reprice_gap=False,
+            reprice_gap=True,
         )
 
     def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
-        """Declare native trailing support for Hyperliquid perps.
+        """Declare that Hyperliquid has no native trailing stop.
 
-        Hyperliquid does not support native trailing stops due to lack of
-        position-scoped reads. All trailing is synthetic via position protection.
+        The venue offers no native trailing primitive, so requests route to
+        synthetic trailing through position protection.
         """
         if instrument.asset_class != AssetClass.FUTURES:
             return super().trailing_capability(instrument)
@@ -1997,7 +2019,7 @@ class HyperliquidAdapter(Adapter):
         """
         return MarketDataCapability(
             ticker_bases=frozenset({TrailingBasis.BID, TrailingBasis.ASK, TrailingBasis.MARK}),
-            min_ticker_interval_seconds=1.0,
+            min_ticker_interval_seconds=5.0,
             candle_timeframes=frozenset(
                 {
                     CandleTimeframe.M1,
@@ -2081,101 +2103,58 @@ class HyperliquidAdapter(Adapter):
     async def fetch_candles(
         self,
         instrument: Instrument,
-        timeframe: str,
+        timeframe: CandleTimeframe,
+        *,
         limit: int,
     ) -> list[Candle]:
-        """Fetch historical candles via ``candles_snapshot``.
+        """Fetch closed historical candles via ``candles_snapshot``.
 
-        Returns up to ``limit`` closed candles, oldest first.  Forming bars
-        (close time in the future) are excluded.  Raises ``InvalidSymbolError``
-        for unknown symbols and ``ValueError`` for unsupported timeframes or
-        invalid limits.  The call is recorded via ``_run_exchange`` so the
-        candle surcharge applies.
+        Returns at most ``limit`` closed candles, oldest first and most recent
+        last.  Forming bars (close time in the future) are excluded.  Unknown
+        symbols raise ``InvalidSymbolError``; an unsupported timeframe raises
+        ``UnsupportedOrderTypeError``; an unexpected response shape or a
+        malformed bar raises ``PlatformError`` rather than masquerading as an
+        empty result.  The call is recorded via ``_run_exchange`` so the candle
+        surcharge applies.
         """
         if limit < 1:
             raise ValueError(f"limit must be >= 1, got {limit}")
-
-        # Map core timeframes to Hyperliquid interval strings
-        interval_map = {
-            "1m": "1m",
-            "5m": "5m",
-            "15m": "15m",
-            "30m": "30m",
-            "1h": "1h",
-            "4h": "4h",
-            "8h": "8h",
-            "12h": "12h",
-            "1d": "1d",
-        }
-
-        if timeframe not in interval_map:
-            raise ValueError(f"Unsupported timeframe: {timeframe}")
+        timeframe_seconds = _CANDLE_SECONDS.get(timeframe)
+        if timeframe_seconds is None:
+            raise UnsupportedOrderTypeError(
+                f"Hyperliquid does not support the {timeframe} candle timeframe"
+            )
 
         exchange = self._require_exchange()
         coin = to_hyperliquid_coin(instrument)
-        interval = interval_map[timeframe]
-
-        # Calculate start and end timestamps based on timeframe and limit
-        # Timeframe in seconds
-        timeframe_seconds = {
-            "1m": 60,
-            "5m": 300,
-            "15m": 900,
-            "30m": 1800,
-            "1h": 3600,
-            "4h": 14400,
-            "8h": 28800,
-            "12h": 43200,
-            "1d": 86400,
-        }[timeframe]
+        if coin not in exchange.info.name_to_coin:
+            raise InvalidSymbolError(f"Unknown coin {coin!r} on Hyperliquid")
 
         now = int(_utcnow().timestamp() * 1000)  # milliseconds
-        start_time = now - (limit + 1) * timeframe_seconds * 1000  # +1 to account for forming bar
+        start_time = now - (limit + 1) * timeframe_seconds * 1000  # forming-bar slack
 
-        # Request candles with time range
         response = await self._run_exchange(
-            exchange.info.candles_snapshot, coin, interval, start_time, now
+            exchange.info.candles_snapshot, coin, timeframe.value, start_time, now
         )
-
-        try:
-            raw_candles = response if isinstance(response, list) else []
-        except (TypeError, AttributeError) as exc:
-            raise PlatformError(f"Unexpected candles response shape for {coin}") from exc
+        if not isinstance(response, list):
+            raise PlatformError(f"Unexpected candles response shape for {coin}: {response!r}")
 
         candles: list[Candle] = []
         current_time: datetime = _utcnow()
 
-        for raw in raw_candles:
+        for raw in response:
             try:
-                # Hyperliquid returns dict with keys: T (timestamp), o (open),
-                # h (high), l (low), c (close), v (volume)
+                # Hyperliquid returns dicts keyed: T (open ms), o, h, l, c, v.
                 timestamp_ms = raw["T"]
                 open_px = Decimal(str(raw["o"]))
                 high_px = Decimal(str(raw["h"]))
                 low_px = Decimal(str(raw["l"]))
                 close_px = Decimal(str(raw["c"]))
-                # Volume is not used in the Candle type
-            except (KeyError, TypeError, ValueError) as exc:
-                raise PlatformError(f"Malformed candle entry for {coin}: {raw}") from exc
+                open_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
+            except (KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+                raise PlatformError(f"Malformed candle entry for {coin}: {raw!r}") from exc
 
-            # Convert timestamp to aware UTC
-            open_time = datetime.fromtimestamp(timestamp_ms / 1000, tz=UTC)
-
-            # Calculate close time based on timeframe
-            timeframe_seconds = {
-                "1m": 60,
-                "5m": 300,
-                "15m": 900,
-                "30m": 1800,
-                "1h": 3600,
-                "4h": 14400,
-                "8h": 28800,
-                "12h": 43200,
-                "1d": 86400,
-            }[timeframe]
             close_time = open_time + timedelta(seconds=timeframe_seconds)
-
-            # Drop forming bars (close time in the future)
             if close_time > current_time:
                 continue
 
@@ -2190,8 +2169,8 @@ class HyperliquidAdapter(Adapter):
                 )
             )
 
-        # Cap to requested limit after dropping forming bars
-        return candles[:limit]
+        candles.sort(key=lambda candle: candle.open_time)
+        return candles[-limit:]
 
     # ---- Position TP/SL modification ----
 
@@ -2437,10 +2416,10 @@ class HyperliquidAdapter(Adapter):
     ) -> None:
         """Clear the named protection sides on an open position leg.
 
-        Cancels legs by oid through ``_position_tpsl_entries`` and confirms
-        disappearance.  Only the named sides are cleared; unmentioned legs
-        stay working.  A flat position returns quietly because protection is
-        attached to the position.
+        Cancels legs by oid through ``_position_tpsl_entries``.  Only the
+        named sides are cleared; unmentioned legs stay working.  A flat
+        position returns quietly because protection is attached to the
+        position.
         """
         if not take_profit and not stop_loss:
             raise ValueError("at least one of take_profit or stop_loss must be true")
@@ -2477,11 +2456,7 @@ class HyperliquidAdapter(Adapter):
         instrument: Instrument,
         position_id: str,
     ) -> NativeTrailingResult | None:
-        """Read the native trail attached to one position leg, keyed by position.
-
-        Return None only when the venue confirms no trail exists. Raise on
-        transport errors. position_id follows modify_position_tpsl conventions.
-        """
+        """Native trailing is unsupported — Hyperliquid has no trailing primitive."""
         raise NotImplementedError(f"{self.platform_name} does not support native trailing stops")
 
     # ---- Reconciliation data ----

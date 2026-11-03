@@ -1,13 +1,13 @@
 # unified-trading-execution-hyperliquid
 
-Hyperliquid adapter for [unified-trading-execution](https://github.com/qaisar/unified-trading-execution).
+Hyperliquid adapter for [unified-trading-execution](https://github.com/aineurog/unified-trading-execution).
 Implements the `Adapter` ABC for Hyperliquid perpetual derivatives markets.
 
 ## Features
 
 - All four guaranteed order types: **Market, Limit, Stop, Stop-Limit**
 - **Position protection** (take-profit and stop-loss) via `modify_position_tpsl`, `get_position_tpsl`, and `clear_position_tpsl`
-- **Trailing stops** with synthetic execution only (no native trailing due to API limitations)
+- **Trailing stops** with synthetic execution only (Hyperliquid has no native trailing primitive)
 - **Reduce-only** orders for position closing
 - Real-time **WebSocket streams** for orders, executions, positions, and wallet balances
 - **Instrument metadata** fetching with TTL-based caching and automatic invalidation
@@ -20,17 +20,18 @@ Implements the `Adapter` ABC for Hyperliquid perpetual derivatives markets.
 | Market | Asset class | Example symbols |
 |---|---|---|
 | Perpetuals | `FUTURES` | BTC, ETH, SOL |
+| Spot | `SPOT` | HYPE/USDC, PURR/USDC |
 
-Spot markets are not currently supported. Hyperliquid uses one-way position mode
-only — hedge mode is not available.
+Hyperliquid uses one-way position mode only — hedge mode is not available.
+Spot markets support order placement and market data; they have no position
+leg, so position protection and trailing stops are perpetual-only.
 
 ## Trailing stops
 
-Hyperliquid uses **synthetic trailing stops only** via position protection. Native
-trailing is not supported because Hyperliquid's API does not provide
-position-scoped trailing stop reads (required for takeover detection, integrity
-verification, and restart recovery). The `get_position_trailing_stop` method raises
-`NotImplementedError`.
+Hyperliquid uses **synthetic trailing stops only** via position protection.
+The venue offers no native trailing-stop order type, so trailing is placed and
+repriced as a stop loss on the specific position leg. The
+`get_position_trailing_stop` method raises `NotImplementedError`.
 
 ### Synthetic trailing
 
@@ -60,7 +61,7 @@ pip install -e packages/core
 pip install -e packages/adapter-hyperliquid
 ```
 
-The adapter depends on `unified-trading-execution` (core) and `hyperliquid-python-sdk>=0.24.0`.
+The adapter depends on `unified-trading-execution` (core) and `hyperliquid-python-sdk==0.24.0`.
 
 ## Quickstart
 
@@ -130,18 +131,19 @@ config = HyperliquidConfig(
     private_key="your-private-key",
     testnet=True,
     platform_name="hyperliquid",
-    account_id="hyperliquid-account",
 )
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `wallet_address` | `str` | *(required)* | Hyperliquid wallet address |
+| `wallet_address` | `str` | *(required)* | Hyperliquid wallet address; also the canonical account identity |
 | `private_key` | `str` | *(required)* | Wallet private key for signing |
-| `testnet` | `bool` | `True` | `False` connects to mainnet |
+| `testnet` | `bool` | `False` | `True` connects to the testnet |
+| `default_margin_mode` | `MarginMode \| str` | `"cross"` | Margin mode seeded per traded asset on connect |
+| `default_leverage` | `int` | `1` | Leverage seeded per traded asset with no explicit intent |
 | `platform_name` | `str` | `"hyperliquid"` | Human-readable label for logs and events |
-| `account_id` | `str` | `"hyperliquid-account"` | Unique account label in logs, events, and the state store filename |
 | `instrument_spec_cache_ttl` | `float \| None` | `86400.0` | Seconds before a cached `InstrumentSpec` is re-fetched. `None` disables TTL-based expiry, relying solely on event-driven invalidation |
+| `request_timeout_seconds` | `float` | `10.0` | Timeout for each blocking SDK call |
 
 ## Running tests
 
@@ -165,7 +167,7 @@ trailing stops, error handling, rate limiting, and every supported operation wit
 inline examples — is at **[docs/platforms/hyperliquid.md](../../docs/platforms/hyperliquid.md)**.
 
 API reference documentation is generated from docstrings via mkdocstrings and
-available in the [documentation site](https://github.com/qaisar/unified-trading-execution).
+available in the [documentation site](https://github.com/aineurog/unified-trading-execution).
 
 ## License
 
