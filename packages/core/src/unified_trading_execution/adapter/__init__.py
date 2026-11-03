@@ -39,6 +39,21 @@ if TYPE_CHECKING:
     from unified_trading_execution.state import StateStore
 
 
+__all__ = [
+    "Adapter",
+    "CandleTimeframe",
+    "MarketDataCapability",
+    "NativeTrailingRequest",
+    "NativeTrailingResult",
+    "PositionProtectionCapability",
+    "RateLimits",
+    "TrailingActivation",
+    "TrailingBasis",
+    "TrailingCapability",
+    "TrailingOffsetType",
+]
+
+
 @dataclass(frozen=True, slots=True)
 class RateLimits:
     """Platform's current rate-limit state — queried by the self-throttling validator."""

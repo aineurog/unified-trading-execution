@@ -73,6 +73,7 @@ def test_open_interest_cap_is_invalid_order() -> None:
     [
         "Post only order would have immediately matched, bbo was 100.",
         "Order could not immediately match against any resting orders.",
+        "Order could not immediately match against any resting orders. asset=3",
     ],
 )
 def test_cancelled_outcomes(message: str) -> None:

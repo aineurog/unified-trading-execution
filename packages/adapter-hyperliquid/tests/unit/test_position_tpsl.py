@@ -106,7 +106,10 @@ def _exchange_mock(
     bulk_statuses: list[Any] | None = None,
 ) -> MagicMock:
     exchange = MagicMock()
-    exchange.info.meta.return_value = _META
+    exchange.info.meta_and_asset_ctxs.return_value = (
+        _META,
+        [{"markPx": "50000"}],
+    )
     exchange.info.user_state.return_value = {
         "assetPositions": legs if legs is not None else [_leg()],
         "time": 1700000000000,
