@@ -129,6 +129,29 @@ _PROTECTION_SL_INFIX = "-sl-"
 _PROTECTION_CANCEL_TIMEOUT_SECONDS = 5.0
 _PROTECTION_CANCEL_POLL_SECONDS = 0.2
 
+# Candle timeframe mappings for historical data requests
+_CANDLE_TIMEFRAME_MAP: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1 min",
+    CandleTimeframe.M5: "5 mins",
+    CandleTimeframe.M15: "15 mins",
+    CandleTimeframe.M30: "30 mins",
+    CandleTimeframe.H1: "1 hour",
+    CandleTimeframe.H4: "4 hours",
+    CandleTimeframe.D1: "1 day",
+}
+
+# Duration map for historical data (IBKR requires "integer unit" format)
+# Duration should be in format "integer unit" where unit is S|D|W|M|Y
+_CANDLE_DURATION_MAP: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1 D",  # 1 day of 1-min bars
+    CandleTimeframe.M5: "1 W",  # 1 week of 5-min bars
+    CandleTimeframe.M15: "1 W",  # 1 week of 15-min bars
+    CandleTimeframe.M30: "1 W",  # 1 week of 30-min bars
+    CandleTimeframe.H1: "1 M",  # 1 month of hourly bars
+    CandleTimeframe.H4: "1 M",  # 1 month of 4-hour bars
+    CandleTimeframe.D1: "1 Y",  # 1 year of daily bars
+}
+
 
 def _is_position_protection_ref(client_order_id: str) -> bool:
     """True for a position-protection ``orderRef`` (``<conId>-tp-...``).
@@ -1099,22 +1122,18 @@ class IBKRAdapter(Adapter):
         if limit < 1:
             raise ValueError("limit must be at least 1")
 
-        # Map core timeframes to IBKR bar size strings
-        timeframe_map = {
-            CandleTimeframe.M1: "1 min",
-            CandleTimeframe.M5: "5 mins",
-            CandleTimeframe.M15: "15 mins",
-            CandleTimeframe.M30: "30 mins",
-            CandleTimeframe.H1: "1 hour",
-            CandleTimeframe.H4: "4 hours",
-            CandleTimeframe.D1: "1 day",
-        }
-        bar_size = timeframe_map.get(timeframe)
+        bar_size = _CANDLE_TIMEFRAME_MAP.get(timeframe)
         if bar_size is None:
             raise ValueError(f"unsupported timeframe: {timeframe}")
 
+        duration_str = _CANDLE_DURATION_MAP.get(timeframe, "1 D")
+
         ib = self._require_ib()
         contract = to_ibkr_contract(instrument)
+
+        # Ensure contract has exchange for historical data (required by IBKR)
+        if not contract.exchange:
+            contract.exchange = "SMART"  # Default if not set
 
         # Calculate end time: now minus a small buffer to exclude forming bar
         now = _utcnow()
@@ -1123,9 +1142,9 @@ class IBKRAdapter(Adapter):
         try:
             bars = await ib.reqHistoricalDataAsync(
                 contract,
-                endDateTime=end_time.strftime("%Y%m%d %H:%M:%S"),
-                durationStr=bar_size,
-                barSizeSetting=bar_size,
+                endDateTime=end_time.strftime("%Y%m%d-%H:%M:%S"),  # UTC format with dash
+                durationStr=duration_str,  # Duration in "integer unit" format
+                barSizeSetting=bar_size,  # Bar size for the candles
                 whatToShow="TRADES",
                 useRTH=False,
                 formatDate=2,  # YYYYMMDD HH:mm:ss
