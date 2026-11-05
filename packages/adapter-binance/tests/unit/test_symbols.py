@@ -277,6 +277,18 @@ class TestFromBinanceSymbol:
         with pytest.raises(InvalidSymbolError, match="contract type"):
             from_binance_symbol(dated, BinanceProduct.USD_M)
 
+    def test_maps_tradfi_perpetual(self) -> None:
+        entry = {
+            **USD_M_ENTRY,
+            "symbol": "XAUUSDT",
+            "baseAsset": "XAU",
+            "contractType": "TRADIFI_PERPETUAL",
+        }
+        instrument = from_binance_symbol(entry, BinanceProduct.USD_M)
+        assert instrument.expiry is None
+        assert instrument.multiplier == 1
+        assert instrument.platform_symbol == "XAUUSDT"
+
     def test_maps_delivery_contract_expiry_from_exchange_metadata(self) -> None:
         delivery = {
             **USD_M_ENTRY,

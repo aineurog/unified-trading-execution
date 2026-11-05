@@ -11,6 +11,7 @@ from unified_trading_execution.errors import InvalidSymbolError, PlatformError
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 
+_PERPETUAL_CONTRACT_TYPES = frozenset({"PERPETUAL", "TRADIFI_PERPETUAL"})
 _DELIVERY_CONTRACT_TYPES = frozenset(
     {
         "CURRENT_WEEK",
@@ -115,7 +116,7 @@ def from_binance_symbol(entry: _Metadata, product: BinanceProduct) -> Instrument
     contract_type = _required_string(entry, "contractType")
     # Delivering types arrive with a space ("CURRENT_QUARTER DELIVERING").
     normalized_type = contract_type.replace(" ", "_")
-    if normalized_type == "PERPETUAL":
+    if normalized_type in _PERPETUAL_CONTRACT_TYPES:
         expiry = None
     elif normalized_type in _DELIVERY_CONTRACT_TYPES:
         expiry = _delivery_date(entry, symbol)

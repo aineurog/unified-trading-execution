@@ -57,6 +57,14 @@ def test_testnet_and_demo_are_mutually_exclusive() -> None:
         BinanceConfig(api_key="key", api_secret="secret", testnet=True, demo=True)
 
 
+def test_instrument_spec_cache_ttl_must_be_positive_or_none() -> None:
+    with pytest.raises(ValueError, match="instrument_spec_cache_ttl"):
+        BinanceConfig(api_key="key", api_secret="secret", instrument_spec_cache_ttl=0)
+
+    config = BinanceConfig(api_key="key", api_secret="secret", instrument_spec_cache_ttl=None)
+    assert config.instrument_spec_cache_ttl is None
+
+
 def test_account_id_does_not_expose_the_api_key(adapter: BinanceAdapter) -> None:
     """The derived label is stable and non-secret until the venue identity is read."""
     account_id = adapter.account_id
