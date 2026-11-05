@@ -124,9 +124,7 @@ class BinanceRateLimitTracker:
             lowered_name = name.lower()
             match = _HEADER_PATTERN.fullmatch(lowered_name)
             if match is None:
-                if lowered_name.startswith(
-                    ("x-mbx-used-weight-", "x-mbx-order-count-")
-                ):
+                if lowered_name.startswith(("x-mbx-used-weight-", "x-mbx-order-count-")):
                     self._fail_closed_on_unparseable_header(
                         product,
                         moment,
@@ -136,9 +134,11 @@ class BinanceRateLimitTracker:
             header_type, raw_interval_num, interval_letter = match.groups()
             rate_limit_type = "REQUEST_WEIGHT" if header_type == "used-weight" else "ORDERS"
             interval_num = _positive_int(raw_interval_num)
-            if interval_num is None or interval_num > _MAX_RETRY_AFTER_SECONDS // _INTERVAL_SECONDS[
-                interval_letter.upper()
-            ]:
+            if (
+                interval_num is None
+                or interval_num
+                > _MAX_RETRY_AFTER_SECONDS // _INTERVAL_SECONDS[interval_letter.upper()]
+            ):
                 self._fail_closed_on_unparseable_header(
                     product,
                     moment,
@@ -174,10 +174,7 @@ class BinanceRateLimitTracker:
         definitions: Mapping[_RateLimitKey, _LimitDefinition],
     ) -> None:
         reset_after = max(
-            (
-                definition.interval_seconds
-                for definition in definitions.values()
-            ),
+            (definition.interval_seconds for definition in definitions.values()),
             default=_UNKNOWN_LIMIT_INTERVAL_SECONDS,
         )
         reset_at = now + timedelta(seconds=reset_after)
@@ -216,9 +213,7 @@ class BinanceRateLimitTracker:
                     )
                     continue
 
-                interval_end = usage.observed_at + timedelta(
-                    seconds=definition.interval_seconds
-                )
+                interval_end = usage.observed_at + timedelta(seconds=definition.interval_seconds)
                 if moment >= interval_end:
                     remaining = definition.limit
                     reset_at = moment + timedelta(seconds=definition.interval_seconds)
@@ -241,9 +236,7 @@ class BinanceRateLimitTracker:
                 if key in definitions:
                     continue
                 _, interval_num, interval_letter = key
-                interval_seconds = float(
-                    interval_num * _INTERVAL_SECONDS.get(interval_letter, 60)
-                )
+                interval_seconds = float(interval_num * _INTERVAL_SECONDS.get(interval_letter, 60))
                 candidates.append(
                     _Candidate(
                         limit=1,
@@ -318,9 +311,10 @@ def _parse_definitions(raw_limits: object) -> tuple[_LimitDefinition, ...]:
             raise PlatformError(
                 f"Binance exchange info has an invalid {rate_limit_type} rate-limit value"
             )
-        if interval_num > _MAX_RETRY_AFTER_SECONDS // _INTERVAL_SECONDS[
-            _INTERVAL_LETTERS[interval.upper()]
-        ]:
+        if (
+            interval_num
+            > _MAX_RETRY_AFTER_SECONDS // _INTERVAL_SECONDS[_INTERVAL_LETTERS[interval.upper()]]
+        ):
             raise PlatformError(
                 f"Binance exchange info has an excessive {rate_limit_type} interval"
             )
