@@ -166,20 +166,28 @@ class TestBinanceRateLimitTracker:
         assert limits.remaining == 0
         assert limits.reset_at == now + timedelta(minutes=1)
 
-    def test_missing_order_header_bootstraps_one_action(self) -> None:
+    def test_unobserved_windows_do_not_constrain_the_snapshot(self) -> None:
         now = datetime.now(UTC)
         tracker = BinanceRateLimitTracker()
         tracker.update(
             BinanceProduct.SPOT,
             headers={"X-MBX-USED-WEIGHT-1M": "1"},
-            rate_limits=_RATE_LIMITS,
+            rate_limits=[
+                *_RATE_LIMITS,
+                {
+                    "rateLimitType": "ORDERS",
+                    "interval": "DAY",
+                    "intervalNum": 1,
+                    "limit": 200000,
+                },
+            ],
             now=now,
         )
 
         limits = tracker.snapshot(now=now)
 
-        assert limits.remaining == 1
-        assert limits.requests_per_interval == 1
+        assert limits.remaining == 1199
+        assert limits.requests_per_interval == 1200
         assert limits.interval_seconds == 60.0
         assert limits.reset_at == now + timedelta(minutes=1)
 

@@ -72,4 +72,8 @@ async def test_demo_exchange_info_updates_rate_limit_observation(
     )
     assert limits.requests_per_interval >= 1
     assert limits.remaining >= 0
+    # Order count headers are absent on metadata calls, so the observed
+    # one minute weight window must drive the snapshot, not an unseen
+    # daily order bucket.
+    assert limits.interval_seconds <= 60.0
     assert limits.reset_at.tzinfo is not None

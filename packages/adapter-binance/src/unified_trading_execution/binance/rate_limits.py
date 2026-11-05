@@ -28,7 +28,6 @@ _INTERVAL_LETTERS = {
 }
 _OBSERVED_LIMIT_TYPES = frozenset({"REQUEST_WEIGHT", "ORDERS", "RAW_REQUESTS"})
 _MAX_RETRY_AFTER_SECONDS = 3 * 24 * 60 * 60
-_UNKNOWN_LIMIT_RESERVE = 1
 _UNKNOWN_LIMIT_INTERVAL_SECONDS = 60.0
 
 _RateLimitKey: TypeAlias = tuple[str, int, str]
@@ -71,11 +70,12 @@ class BinanceRateLimitTracker:
     ``RateLimits`` contract represents only one unweighted budget, so this
     tracker reports the observed bucket with the least remaining count. Since
     these counts have different meanings and request costs, this is not
-    guaranteed to be conservative for every operation. RAW_REQUESTS is counted
-    locally because Binance does not expose a corresponding response header.
-    Only requests routed through this tracker are included, and usage from
-    other processeable. Endpoint-specific reqs sharing an IP is not observuest
-    weights and WebSocket limits remain outside this core budget.
+    guaranteed to be conservative for every operation. ``RAW_REQUESTS`` is
+    counted locally because Binance does not expose a corresponding response
+    header. Only requests routed through this tracker are counted, and usage
+    from other processes sharing the same IP is not observable. Request
+    weights for individual endpoints and WebSocket limits remain outside this
+    core budget.
     """
 
     def __init__(self) -> None:
@@ -200,17 +200,11 @@ class BinanceRateLimitTracker:
                 else:
                     continue
 
+                # A bucket with no observed counter cannot constrain the
+                # budget yet. Counting it as one available request would let
+                # an unseen window such as a daily order cap dominate the
+                # snapshot and block every product for that whole interval.
                 if usage is None:
-                    if definition.rate_limit_type == "RAW_REQUESTS":
-                        continue
-                    candidates.append(
-                        _Candidate(
-                            limit=_UNKNOWN_LIMIT_RESERVE,
-                            remaining=_UNKNOWN_LIMIT_RESERVE,
-                            interval_seconds=definition.interval_seconds,
-                            reset_at=moment + timedelta(seconds=definition.interval_seconds),
-                        )
-                    )
                     continue
 
                 interval_end = usage.observed_at + timedelta(seconds=definition.interval_seconds)

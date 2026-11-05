@@ -71,9 +71,11 @@ publish leverage; the authenticated client branch will populate it.
 
 The adapter includes a rate-limit tracker (`BinanceRateLimitTracker`) that
 observes rate-limit headers from exchange-info requests. Binance applies
-multiple independent, endpoint-weighted limits, while the core exposes only
-one shared budget. Therefore, this snapshot is approximate—not complete
-request throttling—and currently covers metadata requests only.
+multiple independent limits that weight requests per endpoint, while the core
+exposes only one shared budget. Therefore, this snapshot is approximate—not
+complete request throttling—and currently covers metadata requests only.
+Buckets with no observed counter are left out of the snapshot rather than
+guessed at.
 
 ### Error translation
 
