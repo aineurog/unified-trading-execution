@@ -13,6 +13,8 @@ from unified_trading_execution.types.instrument import Instrument, InstrumentSpe
 
 _DELIVERY_CONTRACT_TYPES = frozenset(
     {
+        "CURRENT_WEEK",
+        "NEXT_WEEK",
         "CURRENT_MONTH",
         "NEXT_MONTH",
         "CURRENT_QUARTER",
@@ -111,9 +113,11 @@ def from_binance_symbol(entry: _Metadata, product: BinanceProduct) -> Instrument
         raise InvalidSymbolError(f"Unsupported Binance product {product!r}")
 
     contract_type = _required_string(entry, "contractType")
-    if contract_type == "PERPETUAL":
+    # Delivering types arrive with a space ("CURRENT_QUARTER DELIVERING").
+    normalized_type = contract_type.replace(" ", "_")
+    if normalized_type == "PERPETUAL":
         expiry = None
-    elif contract_type in _DELIVERY_CONTRACT_TYPES:
+    elif normalized_type in _DELIVERY_CONTRACT_TYPES:
         expiry = _delivery_date(entry, symbol)
     else:
         raise InvalidSymbolError(
@@ -127,10 +131,14 @@ def from_binance_symbol(entry: _Metadata, product: BinanceProduct) -> Instrument
                 f"USDⓈ-M symbol {symbol} has margin asset {margin_asset!r}, "
                 f"expected quote asset {quote!r}"
             )
-    elif quote != "USD" or margin_asset != base:
-        raise InvalidSymbolError(
-            f"COIN-M symbol {symbol} must be USD-quoted and margined in its base asset"
-        )
+        # fapi exchange info omits contractSize; linear contracts are sized at 1.
+        multiplier = 1
+    else:
+        if quote != "USD" or margin_asset != base:
+            raise InvalidSymbolError(
+                f"COIN-M symbol {symbol} must be USD-quoted and margined in its base asset"
+            )
+        multiplier = _contract_size(entry, symbol)
 
     return Instrument(
         symbol=base,
@@ -138,7 +146,7 @@ def from_binance_symbol(entry: _Metadata, product: BinanceProduct) -> Instrument
         asset_class=AssetClass.FUTURES,
         currency=margin_asset,
         expiry=expiry,
-        multiplier=1,
+        multiplier=multiplier,
         platform_symbol=symbol,
     )
 
@@ -239,7 +247,7 @@ def parse_instrument_spec(entry: _Metadata) -> InstrumentSpec:
         price_precision=_decimal_places(tick_size),
         qty_precision=_decimal_places(lot_size),
         max_leverage=None,
-        min_stop_distance=tick_size,
+        min_stop_distance=None,
     )
 
 
@@ -266,6 +274,21 @@ def _delivery_date(entry: _Metadata, symbol: str) -> date:
         raise InvalidSymbolError(
             f"Binance delivery contract {symbol} has invalid deliveryDate"
         ) from exc
+
+
+def _contract_size(entry: _Metadata, symbol: str) -> int:
+    raw_value = entry.get("contractSize")
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, str)):
+        raise InvalidSymbolError(f"Binance COIN-M symbol {symbol} has invalid contractSize")
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise InvalidSymbolError(
+            f"Binance COIN-M symbol {symbol} has invalid contractSize"
+        ) from exc
+    if value <= 0:
+        raise InvalidSymbolError(f"Binance COIN-M symbol {symbol} has non-positive contractSize")
+    return value
 
 
 def _required_string(data: _Metadata, key: str) -> str:

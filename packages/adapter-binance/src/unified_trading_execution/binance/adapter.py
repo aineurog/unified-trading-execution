@@ -13,6 +13,8 @@ import hashlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from binance.exceptions import BinanceAPIException  # type: ignore[import-untyped]
+
 from unified_trading_execution.adapter import (
     Adapter,
     MarketDataCapability,
@@ -244,7 +246,17 @@ class BinanceAdapter(Adapter):
                 BinanceProduct.COIN_M: "futures_coin_exchange_info",
             }
             exchange_info = getattr(client, exchange_info_method_names[product])
-            response = await exchange_info()
+            try:
+                response = await exchange_info()
+            except BinanceAPIException as exc:
+                raise PlatformError(
+                    f"Binance {product.value} exchange-info request failed",
+                    platform_error=exc,
+                ) from exc
+            except Exception as exc:
+                raise PlatformConnectionError(
+                    f"Binance {product.value} exchange-info request failed: {exc}"
+                ) from exc
             if not isinstance(response, dict):
                 raise PlatformError(
                     f"Binance {product.value} exchange-info response is not an object",

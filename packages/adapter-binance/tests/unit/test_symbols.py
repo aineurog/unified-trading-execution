@@ -80,6 +80,7 @@ COIN_M_ENTRY: dict[str, object] = {
     "quoteAsset": "USD",
     "marginAsset": "BTC",
     "contractType": "PERPETUAL",
+    "contractSize": 100,
 }
 
 
@@ -207,9 +208,9 @@ class TestExchangeInfoResolution:
 
 class TestFromBinanceSymbol:
     @pytest.mark.parametrize(
-        ("entry", "product", "symbol", "quote", "currency", "asset_class"),
+        ("entry", "product", "symbol", "quote", "currency", "asset_class", "multiplier"),
         [
-            (SPOT_ENTRY, BinanceProduct.SPOT, "BTC", "USDT", None, AssetClass.SPOT),
+            (SPOT_ENTRY, BinanceProduct.SPOT, "BTC", "USDT", None, AssetClass.SPOT, None),
             (
                 USD_M_ENTRY,
                 BinanceProduct.USD_M,
@@ -217,6 +218,7 @@ class TestFromBinanceSymbol:
                 "USDT",
                 "USDT",
                 AssetClass.FUTURES,
+                1,
             ),
             (
                 COIN_M_ENTRY,
@@ -225,6 +227,7 @@ class TestFromBinanceSymbol:
                 "USD",
                 "BTC",
                 AssetClass.FUTURES,
+                100,
             ),
         ],
         ids=("spot", "usd-m", "coin-m"),
@@ -237,13 +240,37 @@ class TestFromBinanceSymbol:
         quote: str,
         currency: str | None,
         asset_class: AssetClass,
+        multiplier: int | None,
     ) -> None:
         instrument = from_binance_symbol(entry, product)
         assert instrument.symbol == symbol
         assert instrument.quote_currency == quote
         assert instrument.currency == currency
         assert instrument.asset_class == asset_class
+        assert instrument.multiplier == multiplier
         assert instrument.platform_symbol == entry["symbol"]
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {k: v for k, v in COIN_M_ENTRY.items() if k != "contractSize"},
+            {**COIN_M_ENTRY, "contractSize": 0},
+            {**COIN_M_ENTRY, "contractSize": "100.5"},
+        ],
+        ids=("missing", "non-positive", "non-integral"),
+    )
+    def test_rejects_invalid_coin_m_contract_size(self, entry: dict[str, object]) -> None:
+        with pytest.raises(InvalidSymbolError, match="contractSize"):
+            from_binance_symbol(entry, BinanceProduct.COIN_M)
+
+    def test_maps_delivery_contract_with_space_separated_status(self) -> None:
+        delivery = {
+            **COIN_M_ENTRY,
+            "contractType": "CURRENT_QUARTER DELIVERING",
+            "deliveryDate": int(datetime(2026, 12, 25, 8, tzinfo=UTC).timestamp() * 1000),
+        }
+        instrument = from_binance_symbol(delivery, BinanceProduct.COIN_M)
+        assert instrument.expiry == date(2026, 12, 25)
 
     def test_rejects_unsupported_contract_type(self) -> None:
         dated = {**USD_M_ENTRY, "contractType": "UNKNOWN"}

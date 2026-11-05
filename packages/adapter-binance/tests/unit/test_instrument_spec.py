@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from binance import AsyncClient
+from binance.exceptions import BinanceAPIException
 
 from unified_trading_execution.binance.symbols import parse_instrument_spec
 from unified_trading_execution.errors import (
@@ -60,6 +61,7 @@ _COIN_M_ENTRY: dict[str, object] = {
     "quoteAsset": "USD",
     "marginAsset": "BTC",
     "contractType": "PERPETUAL",
+    "contractSize": 100,
     "filters": _FILTERS,
 }
 
@@ -111,7 +113,7 @@ def test_parses_exact_filters(
         price_precision=2,
         qty_precision=3,
         max_leverage=None,
-        min_stop_distance=Decimal("0.01000000"),
+        min_stop_distance=None,
     )
 
 
@@ -266,4 +268,29 @@ async def test_fetch_spec_rejects_malformed_exchange_info(
     adapter._client = cast(AsyncClient, binance_client_mock)
 
     with pytest.raises(PlatformError, match="exchange-info"):
+        await adapter.fetch_instrument_spec(_spot_instrument())
+
+
+async def test_fetch_spec_translates_binance_api_errors(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    api_error = BinanceAPIException(MagicMock(), 400, '{"code": -1121, "msg": "Invalid symbol."}')
+    binance_client_mock.get_exchange_info.side_effect = api_error
+    adapter._client = cast(AsyncClient, binance_client_mock)
+
+    with pytest.raises(PlatformError, match="exchange-info request failed") as info:
+        await adapter.fetch_instrument_spec(_spot_instrument())
+
+    assert info.value.platform_error is api_error
+
+
+async def test_fetch_spec_translates_transport_errors(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    binance_client_mock.get_exchange_info.side_effect = ConnectionResetError("reset")
+    adapter._client = cast(AsyncClient, binance_client_mock)
+
+    with pytest.raises(PlatformConnectionError, match="exchange-info request failed"):
         await adapter.fetch_instrument_spec(_spot_instrument())
