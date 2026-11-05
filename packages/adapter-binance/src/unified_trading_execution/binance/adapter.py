@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -30,6 +31,7 @@ from unified_trading_execution.adapter import (
 from unified_trading_execution.binance.config import BinanceConfig
 from unified_trading_execution.binance.enums import BinanceProduct
 from unified_trading_execution.binance.errors import map_binance_error
+from unified_trading_execution.binance.rate_limits import BinanceRateLimitTracker
 from unified_trading_execution.binance.symbols import (
     parse_instrument_spec,
     product_for_instrument,
@@ -118,6 +120,7 @@ class BinanceAdapter(Adapter):
             tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
         ] = {}
         self._exchange_info_cache: dict[BinanceProduct, list[object]] = {}
+        self._rate_limit_tracker = BinanceRateLimitTracker()
         self._native_trailing_ids: dict[str, str] = {}
 
         self._halt_machine: HaltStateMachine | None = None
@@ -266,7 +269,16 @@ class BinanceAdapter(Adapter):
                 OSError,
                 TimeoutError,
             ) as exc:
+                error_response = getattr(exc, "response", None)
+                if error_response is None and isinstance(exc, BinanceRequestException):
+                    error_response = getattr(client, "response", None)
+                self._record_rate_limit_response(
+                    product,
+                    error_response,
+                    status_code=getattr(exc, "status_code", None),
+                )
                 raise map_binance_error(exc, product=product) from exc
+            self._record_rate_limit_response(product, getattr(client, "response", None), response)
             if not isinstance(response, dict):
                 raise PlatformError(
                     f"Binance {product.value} exchange-info response is not an object",
@@ -331,12 +343,27 @@ class BinanceAdapter(Adapter):
         return super().market_data_capability(instrument)
 
     async def get_rate_limits(self) -> RateLimits:
-        """Return a conservative, observed Binance request-budget snapshot.
+        """Return the tightest observed Binance REST rate-limit budget."""
+        return self._rate_limit_tracker.snapshot()
 
-        The completed implementation must not invent remaining capacity when
-        response headers or endpoint-specific limits are unknown.
-        """
-        raise NotImplementedError("Binance adapter scaffold: get_rate_limits is not implemented")
+    def _record_rate_limit_response(
+        self,
+        product: BinanceProduct,
+        response: object,
+        payload: object | None = None,
+        *,
+        status_code: int | None = None,
+    ) -> None:
+        headers = getattr(response, "headers", None)
+        if not isinstance(headers, Mapping):
+            headers = None
+        rate_limits = payload.get("rateLimits") if isinstance(payload, dict) else None
+        self._rate_limit_tracker.update(
+            product,
+            headers=headers,
+            rate_limits=rate_limits,
+            status_code=status_code,
+        )
 
     # ------------------------------------------------------------------
     # Market data
