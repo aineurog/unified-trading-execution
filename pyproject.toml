@@ -86,6 +86,7 @@ forbidden_modules = [
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
     "unified_trading_execution.hyperliquid",
+    "unified_trading_execution.binance",
 ]
 
 [[tool.importlinter.contracts]]
@@ -94,6 +95,20 @@ name = "Adapters must never import each other"
 type = "forbidden"
 source_modules = ["unified_trading_execution.bybit"]
 forbidden_modules = [
+    "unified_trading_execution.ctrader",
+    "unified_trading_execution.mt5",
+    "unified_trading_execution.ibkr",
+    "unified_trading_execution.hyperliquid",
+    "unified_trading_execution.binance",
+]
+
+[[tool.importlinter.contracts]]
+id = "binance-never-imports-adapters"
+name = "Binance adapter must never import other adapters"
+type = "forbidden"
+source_modules = ["unified_trading_execution.binance"]
+forbidden_modules = [
+    "unified_trading_execution.bybit",
     "unified_trading_execution.ctrader",
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
@@ -110,6 +125,7 @@ modules = [
     "unified_trading_execution.mt5",
     "unified_trading_execution.ibkr",
     "unified_trading_execution.hyperliquid",
+    "unified_trading_execution.binance",
 ]
 
 [[tool.importlinter.contracts]]
