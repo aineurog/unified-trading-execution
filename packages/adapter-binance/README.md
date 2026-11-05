@@ -56,9 +56,15 @@ as `symbol`.
 `to_binance_symbol` and `from_binance_symbol` translate between a canonical
 `Instrument` and one product's exchange-info row. A supplied
 `platform_symbol` is authoritative; otherwise resolution requires exactly one
-matching row. `parse_instrument_spec` maps PRICE_FILTER, LOT_SIZE, and the
-notional filters into exact `Decimal` values. COIN-M instruments carry the
-venue `contractSize` as their `multiplier`.
+matching row. Perpetual and TradFi perpetual contracts map without an expiry;
+dated contracts derive it from `deliveryDate`. `parse_instrument_spec` maps
+PRICE_FILTER, LOT_SIZE, and the notional filters into exact `Decimal` values.
+COIN-M instruments carry the venue `contractSize` as their `multiplier`.
+
+Specs are cached per instrument and re-parsed after
+`instrument_spec_cache_ttl` seconds (default one day); `None` caches
+indefinitely. `max_leverage` is left `None` because exchange info does not
+publish leverage; the authenticated client branch will populate it.
 
 Binance exposes both Testnet and Demo Trading API environments. `testnet=True`
 selects Testnet; `demo=True` selects Demo Trading. These flags are mutually
