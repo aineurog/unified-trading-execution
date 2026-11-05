@@ -66,6 +66,14 @@ Specs are cached per instrument and re-parsed after
 indefinitely. `max_leverage` is left `None` because exchange info does not
 publish leverage; the authenticated client branch will populate it.
 
+### Error translation
+
+The Binance error mapper translates SDK API, malformed response, timeout, and
+transport errors into the core error hierarchy while retaining safe context
+for unknown API responses. It is currently used for exchange-info requests;
+future adapter operations should use it around their Binance I/O calls as they
+are implemented.
+
 Binance exposes both Testnet and Demo Trading API environments. `testnet=True`
 selects Testnet; `demo=True` selects Demo Trading. These flags are mutually
 exclusive. When both are false, the SDK selects production (live) endpoints.
@@ -79,8 +87,8 @@ resolution behavior will be reviewed during implementation.
 ## Tests
 
 Unit tests cover product resolution, symbol conversion, exchange-info
-resolution, filter parsing, and adapter lookup. They mock SDK client and
-socket construction and never reach the network:
+resolution, filter parsing, error translation, and adapter lookup. They mock
+SDK client and socket construction and never reach the network:
 
 ```bash
 pytest packages/adapter-binance/tests/unit/

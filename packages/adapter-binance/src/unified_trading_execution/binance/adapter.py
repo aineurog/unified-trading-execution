@@ -13,7 +13,12 @@ import hashlib
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from binance.exceptions import BinanceAPIException  # type: ignore[import-untyped]
+from aiohttp import ClientError
+from binance.exceptions import (  # type: ignore[import-untyped]
+    BinanceAPIException,
+    BinanceOrderException,
+    BinanceRequestException,
+)
 
 from unified_trading_execution.adapter import (
     Adapter,
@@ -24,6 +29,7 @@ from unified_trading_execution.adapter import (
 )
 from unified_trading_execution.binance.config import BinanceConfig
 from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.errors import map_binance_error
 from unified_trading_execution.binance.symbols import (
     parse_instrument_spec,
     product_for_instrument,
@@ -252,15 +258,15 @@ class BinanceAdapter(Adapter):
             exchange_info = getattr(client, exchange_info_method_names[product])
             try:
                 response = await exchange_info()
-            except BinanceAPIException as exc:
-                raise PlatformError(
-                    f"Binance {product.value} exchange-info request failed",
-                    platform_error=exc,
-                ) from exc
-            except Exception as exc:
-                raise PlatformConnectionError(
-                    f"Binance {product.value} exchange-info request failed: {exc}"
-                ) from exc
+            except (
+                BinanceAPIException,
+                BinanceOrderException,
+                BinanceRequestException,
+                ClientError,
+                OSError,
+                TimeoutError,
+            ) as exc:
+                raise map_binance_error(exc, product=product) from exc
             if not isinstance(response, dict):
                 raise PlatformError(
                     f"Binance {product.value} exchange-info response is not an object",

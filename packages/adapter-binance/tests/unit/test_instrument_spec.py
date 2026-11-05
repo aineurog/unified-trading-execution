@@ -300,10 +300,10 @@ async def test_fetch_spec_translates_binance_api_errors(
     binance_client_mock.get_exchange_info.side_effect = api_error
     adapter._client = cast(AsyncClient, binance_client_mock)
 
-    with pytest.raises(PlatformError, match="exchange-info request failed") as info:
+    with pytest.raises(InvalidSymbolError, match="Invalid symbol") as info:
         await adapter.fetch_instrument_spec(_spot_instrument())
 
-    assert info.value.platform_error is api_error
+    assert info.value.__cause__ is api_error
 
 
 async def test_fetch_spec_translates_transport_errors(
@@ -313,5 +313,19 @@ async def test_fetch_spec_translates_transport_errors(
     binance_client_mock.get_exchange_info.side_effect = ConnectionResetError("reset")
     adapter._client = cast(AsyncClient, binance_client_mock)
 
-    with pytest.raises(PlatformConnectionError, match="exchange-info request failed"):
+    with pytest.raises(PlatformConnectionError, match="ConnectionResetError"):
         await adapter.fetch_instrument_spec(_spot_instrument())
+
+
+async def test_fetch_spec_does_not_translate_unexpected_errors(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    error = RuntimeError("unexpected failure")
+    binance_client_mock.get_exchange_info.side_effect = error
+    adapter._client = cast(AsyncClient, binance_client_mock)
+
+    with pytest.raises(RuntimeError, match="unexpected failure") as info:
+        await adapter.fetch_instrument_spec(_spot_instrument())
+
+    assert info.value is error
