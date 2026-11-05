@@ -68,7 +68,7 @@ publish leverage; the authenticated client branch will populate it.
 
 ### Error translation
 
-The Binance error mapper translates SDK API, malformed-response, timeout, and
+The Binance error mapper translates SDK API, malformed response, timeout, and
 transport errors into the core error hierarchy while retaining safe context
 for unknown API responses. It is currently used for exchange-info requests;
 future adapter operations should use it around their Binance I/O calls as they
