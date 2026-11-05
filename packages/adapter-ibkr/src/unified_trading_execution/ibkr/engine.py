@@ -21,15 +21,16 @@ from collections.abc import Callable
 from datetime import datetime
 from decimal import Decimal
 
-from unified_trading_execution.adapter import RateLimits
+from unified_trading_execution.adapter import CandleTimeframe, RateLimits
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.ibkr.adapter import IBKRAdapter
 from unified_trading_execution.ibkr.config import IBKRConfig
 from unified_trading_execution.risk import RiskConfig
 from unified_trading_execution.state import HaltConfig, StateStore
+from unified_trading_execution.trailing import TrailingConfig
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.market_data import Ticker
+from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import FillRecord, OrderRecord, TpSlAttachment
 from unified_trading_execution.types.position import Balance, Position
 
@@ -53,6 +54,7 @@ class IBKREngine(Engine):
         event_bus: EventBus | None = None,
         risk_config: RiskConfig | None = None,
         halt_config: HaltConfig | None = None,
+        trailing_config: TrailingConfig | None = None,
     ) -> None:
         adapter = config if isinstance(config, IBKRAdapter) else IBKRAdapter(config)
         super().__init__(
@@ -62,6 +64,7 @@ class IBKREngine(Engine):
             event_bus=event_bus,
             risk_config=risk_config,
             halt_config=halt_config,
+            trailing_config=trailing_config,
         )
 
     # ── Position TP/SL ───────────────────────────────────────────────
@@ -90,6 +93,22 @@ class IBKREngine(Engine):
         """Read the current TP/SL on an open IBKR position as ``(take_profit, stop_loss)``."""
         return await self._adapter.get_position_tpsl(instrument, position_id)
 
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named protection sides on an open IBKR position leg."""
+        await self._adapter.clear_position_tpsl(
+            instrument,
+            position_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
+
     # ── Snapshots / reads ─────────────────────────────────────────────
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
@@ -97,6 +116,16 @@ class IBKREngine(Engine):
 
     async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
         return await self._adapter.fetch_ticker(instrument)
+
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles for ATR."""
+        return await self._adapter.fetch_candles(instrument, timeframe, limit=limit)
 
     async def get_rate_limits(self) -> RateLimits:
         return await self._adapter.get_rate_limits()

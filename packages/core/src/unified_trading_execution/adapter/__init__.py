@@ -41,16 +41,29 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Adapter",
+    "Balance",
+    "Candle",
     "CandleTimeframe",
+    "FillRecord",
+    "Instrument",
+    "InstrumentSpec",
     "MarketDataCapability",
     "NativeTrailingRequest",
     "NativeTrailingResult",
+    "OrderModification",
+    "OrderRecord",
+    "OrderResult",
+    "OrderType",
+    "Position",
     "PositionProtectionCapability",
     "RateLimits",
+    "Ticker",
+    "TpSlAttachment",
     "TrailingActivation",
     "TrailingBasis",
     "TrailingCapability",
     "TrailingOffsetType",
+    "UnifiedOrder",
 ]
 
 

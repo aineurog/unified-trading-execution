@@ -25,10 +25,10 @@ from unified_trading_execution.ibkr import IBKRAdapter, IBKRConfig
 
 
 def _load_env_files() -> None:
-    """Load any packaged ``.env`` files into the process environment.
+    """Load any packaged `.env` files into the process environment.
 
     Only sets a variable if it is not already set, so a real environment
-    (shell export / CI secret / ``uv run --env-file``) always wins.
+    (shell export / CI secret / `uv run --env-file`) always wins.
     """
     lookups = [
         Path(__file__).resolve().parents[2],  # packages/adapter-ibkr/

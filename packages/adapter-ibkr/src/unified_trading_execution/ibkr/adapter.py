@@ -24,19 +24,29 @@ import logging
 import math
 import threading
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
 from ib_async import IB, ExecutionFilter, Order, Trade
 from uuid_extensions import uuid7
 
-from unified_trading_execution.adapter import Adapter, RateLimits
+from unified_trading_execution.adapter import (
+    Adapter,
+    Candle,
+    CandleTimeframe,
+    MarketDataCapability,
+    PositionProtectionCapability,
+    RateLimits,
+    TrailingBasis,
+    TrailingCapability,
+)
 from unified_trading_execution.errors import (
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
+    UnsupportedOrderTypeError,
     UteError,
 )
 from unified_trading_execution.events import (
@@ -57,8 +67,8 @@ from unified_trading_execution.ibkr.orders import (
     parse_ibkr_trade,
 )
 from unified_trading_execution.ibkr.symbols import from_ibkr_contract, to_ibkr_contract
-from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
+    AssetClass,
     FillEntry,
     FillReason,
     OrderSide,
@@ -120,6 +130,48 @@ _PROTECTION_TP_INFIX = "-tp-"
 _PROTECTION_SL_INFIX = "-sl-"
 _PROTECTION_CANCEL_TIMEOUT_SECONDS = 5.0
 _PROTECTION_CANCEL_POLL_SECONDS = 0.2
+
+# Candle timeframe mappings for historical data requests
+_CANDLE_TIMEFRAME_MAP: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1 min",
+    CandleTimeframe.M5: "5 mins",
+    CandleTimeframe.M15: "15 mins",
+    CandleTimeframe.M30: "30 mins",
+    CandleTimeframe.H1: "1 hour",
+    CandleTimeframe.H4: "4 hours",
+    CandleTimeframe.D1: "1 day",
+}
+
+# Duration map for historical data (IBKR requires "integer unit" format)
+# Duration should be in format "integer unit" where unit is S|D|W|M|Y
+_CANDLE_DURATION_MAP: dict[CandleTimeframe, str] = {
+    CandleTimeframe.M1: "1 D",  # 1 day of 1-min bars
+    CandleTimeframe.M5: "1 W",  # 1 week of 5-min bars
+    CandleTimeframe.M15: "1 W",  # 1 week of 15-min bars
+    CandleTimeframe.M30: "1 W",  # 1 week of 30-min bars
+    CandleTimeframe.H1: "1 M",  # 1 month of hourly bars
+    CandleTimeframe.H4: "1 M",  # 1 month of 4-hour bars
+    CandleTimeframe.D1: "1 Y",  # 1 year of daily bars
+}
+
+# Historical series differ by asset class: forex has no trade prints and crypto
+# rejects TRADES. Everything else uses trade prices.
+_CANDLE_WHAT_TO_SHOW: dict[AssetClass, str] = {
+    AssetClass.MARGIN_FX: "MIDPOINT",
+    AssetClass.SPOT: "AGGTRADES",
+}
+
+#: Asset classes the adapter can address as IBKR contracts at all.
+_SUPPORTED_ASSET_CLASSES: frozenset[AssetClass] = frozenset(
+    {
+        AssetClass.SPOT,
+        AssetClass.MARGIN_FX,
+        AssetClass.CFD,
+        AssetClass.FUTURES,
+        AssetClass.OPTION,
+        AssetClass.STOCK,
+    }
+)
 
 
 def _is_position_protection_ref(client_order_id: str) -> bool:
@@ -1061,6 +1113,152 @@ class IBKRAdapter(Adapter):
             return None
         return Ticker(bid=bid, ask=ask, last=last, mark=None)
 
+    async def fetch_candles(
+        self,
+        instrument: Instrument,
+        timeframe: CandleTimeframe,
+        *,
+        limit: int,
+    ) -> list[Candle]:
+        """Fetch closed OHLC candles for ATR, oldest first and most recent last.
+
+        Uses ``ib.reqHistoricalData`` with ``keepUpToDate=False``. IB dates a
+        bar by its start, so the close time is the start plus the bar width and
+        the candle whose close is still in the future is dropped. Supports the
+        seven core timeframes the adapter advertises. The series requested
+        matches the asset class: ``TRADES`` for stocks, futures, options, and
+        CFDs, ``MIDPOINT`` for forex (which has no trade prints), and
+        ``AGGTRADES`` for crypto.
+
+        Args:
+            instrument: The instrument to fetch candles for.
+            timeframe: One of M1, M5, M15, M30, H1, H4, D1.
+            limit: Maximum number of candles to return (minimum 1).
+
+        Returns:
+            Up to ``limit`` closed candles, oldest first. Empty only when the
+            venue returns no bars for the requested window.
+
+        Raises:
+            ValueError: ``limit`` is below 1.
+            UnsupportedOrderTypeError: the timeframe is not one of the seven.
+            InvalidSymbolError: the contract is unknown on this gateway.
+            PlatformConnectionError: the request timed out or the gateway failed.
+            PlatformError: IBKR returned an error or malformed bar data.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        bar_size = _CANDLE_TIMEFRAME_MAP.get(timeframe)
+        if bar_size is None:
+            raise UnsupportedOrderTypeError(
+                f"IBKR does not support the {timeframe} candle timeframe"
+            )
+
+        duration_str = _CANDLE_DURATION_MAP[timeframe]
+
+        ib = self._require_ib()
+        contract = to_ibkr_contract(instrument, self._config)
+
+        # Qualify first: an unknown symbol must raise InvalidSymbolError rather
+        # than return as an empty bar list.
+        try:
+            details_list = await ib.reqContractDetailsAsync(contract)
+        except UteError:
+            raise
+        except Exception as exc:
+            raise PlatformConnectionError(
+                f"failed to qualify {instrument.symbol!r} for candles: {exc}"
+            ) from exc
+        if not details_list:
+            raise InvalidSymbolError(
+                f"IBKR symbol {instrument.symbol!r} is not available: no contract details"
+            )
+        qualified = getattr(details_list[0], "contract", None) or contract
+
+        what_to_show = _CANDLE_WHAT_TO_SHOW.get(instrument.asset_class, "TRADES")
+        bar_duration = self._bar_duration(bar_size)
+        now = _utcnow()
+
+        # ``timeout=0`` disables ib_async's internal wait, which would swallow
+        # a timeout into an empty bar list. The outer wait surfaces it instead.
+        try:
+            bars = await asyncio.wait_for(
+                ib.reqHistoricalDataAsync(
+                    qualified,
+                    endDateTime=now,
+                    durationStr=duration_str,
+                    barSizeSetting=bar_size,
+                    whatToShow=what_to_show,
+                    useRTH=False,
+                    formatDate=2,
+                    keepUpToDate=False,
+                    timeout=0,
+                ),
+                timeout=self._config.timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise PlatformConnectionError(
+                f"IBKR historical data request for {instrument.symbol!r} timed out"
+            ) from exc
+        except UteError:
+            raise
+        except Exception as exc:
+            raise PlatformError(
+                f"failed to fetch historical data for {instrument.symbol!r}: {exc}"
+            ) from exc
+
+        if not bars:
+            return []
+
+        candles: list[Candle] = []
+        for bar in bars:
+            try:
+                raw_time = bar.date
+                if isinstance(raw_time, datetime):
+                    open_time = (
+                        raw_time if raw_time.tzinfo is not None else raw_time.replace(tzinfo=UTC)
+                    )
+                elif isinstance(raw_time, date):
+                    # Daily bars are returned as yyyyMMdd even with formatDate=2.
+                    open_time = datetime(raw_time.year, raw_time.month, raw_time.day, tzinfo=UTC)
+                else:
+                    raise TypeError(f"unexpected bar date {raw_time!r}")
+
+                candle = Candle(
+                    open_time=open_time,
+                    close_time=open_time + bar_duration,
+                    open=Decimal(str(bar.open)),
+                    high=Decimal(str(bar.high)),
+                    low=Decimal(str(bar.low)),
+                    close=Decimal(str(bar.close)),
+                )
+            except (ArithmeticError, ValueError, AttributeError, TypeError) as exc:
+                raise PlatformError(
+                    f"malformed candle data for {instrument.symbol!r}: {exc}"
+                ) from exc
+
+            if candle.close_time > now:
+                continue
+            candles.append(candle)
+
+        candles.sort(key=lambda candle: candle.open_time)
+        return candles[-limit:]
+
+    def _bar_duration(self, bar_size: str) -> timedelta:
+        """Return the duration of a bar size string as a timedelta."""
+        if "min" in bar_size:
+            minutes = int(bar_size.split()[0])
+            return timedelta(minutes=minutes)
+        elif "hour" in bar_size:
+            hours = int(bar_size.split()[0])
+            return timedelta(hours=hours)
+        elif "day" in bar_size:
+            days = int(bar_size.split()[0])
+            return timedelta(days=days)
+        else:
+            return timedelta(minutes=1)  # Fallback
+
     # ------------------------------------------------------------------
     # Capability reporting
     # ------------------------------------------------------------------
@@ -1074,6 +1272,82 @@ class IBKRAdapter(Adapter):
                 OrderType.STOP,
                 OrderType.STOP_LIMIT,
             }
+        )
+
+    def position_protection_capability(
+        self, instrument: Instrument
+    ) -> PositionProtectionCapability:
+        """Return IBKR position-protection support.
+
+        IBKR supports static TP/SL via OCA-pair orders on the position contract.
+        Every supported asset class carries positions. Every write is cancel and
+        replace (gap), and ``modify_position_tpsl`` reads the unmentioned side
+        back before the replace, so the merge is preserved.
+        """
+        supported = instrument.asset_class in _SUPPORTED_ASSET_CLASSES
+
+        return PositionProtectionCapability(
+            supported=supported,
+            can_set_stop=supported,
+            can_set_take_profit=supported,
+            can_clear_stop=supported,
+            can_clear_take_profit=supported,
+            preserves_unmentioned_side=True,  # Already handled by modify_position_tpsl merge
+            trigger_bases=frozenset(),  # IBKR uses its own feed, no settable trigger basis
+            min_reprice_interval_seconds=2.0,  # Pacing for cancel-replace
+            reprice_gap=True,  # Every write is cancel-and-replace
+        )
+
+    def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
+        """Return IBKR native trailing support.
+
+        IBKR has a TRAIL / TRAIL LIMIT order type, but it is order-scoped
+        (not position-scoped) and requires separate protection order bookkeeping
+        that is out of scope for this version. Synthetic trailing is used instead.
+        """
+        return TrailingCapability(
+            supported=False,  # Native TRAIL out of scope
+            offset_types=frozenset(),
+            bases=frozenset(),
+            activations=frozenset(),
+            supports_step=False,
+            supports_initial_stop=False,
+            supports_take_profit=False,
+            position_scoped=False,
+            min_reprice_interval_seconds=2.0,
+        )
+
+    def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
+        """Return IBKR market data support.
+
+        Ticker provides LAST, BID, ASK via the IB snapshot. Candles are
+        available via reqHistoricalData for seven of the nine core timeframes
+        (H8 and H12 have no IBKR bar size). The adapter serves no data for asset
+        classes it cannot address as contracts.
+        """
+        if instrument.asset_class not in _SUPPORTED_ASSET_CLASSES:
+            return MarketDataCapability(
+                ticker_bases=frozenset(),
+                min_ticker_interval_seconds=0.0,
+                candle_timeframes=frozenset(),
+                streaming_ticker=False,
+            )
+
+        return MarketDataCapability(
+            ticker_bases=frozenset({TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}),
+            min_ticker_interval_seconds=2.0,
+            candle_timeframes=frozenset(
+                {
+                    CandleTimeframe.M1,
+                    CandleTimeframe.M5,
+                    CandleTimeframe.M15,
+                    CandleTimeframe.M30,
+                    CandleTimeframe.H1,
+                    CandleTimeframe.H4,
+                    CandleTimeframe.D1,
+                }
+            ),
+            streaming_ticker=False,
         )
 
     # ------------------------------------------------------------------
@@ -1186,7 +1460,6 @@ class IBKRAdapter(Adapter):
             order_contract.exchange = self._config.default_exchange or "SMART"
         orders: list[Order] = []
         # Use GTC for protective orders (IBKR default for held orders)
-        tif_kwargs: dict[str, object] = {"tif": "GTC"}
         if effective_tp is not None:
             tp = Order(
                 action=action,
@@ -1194,22 +1467,30 @@ class IBKRAdapter(Adapter):
                 orderType="LMT",
                 lmtPrice=effective_tp.trigger_price,
                 orderRef=f"{position_id}-tp-{_protection_ref_suffix()}",
-                **tif_kwargs,  # type: ignore[arg-type]
+                tif="GTC",
             )
             orders.append(tp)
         if effective_sl is not None:
             sl_type = "STP LMT" if effective_sl.limit_price is not None else "STP"
-            sl_kwargs: dict[str, object] = {
-                "action": action,
-                "totalQuantity": abs_qty,
-                "orderType": sl_type,
-                "auxPrice": effective_sl.trigger_price,
-                "orderRef": f"{position_id}-sl-{_protection_ref_suffix()}",
-                **tif_kwargs,
-            }
             if effective_sl.limit_price is not None:
-                sl_kwargs["lmtPrice"] = effective_sl.limit_price
-            sl = Order(**sl_kwargs)  # type: ignore[arg-type]
+                sl = Order(
+                    action=action,
+                    totalQuantity=abs_qty,
+                    orderType=sl_type,
+                    auxPrice=effective_sl.trigger_price,
+                    lmtPrice=effective_sl.limit_price,
+                    orderRef=f"{position_id}-sl-{_protection_ref_suffix()}",
+                    tif="GTC",
+                )
+            else:
+                sl = Order(
+                    action=action,
+                    totalQuantity=abs_qty,
+                    orderType=sl_type,
+                    auxPrice=effective_sl.trigger_price,
+                    orderRef=f"{position_id}-sl-{_protection_ref_suffix()}",
+                    tif="GTC",
+                )
             orders.append(sl)
         if len(orders) == 2:
             oca = f"pos-tpsl-{position_id}"
@@ -1230,6 +1511,24 @@ class IBKRAdapter(Adapter):
         bounded wait, so the caller never places a replacement pair on top of
         one it could not clear.
         """
+        await self._cancel_protection_by_side(position_id, cancel_tp=True, cancel_sl=True)
+
+    async def _cancel_protection_by_side(
+        self, position_id: str, *, cancel_tp: bool, cancel_sl: bool
+    ) -> None:
+        """Cancel only the named protective sides and confirm they left.
+
+        Args:
+            position_id: The contract conId string.
+            cancel_tp: Whether to cancel take-profit orders.
+            cancel_sl: Whether to cancel stop-loss orders.
+
+        Best-effort and idempotent: a no-op when no matching orders exist.
+        Raises ``PlatformError`` when orders are still live after the bounded wait.
+        """
+        if not cancel_tp and not cancel_sl:
+            raise ValueError("at least one of cancel_tp or cancel_sl must be True")
+
         ib = self._require_ib()
         tp_prefix, sl_prefix = _protection_ref_prefixes(position_id)
 
@@ -1242,13 +1541,14 @@ class IBKRAdapter(Adapter):
                 raise PlatformConnectionError(
                     f"failed to list IBKR open orders while replacing protection: {exc}"
                 ) from exc
-            return [
-                trade
-                for trade in trades
-                if str(getattr(trade.order, "orderRef", "") or "").startswith(
-                    (tp_prefix, sl_prefix)
-                )
-            ]
+            matching = []
+            for trade in trades:
+                ref = str(getattr(trade.order, "orderRef", "") or "")
+                if cancel_tp and ref.startswith(tp_prefix):
+                    matching.append(trade)
+                if cancel_sl and ref.startswith(sl_prefix):
+                    matching.append(trade)
+            return matching
 
         for trade in _matching():
             ref = str(getattr(trade.order, "orderRef", "") or "")
@@ -1270,6 +1570,40 @@ class IBKRAdapter(Adapter):
         raise PlatformError(
             f"protective orders for conId {position_id!r} did not cancel within "
             f"{_PROTECTION_CANCEL_TIMEOUT_SECONDS:.0f}s; refusing to stack a new pair"
+        )
+
+    async def clear_position_tpsl(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        take_profit: bool = False,
+        stop_loss: bool = False,
+    ) -> None:
+        """Clear the named protection sides on an open position leg.
+
+        IBKR protective orders are separate from the position and can open a new
+        opposite position if left live, so this cancels them even when the
+        position is flat. At least one of *take_profit* or *stop_loss* must be
+        true. Cancels only the named sides and returns quietly when no matching
+        orders remain.
+
+        Args:
+            instrument: The instrument (accepted for interface uniformity;
+                position_id is globally unique for IBKR).
+            position_id: The contract conId string.
+            take_profit: Whether to cancel take-profit orders.
+            stop_loss: Whether to cancel stop-loss orders.
+
+        Raises:
+            ValueError: neither side given.
+            PlatformError: orders could not be confirmed cancelled.
+        """
+        if not take_profit and not stop_loss:
+            raise ValueError("at least one of take_profit or stop_loss must be true")
+
+        await self._cancel_protection_by_side(
+            position_id, cancel_tp=take_profit, cancel_sl=stop_loss
         )
 
     async def get_position_tpsl(
@@ -1383,6 +1717,7 @@ class IBKRAdapter(Adapter):
                         average_entry_price=avg_price,
                         updated_at=now,
                         position_id=position_id,
+                        opened_at=None,  # IBKR has no reliable position open time field
                     )
                 )
             except Exception as exc:
@@ -1791,6 +2126,7 @@ class IBKRAdapter(Adapter):
                 average_entry_price=avg_cost,
                 updated_at=_utcnow(),
                 position_id=pos_id,
+                opened_at=None,  # IBKR has no reliable position open time field
             )
             self._publish(
                 PositionUpdateEvent(
