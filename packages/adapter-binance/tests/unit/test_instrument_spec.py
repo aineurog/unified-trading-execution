@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -16,6 +16,7 @@ from unified_trading_execution.errors import (
     InvalidSymbolError,
     PlatformConnectionError,
     PlatformError,
+    RateLimitError,
 )
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
@@ -329,3 +330,68 @@ async def test_fetch_spec_does_not_translate_unexpected_errors(
         await adapter.fetch_instrument_spec(_spot_instrument())
 
     assert info.value is error
+
+
+async def test_fetch_spec_updates_rate_limits_from_sdk_response(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    binance_client_mock.get_exchange_info.return_value = {
+        "symbols": [_SPOT_ENTRY],
+        "rateLimits": [
+            {
+                "rateLimitType": "REQUEST_WEIGHT",
+                "interval": "MINUTE",
+                "intervalNum": 1,
+                "limit": 1200,
+            },
+            {
+                "rateLimitType": "ORDERS",
+                "interval": "SECOND",
+                "intervalNum": 10,
+                "limit": 10,
+            },
+            {
+                "rateLimitType": "RAW_REQUESTS",
+                "interval": "MINUTE",
+                "intervalNum": 5,
+                "limit": 5000,
+            },
+        ],
+    }
+    binance_client_mock.response = MagicMock(
+        headers={
+            "X-MBX-USED-WEIGHT-1M": "100",
+            "X-MBX-ORDER-COUNT-10S": "7",
+        }
+    )
+    adapter._client = cast(AsyncClient, binance_client_mock)
+
+    await adapter.fetch_instrument_spec(_spot_instrument())
+    limits = await adapter.get_rate_limits()
+
+    assert limits.requests_per_interval == 10
+    assert limits.interval_seconds == 10.0
+    assert limits.remaining == 3
+
+
+async def test_fetch_spec_uses_retry_after_from_binance_api_error(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    api_response = MagicMock(headers={"Retry-After": "5"})
+    api_error = BinanceAPIException(
+        api_response,
+        429,
+        '{"code": -1003, "msg": "Too many requests"}',
+    )
+    binance_client_mock.get_exchange_info.side_effect = api_error
+    adapter._client = cast(AsyncClient, binance_client_mock)
+
+    before = datetime.now(UTC)
+    with pytest.raises(RateLimitError):
+        await adapter.fetch_instrument_spec(_spot_instrument())
+    limits = await adapter.get_rate_limits()
+
+    assert limits.remaining == 0
+    assert before + timedelta(seconds=5) <= limits.reset_at

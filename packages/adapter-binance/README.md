@@ -2,9 +2,10 @@
 
 Scaffold for the Binance adapter in
 [unified-trading-execution](https://github.com/aineurog/unified-trading-execution).
-Product and instrument metadata translation is implemented; exchange
-connectivity, market data, trailing stops, and trading operations have **not**
-been implemented. Unimplemented methods raise `NotImplementedError`.
+Product and instrument metadata translation and a limited REST rate-limit
+observation path are implemented. Exchange connectivity, market data, trailing
+stops, and trading operations have **not** been implemented. Unimplemented
+methods raise `NotImplementedError`.
 
 ## Installation
 
@@ -65,6 +66,14 @@ Specs are cached per instrument and re-parsed after
 `instrument_spec_cache_ttl` seconds (default one day); `None` caches
 indefinitely. `max_leverage` is left `None` because exchange info does not
 publish leverage; the authenticated client branch will populate it.
+
+### REST rate-limit observations
+
+The adapter includes a rate-limit tracker (`BinanceRateLimitTracker`) that
+observes rate-limit headers from exchange-info requests. Binance applies
+multiple independent, endpoint-weighted limits, while the core exposes only
+one shared budget. Therefore, this snapshot is approximate—not complete
+request throttling—and currently covers metadata requests only.
 
 ### Error translation
 
