@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock
@@ -269,6 +270,26 @@ async def test_fetch_spec_rejects_malformed_exchange_info(
 
     with pytest.raises(PlatformError, match="exchange-info"):
         await adapter.fetch_instrument_spec(_spot_instrument())
+
+
+async def test_fetch_spec_reparses_expired_cache_entry(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    binance_client_mock.get_exchange_info.return_value = {"symbols": [_SPOT_ENTRY]}
+    adapter._client = cast(AsyncClient, binance_client_mock)
+    instrument = _spot_instrument()
+    first = await adapter.fetch_instrument_spec(instrument)
+
+    key = (instrument, instrument.platform_symbol)
+    spec, _ = adapter._instrument_spec_cache[key]
+    expired = datetime(2020, 1, 1, tzinfo=UTC)
+    adapter._instrument_spec_cache[key] = (spec, expired)
+
+    second = await adapter.fetch_instrument_spec(instrument)
+
+    assert second == first
+    assert adapter._instrument_spec_cache[key][1] > expired
 
 
 async def test_fetch_spec_translates_binance_api_errors(

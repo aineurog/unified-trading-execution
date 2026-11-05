@@ -230,7 +230,11 @@ class BinanceAdapter(Adapter):
         cache_key = (instrument, instrument.platform_symbol)
         cached = self._instrument_spec_cache.get(cache_key)
         if cached is not None:
-            return cached[0]
+            spec, fetched_at = cached
+            ttl = self._config.instrument_spec_cache_ttl
+            if ttl is None or (datetime.now(UTC) - fetched_at).total_seconds() < ttl:
+                return spec
+            self._instrument_spec_cache.pop(cache_key, None)
 
         client = self._client
         if client is None:
