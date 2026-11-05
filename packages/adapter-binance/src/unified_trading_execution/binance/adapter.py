@@ -1,17 +1,16 @@
-"""Binance adapter contract scaffold.
+"""Binance adapter implementation.
 
 The adapter will translate the core's product-neutral contract into Binance
-Spot, USDⓈ-M Futures, and COIN-M Futures APIs. This scaffold deliberately does
-not construct an SDK client, connect to an exchange, or claim support for any
-exchange operation. Each operation raises ``NotImplementedError`` until its
-implementation branch is completed.
+Spot, USDⓈ-M Futures, and COIN-M Futures APIs. Symbol and instrument metadata
+mapping are implemented; client lifecycle and trading operations remain
+deferred to their respective feature branches.
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from unified_trading_execution.adapter import (
@@ -22,6 +21,17 @@ from unified_trading_execution.adapter import (
     TrailingCapability,
 )
 from unified_trading_execution.binance.config import BinanceConfig
+from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.symbols import (
+    parse_instrument_spec,
+    product_for_instrument,
+    resolve_binance_symbol,
+)
+from unified_trading_execution.errors import (
+    InvalidSymbolError,
+    PlatformConnectionError,
+    PlatformError,
+)
 from unified_trading_execution.events import EventBus
 from unified_trading_execution.trailing.types import (
     CandleTimeframe,
@@ -73,7 +83,10 @@ class BinanceAdapter(Adapter):
         _stream_tasks: Background stream tasks keyed by stream purpose.
         _client_order_ids: Local mapping between core client IDs and native
             order IDs. It is not authoritative across process restarts.
-        _instrument_spec_cache: Metadata cache populated by the symbols branch.
+        _instrument_spec_cache: Successful instrument specs keyed by canonical
+            instrument identity.
+        _exchange_info_cache: Product-wide exchange metadata, fetched once per
+            adapter instance to avoid repeating the full catalog request.
         _native_trailing_ids: Native protection references keyed by core
             trailing identity once trailing support is implemented.
     """
@@ -93,7 +106,10 @@ class BinanceAdapter(Adapter):
         self._stream_tasks: dict[str, asyncio.Task[None]] = {}
 
         self._client_order_ids: dict[str, str] = {}
-        self._instrument_spec_cache: dict[Instrument, tuple[InstrumentSpec, datetime]] = {}
+        self._instrument_spec_cache: dict[
+            tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
+        ] = {}
+        self._exchange_info_cache: dict[BinanceProduct, list[object]] = {}
         self._native_trailing_ids: dict[str, str] = {}
 
         self._halt_machine: HaltStateMachine | None = None
@@ -201,16 +217,58 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     async def fetch_instrument_spec(self, instrument: Instrument) -> InstrumentSpec:
-        """Fetch and map exchange metadata for a product-specific symbol.
+        """Fetch product-specific exchange metadata and map its trading rules.
 
-        Symbol identity must come from the corresponding Spot, USDⓈ-M, or
-        COIN-M exchange metadata. The finished implementation must reject
-        ambiguous symbols and preserve all price/quantity increments using
-        Decimal values.
+        Binance publishes separate Spot, USDⓈ-M, and COIN-M exchange-info
+        catalogs. Resolution requires exactly one row matching the canonical
+        identity; ambiguous listings require ``platform_symbol``. Trading
+        constraints are parsed from the row's filters using exact Decimals.
         """
-        raise NotImplementedError(
-            "Binance adapter scaffold: fetch_instrument_spec is not implemented"
-        )
+        product = product_for_instrument(instrument)
+        cache_key = (instrument, instrument.platform_symbol)
+        cached = self._instrument_spec_cache.get(cache_key)
+        if cached is not None:
+            return cached[0]
+
+        client = self._client
+        if client is None:
+            raise PlatformConnectionError(
+                "Binance adapter must be connected before fetching instrument metadata"
+            )
+
+        entries = self._exchange_info_cache.get(product)
+        if entries is None:
+            exchange_info_method_names = {
+                BinanceProduct.SPOT: "get_exchange_info",
+                BinanceProduct.USD_M: "futures_exchange_info",
+                BinanceProduct.COIN_M: "futures_coin_exchange_info",
+            }
+            exchange_info = getattr(client, exchange_info_method_names[product])
+            response = await exchange_info()
+            if not isinstance(response, dict):
+                raise PlatformError(
+                    f"Binance {product.value} exchange-info response is not an object",
+                    platform_error=response,
+                )
+            response_symbols = response.get("symbols")
+            if not isinstance(response_symbols, list):
+                raise PlatformError(
+                    f"Binance {product.value} exchange-info response has no symbols list",
+                    platform_error=response,
+                )
+            entries = response_symbols
+            self._exchange_info_cache[product] = entries
+
+        symbol, entry = resolve_binance_symbol(instrument, product, entries)
+        status = entry.get("status")
+        if status is None:
+            status = entry.get("contractStatus")
+        if status != "TRADING":
+            raise InvalidSymbolError(f"Binance symbol {symbol} is not trading (status: {status!r})")
+
+        spec = parse_instrument_spec(entry)
+        self._instrument_spec_cache[cache_key] = (spec, datetime.now(UTC))
+        return spec
 
     def supported_order_types(self) -> frozenset[OrderType]:
         """Return only the order types implemented consistently by product.

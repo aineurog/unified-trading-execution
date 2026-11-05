@@ -1,1 +1,1 @@
-"""Binance Testnet integration-test package."""
+"""Binance integration-test package."""
