@@ -2,8 +2,8 @@
 
 The adapter will translate the core's product-neutral contract into Binance
 Spot, USDⓈ-M Futures, and COIN-M Futures APIs. Symbol and instrument metadata
-mapping and REST client lifecycle are implemented; trading operations remain
-deferred to their respective feature branches.
+mapping, REST client lifecycle, and initial order operations are implemented.
+Account streams, reconciliation, and market data are handled separately.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -34,6 +34,14 @@ from unified_trading_execution.adapter import (
 from unified_trading_execution.binance.config import BinanceConfig
 from unified_trading_execution.binance.enums import BinanceProduct
 from unified_trading_execution.binance.errors import map_binance_error
+from unified_trading_execution.binance.orders import (
+    OrderReference,
+    _MissingAverageFillPriceError,
+    build_modify_order_payload,
+    build_place_order_payload,
+    parse_order_result,
+    to_binance_client_order_id,
+)
 from unified_trading_execution.binance.rate_limits import BinanceRateLimitTracker
 from unified_trading_execution.binance.symbols import (
     parse_instrument_spec,
@@ -42,8 +50,10 @@ from unified_trading_execution.binance.symbols import (
 )
 from unified_trading_execution.errors import (
     InvalidSymbolError,
+    OrderNotFoundError,
     PlatformConnectionError,
     PlatformError,
+    UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.trailing.types import (
@@ -52,7 +62,7 @@ from unified_trading_execution.trailing.types import (
     NativeTrailingResult,
     TrailingBasis,
 )
-from unified_trading_execution.types.enums import OrderType
+from unified_trading_execution.types.enums import OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
@@ -73,6 +83,13 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _order_response(response: object) -> dict[str, object]:
+    if not isinstance(response, dict):
+        raise PlatformError("Binance order endpoint returned a non-object response")
+    return response
+
 
 _EXPECTED_REST_PING_URLS: dict[str, tuple[str, str, str]] = {
     "production": (
@@ -115,8 +132,8 @@ class BinanceAdapter(Adapter):
         _client: The async REST client, or ``None`` while disconnected.
         _socket_manager: Reserved for public/private stream management.
         _stream_tasks: Background stream tasks keyed by stream purpose.
-        _client_order_ids: Local mapping between core client IDs and native
-            order IDs. It is not authoritative across process restarts.
+        _order_refs: Product/symbol routing references for orders placed during
+            this adapter session.
         _instrument_spec_cache: Successful instrument specs keyed by canonical
             instrument identity.
         _exchange_info_cache: Product-wide exchange metadata, fetched once per
@@ -140,7 +157,7 @@ class BinanceAdapter(Adapter):
         self._socket_manager: BinanceSocketManager | None = None
         self._stream_tasks: dict[str, asyncio.Task[None]] = {}
 
-        self._client_order_ids: dict[str, str] = {}
+        self._order_refs: dict[str, OrderReference] = {}
         self._instrument_spec_cache: dict[
             tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
         ] = {}
@@ -337,44 +354,319 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
-        """Translate and submit a core-validated Spot or Futures order.
+        """Submit a supported order and retain lookup data before network I/O."""
+        client = self._require_client()
+        product = product_for_instrument(order.instrument)
+        symbol = await self._resolve_order_symbol(order.instrument, product)
+        core_client_order_id = order.client_order_id
+        if core_client_order_id is None:
+            raise PlatformError("Core must assign client_order_id before Binance order placement")
+        binance_client_order_id = to_binance_client_order_id(core_client_order_id)
+        payload, conditional = build_place_order_payload(
+            order,
+            product=product,
+            symbol=symbol,
+            client_order_id=binance_client_order_id,
+        )
+        reference = OrderReference(
+            product=product,
+            symbol=symbol,
+            conditional=conditional,
+            order_type=order.order_type,
+        )
+        self._order_refs[core_client_order_id] = reference
 
-        The implementation must select the correct product API, preserve
-        Decimal precision and client order identity, translate venue errors,
-        and resolve ambiguous submission outcomes before any retry. Unsupported
-        product/order combinations must raise the core's explicit error rather
-        than being approximated.
-        """
-        raise NotImplementedError("Binance adapter scaffold: place_order is not implemented")
+        method_names = {
+            BinanceProduct.SPOT: "create_order",
+            BinanceProduct.USD_M: "futures_create_order",
+            BinanceProduct.COIN_M: "futures_coin_create_order",
+        }
+        response = await self._run_order_request(
+            product,
+            lambda: getattr(client, method_names[product])(**payload),
+        )
+        response_entry = _order_response(response)
+        try:
+            result = parse_order_result(
+                response_entry,
+                client_order_id=core_client_order_id,
+                conditional=conditional,
+            )
+        except _MissingAverageFillPriceError:
+            platform_order_id = response_entry.get("orderId")
+            if platform_order_id is None and conditional:
+                platform_order_id = response_entry.get("algoId")
+            if platform_order_id is None:
+                raise
+            self._order_refs[core_client_order_id] = OrderReference(
+                product=product,
+                symbol=symbol,
+                conditional=conditional,
+                order_type=order.order_type,
+                platform_order_id=str(platform_order_id),
+            )
+            try:
+                queried = await self.get_order_by_client_id(core_client_order_id)
+            except _MissingAverageFillPriceError as exc:
+                raise PlatformError(
+                    f"Binance filled order {core_client_order_id} has no average fill price "
+                    "in its placement or order-query response"
+                ) from exc
+            if queried is None:
+                raise PlatformError(
+                    f"Binance filled order {core_client_order_id} could not be queried "
+                    "to obtain its average fill price"
+                ) from None
+            result = queried
+        self._order_refs[core_client_order_id] = OrderReference(
+            product=product,
+            symbol=symbol,
+            conditional=conditional,
+            order_type=order.order_type,
+            platform_order_id=result.platform_order_id,
+        )
+        return result
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
-        """Modify a native order when the selected Binance product permits it.
+        """Modify price/quantity for a working Futures LIMIT order only."""
+        client = self._require_client()
+        reference = self._order_refs.get(modification.client_order_id)
+        if reference is None:
+            raise OrderNotFoundError(
+                f"Order {modification.client_order_id} is not known to this Binance adapter"
+            )
+        if reference.product == BinanceProduct.SPOT:
+            raise UnsupportedOrderTypeError(
+                "Spot order modification is not supported; cancel and submit a new order"
+            )
+        if reference.conditional or reference.order_type != OrderType.LIMIT:
+            raise UnsupportedOrderTypeError(
+                "Binance Futures modification is supported only for ordinary LIMIT orders"
+            )
+        if (
+            modification.stop_price is not None
+            or modification.take_profit is not None
+            or modification.stop_loss is not None
+        ):
+            raise UnsupportedOrderTypeError(
+                "Binance order modification supports price and quantity only"
+            )
 
-        Unsupported modification fields or product combinations must fail
-        explicitly. Never emulate an unsupported modify as cancel-and-replace
-        without a separately verified safe contract.
-        """
-        raise NotImplementedError("Binance adapter scaffold: modify_order is not implemented")
+        payload = build_modify_order_payload(
+            symbol=reference.symbol,
+            client_order_id=modification.client_order_id,
+            price=modification.price,
+            quantity=modification.quantity,
+        )
+        request_method = (
+            client.futures_modify_order
+            if reference.product == BinanceProduct.USD_M
+            else client.futures_coin_v1_put_order
+        )
+
+        async def request() -> object:
+            return await request_method(**payload)
+
+        response = await self._run_order_request(reference.product, request)
+        return parse_order_result(
+            _order_response(response),
+            client_order_id=modification.client_order_id,
+        )
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
-        """Cancel an order by its core client ID.
+        """Cancel by the deterministic venue client ID and return the final state."""
+        client = self._require_client()
+        reference = self._order_refs.get(client_order_id)
+        if reference is None:
+            raise OrderNotFoundError(f"Order {client_order_id} is not known to this adapter")
+        method_names = {
+            BinanceProduct.SPOT: "cancel_order",
+            BinanceProduct.USD_M: "futures_cancel_order",
+            BinanceProduct.COIN_M: "futures_coin_cancel_order",
+        }
+        params = {"symbol": reference.symbol}
+        if reference.conditional:
+            if reference.platform_order_id is None:
+                params["clientAlgoId"] = client_order_id
+            else:
+                params["algoId"] = reference.platform_order_id
+        else:
+            if reference.platform_order_id is None:
+                params["origClientOrderId"] = client_order_id
+            else:
+                params["orderId"] = reference.platform_order_id
+        if reference.conditional:
+            try:
+                await self._run_order_request(
+                    reference.product,
+                    lambda: getattr(client, method_names[reference.product])(**params),
+                )
+            except OrderNotFoundError:
+                current = await self._wait_for_conditional_terminal_order(client_order_id)
+                if current is None:
+                    raise
+                return current
 
-        The implementation must resolve the ID in the correct product scope
-        and raise the unified not-found error when Binance confirms the order
-        is absent.
-        """
-        raise NotImplementedError("Binance adapter scaffold: cancel_order is not implemented")
+            current = await self._wait_for_conditional_terminal_order(client_order_id)
+            if current is None:
+                raise PlatformError(
+                    f"Binance accepted cancellation for conditional order {client_order_id}, "
+                    "but its terminal state could not be verified"
+                )
+            return current
+
+        response = await self._run_order_request(
+            reference.product,
+            lambda: getattr(client, method_names[reference.product])(**params),
+        )
+        return parse_order_result(
+            _order_response(response),
+            client_order_id=client_order_id,
+            conditional=reference.conditional,
+        )
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
-        """Query a native order by core client ID.
-
-        Return ``None`` only when the venue confirms no matching order exists;
-        transport and authentication failures must propagate as translated
-        exceptions.
-        """
-        raise NotImplementedError(
-            "Binance adapter scaffold: get_order_by_client_id is not implemented"
+        """Query a known order; return ``None`` only for confirmed absence."""
+        client = self._require_client()
+        reference = self._order_refs.get(client_order_id)
+        if reference is None:
+            raise PlatformError(
+                f"Cannot resolve Binance product and symbol for order {client_order_id}; "
+                "routing references are available only for orders placed in this adapter session"
+            )
+        method_names = {
+            BinanceProduct.SPOT: "get_order",
+            BinanceProduct.USD_M: "futures_get_order",
+            BinanceProduct.COIN_M: "futures_coin_get_order",
+        }
+        params = {"symbol": reference.symbol}
+        if reference.conditional:
+            if reference.platform_order_id is None:
+                params["clientAlgoId"] = client_order_id
+            else:
+                params["algoId"] = reference.platform_order_id
+        else:
+            if reference.platform_order_id is None:
+                params["origClientOrderId"] = client_order_id
+            else:
+                params["orderId"] = reference.platform_order_id
+        try:
+            response = await self._run_order_request(
+                reference.product,
+                lambda: getattr(client, method_names[reference.product])(**params),
+            )
+        except OrderNotFoundError:
+            history_methods = {
+                (BinanceProduct.SPOT, False): "get_all_orders",
+                (BinanceProduct.USD_M, False): "futures_get_all_orders",
+                (BinanceProduct.USD_M, True): "futures_get_all_algo_orders",
+                (BinanceProduct.COIN_M, False): "futures_coin_get_all_orders",
+            }
+            history_method = history_methods.get((reference.product, reference.conditional))
+            if history_method is None:
+                return None
+            history = await self._run_order_request(
+                reference.product,
+                lambda: getattr(client, history_method)(symbol=reference.symbol),
+            )
+            if not isinstance(history, list):
+                raise PlatformError(
+                    f"Binance {reference.product.value} order history response is not a list"
+                ) from None
+            for entry in history:
+                if not isinstance(entry, dict):
+                    raise PlatformError(
+                        f"Binance {reference.product.value} order history "
+                        "contains a non-object entry"
+                    ) from None
+            id_field = "algoId" if reference.conditional else "orderId"
+            client_id_field = "clientAlgoId" if reference.conditional else "clientOrderId"
+            response = next(
+                (
+                    entry
+                    for entry in history
+                    if isinstance(entry, dict)
+                    and (
+                        (
+                            reference.platform_order_id is not None
+                            and str(entry.get(id_field)) == reference.platform_order_id
+                        )
+                        or (
+                            reference.platform_order_id is None
+                            and entry.get(client_id_field) == client_order_id
+                        )
+                    )
+                ),
+                None,
+            )
+            if response is None:
+                return None
+        return parse_order_result(
+            _order_response(response),
+            client_order_id=client_order_id,
+            conditional=reference.conditional,
         )
+
+    async def _wait_for_conditional_terminal_order(
+        self,
+        client_order_id: str,
+    ) -> OrderResult | None:
+        for attempt in range(8):
+            current = await self.get_order_by_client_id(client_order_id)
+            if current is not None and current.status in (
+                OrderStatus.FILLED,
+                OrderStatus.CANCELLED,
+                OrderStatus.REJECTED,
+                OrderStatus.EXPIRED,
+            ):
+                return current
+            if attempt < 7:
+                await asyncio.sleep(0.25)
+        return None
+
+    def _require_client(self) -> AsyncClient:
+        if not self._connected or self._client is None:
+            raise PlatformConnectionError("Binance adapter is not connected")
+        return self._client
+
+    async def _resolve_order_symbol(
+        self,
+        instrument: Instrument,
+        product: BinanceProduct,
+    ) -> str:
+        await self.fetch_instrument_spec(instrument)
+        entries = self._exchange_info_cache.get(product)
+        if entries is None:
+            raise PlatformError(f"Binance {product.value} exchange-info cache was not populated")
+        symbol, _ = resolve_binance_symbol(instrument, product, entries)
+        return symbol
+
+    async def _run_order_request(
+        self,
+        product: BinanceProduct,
+        request: Callable[[], Awaitable[object]],
+    ) -> object:
+        client = self._require_client()
+        try:
+            response = await request()
+        except TimeoutError:
+            raise
+        except (
+            BinanceAPIException,
+            BinanceOrderException,
+            BinanceRequestException,
+            ClientError,
+            OSError,
+        ) as exc:
+            error_response = getattr(exc, "response", None)
+            self._record_rate_limit_response(
+                product,
+                error_response,
+                status_code=getattr(exc, "status_code", None),
+            )
+            raise map_binance_error(exc, product=product) from exc
+        self._record_rate_limit_response(product, getattr(client, "response", None), response)
+        return response
 
     # ------------------------------------------------------------------
     # Instrument metadata and capabilities
@@ -458,14 +750,18 @@ class BinanceAdapter(Adapter):
         return spec
 
     def supported_order_types(self) -> frozenset[OrderType]:
-        """Return only the order types implemented consistently by product.
+        """Return portable types available on at least one supported product.
 
-        Capability claims are intentionally withheld by this scaffold. The
-        completed implementation must not infer that a portable order type is
-        supported merely because a similarly named Binance order exists.
+        Product-specific constraints are enforced in the payload builder; in
+        particular, COIN-M conditional orders are not exposed by the pinned SDK.
         """
-        raise NotImplementedError(
-            "Binance adapter scaffold: supported_order_types is not implemented"
+        return frozenset(
+            {
+                OrderType.MARKET,
+                OrderType.LIMIT,
+                OrderType.STOP,
+                OrderType.STOP_LIMIT,
+            }
         )
 
     def position_protection_capability(

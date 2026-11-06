@@ -122,6 +122,7 @@ class TestMapBinanceCodes:
             (-4142, InvalidOrderError),
             (-4144, InvalidSymbolError),
             (-4164, InvalidOrderError),
+            (-5021, InvalidOrderError),
             (-4000, InvalidOrderError),
             (-4001, InvalidOrderError),
             (-4004, InvalidOrderError),
