@@ -11,7 +11,6 @@ import pytest
 from unified_trading_execution.binance import (
     BinanceAdapter,
     BinanceConfig,
-    BinanceEngine,
     SyncBinanceEngine,
 )
 from unified_trading_execution.sync import SyncEngine
@@ -70,19 +69,6 @@ def test_account_id_does_not_expose_the_api_key(adapter: BinanceAdapter) -> None
     account_id = adapter.account_id
     assert account_id.startswith("binance-")
     assert "test-api-key" not in account_id
-
-
-async def test_adapter_connect_is_not_implemented(adapter: BinanceAdapter) -> None:
-    assert adapter.is_connected is False
-    with pytest.raises(NotImplementedError, match="connect is not implemented"):
-        await adapter.connect()
-    assert adapter.is_connected is False
-
-
-async def test_engine_connect_is_not_implemented(binance_config: BinanceConfig) -> None:
-    engine = BinanceEngine(binance_config)
-    with pytest.raises(NotImplementedError, match="connect is not implemented"):
-        await engine.connect()
 
 
 def test_sync_engine_constructs_without_connecting(binance_config: BinanceConfig) -> None:

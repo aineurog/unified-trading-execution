@@ -54,5 +54,5 @@ class BinanceEngine(Engine):
         )
 
     async def connect(self) -> None:
-        """Fail before the core initializes persistent state for this scaffold."""
-        raise NotImplementedError("Binance engine scaffold: connect is not implemented")
+        """Connect the Binance adapter through the core engine lifecycle."""
+        await super().connect()

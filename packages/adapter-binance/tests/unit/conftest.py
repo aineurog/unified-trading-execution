@@ -20,6 +20,15 @@ from unified_trading_execution.events import EventBus
 def binance_client_mock() -> AsyncMock:
     """An async SDK client mock with awaitable methods by default."""
     client = AsyncMock()
+    client.testnet = True
+    client.demo = False
+    client._create_api_uri = MagicMock(return_value="https://testnet.binance.vision/api/v3/ping")
+    client._create_futures_api_uri = MagicMock(
+        return_value="https://testnet.binancefuture.com/fapi/v1/ping"
+    )
+    client._create_futures_coin_api_url = MagicMock(
+        return_value="https://testnet.binancefuture.com/dapi/v1/ping"
+    )
     client.close_connection = AsyncMock()
     return client
 

@@ -1,4 +1,4 @@
-"""Immutable configuration for the Binance adapter scaffold."""
+"""Immutable configuration for the Binance adapter."""
 
 from __future__ import annotations
 
@@ -21,8 +21,7 @@ class BinanceConfig:
     ``testnet`` selects Binance Testnet endpoints and ``demo`` selects Binance
     Demo Trading endpoints. They are mutually exclusive. When both are false,
     the selected environment is production (live). Both default to false to
-    match the SDK's live-by-default behavior. Exchange connectivity is not
-    implemented by this scaffold.
+    match the SDK's live-by-default behavior.
 
     ``instrument_spec_cache_ttl`` is the number of seconds a cached
     ``InstrumentSpec`` is trusted before it is re-parsed on the next access.

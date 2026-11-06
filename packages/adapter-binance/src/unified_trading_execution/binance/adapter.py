@@ -2,7 +2,7 @@
 
 The adapter will translate the core's product-neutral contract into Binance
 Spot, USDⓈ-M Futures, and COIN-M Futures APIs. Symbol and instrument metadata
-mapping are implemented; client lifecycle and trading operations remain
+mapping and REST client lifecycle are implemented; trading operations remain
 deferred to their respective feature branches.
 """
 
@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 from aiohttp import ClientError
+from binance import AsyncClient  # type: ignore[import-untyped]
 from binance.exceptions import (  # type: ignore[import-untyped]
     BinanceAPIException,
     BinanceOrderException,
     BinanceRequestException,
 )
+from uuid_extensions import uuid7
 
 from unified_trading_execution.adapter import (
     Adapter,
@@ -42,7 +45,7 @@ from unified_trading_execution.errors import (
     PlatformConnectionError,
     PlatformError,
 )
-from unified_trading_execution.events import EventBus
+from unified_trading_execution.events import ConnectionStateEvent, EventBus
 from unified_trading_execution.trailing.types import (
     CandleTimeframe,
     NativeTrailingRequest,
@@ -63,22 +66,44 @@ from unified_trading_execution.types.order import (
 from unified_trading_execution.types.position import Balance, Position
 
 if TYPE_CHECKING:
-    from binance import AsyncClient, BinanceSocketManager  # type: ignore[import-untyped]
+    from binance import BinanceSocketManager
 
     from unified_trading_execution.state.halt import HaltStateMachine
     from unified_trading_execution.state.store import StateStore
 
 
+logger = logging.getLogger(__name__)
+
+_EXPECTED_REST_PING_URLS: dict[str, tuple[str, str, str]] = {
+    "production": (
+        "https://api.binance.com/api/v3/ping",
+        "https://fapi.binance.com/fapi/v1/ping",
+        "https://dapi.binance.com/dapi/v1/ping",
+    ),
+    "testnet": (
+        "https://testnet.binance.vision/api/v3/ping",
+        "https://testnet.binancefuture.com/fapi/v1/ping",
+        "https://testnet.binancefuture.com/dapi/v1/ping",
+    ),
+    "demo": (
+        "https://demo-api.binance.com/api/v3/ping",
+        "https://demo-fapi.binance.com/fapi/v1/ping",
+        "https://demo-dapi.binance.com/dapi/v1/ping",
+    ),
+}
+_REST_PRODUCTS = ("Spot", "USDⓈ-M Futures", "COIN-M Futures")
+
+
 class BinanceAdapter(Adapter):
-    """Concrete but unimplemented adapter surface for Binance.
+    """Partially implemented adapter surface for Binance.
 
     One ``AsyncClient`` instance is intended to provide asynchronous REST
     access for the selected Binance products. Product selection must remain
     explicit when resolving symbols and endpoint families: Spot, USDⓈ-M, and
     COIN-M are not interchangeable markets. ``BinanceConfig.testnet`` and
     ``BinanceConfig.demo`` select distinct sandbox environments; both false
-    selects production. Client creation and endpoint routing are deferred to
-    the client branch.
+    selects production. The REST client is created by :meth:`connect`;
+    private account streams are added separately.
 
     Args:
         config: Immutable API credentials and environment selection.
@@ -87,8 +112,7 @@ class BinanceAdapter(Adapter):
             replaces it with the core-owned bus via ``attach_event_bus``.
 
     Attributes:
-        _client: Reserved for the async REST client; remains ``None`` until
-            client lifecycle work is implemented.
+        _client: The async REST client, or ``None`` while disconnected.
         _socket_manager: Reserved for public/private stream management.
         _stream_tasks: Background stream tasks keyed by stream purpose.
         _client_order_ids: Local mapping between core client IDs and native
@@ -110,6 +134,7 @@ class BinanceAdapter(Adapter):
         self._config = config
         self._event_bus = event_bus if event_bus is not None else EventBus()
         self._connected = False
+        self._lifecycle_lock = asyncio.Lock()
 
         self._client: AsyncClient | None = None
         self._socket_manager: BinanceSocketManager | None = None
@@ -158,26 +183,154 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     async def connect(self) -> None:
-        """Create the async REST client and start required account streams.
+        """Create the async REST client using the configured Binance environment.
 
-        The completed implementation must honor the mutually exclusive
-        Testnet/Demo configuration, fail closed if the selected endpoint
-        resolves to the wrong environment, clean up partial startup, and
-        publish a connected event only after the required resources are ready.
-        Repeated calls and concurrent callers must not create duplicate
-        clients or streams.
+        The pinned SDK factory validates connectivity with Spot ping/server
+        time requests. All three product URL builders are then checked before
+        the client is retained, preventing an incorrect or live fallback for a
+        sandbox configuration. Private streams are initialized separately.
         """
-        raise NotImplementedError("Binance adapter scaffold: connect is not implemented")
+        async with self._lifecycle_lock:
+            if self._connected:
+                return
+            if self._client is not None:
+                raise PlatformConnectionError(
+                    "Binance adapter has an unclosed client; disconnect before reconnecting"
+                )
+
+            creation_task = asyncio.create_task(
+                AsyncClient.create(
+                    api_key=self._config.api_key,
+                    api_secret=self._config.api_secret,
+                    testnet=self._config.testnet,
+                    demo=self._config.demo,
+                )
+            )
+            try:
+                client = await asyncio.shield(creation_task)
+            except asyncio.CancelledError:
+                try:
+                    client = await creation_task
+                except Exception:
+                    logger.exception(
+                        "Binance client creation failed while connection was cancelled"
+                    )
+                else:
+                    try:
+                        await client.close_connection()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close Binance client after connection was cancelled"
+                        )
+                raise
+            except (
+                BinanceAPIException,
+                BinanceOrderException,
+                BinanceRequestException,
+                ClientError,
+                OSError,
+                TimeoutError,
+            ) as exc:
+                raise map_binance_error(exc) from exc
+
+            try:
+                self._validate_client_urls(client)
+            except BaseException:
+                try:
+                    await client.close_connection()
+                except Exception:
+                    logger.exception("Failed to close Binance client after connection setup failed")
+                raise
+
+            self._client = client
+            self._connected = True
+            self._publish_connection_state(True)
 
     async def disconnect(self) -> None:
-        """Stop stream workers and close resources without mutating protection.
+        """Close the REST client and publish a disconnected state.
 
-        The implementation must be safe after partial startup and repeated
-        shutdown, cancel and await owned background tasks, close the async
-        client, and publish the disconnected state. Exchange-side orders and
-        position protection must remain untouched.
+        This method does not cancel or mutate exchange-side orders or
+        protection. Stream workers are owned by the separate account-stream
+        lifecycle.
         """
-        raise NotImplementedError("Binance adapter scaffold: disconnect is not implemented")
+        async with self._lifecycle_lock:
+            client = self._client
+            if client is None:
+                if self._connected:
+                    raise PlatformConnectionError(
+                        "Binance adapter is marked connected without an active REST client"
+                    )
+                return
+
+            try:
+                await client.close_connection()
+            except (
+                BinanceAPIException,
+                BinanceOrderException,
+                BinanceRequestException,
+                ClientError,
+                OSError,
+                TimeoutError,
+            ) as exc:
+                raise map_binance_error(exc) from exc
+
+            was_connected = self._connected
+            self._client = None
+            self._connected = False
+            if was_connected:
+                self._publish_connection_state(False)
+
+    def _validate_client_urls(self, client: AsyncClient) -> None:
+        """Fail closed unless SDK builders resolve to the configured environment."""
+        environment = (
+            "testnet" if self._config.testnet else "demo" if self._config.demo else "production"
+        )
+        if (
+            getattr(client, "testnet", None) != self._config.testnet
+            or getattr(client, "demo", None) != self._config.demo
+        ):
+            raise PlatformConnectionError(
+                f"Binance SDK environment flags do not match configured {environment}"
+            )
+
+        spot_url_builder = getattr(client, "_create_api_uri", None)
+        usdm_url_builder = getattr(client, "_create_futures_api_uri", None)
+        coinm_url_builder = getattr(client, "_create_futures_coin_api_url", None)
+        if (
+            not callable(spot_url_builder)
+            or not callable(usdm_url_builder)
+            or not callable(coinm_url_builder)
+        ):
+            raise PlatformConnectionError(
+                "Binance SDK does not expose the expected Spot and Futures REST URL builders"
+            )
+
+        actual_urls = (
+            spot_url_builder("ping", signed=False),
+            usdm_url_builder("ping"),
+            coinm_url_builder("ping"),
+        )
+        expected_urls = _EXPECTED_REST_PING_URLS[environment]
+        for product, actual_url, expected_url in zip(
+            _REST_PRODUCTS, actual_urls, expected_urls, strict=True
+        ):
+            if actual_url != expected_url:
+                raise PlatformConnectionError(
+                    f"Binance {product} REST endpoint does not match configured {environment}; "
+                    "refusing to connect"
+                )
+
+    def _publish_connection_state(self, connected: bool) -> None:
+        self._event_bus.publish(
+            ConnectionStateEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                connected=connected,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Order lifecycle
