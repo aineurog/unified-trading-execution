@@ -3,9 +3,9 @@
 Partially implemented Binance adapter for
 [unified-trading-execution](https://github.com/aineurog/unified-trading-execution).
 Product and instrument metadata translation, a limited REST rate-limit
-observation path, and the async REST client lifecycle are implemented. Market
-data, account streams, trailing stops, and trading operations have **not** been
-implemented. Unimplemented methods raise `NotImplementedError`.
+observation path, the async REST client lifecycle, and core order operations
+are implemented. Market data, account streams, reconciliation, position
+protection, and trailing stops remain unimplemented.
 
 ## Installation
 
@@ -42,8 +42,7 @@ engine = BinanceEngine(config)
 
 `connect` creates the REST client and publishes a connection state event.
 Pass `testnet=True` or `demo=True` to select a sandbox; both default to
-production. Other unimplemented adapter operations raise
-`NotImplementedError`; complete their implementation branches before use.
+production. Operations not yet implemented raise `NotImplementedError`.
 
 ### Products, symbols, and specs
 
@@ -81,9 +80,7 @@ guessed at.
 
 The Binance error mapper translates SDK API, malformed response, timeout, and
 transport errors into the core error hierarchy while retaining safe context
-for unknown API responses. It is currently used for exchange-info requests;
-future adapter operations should use it around their Binance I/O calls as they
-are implemented.
+for unknown API responses. It is used for exchange-info and order requests.
 
 Binance exposes both Testnet and Demo Trading API environments. `testnet=True`
 selects Testnet; `demo=True` selects Demo Trading. These flags are mutually
@@ -95,11 +92,28 @@ Both default to `False`, so set the desired non-live environment explicitly.
 derives a stable, non-secret label from the API key. The exchange identity
 resolution behavior will be reviewed during implementation.
 
+### Order operations
+
+The adapter supports Spot and Futures MARKET/LIMIT orders, Spot STOP/STOP_LIMIT,
+and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. COIN-M
+conditional orders, Spot order modification, conditional-order modification,
+and order-level TP/SL attachments are explicitly unsupported. USDⓈ-M and
+COIN-M ordinary LIMIT orders can be modified by price and/or quantity.
+Order routing references are currently kept in memory for the adapter session;
+looking up an order after a process restart is deferred to reconciliation work.
+Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
+length or character constraints are rejected instead of being rewritten.
+
+When a filled placement response omits its average fill price, the adapter
+queries the order by its Binance order ID and requires the query response to
+provide the average. Individual trade-fill ingestion is not implemented.
+
 ## Tests
 
 Unit tests cover product resolution, symbol conversion, exchange-info
-resolution, filter parsing, error translation, and adapter lookup. They mock
-SDK client and socket construction and never reach the network:
+resolution, filter parsing, error translation, order translation, and order
+lookup. They mock SDK client and socket construction and never reach the
+network:
 
 ```bash
 pytest packages/adapter-binance/tests/unit/
@@ -121,11 +135,16 @@ credentials and requires the explicit `BINANCE_REST_URL_SMOKE=true` opt-in:
 BINANCE_REST_URL_SMOKE=true pytest packages/adapter-binance/tests/binance_integration/test_rest_urls.py
 ```
 
-Authenticated Testnet tests require dedicated credentials and
-`BINANCE_TESTNET=true`; the integration fixtures configure Testnet and never
-select Demo or production when that opt-in is used.
+Order integration tests submit, query, cancel, and clean up the orders they
+create, so they need dedicated sandbox credentials. They run against Demo
+Trading by default with `BINANCE_DEMO_API_KEY` and `BINANCE_DEMO_API_SECRET`;
+set `BINANCE_DEMO_ORDER_INTEGRATION=false` to skip them. Set
+`BINANCE_TESTNET=true` and `BINANCE_TESTNET_ORDER_INTEGRATION=true` to run
+them on Testnet instead, using `BINANCE_SPOT_TESTNET_API_KEY`,
+`BINANCE_USDM_TESTNET_API_KEY`, and `BINANCE_COINM_TESTNET_API_KEY` with
+their matching secrets.
 
-Copy `.env.example` to `.env` only when preparing local testnet work. Never
+Copy `.env.example` to `.env` only when preparing local sandbox work. Never
 commit API credentials.
 
 ## License

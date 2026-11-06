@@ -121,6 +121,7 @@ _BINANCE_CODE_MAP: dict[int, type[UteError]] = {
     -2038: InvalidOrderError,
     -2039: InvalidOrderError,
     -2043: InvalidOrderError,
+    -5021: InvalidOrderError,
     -4115: InvalidOrderError,
     -4116: DuplicateOrderIdError,
     -4117: InvalidOrderError,

@@ -1,8 +1,8 @@
-"""Shared fixtures for Binance testnet integration tests.
+"""Shared fixtures for Binance integration tests.
 
-Integration tests require ``BINANCE_TESTNET=true`` as an explicit opt-in.
-Authenticated tests additionally require dedicated Testnet credentials. The
-fixtures always construct a Testnet config and never select Demo or production.
+Integration tests require explicit environment opt-ins and dedicated
+credentials for authenticated order operations. Order tests default to Demo;
+set ``BINANCE_TESTNET=true`` to select Testnet instead.
 """
 
 from __future__ import annotations
@@ -67,6 +67,39 @@ def binance_rest_url_smoke_opt_in() -> None:
 
 
 @pytest.fixture
+def binance_order_config(request: pytest.FixtureRequest) -> BinanceConfig:
+    """Select an explicitly opted-in Testnet or Demo order-test configuration."""
+    product = request.param
+    testnet = os.getenv("BINANCE_TESTNET", "").strip().lower() == "true"
+    demo = os.getenv("BINANCE_DEMO", "").strip().lower() == "true"
+    if testnet and demo:
+        pytest.fail("Choose only one Binance order integration environment")
+
+    if testnet:
+        if os.getenv("BINANCE_TESTNET_ORDER_INTEGRATION", "").strip().lower() != "true":
+            pytest.skip(
+                "Set BINANCE_TESTNET_ORDER_INTEGRATION=true to opt in to "
+                "Binance Testnet order tests"
+            )
+        names = {
+            "spot": ("BINANCE_SPOT_TESTNET_API_KEY", "BINANCE_SPOT_TESTNET_API_SECRET"),
+            "usd_m": ("BINANCE_USDM_TESTNET_API_KEY", "BINANCE_USDM_TESTNET_API_SECRET"),
+            "coin_m": ("BINANCE_COINM_TESTNET_API_KEY", "BINANCE_COINM_TESTNET_API_SECRET"),
+        }
+        if product not in names:
+            raise ValueError(f"Unknown Binance Testnet order product {product!r}")
+        api_key_name, api_secret_name = names[product]
+        api_key, api_secret = _require_env(api_key_name), _require_env(api_secret_name)
+        return BinanceConfig(api_key=api_key, api_secret=api_secret, testnet=True, demo=False)
+
+    if os.getenv("BINANCE_DEMO_ORDER_INTEGRATION", "true").strip().lower() != "true":
+        pytest.skip("Set BINANCE_DEMO_ORDER_INTEGRATION=false to disable Binance Demo order tests")
+    api_key = _require_env("BINANCE_DEMO_API_KEY")
+    api_secret = _require_env("BINANCE_DEMO_API_SECRET")
+    return BinanceConfig(api_key=api_key, api_secret=api_secret, testnet=False, demo=True)
+
+
+@pytest.fixture
 def binance_testnet_opt_in() -> None:
     """Require explicit Testnet selection without requiring API credentials."""
     _require_testnet_opt_in()
@@ -81,7 +114,7 @@ def binance_demo_opt_in() -> None:
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
-        pytest.skip(f"{name} not set — skipping Binance testnet integration test")
+        pytest.skip(f"{name} not set — skipping Binance integration test")
     return value
 
 
