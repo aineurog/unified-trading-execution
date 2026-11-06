@@ -60,6 +60,13 @@ def _require_demo_opt_in() -> None:
 
 
 @pytest.fixture
+def binance_rest_url_smoke_opt_in() -> None:
+    """Require explicit opt-in before contacting all public Binance environments."""
+    if os.getenv("BINANCE_REST_URL_SMOKE", "").strip().lower() != "true":
+        pytest.skip("Set BINANCE_REST_URL_SMOKE=true to opt in to Binance REST URL smoke tests")
+
+
+@pytest.fixture
 def binance_testnet_opt_in() -> None:
     """Require explicit Testnet selection without requiring API credentials."""
     _require_testnet_opt_in()

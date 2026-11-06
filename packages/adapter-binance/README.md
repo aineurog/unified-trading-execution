@@ -113,6 +113,14 @@ perform no authenticated or trading calls. They require an explicit
 BINANCE_DEMO=true pytest packages/adapter-binance/tests/binance_integration/
 ```
 
+The REST URL smoke test sends read-only `ping` requests to Spot, USDⓈ-M, and
+COIN-M endpoints in production, Testnet, and Demo Trading. It needs no API
+credentials and requires the explicit `BINANCE_REST_URL_SMOKE=true` opt-in:
+
+```bash
+BINANCE_REST_URL_SMOKE=true pytest packages/adapter-binance/tests/binance_integration/test_rest_urls.py
+```
+
 Authenticated Testnet tests require dedicated credentials and
 `BINANCE_TESTNET=true`; the integration fixtures configure Testnet and never
 select Demo or production when that opt-in is used.
