@@ -198,13 +198,31 @@ class BinanceAdapter(Adapter):
                     "Binance adapter has an unclosed client; disconnect before reconnecting"
                 )
 
-            try:
-                client = await AsyncClient.create(
+            creation_task = asyncio.create_task(
+                AsyncClient.create(
                     api_key=self._config.api_key,
                     api_secret=self._config.api_secret,
                     testnet=self._config.testnet,
                     demo=self._config.demo,
                 )
+            )
+            try:
+                client = await asyncio.shield(creation_task)
+            except asyncio.CancelledError:
+                try:
+                    client = await creation_task
+                except Exception:
+                    logger.exception(
+                        "Binance client creation failed while connection was cancelled"
+                    )
+                else:
+                    try:
+                        await client.close_connection()
+                    except Exception:
+                        logger.exception(
+                            "Failed to close Binance client after connection was cancelled"
+                        )
+                raise
             except (
                 BinanceAPIException,
                 BinanceOrderException,

@@ -163,6 +163,34 @@ async def test_factory_transport_failure_is_mapped_to_connection_error(
     assert adapter._client is None
 
 
+async def test_cancelled_startup_closes_client_created_by_sdk_factory(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    factory_started = asyncio.Event()
+    finish_factory = asyncio.Event()
+
+    async def delayed_factory(**_: object) -> AsyncMock:
+        factory_started.set()
+        await finish_factory.wait()
+        return binance_client_mock
+
+    factory = AsyncMock(side_effect=delayed_factory)
+    monkeypatch.setattr(AsyncClient, "create", factory)
+    connect_task = asyncio.create_task(adapter.connect())
+    await factory_started.wait()
+    connect_task.cancel()
+    finish_factory.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    binance_client_mock.close_connection.assert_awaited_once()
+    assert adapter._client is None
+    assert adapter.is_connected is False
+
+
 async def test_failed_close_retains_client_for_retry(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
