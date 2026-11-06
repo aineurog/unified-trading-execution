@@ -1,11 +1,11 @@
 # unified-trading-execution-binance
 
-Scaffold for the Binance adapter in
+Partially implemented Binance adapter for
 [unified-trading-execution](https://github.com/aineurog/unified-trading-execution).
-Product and instrument metadata translation and a limited REST rate-limit
-observation path are implemented. Exchange connectivity, market data, trailing
-stops, and trading operations have **not** been implemented. Unimplemented
-methods raise `NotImplementedError`.
+Product and instrument metadata translation, a limited REST rate-limit
+observation path, and the async REST client lifecycle are implemented. Market
+data, account streams, trailing stops, and trading operations have **not** been
+implemented. Unimplemented methods raise `NotImplementedError`.
 
 ## Installation
 
@@ -16,11 +16,11 @@ uv pip install -e packages/core
 uv pip install -e packages/adapter-binance
 ```
 
-The adapter package pins `python-binance==1.0.37`. `fetch_instrument_spec`
-expects an injected SDK client, but `connect` does not create one yet, so the
-client lifecycle is wired in a later implementation branch. Unit fixtures
-never reach the network; the integration fixtures construct the SDK client
-directly.
+The adapter package pins `python-binance==1.0.37`. `connect` creates the SDK
+client for the configured environment and verifies that all three REST endpoint
+families resolve to it before retaining the client. `fetch_instrument_spec`
+requires that connected client. Unit fixtures never reach the network; the
+integration fixtures target only their explicitly selected environment.
 
 ## Public package
 
@@ -40,10 +40,10 @@ config = BinanceConfig(
 engine = BinanceEngine(config)
 ```
 
-This example only constructs the scaffold. `connect` fails immediately before
-opening a client, starting the sync loop, or initializing persistent state.
-Other unimplemented adapter operations raise `NotImplementedError`; complete
-their implementation branches before use.
+`connect` creates the REST client and publishes a connection state event.
+Pass `testnet=True` or `demo=True` to select a sandbox; both default to
+production. Other unimplemented adapter operations raise
+`NotImplementedError`; complete their implementation branches before use.
 
 ### Products, symbols, and specs
 

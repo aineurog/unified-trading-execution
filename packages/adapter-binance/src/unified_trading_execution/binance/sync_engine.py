@@ -1,4 +1,4 @@
-"""Synchronous Binance engine scaffold."""
+"""Synchronous Binance engine facade."""
 
 from __future__ import annotations
 
@@ -47,7 +47,3 @@ class SyncBinanceEngine(SyncEngine):
             reconcile_interval_seconds=reconcile_interval_seconds,
             fill_settle_lag_seconds=fill_settle_lag_seconds,
         )
-
-    def connect(self) -> None:
-        """Fail before starting the sync loop for this scaffold."""
-        raise NotImplementedError("Binance sync engine scaffold: connect is not implemented")

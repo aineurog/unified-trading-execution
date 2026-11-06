@@ -11,6 +11,7 @@ dependencies = [
     "unified-trading-execution",
     "python-binance==1.0.37",
     "aiohttp>=3.9,<4.0",
+    "uuid7>=0.1",
 ]
 
 [project.optional-dependencies]

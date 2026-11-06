@@ -9,7 +9,12 @@ import pytest
 from aiohttp import ClientError
 from binance import AsyncClient  # type: ignore[import-untyped]
 
-from unified_trading_execution.binance import BinanceAdapter, BinanceConfig, BinanceEngine
+from unified_trading_execution.binance import (
+    BinanceAdapter,
+    BinanceConfig,
+    BinanceEngine,
+    SyncBinanceEngine,
+)
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import PlatformConnectionError
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
@@ -231,3 +236,28 @@ async def test_binance_engine_delegates_connect_to_core_lifecycle(
     await engine.connect()
 
     assert connected_engines == [engine]
+
+
+def test_sync_engine_delegates_connect_to_core_lifecycle(
+    binance_config: BinanceConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connected_engines: list[Engine] = []
+
+    async def connect_core(engine: Engine) -> None:
+        connected_engines.append(engine)
+
+    async def ashutdown_core(engine: Engine) -> None:
+        return None
+
+    monkeypatch.setattr(Engine, "connect", connect_core)
+    monkeypatch.setattr(Engine, "ashutdown", ashutdown_core)
+    engine = SyncBinanceEngine(binance_config)
+
+    try:
+        engine.connect()
+    finally:
+        engine.shutdown()
+
+    assert len(connected_engines) == 1
+    assert isinstance(connected_engines[0], Engine)

@@ -140,9 +140,9 @@ async def demo_metadata_adapter(
 ) -> AsyncIterator[BinanceAdapter]:
     """Provide an adapter backed by a verified Demo Trading SDK client.
 
-    Adapter connection lifecycle is implemented in a later branch. This
-    fixture initializes the pinned SDK directly so metadata-only integration
-    tests can exercise real public Demo endpoints without trading.
+    This fixture initializes the pinned SDK directly so metadata-only
+    integration tests can exercise real public Demo endpoints without
+    credentials or trading.
     """
     config = BinanceConfig(
         api_key="read-only-metadata-test",
