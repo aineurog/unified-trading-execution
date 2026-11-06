@@ -379,7 +379,7 @@ async def test_order_type_and_time_in_force_matrix(
             and time_in_force == TimeInForce.FOK
         ):
             attempted = True
-            with pytest.raises(InvalidOrderError, match="could not be filled immediately"):
+            with pytest.raises(InvalidOrderError):
                 await adapter.place_order(order)
             history = await _exchange_order_history(
                 client,

@@ -19,7 +19,8 @@ uv pip install -e packages/adapter-binance
 The adapter package pins `python-binance==1.0.37`. `connect` creates the SDK
 client for the configured environment and verifies that all three REST endpoint
 families resolve to it before retaining the client. `fetch_instrument_spec`
-requires that connected client.
+requires that connected client. Unit fixtures never reach the network; the
+integration fixtures target only their explicitly selected environment.
 
 ## Public package
 
@@ -109,9 +110,42 @@ provide the average. Individual trade-fill ingestion is not implemented.
 
 ## Tests
 
-Run unit tests with `pytest packages/adapter-binance/tests/unit/`. Sandbox
-integration tests require explicit environment configuration; order tests can
-submit orders, so use dedicated sandbox credentials.
+Unit tests cover product resolution, symbol conversion, exchange-info
+resolution, filter parsing, error translation, order translation, and order
+lookup. They mock SDK client and socket construction and never reach the
+network:
+
+```bash
+pytest packages/adapter-binance/tests/unit/
+```
+
+The metadata integration tests read public Demo exchange-info catalogs and
+perform no authenticated or trading calls. They require an explicit
+`BINANCE_DEMO=true` opt-in but no credentials:
+
+```bash
+BINANCE_DEMO=true pytest packages/adapter-binance/tests/binance_integration/
+```
+
+The REST URL smoke test sends read-only `ping` requests to Spot, USDⓈ-M, and
+COIN-M endpoints in production, Testnet, and Demo Trading. It needs no API
+credentials and requires the explicit `BINANCE_REST_URL_SMOKE=true` opt-in:
+
+```bash
+BINANCE_REST_URL_SMOKE=true pytest packages/adapter-binance/tests/binance_integration/test_rest_urls.py
+```
+
+Order integration tests submit, query, cancel, and clean up the orders they
+create, so they need dedicated sandbox credentials. They run against Demo
+Trading by default with `BINANCE_DEMO_API_KEY` and `BINANCE_DEMO_API_SECRET`;
+set `BINANCE_DEMO_ORDER_INTEGRATION=false` to skip them. Set
+`BINANCE_TESTNET=true` and `BINANCE_TESTNET_ORDER_INTEGRATION=true` to run
+them on Testnet instead, using `BINANCE_SPOT_TESTNET_API_KEY`,
+`BINANCE_USDM_TESTNET_API_KEY`, and `BINANCE_COINM_TESTNET_API_KEY` with
+their matching secrets.
+
+Copy `.env.example` to `.env` only when preparing local sandbox work. Never
+commit API credentials.
 
 ## License
 

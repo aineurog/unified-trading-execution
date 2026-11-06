@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 from uuid_extensions import uuid7
@@ -83,11 +83,12 @@ def _order(
     **kwargs: Any,
 ) -> UnifiedOrder:
     time_in_force = kwargs.pop("time_in_force", TimeInForce.GTC)
+    quantity = kwargs.pop("quantity", Decimal("0.001"))
     return UnifiedOrder(
         instrument=_instrument(product),
         order_type=order_type,
         side=OrderSide.BUY,
-        quantity=Decimal("0.001"),
+        quantity=quantity,
         time_in_force=time_in_force,
         client_order_id="test-order-1",
         **kwargs,
@@ -227,6 +228,33 @@ def test_build_modify_payload_contains_only_supported_fields() -> None:
     }
 
 
+def test_order_payloads_render_decimals_without_exponent_notation() -> None:
+    payload, _ = build_place_order_payload(
+        _order(
+            BinanceProduct.SPOT,
+            OrderType.LIMIT,
+            price=Decimal("1E+1"),
+            quantity=Decimal("1E-8"),
+        ),
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        client_order_id="ute-123",
+    )
+    assert payload["quantity"] == "0.00000001"
+    assert payload["price"] == "10"
+    assert build_modify_order_payload(
+        symbol="BTCUSDT",
+        client_order_id="ute-123",
+        price=Decimal("1E+1"),
+        quantity=Decimal("1E-8"),
+    ) == {
+        "symbol": "BTCUSDT",
+        "origClientOrderId": "ute-123",
+        "price": "10",
+        "quantity": "0.00000001",
+    }
+
+
 @pytest.mark.parametrize(
     "client_order_id",
     ["trade1232432453", str(uuid7()), "a_b-c.d:e/f"],
@@ -292,7 +320,7 @@ def test_filled_order_does_not_use_order_price_as_fill_average() -> None:
         )
 
 
-def test_parses_futures_algo_order_and_rejects_ambiguous_finished_status() -> None:
+def test_parses_futures_algo_order_status_and_finished_outcome() -> None:
     entry = {
         "algoId": 123,
         "algoStatus": "NEW",
@@ -304,12 +332,41 @@ def test_parses_futures_algo_order_and_rejects_ambiguous_finished_status() -> No
     assert result.status is OrderStatus.OPEN
     assert result.filled_quantity == Decimal("0")
 
-    with pytest.raises(PlatformError, match="FINISHED"):
-        parse_order_result(
-            {**entry, "algoStatus": "FINISHED"},
-            client_order_id="test-order-1",
-            conditional=True,
-        )
+    filled = parse_order_result(
+        {
+            **entry,
+            "algoStatus": "FINISHED",
+            "quantity": "0.001",
+            "actualQty": "0.001",
+            "actualPrice": "101.5",
+        },
+        client_order_id="test-order-1",
+        conditional=True,
+    )
+    assert filled.status is OrderStatus.FILLED
+    assert filled.filled_quantity == Decimal("0.001")
+    assert filled.average_fill_price == Decimal("101.5")
+
+    canceled = parse_order_result(
+        {**entry, "algoStatus": "FINISHED", "quantity": "0.001"},
+        client_order_id="test-order-1",
+        conditional=True,
+    )
+    assert canceled.status is OrderStatus.CANCELLED
+
+    partial = parse_order_result(
+        {
+            **entry,
+            "algoStatus": "FINISHED",
+            "quantity": "0.002",
+            "actualQty": "0.001",
+            "actualPrice": "101.5",
+        },
+        client_order_id="test-order-1",
+        conditional=True,
+    )
+    assert partial.status is OrderStatus.CANCELLED
+    assert partial.filled_quantity == Decimal("0.001")
 
 
 async def test_place_order_routes_spot_and_retains_query_reference(
@@ -661,6 +718,80 @@ async def test_usdm_conditional_query_falls_back_to_algo_history(
     )
 
 
+async def test_usdm_finished_conditional_order_follows_actual_order(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = BinanceProduct.USD_M
+    await adapter.connect()
+    adapter._exchange_info_cache[product] = [_metadata(product)]
+    monkeypatch.setattr(
+        adapter,
+        "fetch_instrument_spec",
+        AsyncMock(
+            return_value=InstrumentSpec(
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("100"),
+                min_notional=Decimal("5"),
+                price_precision=1,
+                qty_precision=3,
+            )
+        ),
+    )
+    algo = {
+        "algoId": 45,
+        "algoStatus": "NEW",
+        "createTime": _TIMESTAMP,
+        "updateTime": _TIMESTAMP,
+    }
+    binance_client_mock.futures_create_order.return_value = algo
+    await adapter.place_order(_order(product, OrderType.STOP, stop_price=Decimal("95")))
+
+    finished = {
+        **algo,
+        "algoStatus": "FINISHED",
+        "actualOrderId": 7001,
+        "quantity": "0.001",
+        "actualQty": "0.001",
+        "actualPrice": "101.5",
+    }
+    binance_client_mock.futures_get_order.side_effect = [
+        finished,
+        _order_response(
+            order_id="7001",
+            status="FILLED",
+            executedQty="0.001",
+            avgPrice="101.5",
+        ),
+    ]
+
+    result = await adapter.get_order_by_client_id("test-order-1")
+
+    assert result is not None
+    assert result.status is OrderStatus.FILLED
+    assert result.filled_quantity == Decimal("0.001")
+    assert result.average_fill_price == Decimal("101.5")
+    assert result.platform_order_id == "45"
+    assert binance_client_mock.futures_get_order.await_args_list == [
+        call(symbol="BTCUSDT", algoId="45"),
+        call(symbol="BTCUSDT", orderId="7001"),
+    ]
+
+    binance_client_mock.futures_get_order.side_effect = [
+        finished,
+        OrderNotFoundError("missing"),
+    ]
+    fallback = await adapter.get_order_by_client_id("test-order-1")
+    assert fallback is not None
+    assert fallback.status is OrderStatus.FILLED
+    assert fallback.filled_quantity == Decimal("0.001")
+    assert fallback.average_fill_price == Decimal("101.5")
+    assert fallback.platform_order_id == "45"
+
+
 async def test_coinm_limit_order_routes_through_public_coinm_methods(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
@@ -764,6 +895,60 @@ async def test_futures_modify_supports_only_normal_limit_orders(
         symbol="BTCUSDT",
         origClientOrderId=to_binance_client_order_id("test-order-1"),
         price="101",
+    )
+
+
+async def test_futures_modify_requeries_when_response_omits_average_price(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    product = BinanceProduct.USD_M
+    await adapter.connect()
+    adapter._exchange_info_cache[product] = [_metadata(product)]
+    monkeypatch.setattr(
+        adapter,
+        "fetch_instrument_spec",
+        AsyncMock(
+            return_value=InstrumentSpec(
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("100"),
+                min_notional=Decimal("5"),
+                price_precision=1,
+                qty_precision=3,
+            )
+        ),
+    )
+    binance_client_mock.futures_create_order.return_value = _order_response()
+    await adapter.place_order(_order(product, OrderType.LIMIT, price=Decimal("100")))
+
+    modify_response = _order_response(
+        order_id="987",
+        status="PARTIALLY_FILLED",
+        executedQty="0.0005",
+        cummulativeQuoteQty="0",
+    )
+    modify_response.pop("avgPrice")
+    binance_client_mock.futures_modify_order.return_value = modify_response
+    binance_client_mock.futures_get_order.return_value = _order_response(
+        order_id="987",
+        status="PARTIALLY_FILLED",
+        executedQty="0.0005",
+        cummulativeQuoteQty="0.05",
+    )
+
+    result = await adapter.modify_order(
+        OrderModification(client_order_id="test-order-1", price=Decimal("101"))
+    )
+
+    assert result.status is OrderStatus.PARTIALLY_FILLED
+    assert result.filled_quantity == Decimal("0.0005")
+    assert result.average_fill_price == Decimal("100")
+    binance_client_mock.futures_get_order.assert_awaited_once_with(
+        symbol="BTCUSDT",
+        orderId="987",
     )
 
 

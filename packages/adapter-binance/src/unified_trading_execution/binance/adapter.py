@@ -12,6 +12,7 @@ import asyncio
 import hashlib
 import logging
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -468,10 +469,19 @@ class BinanceAdapter(Adapter):
             return await request_method(**payload)
 
         response = await self._run_order_request(reference.product, request)
-        return parse_order_result(
-            _order_response(response),
-            client_order_id=modification.client_order_id,
-        )
+        try:
+            return parse_order_result(
+                _order_response(response),
+                client_order_id=modification.client_order_id,
+            )
+        except _MissingAverageFillPriceError:
+            queried = await self.get_order_by_client_id(modification.client_order_id)
+            if queried is None:
+                raise PlatformError(
+                    f"Binance modified order {modification.client_order_id} could not be "
+                    "queried to obtain its average fill price"
+                ) from None
+            return queried
 
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel by the deterministic venue client ID and return the final state."""
@@ -601,11 +611,61 @@ class BinanceAdapter(Adapter):
             )
             if response is None:
                 return None
+        response_entry = _order_response(response)
+        if reference.conditional:
+            resolved = await self._resolve_conditional_actual_order(
+                client,
+                reference=reference,
+                entry=response_entry,
+                client_order_id=client_order_id,
+            )
+            if resolved is not None:
+                return resolved
         return parse_order_result(
-            _order_response(response),
+            response_entry,
             client_order_id=client_order_id,
             conditional=reference.conditional,
         )
+
+    async def _resolve_conditional_actual_order(
+        self,
+        client: AsyncClient,
+        *,
+        reference: OrderReference,
+        entry: dict[str, object],
+        client_order_id: str,
+    ) -> OrderResult | None:
+        """Resolve a finished algo order through its triggered exchange order.
+
+        Algo status FINISHED does not say whether the triggered order filled or
+        was canceled, so the actual order is the authoritative state.
+        """
+        algo_status = entry.get("algoStatus")
+        actual_order_id = entry.get("actualOrderId")
+        if (
+            not isinstance(algo_status, str)
+            or algo_status.upper() != "FINISHED"
+            or actual_order_id in (None, "")
+        ):
+            return None
+        try:
+            response = await self._run_order_request(
+                reference.product,
+                lambda: client.futures_get_order(
+                    symbol=reference.symbol,
+                    orderId=str(actual_order_id),
+                ),
+            )
+        except OrderNotFoundError:
+            return None
+        result = parse_order_result(
+            _order_response(response),
+            client_order_id=client_order_id,
+        )
+        algo_id = entry.get("algoId") or reference.platform_order_id
+        if algo_id is not None:
+            result = replace(result, platform_order_id=str(algo_id))
+        return result
 
     async def _wait_for_conditional_terminal_order(
         self,

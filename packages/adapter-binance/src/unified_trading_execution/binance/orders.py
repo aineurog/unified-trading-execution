@@ -75,6 +75,13 @@ def to_binance_client_order_id(client_order_id: str) -> str:
     return client_order_id
 
 
+def _decimal_string(value: Decimal | None) -> str:
+    """Render a Decimal in plain notation, because Binance rejects exponents."""
+    if value is None:
+        raise InvalidOrderError("Binance order payload requires a decimal price value")
+    return format(value, "f")
+
+
 def build_place_order_payload(
     order: UnifiedOrder,
     *,
@@ -135,7 +142,7 @@ def build_place_order_payload(
         "symbol": symbol,
         "side": "BUY" if order.side == OrderSide.BUY else "SELL",
         "type": binance_type,
-        "quantity": str(order.quantity),
+        "quantity": _decimal_string(order.quantity),
     }
     if conditional:
         payload["clientAlgoId"] = client_order_id
@@ -143,10 +150,10 @@ def build_place_order_payload(
         payload["newClientOrderId"] = client_order_id
 
     if order.order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT):
-        payload["price"] = str(order.price)
+        payload["price"] = _decimal_string(order.price)
         payload["timeInForce"] = _TIME_IN_FORCE[order.time_in_force]
     if order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
-        payload["stopPrice"] = str(order.stop_price)
+        payload["stopPrice"] = _decimal_string(order.stop_price)
     if order.reduce_only:
         payload["reduceOnly"] = "true"
     if not conditional:
@@ -168,9 +175,9 @@ def build_modify_order_payload(
         "origClientOrderId": client_order_id,
     }
     if price is not None:
-        payload["price"] = str(price)
+        payload["price"] = _decimal_string(price)
     if quantity is not None:
-        payload["quantity"] = str(quantity)
+        payload["quantity"] = _decimal_string(quantity)
     return payload
 
 
@@ -200,22 +207,36 @@ def parse_order_result(
     if order_id is None:
         raise PlatformError("Binance order response is missing orderId/algoId")
 
-    status = entry.get("actualOrderStatus") or entry.get("status")
-    if conditional and entry.get("actualOrderStatus") is None:
-        status = entry.get("algoStatus") or status
-    if conditional and status == "FINISHED":
-        raise PlatformError("Binance conditional order is FINISHED without an actualOrderStatus")
+    raw_status = entry.get("algoStatus") if conditional else entry.get("status")
+    if raw_status is None:
+        raise PlatformError(
+            "Binance conditional order response is missing algoStatus"
+            if conditional
+            else "Binance order response is missing status"
+        )
 
     raw_filled_quantity = entry.get(
         "executedQty",
         entry.get("cumQty", entry.get("actualQty")),
     )
     if raw_filled_quantity is None:
-        if conditional and entry.get("actualOrderStatus") is None:
+        if conditional:
             raw_filled_quantity = "0"
         else:
             raise PlatformError("Binance order response is missing executedQty")
     filled_quantity = _decimal(raw_filled_quantity, field="executedQty")
+
+    if conditional and isinstance(raw_status, str) and raw_status.upper() == "FINISHED":
+        # FINISHED covers both a filled and a canceled triggered order; the
+        # executed quantity is the only field that distinguishes them.
+        ordered_quantity = _optional_decimal(entry.get("quantity"), field="quantity")
+        status = (
+            OrderStatus.FILLED
+            if ordered_quantity is not None and filled_quantity >= ordered_quantity
+            else OrderStatus.CANCELLED
+        )
+    else:
+        status = map_order_status(raw_status, conditional=conditional)
     average_fill_price = _optional_decimal(
         entry.get("avgPrice", entry.get("actualPrice")),
         field="avgPrice",
@@ -245,7 +266,7 @@ def parse_order_result(
     return OrderResult(
         client_order_id=client_order_id,
         platform_order_id=str(order_id),
-        status=map_order_status(status, conditional=conditional),
+        status=status,
         filled_quantity=filled_quantity,
         average_fill_price=average_fill_price,
         created_at=created_at,
