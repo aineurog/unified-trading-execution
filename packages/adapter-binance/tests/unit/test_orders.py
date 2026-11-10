@@ -25,6 +25,7 @@ from unified_trading_execution.errors import (
     PlatformError,
     UnsupportedOrderTypeError,
 )
+from unified_trading_execution.events import OrderCancelledEvent
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -372,6 +373,7 @@ def test_parses_futures_algo_order_status_and_finished_outcome() -> None:
 async def test_place_order_routes_spot_and_retains_query_reference(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
+    event_bus,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     product = BinanceProduct.SPOT
@@ -421,12 +423,36 @@ async def test_place_order_routes_spot_and_retains_query_reference(
     )
 
     binance_client_mock.cancel_order.return_value = _order_response(status="CANCELED")
+    cancelled_events: list[OrderCancelledEvent] = []
+    event_bus.subscribe(OrderCancelledEvent, cancelled_events.append)
     cancelled = await adapter.cancel_order("test-order-1")
     assert cancelled.status is OrderStatus.CANCELLED
     binance_client_mock.cancel_order.assert_awaited_once_with(
         symbol="BTCUSDT",
         orderId="987",
     )
+    assert len(cancelled_events) == 1
+    assert cancelled_events[0].client_order_id == "test-order-1"
+    assert cancelled_events[0].instrument == order.instrument
+
+    await adapter._handle_user_stream_message(
+        BinanceProduct.SPOT,
+        {
+            "e": "executionReport",
+            "E": _TIMESTAMP,
+            "s": "BTCUSDT",
+            "c": "test-order-1",
+            "i": 987,
+            "S": "BUY",
+            "o": "LIMIT",
+            "f": "GTC",
+            "q": "0.001",
+            "z": "0",
+            "X": "CANCELED",
+            "p": "100",
+        },
+    )
+    assert len(cancelled_events) == 1
 
 
 @pytest.mark.parametrize(

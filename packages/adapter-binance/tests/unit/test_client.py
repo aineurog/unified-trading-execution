@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import ClientError
-from binance import AsyncClient  # type: ignore[import-untyped]
+from binance import AsyncClient, BinanceSocketManager  # type: ignore[import-untyped]
 
 from unified_trading_execution.binance import (
     BinanceAdapter,
@@ -72,6 +72,32 @@ async def test_pinned_sdk_resolves_all_rest_products_for_each_environment(
 
         assert urls == _REST_PING_URLS[environment]
         BinanceAdapter(config)._validate_client_urls(client)
+    finally:
+        await client.close_connection()
+
+
+@pytest.mark.parametrize(
+    ("testnet", "demo", "expected_url"),
+    [
+        (False, False, "wss://dstream.binance.com/"),
+        (True, False, "wss://dstream.binancefuture.com/"),
+        (False, True, "wss://dstream.binancefuture.com/"),
+    ],
+)
+async def test_pinned_sdk_coin_m_socket_selects_configured_environment(
+    testnet: bool,
+    demo: bool,
+    expected_url: str,
+) -> None:
+    client = AsyncClient(
+        api_key="test-api-key",
+        api_secret="test-api-secret",
+        testnet=testnet,
+        demo=demo,
+    )
+    try:
+        socket = BinanceSocketManager(client).coin_futures_socket()
+        assert socket._url == expected_url
     finally:
         await client.close_connection()
 
@@ -209,9 +235,9 @@ async def test_failed_close_retains_client_for_retry(
     with pytest.raises(PlatformConnectionError, match="transport failure"):
         await adapter.disconnect()
 
-    assert adapter.is_connected is True
+    assert adapter.is_connected is False
     assert adapter._client is binance_client_mock
-    assert [event.connected for event in events] == [True]
+    assert [event.connected for event in events] == [True, False]
 
     binance_client_mock.close_connection.side_effect = None
     await adapter.disconnect()
