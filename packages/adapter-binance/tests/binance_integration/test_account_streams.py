@@ -161,8 +161,7 @@ def _limit_order(
         pytest.skip(f"Minimum valid quantity exceeds the {product.value} maximum")
     if notional > _MAX_TEST_NOTIONAL_USD:
         pytest.skip(
-            f"Minimum valid {product.value} order exceeds the "
-            f"{_MAX_TEST_NOTIONAL_USD} USD test cap"
+            f"Minimum valid {product.value} order exceeds the {_MAX_TEST_NOTIONAL_USD} USD test cap"
         )
 
     return UnifiedOrder(
@@ -179,9 +178,7 @@ def _limit_order(
 def _assert_sandbox_environment(adapter: BinanceAdapter, config: BinanceConfig) -> None:
     client = adapter._client
     if client is None or client.testnet != config.testnet or client.demo != config.demo:
-        raise AssertionError(
-            "Refusing stream order test: SDK client does not match sandbox config"
-        )
+        raise AssertionError("Refusing stream order test: SDK client does not match sandbox config")
     if not client.testnet and not client.demo:
         raise AssertionError("Refusing stream order test: production environment is not allowed")
 
@@ -290,9 +287,9 @@ async def test_private_stream_order_and_cancel_events(
         assert placed.order.platform_order_id == result.platform_order_id
         assert placed.order.quantity == order.quantity
         assert placed.timestamp.tzinfo is not None
-        assert all(
-            adapter._stream_states.values()
-        ), "all product streams should remain available while handling the order event"
+        assert all(adapter._stream_states.values()), (
+            "all product streams should remain available while handling the order event"
+        )
 
         cancel_result = await adapter.cancel_order(client_order_id)
         assert cancel_result.status is OrderStatus.CANCELLED, (
@@ -301,8 +298,7 @@ async def test_private_stream_order_and_cancel_events(
         cancelled = await collector.wait_for(
             OrderCancelledEvent,
             predicate=lambda event: (
-                isinstance(event, OrderCancelledEvent)
-                and event.client_order_id == client_order_id
+                isinstance(event, OrderCancelledEvent) and event.client_order_id == client_order_id
             ),
         )
         assert isinstance(cancelled, OrderCancelledEvent)
@@ -313,11 +309,14 @@ async def test_private_stream_order_and_cancel_events(
 
         open_orders = await adapter.fetch_open_orders()
         assert client_order_id not in open_orders
-        assert sum(
-            isinstance(event, OrderPlacedEvent)
-            and event.order.client_order_id == client_order_id
-            for event in collector.events
-        ) == 1, "an order stream update must not duplicate the initial order event"
+        assert (
+            sum(
+                isinstance(event, OrderPlacedEvent)
+                and event.order.client_order_id == client_order_id
+                for event in collector.events
+            )
+            == 1
+        ), "an order stream update must not duplicate the initial order event"
     finally:
         try:
             await _cancel_if_still_open(adapter, client_order_id)

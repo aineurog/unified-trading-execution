@@ -345,9 +345,7 @@ async def test_usdm_algo_update_stream_schema_is_normalized(
     assert order.stop_price == Decimal("65000")
     assert order.status == OrderStatus.OPEN
     assert adapter._order_refs["algo-client"].conditional is True
-    assert adapter._platform_order_keys[
-        (BinanceProduct.USD_M, "BTCUSDT", "12345")
-    ] == "algo-client"
+    assert adapter._platform_order_keys[(BinanceProduct.USD_M, "BTCUSDT", "12345")] == "algo-client"
 
 
 @pytest.mark.asyncio

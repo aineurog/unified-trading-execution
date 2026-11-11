@@ -352,9 +352,7 @@ async def test_connect_restores_only_live_order_references(adapter) -> None:
     await adapter._restore_order_references()
 
     assert set(adapter._order_refs) == {"live-order"}
-    assert adapter._platform_order_keys == {
-        (BinanceProduct.SPOT, "BTCUSDT", "10"): "live-order"
-    }
+    assert adapter._platform_order_keys == {(BinanceProduct.SPOT, "BTCUSDT", "10"): "live-order"}
     assert adapter._open_order_ids == {"spot:BTCUSDT:10"}
     assert adapter._known_instruments == {instrument, historical_instrument}
     store.query_open_orders.assert_awaited_once_with(limit=100_000)
@@ -398,8 +396,6 @@ async def test_order_reference_cache_miss_recovers_one_persisted_order(adapter) 
     assert reference.order_type == OrderType.LIMIT
     assert reference.platform_order_id == "10"
     assert adapter._order_refs["core-order"] == reference
-    assert adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] == (
-        "core-order"
-    )
+    assert adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] == ("core-order")
     assert adapter._open_order_ids == {"spot:BTCUSDT:10"}
     store.get_order.assert_awaited_once_with("core-order")

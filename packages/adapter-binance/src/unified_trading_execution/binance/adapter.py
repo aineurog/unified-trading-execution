@@ -302,9 +302,7 @@ class BinanceAdapter(Adapter):
             self._client = client
             self._connected = True
             self._stream_states = dict.fromkeys(_PRODUCT_ORDER, False)
-            self._stream_ready = {
-                product: asyncio.Event() for product in _PRODUCT_ORDER
-            }
+            self._stream_ready = {product: asyncio.Event() for product in _PRODUCT_ORDER}
             try:
                 await asyncio.gather(
                     *(self._load_exchange_info(product) for product in _PRODUCT_ORDER)
@@ -533,9 +531,9 @@ class BinanceAdapter(Adapter):
         product: BinanceProduct,
         symbol: str,
     ) -> OrderReference:
-        conditional = (
-            product == BinanceProduct.USD_M
-            and record.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
+        conditional = product == BinanceProduct.USD_M and record.order_type in (
+            OrderType.STOP,
+            OrderType.STOP_LIMIT,
         )
         return OrderReference(
             product=product,
@@ -656,9 +654,7 @@ class BinanceAdapter(Adapter):
                 task.cancel()
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for result in results:
-            if isinstance(result, BaseException) and not isinstance(
-                result, asyncio.CancelledError
-            ):
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
                 logger.error("Binance private stream stopped with an error: %s", result)
         for task in self._balance_refresh_tasks.values():
             if not task.done():
@@ -1296,9 +1292,7 @@ class BinanceAdapter(Adapter):
             return
 
         if result.platform_order_id is None:
-            order_identity = (
-                f"{reference.product.value}:{reference.symbol}:{client_order_id}"
-            )
+            order_identity = f"{reference.product.value}:{reference.symbol}:{client_order_id}"
         else:
             order_identity = self._order_identity(
                 reference.product,
@@ -1421,10 +1415,7 @@ class BinanceAdapter(Adapter):
                 client_order_id=client_order_id,
             )
             if resolved is not None:
-                if (
-                    resolved.status not in LIVE_ORDER_STATUSES
-                    and self._state_store is not None
-                ):
+                if resolved.status not in LIVE_ORDER_STATUSES and self._state_store is not None:
                     self._forget_order_reference(client_order_id)
                 return resolved
         result = parse_order_result(
@@ -1767,9 +1758,7 @@ class BinanceAdapter(Adapter):
             *(self._fetch_product_balances(product) for product in _PRODUCT_ORDER)
         )
         return {
-            key: value
-            for product_balances in responses
-            for key, value in product_balances.items()
+            key: value for product_balances in responses for key, value in product_balances.items()
         }
 
     async def _fetch_product_balances(
@@ -2043,9 +2032,9 @@ class BinanceAdapter(Adapter):
         )
         self._order_refs[order.client_order_id] = reference
         if order.platform_order_id is not None:
-            self._platform_order_keys[
-                (product, reference.symbol, order.platform_order_id)
-            ] = order.client_order_id
+            self._platform_order_keys[(product, reference.symbol, order.platform_order_id)] = (
+                order.client_order_id
+            )
         return order
 
     # ------------------------------------------------------------------
