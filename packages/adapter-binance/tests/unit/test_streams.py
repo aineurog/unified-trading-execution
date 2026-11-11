@@ -297,6 +297,8 @@ async def test_cancelled_order_stream_updates_publish_once(
     assert len(published) == 1
     assert published[0].client_order_id == f"cancel-{product.value}"
     assert published[0].instrument == instrument
+    assert f"cancel-{product.value}" not in adapter._order_refs
+    assert adapter._platform_order_keys == {}
 
 
 @pytest.mark.asyncio

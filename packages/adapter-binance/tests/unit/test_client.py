@@ -15,9 +15,12 @@ from unified_trading_execution.binance import (
     BinanceEngine,
     SyncBinanceEngine,
 )
+from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.orders import OrderReference
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import PlatformConnectionError
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
+from unified_trading_execution.types.enums import OrderType
 
 _REST_PING_URLS = {
     "production": (
@@ -124,9 +127,26 @@ async def test_connect_and_disconnect_publish_state_and_use_configured_environme
     )
     assert [event.connected for event in events] == [True]
 
+    adapter._order_refs["cached-order"] = OrderReference(
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        conditional=False,
+        order_type=OrderType.LIMIT,
+        platform_order_id="10",
+    )
+    adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] = "cached-order"
+    adapter._open_order_ids.add("spot:BTCUSDT:10")
+    adapter._remember_final_order_id("spot:BTCUSDT:9")
+    adapter._seen_fill_ids["spot:BTCUSDT:8"] = None
+
     await adapter.disconnect()
 
     assert adapter.is_connected is False
+    assert adapter._order_refs == {}
+    assert adapter._platform_order_keys == {}
+    assert adapter._open_order_ids == set()
+    assert adapter._final_order_ids == {}
+    assert adapter._seen_fill_ids == {}
     binance_client_mock.close_connection.assert_awaited_once()
     assert [event.connected for event in events] == [True, False]
 

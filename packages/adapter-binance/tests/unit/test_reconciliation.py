@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from unittest.mock import AsyncMock
@@ -204,7 +205,32 @@ async def test_fetch_fills_uses_known_symbol_and_rest_trade_fields(
     instrument = _spot_instrument()
     adapter._known_instruments.add(instrument)
     adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
-    adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] = "core-order"
+    timestamp = datetime.fromtimestamp(_EVENT_TIME / 1000, tz=UTC)
+    store = AsyncMock()
+    store.query_orders.return_value = [
+        OrderRecord(
+            instrument=instrument,
+            order_type=OrderType.LIMIT,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.5"),
+            time_in_force=TimeInForce.GTC,
+            client_order_id="core-order",
+            price=Decimal("61000"),
+            stop_price=None,
+            reduce_only=False,
+            client_tag=None,
+            take_profit=None,
+            stop_loss=None,
+            platform_order_id="10",
+            status=OrderStatus.FILLED,
+            filled_quantity=Decimal("0.5"),
+            average_fill_price=Decimal("62000"),
+            correlation_id="core-order",
+            created_at=timestamp,
+            updated_at=timestamp,
+        )
+    ]
+    adapter._state_store = store
     binance_client_mock.get_my_trades.return_value = [
         {
             "symbol": "BTCUSDT",
@@ -228,6 +254,8 @@ async def test_fetch_fills_uses_known_symbol_and_rest_trade_fields(
     assert fill.platform_fill_id == "spot:BTCUSDT:99"
     assert fill.fill_quantity == Decimal("0.5")
     assert fill.fill_price == Decimal("62000")
+    assert adapter._platform_order_keys == {}
+    store.query_orders.assert_awaited_once_with(instrument=instrument, limit=100_000)
     binance_client_mock.get_my_trades.assert_awaited_once_with(
         symbol="BTCUSDT",
         limit=1000,
@@ -262,6 +290,7 @@ async def test_connect_recovery_restores_persisted_order_routing(adapter) -> Non
     )
     store = AsyncMock()
     store.query_orders.return_value = [record]
+    store.query_open_orders.return_value = [record]
     store.query_positions.return_value = []
     adapter._state_store = store
     adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
@@ -274,3 +303,103 @@ async def test_connect_recovery_restores_persisted_order_routing(adapter) -> Non
     assert reference.platform_order_id == "10"
     assert adapter._open_order_ids == {"spot:BTCUSDT:10"}
     assert instrument in adapter._known_instruments
+
+
+@pytest.mark.asyncio
+async def test_connect_restores_only_live_order_references(adapter) -> None:
+    instrument = _spot_instrument()
+    timestamp = datetime.fromtimestamp(_EVENT_TIME / 1000, tz=UTC)
+    live_order = OrderRecord(
+        instrument=instrument,
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.5"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="live-order",
+        price=Decimal("61000"),
+        stop_price=None,
+        reduce_only=False,
+        client_tag=None,
+        take_profit=None,
+        stop_loss=None,
+        platform_order_id="10",
+        status=OrderStatus.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.1"),
+        average_fill_price=Decimal("60000"),
+        correlation_id="live-order",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    historical_instrument = Instrument(
+        symbol="ETH",
+        quote_currency="USDT",
+        asset_class=AssetClass.SPOT,
+    )
+    terminal_order = replace(
+        live_order,
+        instrument=historical_instrument,
+        client_order_id="historical-order",
+        platform_order_id="11",
+        status=OrderStatus.CANCELLED,
+    )
+    store = AsyncMock()
+    store.query_orders.return_value = [live_order, terminal_order]
+    store.query_open_orders.return_value = [live_order]
+    store.query_positions.return_value = []
+    adapter._state_store = store
+    adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
+
+    await adapter._restore_order_references()
+
+    assert set(adapter._order_refs) == {"live-order"}
+    assert adapter._platform_order_keys == {
+        (BinanceProduct.SPOT, "BTCUSDT", "10"): "live-order"
+    }
+    assert adapter._open_order_ids == {"spot:BTCUSDT:10"}
+    assert adapter._known_instruments == {instrument, historical_instrument}
+    store.query_open_orders.assert_awaited_once_with(limit=100_000)
+
+
+@pytest.mark.asyncio
+async def test_order_reference_cache_miss_recovers_one_persisted_order(adapter) -> None:
+    instrument = _spot_instrument()
+    timestamp = datetime.fromtimestamp(_EVENT_TIME / 1000, tz=UTC)
+    record = OrderRecord(
+        instrument=instrument,
+        order_type=OrderType.LIMIT,
+        side=OrderSide.BUY,
+        quantity=Decimal("0.5"),
+        time_in_force=TimeInForce.GTC,
+        client_order_id="core-order",
+        price=Decimal("61000"),
+        stop_price=None,
+        reduce_only=False,
+        client_tag=None,
+        take_profit=None,
+        stop_loss=None,
+        platform_order_id="10",
+        status=OrderStatus.PARTIALLY_FILLED,
+        filled_quantity=Decimal("0.1"),
+        average_fill_price=Decimal("60000"),
+        correlation_id="core-order",
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+    store = AsyncMock()
+    store.get_order.return_value = record
+    adapter._state_store = store
+    adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
+
+    reference = await adapter._restore_order_reference("core-order")
+
+    assert reference is not None
+    assert reference.product == BinanceProduct.SPOT
+    assert reference.symbol == "BTCUSDT"
+    assert reference.order_type == OrderType.LIMIT
+    assert reference.platform_order_id == "10"
+    assert adapter._order_refs["core-order"] == reference
+    assert adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] == (
+        "core-order"
+    )
+    assert adapter._open_order_ids == {"spot:BTCUSDT:10"}
+    store.get_order.assert_awaited_once_with("core-order")

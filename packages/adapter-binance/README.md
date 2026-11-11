@@ -124,6 +124,12 @@ balance store keys by currency. Fill-history requests are limited to symbols
 known from stored orders, positions, open orders, or stream activity; fills on
 unrelated external symbols cannot be discovered automatically.
 
+Order-routing references are a session cache: startup restores live orders,
+cache misses resolve through persisted `OrderRecord`s, and terminal or
+disconnected order references are evicted. Historical order-to-platform-ID
+mapping for fill snapshots is read from the existing state store rather than
+retained for the lifetime of the adapter.
+
 ## Tests
 
 Unit tests cover product resolution, symbol conversion, metadata parsing,

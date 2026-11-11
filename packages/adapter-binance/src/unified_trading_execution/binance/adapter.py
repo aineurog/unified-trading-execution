@@ -329,6 +329,7 @@ class BinanceAdapter(Adapter):
                     )
                 else:
                     self._client = None
+                    self._clear_session_order_state()
                 raise
 
     async def disconnect(self) -> None:
@@ -340,6 +341,7 @@ class BinanceAdapter(Adapter):
                     raise PlatformConnectionError(
                         "Binance adapter is marked connected without an active REST client"
                     )
+                self._clear_session_order_state()
                 return
 
             was_connected = self.is_connected
@@ -362,6 +364,15 @@ class BinanceAdapter(Adapter):
 
             self._client = None
             self._socket_manager = None
+            self._clear_session_order_state()
+
+    def _clear_session_order_state(self) -> None:
+        self._order_refs.clear()
+        self._platform_order_keys.clear()
+        self._open_order_ids.clear()
+        self._final_order_ids.clear()
+        self._seen_fill_ids.clear()
+        self._known_instruments.clear()
 
     def _validate_client_urls(self, client: AsyncClient) -> None:
         """Fail closed unless SDK builders resolve to the configured environment."""
@@ -473,14 +484,23 @@ class BinanceAdapter(Adapter):
         if self._state_store is None:
             return
         orders = await self._state_store.query_orders(limit=_ORDER_HISTORY_LIMIT)
+        open_orders = await self._state_store.query_open_orders(limit=_ORDER_HISTORY_LIMIT)
         positions = await self._state_store.query_positions(limit=_ORDER_HISTORY_LIMIT)
-        records_by_instrument: dict[Instrument, list[OrderRecord]] = {}
         for record in orders:
             try:
                 product_for_instrument(record.instrument)
             except InvalidSymbolError:
                 continue
-            records_by_instrument.setdefault(record.instrument, []).append(record)
+            self._known_instruments.add(record.instrument)
+
+        records_by_instrument: dict[Instrument, list[OrderRecord]] = {}
+        for record in open_orders:
+            try:
+                product_for_instrument(record.instrument)
+            except InvalidSymbolError:
+                continue
+            if record.status in LIVE_ORDER_STATUSES:
+                records_by_instrument.setdefault(record.instrument, []).append(record)
 
         for instrument, instrument_orders in records_by_instrument.items():
             product = product_for_instrument(instrument)
@@ -489,27 +509,12 @@ class BinanceAdapter(Adapter):
                 symbol, _ = resolve_binance_symbol(instrument, product, entries)
             except InvalidSymbolError:
                 continue
-            self._known_instruments.add(instrument)
             for record in instrument_orders:
-                conditional = (
-                    product == BinanceProduct.USD_M
-                    and record.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
-                )
-                self._order_refs[record.client_order_id] = OrderReference(
+                self._cache_order_reference(
+                    record,
                     product=product,
                     symbol=symbol,
-                    conditional=conditional,
-                    order_type=record.order_type,
-                    platform_order_id=record.platform_order_id,
                 )
-                if record.platform_order_id is not None:
-                    self._platform_order_keys[
-                        (product, symbol, record.platform_order_id)
-                    ] = record.client_order_id
-                    if record.status in LIVE_ORDER_STATUSES:
-                        self._open_order_ids.add(
-                            self._order_identity(product, symbol, record.platform_order_id)
-                        )
 
         known_positions = {position.instrument for position in positions}
         for instrument in known_positions:
@@ -520,6 +525,81 @@ class BinanceAdapter(Adapter):
             except InvalidSymbolError:
                 continue
             self._known_instruments.add(instrument)
+
+    @staticmethod
+    def _order_reference_from_record(
+        record: OrderRecord,
+        *,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> OrderReference:
+        conditional = (
+            product == BinanceProduct.USD_M
+            and record.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
+        )
+        return OrderReference(
+            product=product,
+            symbol=symbol,
+            conditional=conditional,
+            order_type=record.order_type,
+            platform_order_id=record.platform_order_id,
+        )
+
+    def _cache_order_reference(
+        self,
+        record: OrderRecord,
+        *,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> OrderReference:
+        reference = self._order_reference_from_record(
+            record,
+            product=product,
+            symbol=symbol,
+        )
+        self._known_instruments.add(record.instrument)
+        if record.status in LIVE_ORDER_STATUSES:
+            self._order_refs[record.client_order_id] = reference
+            if record.platform_order_id is not None:
+                self._platform_order_keys[(product, symbol, record.platform_order_id)] = (
+                    record.client_order_id
+                )
+                self._open_order_ids.add(
+                    self._order_identity(product, symbol, record.platform_order_id)
+                )
+        return reference
+
+    async def _restore_order_reference(
+        self,
+        client_order_id: str,
+    ) -> OrderReference | None:
+        reference = self._order_refs.get(client_order_id)
+        if reference is not None:
+            return reference
+        if self._state_store is None:
+            return None
+
+        record = await self._state_store.get_order(client_order_id)
+        if record is None:
+            return None
+        if record.client_order_id != client_order_id:
+            raise PlatformError(
+                f"StateStore returned order {record.client_order_id!r} for "
+                f"requested client order id {client_order_id!r}"
+            )
+        product = product_for_instrument(record.instrument)
+        entries = await self._load_exchange_info(product)
+        try:
+            symbol, _ = resolve_binance_symbol(record.instrument, product, entries)
+        except InvalidSymbolError:
+            if record.instrument.platform_symbol is None:
+                raise
+            symbol = record.instrument.platform_symbol
+        return self._cache_order_reference(
+            record,
+            product=product,
+            symbol=symbol,
+        )
 
     async def _start_private_streams(self) -> None:
         self._stream_tasks = {
@@ -820,6 +900,7 @@ class BinanceAdapter(Adapter):
         )
         if exchange_order_id in (None, ""):
             raise PlatformError("Binance order update is missing exchange order id")
+        order_identity = self._order_identity(product, str(symbol), str(exchange_order_id))
         raw_client_id = (
             entry.get("c")
             or entry.get("clientOrderId")
@@ -833,7 +914,19 @@ class BinanceAdapter(Adapter):
         if raw_client_id in (None, ""):
             raw_client_id = f"binance-{product.value}:{exchange_order_id}"
         client_order_id = str(raw_client_id)
+        if order_identity in self._final_order_ids:
+            return
+
         reference = self._order_refs.get(client_order_id)
+        if reference is None:
+            reference = await self._restore_order_reference(client_order_id)
+        if reference is not None and (
+            reference.product != product or reference.symbol != str(symbol)
+        ):
+            raise PlatformError(
+                f"Binance stream order {client_order_id} does not match its stored "
+                f"{reference.product.value} {reference.symbol} routing reference"
+            )
         if reference is None:
             reference = OrderReference(
                 product=product,
@@ -842,7 +935,7 @@ class BinanceAdapter(Adapter):
                 order_type=OrderType.MARKET,
                 platform_order_id=str(exchange_order_id),
             )
-            self._order_refs[client_order_id] = reference
+        self._order_refs[client_order_id] = reference
 
         if conditional and str(entry.get("algoStatus", entry.get("X", ""))).upper() == "FINISHED":
             actual = await self.get_order_by_client_id(client_order_id)
@@ -874,7 +967,6 @@ class BinanceAdapter(Adapter):
             self._platform_order_keys[(product, str(symbol), str(actual_order_id))] = (
                 order.client_order_id
             )
-        order_identity = self._order_identity(product, str(symbol), str(exchange_order_id))
         self._order_refs[order.client_order_id] = replace(
             reference,
             conditional=conditional,
@@ -882,8 +974,6 @@ class BinanceAdapter(Adapter):
             platform_order_id=str(exchange_order_id),
         )
 
-        if order_identity in self._final_order_ids:
-            return
         already_open = order_identity in self._open_order_ids
         if not already_open:
             self._event_bus.publish(
@@ -938,11 +1028,13 @@ class BinanceAdapter(Adapter):
             )
             self._open_order_ids.discard(order_identity)
             self._remember_final_order_id(order_identity)
+            self._forget_order_reference(order.client_order_id)
         elif order.status == OrderStatus.FILLED:
             if already_open:
                 self._publish_order_status(order, timestamp)
             self._open_order_ids.discard(order_identity)
             self._remember_final_order_id(order_identity)
+            self._forget_order_reference(order.client_order_id)
         elif already_open:
             self._publish_order_status(order, timestamp)
 
@@ -971,6 +1063,16 @@ class BinanceAdapter(Adapter):
         self._final_order_ids.move_to_end(order_identity)
         while len(self._final_order_ids) > _MAX_FINAL_ORDER_IDS:
             self._final_order_ids.popitem(last=False)
+
+    def _forget_order_reference(self, client_order_id: str) -> None:
+        self._order_refs.pop(client_order_id, None)
+        stale_platform_keys = [
+            key
+            for key, mapped_client_order_id in self._platform_order_keys.items()
+            if mapped_client_order_id == client_order_id
+        ]
+        for key in stale_platform_keys:
+            del self._platform_order_keys[key]
 
     def _schedule_balance_refresh(self, product: BinanceProduct) -> None:
         task = self._balance_refresh_tasks.get(product)
@@ -1127,7 +1229,7 @@ class BinanceAdapter(Adapter):
     async def cancel_order(self, client_order_id: str) -> OrderResult:
         """Cancel by the deterministic venue client ID and return the final state."""
         client = self._require_client()
-        reference = self._order_refs.get(client_order_id)
+        reference = await self._restore_order_reference(client_order_id)
         if reference is None:
             raise OrderNotFoundError(f"Order {client_order_id} is not known to this adapter")
         method_names = {
@@ -1220,26 +1322,28 @@ class BinanceAdapter(Adapter):
 
         self._open_order_ids.discard(order_identity)
         self._remember_final_order_id(order_identity)
-        self._event_bus.publish(
-            OrderCancelledEvent(
-                event_id=str(uuid7()),
-                timestamp=result.updated_at,
-                adapter_name=self.platform_name,
-                account_id=self.account_id,
-                correlation_id=None,
-                client_order_id=client_order_id,
-                instrument=instrument,
+        if self._state_store is None:
+            self._event_bus.publish(
+                OrderCancelledEvent(
+                    event_id=str(uuid7()),
+                    timestamp=result.updated_at,
+                    adapter_name=self.platform_name,
+                    account_id=self.account_id,
+                    correlation_id=None,
+                    client_order_id=client_order_id,
+                    instrument=instrument,
+                )
             )
-        )
+        self._forget_order_reference(client_order_id)
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query a known order; return ``None`` only for confirmed absence."""
         client = self._require_client()
-        reference = self._order_refs.get(client_order_id)
+        reference = await self._restore_order_reference(client_order_id)
         if reference is None:
             raise PlatformError(
                 f"Cannot resolve Binance product and symbol for order {client_order_id}; "
-                "routing references are available only for orders placed in this adapter session"
+                "no in-memory routing reference or persisted OrderRecord exists"
             )
         method_names = {
             BinanceProduct.SPOT: "get_order",
@@ -1317,12 +1421,20 @@ class BinanceAdapter(Adapter):
                 client_order_id=client_order_id,
             )
             if resolved is not None:
+                if (
+                    resolved.status not in LIVE_ORDER_STATUSES
+                    and self._state_store is not None
+                ):
+                    self._forget_order_reference(client_order_id)
                 return resolved
-        return parse_order_result(
+        result = parse_order_result(
             response_entry,
             client_order_id=client_order_id,
             conditional=reference.conditional,
         )
+        if result.status not in LIVE_ORDER_STATUSES and self._state_store is not None:
+            self._forget_order_reference(client_order_id)
+        return result
 
     async def _resolve_conditional_actual_order(
         self,
@@ -1707,6 +1819,7 @@ class BinanceAdapter(Adapter):
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch user-owned open orders keyed by core client order ID."""
         client = self._require_client()
+        previous_order_references = set(self._order_refs)
         methods = {
             BinanceProduct.SPOT: "get_open_orders",
             BinanceProduct.USD_M: "futures_get_open_orders",
@@ -1752,6 +1865,8 @@ class BinanceAdapter(Adapter):
                         )
                     )
         self._open_order_ids = open_ids
+        for client_order_id in previous_order_references.difference(orders):
+            self._forget_order_reference(client_order_id)
         return orders
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:
@@ -1789,6 +1904,11 @@ class BinanceAdapter(Adapter):
                     instrument,
                 )
                 continue
+            platform_order_keys = await self._platform_order_keys_for_instrument(
+                instrument,
+                product=product,
+                symbol=symbol,
+            )
             cursor: int | None = None
             for _ in range(_MAX_TRADE_PAGES):
                 params: dict[str, object] = {"symbol": symbol, "limit": 1000}
@@ -1805,9 +1925,7 @@ class BinanceAdapter(Adapter):
                         raise PlatformError(
                             f"Binance {product.value} trade entry is missing orderId"
                         )
-                    mapped_id = self._platform_order_keys.get(
-                        (product, symbol, str(order_id))
-                    )
+                    mapped_id = platform_order_keys.get(str(order_id))
                     client_order_id = mapped_id or f"binance-{product.value}:{order_id}"
                     fill = translate_fill_entry(
                         entry,
@@ -1831,6 +1949,49 @@ class BinanceAdapter(Adapter):
                     f"{_MAX_TRADE_PAGES} pages for {symbol}"
                 )
         return fills_by_order
+
+    async def _platform_order_keys_for_instrument(
+        self,
+        instrument: Instrument,
+        *,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> dict[str, str]:
+        keys = {
+            platform_order_id: client_order_id
+            for (key_product, key_symbol, platform_order_id), client_order_id in (
+                self._platform_order_keys.items()
+            )
+            if key_product == product and key_symbol == symbol
+        }
+        if self._state_store is None:
+            return keys
+
+        records = await self._state_store.query_orders(
+            instrument=instrument,
+            limit=_ORDER_HISTORY_LIMIT,
+        )
+        for record in records:
+            if record.platform_order_id is None:
+                continue
+            try:
+                record_product = product_for_instrument(record.instrument)
+                if record_product != product:
+                    continue
+                if record.instrument.platform_symbol is not None:
+                    record_symbol = record.instrument.platform_symbol
+                else:
+                    exchange_entries = await self._load_exchange_info(product)
+                    record_symbol, _ = resolve_binance_symbol(
+                        record.instrument,
+                        product,
+                        exchange_entries,
+                    )
+            except InvalidSymbolError:
+                continue
+            if record_symbol == symbol:
+                keys[record.platform_order_id] = record.client_order_id
+        return keys
 
     @staticmethod
     def _response_list(
