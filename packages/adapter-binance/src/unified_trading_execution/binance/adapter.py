@@ -1061,6 +1061,13 @@ class BinanceAdapter(Adapter):
             self._final_order_ids.popitem(last=False)
 
     def _forget_order_reference(self, client_order_id: str) -> None:
+        """Remove all routing metadata for a terminal or cancelled order.
+
+        Intentionally does *not* touch ``_open_order_ids``; callers are
+        responsible for discarding the order identity from that set before
+        calling this method.  Mixing the two responsibilities here would
+        create silent double-discard races in the stream handler path.
+        """
         self._order_refs.pop(client_order_id, None)
         stale_platform_keys = [
             key
@@ -1317,6 +1324,8 @@ class BinanceAdapter(Adapter):
         self._open_order_ids.discard(order_identity)
         self._remember_final_order_id(order_identity)
         if self._state_store is None:
+            # Direct adapter users have no engine dispatch to publish this event;
+            # engine-managed cancellation publishes it after persisting the result.
             self._event_bus.publish(
                 OrderCancelledEvent(
                     event_id=str(uuid7()),
@@ -1448,6 +1457,10 @@ class BinanceAdapter(Adapter):
             or actual_order_id in (None, "")
         ):
             return None
+        if reference.product != BinanceProduct.USD_M:
+            raise PlatformError(
+                "Binance conditional actual-order lookup is only supported for USDⓈ-M Futures"
+            )
         try:
             response = await self._run_order_request(
                 reference.product,

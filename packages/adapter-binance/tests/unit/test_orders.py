@@ -819,6 +819,29 @@ async def test_usdm_finished_conditional_order_follows_actual_order(
     assert fallback.platform_order_id == "45"
 
 
+async def test_conditional_actual_order_lookup_rejects_non_usdm_product(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    reference = OrderReference(
+        product=BinanceProduct.COIN_M,
+        symbol="BTCUSD_PERP",
+        conditional=True,
+        order_type=OrderType.STOP,
+        platform_order_id="45",
+    )
+
+    with pytest.raises(PlatformError, match="only supported for USDⓈ-M Futures"):
+        await adapter._resolve_conditional_actual_order(
+            binance_client_mock,
+            reference=reference,
+            entry={"algoStatus": "FINISHED", "actualOrderId": "7001"},
+            client_order_id="test-order-1",
+        )
+
+    binance_client_mock.futures_get_order.assert_not_awaited()
+
+
 async def test_coinm_limit_order_routes_through_public_coinm_methods(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,

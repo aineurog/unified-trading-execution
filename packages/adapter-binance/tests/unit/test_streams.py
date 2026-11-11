@@ -26,7 +26,7 @@ from unified_trading_execution.events import (
     OrderStatusEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.types.enums import AssetClass, FillEntry, OrderStatus
+from unified_trading_execution.types.enums import AssetClass, FillEntry, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument
 
 _EVENT_TIME = 1_684_738_540_559
@@ -153,6 +153,26 @@ def test_order_and_fill_translators_accept_execution_report_shape() -> None:
     assert fill.fee_currency == "USDT"
     assert fill.fee_amount == Decimal("0.01")
     assert fill.entry == FillEntry.OUT
+
+
+def test_take_profit_market_maps_to_stop_until_core_distinguishes_tp_sl() -> None:
+    order = translate_order_entry(
+        {
+            "orderId": 123,
+            "clientOrderId": "take-profit-order",
+            "side": "SELL",
+            "type": "TAKE_PROFIT_MARKET",
+            "origQty": "0.5",
+            "executedQty": "0",
+            "status": "NEW",
+            "stopPrice": "65000",
+        },
+        product=BinanceProduct.USD_M,
+        instrument=_usd_m_instrument(),
+    )
+
+    assert order.order_type is OrderType.STOP
+    assert order.stop_price == Decimal("65000")
 
 
 @pytest.mark.asyncio

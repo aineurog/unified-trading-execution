@@ -39,6 +39,9 @@ _FUTURES_TYPES = {
     "MARKET": OrderType.MARKET,
     "LIMIT": OrderType.LIMIT,
     "STOP_MARKET": OrderType.STOP,
+    # TODO: The core models attached TP/SL, but has no distinct order type for standalone
+    # take-profit orders. Collapse TAKE_PROFIT_MARKET to STOP for now; add a dedicated
+    # OrderType.TAKE_PROFIT and update order/fill translation when that core API is introduced.
     "TAKE_PROFIT_MARKET": OrderType.STOP,
     "STOP": OrderType.STOP_LIMIT,
     "TAKE_PROFIT": OrderType.STOP_LIMIT,

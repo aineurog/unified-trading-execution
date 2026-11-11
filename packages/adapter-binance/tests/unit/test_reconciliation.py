@@ -5,11 +5,15 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, call
 
 import pytest
 
+import unified_trading_execution.binance.adapter as binance_adapter_module
 from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.orders import OrderReference
+from unified_trading_execution.errors import PlatformError
+from unified_trading_execution.events import OrderCancelledEvent
 from unified_trading_execution.types.enums import (
     AssetClass,
     OrderSide,
@@ -18,7 +22,7 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument
-from unified_trading_execution.types.order import OrderRecord
+from unified_trading_execution.types.order import OrderRecord, OrderResult
 
 _EVENT_TIME = 1_684_738_540_559
 
@@ -76,6 +80,20 @@ def _futures_metadata(product: BinanceProduct) -> dict[str, object]:
         "marginAsset": "USDT",
         "contractType": "PERPETUAL",
         "status": "TRADING",
+    }
+
+
+def _spot_trade(trade_id: int) -> dict[str, object]:
+    return {
+        "symbol": "BTCUSDT",
+        "id": trade_id,
+        "orderId": 42,
+        "price": "62000",
+        "qty": "0.001",
+        "commission": "0",
+        "commissionAsset": "USDT",
+        "time": _EVENT_TIME,
+        "isBuyer": True,
     }
 
 
@@ -144,6 +162,42 @@ async def test_fetch_positions_reads_usd_m_and_coin_m_legs(
     assert positions[1].quantity == Decimal("-2")
     assert positions[1].position_id == "coin_m:BTCUSD_PERP:SHORT"
     assert positions[0].updated_at == datetime.fromtimestamp(_EVENT_TIME / 1000, tz=UTC)
+
+
+@pytest.mark.asyncio
+async def test_fetch_positions_excludes_zero_quantity_both_sides(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    _connect_fake_client(adapter, binance_client_mock)
+    adapter._exchange_info_cache = {
+        BinanceProduct.USD_M: [_futures_metadata(BinanceProduct.USD_M)],
+        BinanceProduct.COIN_M: [_futures_metadata(BinanceProduct.COIN_M)],
+    }
+    binance_client_mock.futures_position_information.return_value = [
+        {
+            "symbol": "BTCUSDT",
+            "positionAmt": "0",
+            "entryPrice": "0",
+            "positionSide": "BOTH",
+            "updateTime": _EVENT_TIME,
+        }
+    ]
+    binance_client_mock.futures_coin_position_information.return_value = [
+        {
+            "symbol": "BTCUSD_PERP",
+            "positionAmt": "0",
+            "entryPrice": "0",
+            "positionSide": "BOTH",
+            "updateTime": _EVENT_TIME,
+        }
+    ]
+
+    positions = await adapter.fetch_positions()
+
+    assert positions == []
+    binance_client_mock.futures_position_information.assert_awaited_once()
+    binance_client_mock.futures_coin_position_information.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -261,6 +315,96 @@ async def test_fetch_fills_uses_known_symbol_and_rest_trade_fields(
         limit=1000,
         startTime=_EVENT_TIME - 1000,
     )
+
+
+@pytest.mark.asyncio
+async def test_fetch_fills_paginates_after_exactly_1000_trades(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    _connect_fake_client(adapter, binance_client_mock)
+    adapter._known_instruments.add(_spot_instrument())
+    adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
+    binance_client_mock.get_my_trades.side_effect = [
+        [_spot_trade(trade_id) for trade_id in range(1, 1001)],
+        [_spot_trade(1001)],
+    ]
+    since = datetime.fromtimestamp((_EVENT_TIME - 1000) / 1000, tz=UTC)
+
+    fills = await adapter.fetch_fills(since=since)
+
+    assert len(fills["binance-spot:42"]) == 1001
+    assert binance_client_mock.get_my_trades.await_args_list == [
+        call(symbol="BTCUSDT", limit=1000, startTime=_EVENT_TIME - 1000),
+        call(symbol="BTCUSDT", limit=1000, fromId=1001),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_fetch_fills_raises_when_trade_page_limit_is_exceeded(
+    adapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _connect_fake_client(adapter, binance_client_mock)
+    adapter._known_instruments.add(_spot_instrument())
+    adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
+    monkeypatch.setattr(binance_adapter_module, "_MAX_TRADE_PAGES", 2)
+    binance_client_mock.get_my_trades.side_effect = [
+        [_spot_trade(trade_id) for trade_id in range(1, 1001)],
+        [_spot_trade(trade_id) for trade_id in range(1001, 2001)],
+    ]
+
+    with pytest.raises(PlatformError, match="trade history exceeded 2 pages"):
+        await adapter.fetch_fills()
+
+    assert binance_client_mock.get_my_trades.await_count == 2
+    assert binance_client_mock.get_my_trades.await_args_list[-1] == call(
+        symbol="BTCUSDT",
+        limit=1000,
+        fromId=1001,
+    )
+
+
+@pytest.mark.asyncio
+async def test_publish_cancel_result_does_not_duplicate_engine_event(
+    adapter,
+    event_bus,
+) -> None:
+    instrument = _spot_instrument()
+    adapter._symbol_instruments[(BinanceProduct.SPOT, "BTCUSDT")] = instrument
+    adapter._state_store = AsyncMock()
+    reference = OrderReference(
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        conditional=False,
+        order_type=OrderType.LIMIT,
+        platform_order_id="42",
+    )
+    adapter._order_refs["cancelled-order"] = reference
+    adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "42")] = "cancelled-order"
+    identity = adapter._order_identity(BinanceProduct.SPOT, "BTCUSDT", "42")
+    adapter._open_order_ids.add(identity)
+    cancelled_events: list[OrderCancelledEvent] = []
+    event_bus.subscribe(OrderCancelledEvent, cancelled_events.append)
+    timestamp = datetime.fromtimestamp(_EVENT_TIME / 1000, tz=UTC)
+    result = OrderResult(
+        client_order_id="cancelled-order",
+        platform_order_id="42",
+        status=OrderStatus.CANCELLED,
+        filled_quantity=Decimal("0"),
+        average_fill_price=None,
+        created_at=timestamp,
+        updated_at=timestamp,
+    )
+
+    await adapter._publish_cancel_result("cancelled-order", reference, result)
+
+    assert cancelled_events == []
+    assert identity not in adapter._open_order_ids
+    assert identity in adapter._final_order_ids
+    assert "cancelled-order" not in adapter._order_refs
+    assert adapter._platform_order_keys == {}
 
 
 @pytest.mark.asyncio
