@@ -6,7 +6,8 @@ Product and instrument metadata translation, a limited REST rate-limit
 observation path, the async REST client lifecycle, and core order operations
 are implemented, along with private account streams and reconciliation
 snapshots. Market data, position protection, and trailing stops remain
-unimplemented.
+unimplemented. Futures leverage, margin mode, and position mode are managed as
+persisted adapter intent.
 
 ## Installation
 
@@ -130,12 +131,26 @@ disconnected order references are evicted. Historical order-to-platform-ID
 mapping for fill snapshots is read from the existing state store rather than
 retained for the lifetime of the adapter.
 
+### Futures configuration intent
+
+The adapter manages leverage and `MarginMode` (`CROSS`, `ISOLATED`) per
+Futures product and symbol, and `PositionMode` (`ONE_WAY`, `HEDGE`) account-wide.
+It persists desired settings in the StateStore, reapplies them on connect by
+default, and reconciles drift using `halt` (default), `notify`, or `reapply`
+policies.
+
+Changes are refused when the affected scope has open orders or non-flat
+positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
+orders or close positions. Checks are serialized with its own order operations,
+but external activity can race the Binance request. Removing a setting removes
+local intent only. 
+
 ## Tests
 
 Unit tests cover product resolution, symbol conversion, metadata parsing,
-error and order translation, account streams, reconciliation snapshots, and
-order lookup. They mock SDK client and socket construction and never reach the
-network:
+error and order translation, account streams, reconciliation snapshots, order
+lookup, and Futures configuration safety/persistence/recovery. They mock SDK
+client and socket construction and never reach the network:
 
 ```bash
 pytest packages/adapter-binance/tests/unit/
@@ -168,6 +183,16 @@ credentials:
 BINANCE_TESTNET=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
 BINANCE_TESTNET=true BINANCE_TESTNET_ORDER_INTEGRATION=true BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
 BINANCE_DEMO=true BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
+```
+
+Opt-in Futures configuration integration tests change leverage and margin mode
+on both Futures products, verify drift reconciliation and reconnect reapply,
+then attempt to restore the original sandbox settings. They require sandbox
+credentials and `BINANCE_FUTURES_CONFIG_INTEGRATION=true`:
+
+```bash
+BINANCE_TESTNET=true BINANCE_FUTURES_CONFIG_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_futures_configuration.py
+BINANCE_DEMO=true BINANCE_FUTURES_CONFIG_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_futures_configuration.py
 ```
 
 Order integration tests submit, query, cancel, and clean up the orders they

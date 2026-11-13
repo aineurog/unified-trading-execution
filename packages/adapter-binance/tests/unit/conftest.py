@@ -42,6 +42,19 @@ def binance_client_mock() -> AsyncMock:
     client.futures_exchange_info.return_value = {"symbols": []}
     client.futures_coin_exchange_info.return_value = {"symbols": []}
     client.close_connection = AsyncMock()
+
+    # Mock _request_futures_api for USD-M v2 endpoints (positionRisk, etc.)
+    # This routes to futures_position_information by default for backward compatibility
+    async def mock_request_futures_api(
+        method: str, path: str, signed: bool = False, version: int = 1, **kwargs
+    ):
+        if path == "positionRisk" and version == 2:
+            # Route to futures_position_information mock for test compatibility
+            return await client.futures_position_information(**kwargs.get("data", {}))
+        # Default: return empty list for unknown endpoints
+        return []
+
+    client._request_futures_api = AsyncMock(side_effect=mock_request_futures_api)
     return client
 
 
