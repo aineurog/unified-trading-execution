@@ -50,6 +50,20 @@ from unified_trading_execution.binance.events import (
     FuturesSettingApplyFailedEvent,
     FuturesSettingDriftEvent,
 )
+from unified_trading_execution.binance.market_data import (
+    MAX_KLINE_LIMIT,
+    book_ticker_method,
+    coin_m_contract_type,
+    kline_interval,
+    klines_method,
+    last_price_field,
+    last_price_method,
+    mark_price_method,
+    optional_price,
+    parse_kline_row,
+    supported_timeframes,
+    symbol_entry,
+)
 from unified_trading_execution.binance.orders import (
     OrderReference,
     _MissingAverageFillPriceError,
@@ -1549,12 +1563,52 @@ class BinanceAdapter(Adapter):
         symbol, _ = resolve_binance_symbol(instrument, product, entries)
         return symbol
 
+    async def _resolve_market_symbol(
+        self,
+        instrument: Instrument,
+    ) -> tuple[BinanceProduct, str, dict[str, object]]:
+        """Resolve a market-data target without order-only checks.
+
+        Unlike ``_resolve_order_symbol`` this skips ``fetch_instrument_spec``:
+        public reads must not require TRADING status or the signed
+        leverage-bracket call, and historical candles remain meaningful for
+        symbols that are not currently trading. The exchange-info row is
+        returned so COIN-M callers can derive ``contractType``.
+        """
+        product = product_for_instrument(instrument)
+        entries = await self._load_exchange_info(product)
+        symbol, entry = resolve_binance_symbol(instrument, product, entries)
+        return product, symbol, entry
+
     async def _run_order_request(
         self,
         product: BinanceProduct,
         request: Callable[[], Awaitable[object]],
     ) -> object:
-        client = self._require_client()
+        return await self._dispatch_request(product, self._require_client(), request)
+
+    async def _run_market_data_request(
+        self,
+        product: BinanceProduct,
+        request: Callable[[], Awaitable[object]],
+    ) -> object:
+        """Dispatch a public market-data call without requiring ``connect``.
+
+        Market-data endpoints are unsigned, so an adapter holding a client —
+        including one injected for read-only metadata use — can serve ticker
+        and candle reads without private streams or credentials.
+        """
+        client = self._client
+        if client is None:
+            raise PlatformConnectionError("Binance adapter is not connected")
+        return await self._dispatch_request(product, client, request)
+
+    async def _dispatch_request(
+        self,
+        product: BinanceProduct,
+        client: AsyncClient,
+        request: Callable[[], Awaitable[object]],
+    ) -> object:
         try:
             response = await request()
         except TimeoutError:
@@ -1737,11 +1791,26 @@ class BinanceAdapter(Adapter):
         return super().trailing_capability(instrument)
 
     def market_data_capability(self, instrument: Instrument) -> MarketDataCapability:
-        """Report implemented ticker and candle features for this instrument.
+        """Declare ticker and candle reads verified for this instrument.
 
-        No market-data capabilities are advertised by the scaffold.
+        ``fetch_ticker`` populates last, bid, and ask for every product and
+        mark for Futures (premium index); Spot has no mark. All nine core
+        candle timeframes map to Binance kline intervals on every product.
         """
-        return super().market_data_capability(instrument)
+        try:
+            product = product_for_instrument(instrument)
+        except InvalidSymbolError:
+            return super().market_data_capability(instrument)
+
+        bases = {TrailingBasis.LAST, TrailingBasis.BID, TrailingBasis.ASK}
+        if product is not BinanceProduct.SPOT:
+            bases.add(TrailingBasis.MARK)
+        return MarketDataCapability(
+            ticker_bases=frozenset(bases),
+            min_ticker_interval_seconds=2.0,
+            candle_timeframes=supported_timeframes(),
+            streaming_ticker=False,
+        )
 
     async def get_rate_limits(self) -> RateLimits:
         """Return the tightest observed Binance REST rate-limit budget."""
@@ -1771,8 +1840,95 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     async def fetch_ticker(self, instrument: Instrument) -> Ticker | None:
-        """Fetch a fresh current-price snapshot for a supported symbol."""
-        raise NotImplementedError("Binance adapter scaffold: fetch_ticker is not implemented")
+        """Fetch a fresh price snapshot for *instrument*.
+
+        Spot reads the 24-hour ticker, which carries ``lastPrice``,
+        ``bidPrice``, and ``askPrice`` in one call. Futures read the
+        dedicated latest-price ticker for ``last`` (``/fapi/v2`` and
+        ``/dapi/v1`` ``ticker/price``), the book ticker for the book side —
+        price tickers carry no book fields — and the premium index for
+        ``markPrice``; the three public calls run concurrently. ``None`` is
+        returned only when the venue has no quote row at all for the
+        resolved symbol.
+        """
+        product, symbol, _entry = await self._resolve_market_symbol(instrument)
+        client = self._client
+        if client is None:
+            raise PlatformConnectionError("Binance adapter is not connected")
+
+        if product == BinanceProduct.SPOT:
+            response = await self._run_market_data_request(
+                product,
+                partial(getattr(client, last_price_method(product)), symbol=symbol),
+            )
+            entry = symbol_entry(response, symbol=symbol, product=product)
+            if entry is None:
+                return None
+            ticker = Ticker(
+                bid=optional_price(entry, "bidPrice", symbol=symbol, product=product),
+                ask=optional_price(entry, "askPrice", symbol=symbol, product=product),
+                last=optional_price(
+                    entry, last_price_field(product), symbol=symbol, product=product
+                ),
+            )
+        else:
+            mark_method = mark_price_method(product)
+            if mark_method is None:
+                raise PlatformError(f"Binance {product.value} has no mark-price endpoint")
+            responses = await asyncio.gather(
+                self._run_market_data_request(
+                    product,
+                    partial(getattr(client, last_price_method(product)), symbol=symbol),
+                ),
+                self._run_market_data_request(
+                    product,
+                    partial(getattr(client, book_ticker_method(product)), symbol=symbol),
+                ),
+                self._run_market_data_request(
+                    product,
+                    partial(getattr(client, mark_method), symbol=symbol),
+                ),
+            )
+            ticker_entry = symbol_entry(responses[0], symbol=symbol, product=product)
+            book_entry = symbol_entry(responses[1], symbol=symbol, product=product)
+            mark_entry = symbol_entry(responses[2], symbol=symbol, product=product)
+            if ticker_entry is None and book_entry is None and mark_entry is None:
+                return None
+            ticker = Ticker(
+                bid=(
+                    optional_price(book_entry, "bidPrice", symbol=symbol, product=product)
+                    if book_entry is not None
+                    else None
+                ),
+                ask=(
+                    optional_price(book_entry, "askPrice", symbol=symbol, product=product)
+                    if book_entry is not None
+                    else None
+                ),
+                last=(
+                    optional_price(
+                        ticker_entry,
+                        last_price_field(product),
+                        symbol=symbol,
+                        product=product,
+                    )
+                    if ticker_entry is not None
+                    else None
+                ),
+                mark=(
+                    optional_price(mark_entry, "markPrice", symbol=symbol, product=product)
+                    if mark_entry is not None
+                    else None
+                ),
+            )
+        if (
+            ticker.bid is None
+            and ticker.ask is None
+            and ticker.last is None
+            and ticker.mark is None
+        ):
+            return None
+        return ticker
 
     async def fetch_candles(
         self,
@@ -1781,8 +1937,49 @@ class BinanceAdapter(Adapter):
         *,
         limit: int,
     ) -> list[Candle]:
-        """Fetch closed OHLC candles, oldest first, excluding the forming bar."""
-        raise NotImplementedError("Binance adapter scaffold: fetch_candles is not implemented")
+        """Fetch closed OHLC candles for ATR, oldest first.
+
+        Binance klines already arrive oldest-first with the still-forming bar
+        last, so rows are filtered by close time rather than reversed. One
+        extra bar is requested so dropping the forming candle still yields
+        ``limit`` closed candles when available.
+        """
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+        interval = kline_interval(timeframe)
+        if interval is None:
+            raise UnsupportedOrderTypeError(
+                f"Binance does not support the {timeframe.value} candle timeframe"
+            )
+        product, symbol, entry = await self._resolve_market_symbol(instrument)
+        client = self._client
+        if client is None:
+            raise PlatformConnectionError("Binance adapter is not connected")
+
+        params: dict[str, object] = {
+            "symbol": symbol,
+            "interval": interval,
+            "limit": min(limit + 1, MAX_KLINE_LIMIT),
+        }
+        if product == BinanceProduct.COIN_M:
+            params["contractType"] = coin_m_contract_type(entry, symbol=symbol)
+        response = await self._run_market_data_request(
+            product,
+            partial(getattr(client, klines_method(product)), **params),
+        )
+        if not isinstance(response, list):
+            raise PlatformError(
+                f"Binance {product.value} klines response is not a list",
+                platform_error=response,
+            )
+
+        now = datetime.now(UTC)
+        candles: list[Candle] = []
+        for row in response:
+            candle = parse_kline_row(row, timeframe=timeframe, now=now)
+            if candle is not None:
+                candles.append(candle)
+        return candles[-limit:]
 
     # ------------------------------------------------------------------
     # Position protection and native trailing
