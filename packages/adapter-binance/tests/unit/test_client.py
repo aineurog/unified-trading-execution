@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 import pytest
 from aiohttp import ClientError
-from binance import AsyncClient  # type: ignore[import-untyped]
+from binance import AsyncClient, BinanceSocketManager  # type: ignore[import-untyped]
 
 from unified_trading_execution.binance import (
     BinanceAdapter,
@@ -15,9 +17,13 @@ from unified_trading_execution.binance import (
     BinanceEngine,
     SyncBinanceEngine,
 )
+from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.orders import OrderReference
 from unified_trading_execution.engine import Engine
 from unified_trading_execution.errors import PlatformConnectionError
 from unified_trading_execution.events import ConnectionStateEvent, EventBus
+from unified_trading_execution.types.enums import OrderStatus, OrderType
+from unified_trading_execution.types.order import OrderResult
 
 _REST_PING_URLS = {
     "production": (
@@ -36,6 +42,19 @@ _REST_PING_URLS = {
         "https://demo-dapi.binance.com/dapi/v1/ping",
     ),
 }
+
+
+def _order_result(status: OrderStatus) -> OrderResult:
+    now = datetime.now(UTC)
+    return OrderResult(
+        client_order_id="conditional-order",
+        platform_order_id="42",
+        status=status,
+        filled_quantity=Decimal("0"),
+        average_fill_price=None,
+        created_at=now,
+        updated_at=now,
+    )
 
 
 @pytest.mark.parametrize(
@@ -76,6 +95,81 @@ async def test_pinned_sdk_resolves_all_rest_products_for_each_environment(
         await client.close_connection()
 
 
+@pytest.mark.parametrize(
+    ("testnet", "demo", "expected_url"),
+    [
+        (False, False, "wss://dstream.binance.com/"),
+        (True, False, "wss://dstream.binancefuture.com/"),
+        (False, True, "wss://dstream.binancefuture.com/"),
+    ],
+)
+async def test_pinned_sdk_coin_m_socket_selects_configured_environment(
+    testnet: bool,
+    demo: bool,
+    expected_url: str,
+) -> None:
+    client = AsyncClient(
+        api_key="test-api-key",
+        api_secret="test-api-secret",
+        testnet=testnet,
+        demo=demo,
+    )
+    try:
+        socket = BinanceSocketManager(client).coin_futures_socket()
+        assert socket._url == expected_url
+    finally:
+        await client.close_connection()
+
+
+def test_validate_client_urls_rejects_environment_flag_mismatch(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    binance_client_mock.testnet = False
+    binance_client_mock.demo = False
+
+    with pytest.raises(PlatformConnectionError, match="flags do not match configured testnet"):
+        adapter._validate_client_urls(binance_client_mock)
+
+
+@pytest.mark.parametrize(
+    ("results", "expected_status", "expected_calls", "expected_sleeps"),
+    [
+        ([_order_result(OrderStatus.CANCELLED)], OrderStatus.CANCELLED, 1, 0),
+        (
+            [_order_result(OrderStatus.OPEN), _order_result(OrderStatus.FILLED)],
+            OrderStatus.FILLED,
+            2,
+            1,
+        ),
+        (
+            [_order_result(OrderStatus.OPEN) for _ in range(8)],
+            None,
+            8,
+            7,
+        ),
+    ],
+)
+async def test_wait_for_conditional_terminal_order_polling_paths(
+    adapter: BinanceAdapter,
+    monkeypatch: pytest.MonkeyPatch,
+    results: list[OrderResult],
+    expected_status: OrderStatus | None,
+    expected_calls: int,
+    expected_sleeps: int,
+) -> None:
+    get_order = AsyncMock(side_effect=results)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter, "get_order_by_client_id", get_order)
+    monkeypatch.setattr("unified_trading_execution.binance.adapter.asyncio.sleep", sleep)
+
+    result = await adapter._wait_for_conditional_terminal_order("conditional-order")
+
+    assert (result.status if result is not None else None) is expected_status
+    assert get_order.await_count == expected_calls
+    assert sleep.await_count == expected_sleeps
+
+
 async def test_connect_and_disconnect_publish_state_and_use_configured_environment(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
@@ -98,9 +192,26 @@ async def test_connect_and_disconnect_publish_state_and_use_configured_environme
     )
     assert [event.connected for event in events] == [True]
 
+    adapter._order_refs["cached-order"] = OrderReference(
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        conditional=False,
+        order_type=OrderType.LIMIT,
+        platform_order_id="10",
+    )
+    adapter._platform_order_keys[(BinanceProduct.SPOT, "BTCUSDT", "10")] = "cached-order"
+    adapter._open_order_ids.add("spot:BTCUSDT:10")
+    adapter._remember_final_order_id("spot:BTCUSDT:9")
+    adapter._seen_fill_ids["spot:BTCUSDT:8"] = None
+
     await adapter.disconnect()
 
     assert adapter.is_connected is False
+    assert adapter._order_refs == {}
+    assert adapter._platform_order_keys == {}
+    assert adapter._open_order_ids == set()
+    assert adapter._final_order_ids == {}
+    assert adapter._seen_fill_ids == {}
     binance_client_mock.close_connection.assert_awaited_once()
     assert [event.connected for event in events] == [True, False]
 
@@ -209,9 +320,9 @@ async def test_failed_close_retains_client_for_retry(
     with pytest.raises(PlatformConnectionError, match="transport failure"):
         await adapter.disconnect()
 
-    assert adapter.is_connected is True
+    assert adapter.is_connected is False
     assert adapter._client is binance_client_mock
-    assert [event.connected for event in events] == [True]
+    assert [event.connected for event in events] == [True, False]
 
     binance_client_mock.close_connection.side_effect = None
     await adapter.disconnect()

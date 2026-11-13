@@ -33,6 +33,7 @@ _TIME_IN_FORCE: dict[TimeInForce, str] = {
 }
 
 _ORDER_STATUS: dict[str, OrderStatus] = {
+    "PENDING_NEW": OrderStatus.PENDING,
     "NEW": OrderStatus.OPEN,
     "PENDING_CANCEL": OrderStatus.OPEN,
     "PARTIALLY_FILLED": OrderStatus.PARTIALLY_FILLED,

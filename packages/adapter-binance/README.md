@@ -4,8 +4,10 @@ Partially implemented Binance adapter for
 [unified-trading-execution](https://github.com/aineurog/unified-trading-execution).
 Product and instrument metadata translation, a limited REST rate-limit
 observation path, the async REST client lifecycle, and core order operations
-are implemented. Market data, account streams, reconciliation, position
-protection, and trailing stops remain unimplemented.
+are implemented, along with private account streams and reconciliation
+snapshots. Market data, position protection, and trailing stops remain
+unimplemented. Futures leverage, margin mode, and position mode are managed as
+persisted adapter intent.
 
 ## Installation
 
@@ -40,9 +42,10 @@ config = BinanceConfig(
 engine = BinanceEngine(config)
 ```
 
-`connect` creates the REST client and publishes a connection state event.
-Pass `testnet=True` or `demo=True` to select a sandbox; both default to
-production. Operations not yet implemented raise `NotImplementedError`.
+`connect` creates the REST client and starts private account streams for Spot,
+USDⓈ-M, and COIN-M before publishing a connected state. Pass `testnet=True` or
+`demo=True` to select a sandbox; both default to production. Operations not yet
+implemented raise `NotImplementedError`.
 
 ### Products, symbols, and specs
 
@@ -72,7 +75,7 @@ The adapter includes a rate-limit tracker (`BinanceRateLimitTracker`) that
 observes rate-limit headers from exchange-info requests. Binance applies
 multiple independent limits that weight requests per endpoint, while the core
 exposes only one shared budget. Therefore, this snapshot is approximate—not
-complete request throttling—and currently covers metadata requests only.
+complete request throttling—and observes requests routed through the adapter.
 Buckets with no observed counter are left out of the snapshot rather than
 guessed at.
 
@@ -80,7 +83,8 @@ guessed at.
 
 The Binance error mapper translates SDK API, malformed response, timeout, and
 transport errors into the core error hierarchy while retaining safe context
-for unknown API responses. It is used for exchange-info and order requests.
+for unknown API responses. Metadata, order, and reconciliation REST requests
+use the adapter's error and rate-limit handling.
 
 Binance exposes both Testnet and Demo Trading API environments. `testnet=True`
 selects Testnet; `demo=True` selects Demo Trading. These flags are mutually
@@ -88,9 +92,8 @@ exclusive. When both are false, the SDK selects production (live) endpoints.
 Both default to `False`, so set the desired non-live environment explicitly.
 
 `BinanceConfig` redacts credentials from its representation. Its optional
-`account_id` can be used as a local account label; when omitted, the scaffold
-derives a stable, non-secret label from the API key. The exchange identity
-resolution behavior will be reviewed during implementation.
+`account_id` can be used as a local account label; when omitted, the adapter
+derives a stable, non-secret label from the API key.
 
 ### Order operations
 
@@ -99,21 +102,55 @@ and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. COIN-M
 conditional orders, Spot order modification, conditional-order modification,
 and order-level TP/SL attachments are explicitly unsupported. USDⓈ-M and
 COIN-M ordinary LIMIT orders can be modified by price and/or quantity.
-Order routing references are currently kept in memory for the adapter session;
-looking up an order after a process restart is deferred to reconciliation work.
+Order routing references are restored from persisted orders and refreshed from
+live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
 length or character constraints are rejected instead of being rewritten.
 
 When a filled placement response omits its average fill price, the adapter
 queries the order by its Binance order ID and requires the query response to
-provide the average. Individual trade-fill ingestion is not implemented.
+provide the average.
+
+### Account streams and reconciliation
+
+The adapter translates Spot execution and balance updates, USDⓈ-M and COIN-M
+order/position updates, and USDⓈ-M algo-order updates into core events. REST
+snapshots provide balances, derivative positions, open orders (including
+USDⓈ-M algo orders), and account trades. Reconnects use bounded backoff; final
+order and fill events are deduplicated in memory.
+
+Balance keys are product-qualified (for example, `SPOT:USDT` and
+`USD_M:USDT`) because Binance maintains separate product wallets while the core
+balance store keys by currency. Fill-history requests are limited to symbols
+known from stored orders, positions, open orders, or stream activity; fills on
+unrelated external symbols cannot be discovered automatically.
+
+Order-routing references are a session cache: startup restores live orders,
+cache misses resolve through persisted `OrderRecord`s, and terminal or
+disconnected order references are evicted. Historical order-to-platform-ID
+mapping for fill snapshots is read from the existing state store rather than
+retained for the lifetime of the adapter.
+
+### Futures configuration intent
+
+The adapter manages leverage and `MarginMode` (`CROSS`, `ISOLATED`) per
+Futures product and symbol, and `PositionMode` (`ONE_WAY`, `HEDGE`) account-wide.
+It persists desired settings in the StateStore, reapplies them on connect by
+default, and reconciles drift using `halt` (default), `notify`, or `reapply`
+policies.
+
+Changes are refused when the affected scope has open orders or non-flat
+positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
+orders or close positions. Checks are serialized with its own order operations,
+but external activity can race the Binance request. Removing a setting removes
+local intent only. 
 
 ## Tests
 
-Unit tests cover product resolution, symbol conversion, exchange-info
-resolution, filter parsing, error translation, order translation, and order
-lookup. They mock SDK client and socket construction and never reach the
-network:
+Unit tests cover product resolution, symbol conversion, metadata parsing,
+error and order translation, account streams, reconciliation snapshots, order
+lookup, and Futures configuration safety/persistence/recovery. They mock SDK
+client and socket construction and never reach the network:
 
 ```bash
 pytest packages/adapter-binance/tests/unit/
@@ -133,6 +170,29 @@ credentials and requires the explicit `BINANCE_REST_URL_SMOKE=true` opt-in:
 
 ```bash
 BINANCE_REST_URL_SMOKE=true pytest packages/adapter-binance/tests/binance_integration/test_rest_urls.py
+```
+
+Account-stream integration tests verify private stream readiness and REST
+reconciliation snapshots on the selected Testnet or Demo sandbox. Their
+order-event cases create and cancel one passive sandbox limit order per product;
+they require explicit
+`BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true` opt-in and dedicated sandbox
+credentials:
+
+```bash
+BINANCE_TESTNET=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
+BINANCE_TESTNET=true BINANCE_TESTNET_ORDER_INTEGRATION=true BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
+BINANCE_DEMO=true BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_account_streams.py
+```
+
+Opt-in Futures configuration integration tests change leverage and margin mode
+on both Futures products, verify drift reconciliation and reconnect reapply,
+then attempt to restore the original sandbox settings. They require sandbox
+credentials and `BINANCE_FUTURES_CONFIG_INTEGRATION=true`:
+
+```bash
+BINANCE_TESTNET=true BINANCE_FUTURES_CONFIG_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_futures_configuration.py
+BINANCE_DEMO=true BINANCE_FUTURES_CONFIG_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_futures_configuration.py
 ```
 
 Order integration tests submit, query, cancel, and clean up the orders they
