@@ -426,3 +426,67 @@ async def test_coin_m_private_stream_uses_sdk_coin_futures_socket(
         worker.cancel()
         with pytest.raises(asyncio.CancelledError):
             await worker
+
+
+@pytest.mark.asyncio
+async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_bus) -> None:
+    adapter._symbol_instruments[(BinanceProduct.USD_M, "BTCUSDT")] = _usd_m_instrument()
+    fills: list[FillEvent] = []
+    event_bus.subscribe(FillEvent, fills.append)
+
+    await adapter._handle_user_stream_message(
+        BinanceProduct.USD_M,
+        {
+            "e": "ALGO_UPDATE",
+            "E": _EVENT_TIME,
+            "o": {
+                "caid": "algo-client",
+                "aid": 987,
+                "at": "CONDITIONAL",
+                "o": "TAKE_PROFIT_MARKET",
+                "s": "BTCUSDT",
+                "S": "SELL",
+                "ps": "BOTH",
+                "f": "GTC",
+                "q": "0.25",
+                "X": "TRIGGERED",
+                "ai": "12345",
+                "ap": "0",
+                "aq": "0",
+                "tp": "65000",
+                "p": "0",
+                "R": True,
+            },
+        },
+    )
+    await adapter._handle_user_stream_message(
+        BinanceProduct.USD_M,
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": _EVENT_TIME,
+            "o": {
+                "s": "BTCUSDT",
+                "c": "venue-generated-child",
+                "i": 12345,
+                "S": "SELL",
+                "o": "TAKE_PROFIT_MARKET",
+                "f": "GTC",
+                "q": "0.25",
+                "z": "0.25",
+                "X": "FILLED",
+                "p": "0",
+                "ap": "65000",
+                "l": "0.25",
+                "L": "65000",
+                "T": _EVENT_TIME,
+                "t": 555,
+                "n": "0.01",
+                "N": "USDT",
+                "R": True,
+                "x": "TRADE",
+            },
+        },
+    )
+
+    assert len(fills) == 1
+    assert fills[0].fill.client_order_id == "algo-client"

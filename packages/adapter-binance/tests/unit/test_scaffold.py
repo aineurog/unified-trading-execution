@@ -22,8 +22,8 @@ def _instrument() -> Instrument:
     return Instrument(symbol="BTC", quote_currency="USDT", asset_class=AssetClass.SPOT)
 
 
-def test_capabilities_declare_no_support(adapter: BinanceAdapter) -> None:
-    """The scaffold must not claim protection, trailing, or market data."""
+def test_capabilities_declare_no_protection_or_trailing(adapter: BinanceAdapter) -> None:
+    """The adapter must not claim position protection or native trailing."""
     instrument = _instrument()
 
     protection = adapter.position_protection_capability(instrument)
@@ -37,11 +37,6 @@ def test_capabilities_declare_no_support(adapter: BinanceAdapter) -> None:
     assert trailing.supported is False
     assert trailing.offset_types == frozenset()
     assert trailing.position_scoped is False
-
-    market_data = adapter.market_data_capability(instrument)
-    assert market_data.ticker_bases == frozenset()
-    assert market_data.candle_timeframes == frozenset()
-    assert market_data.streaming_ticker is False
 
 
 def test_config_redacts_credentials(binance_config: BinanceConfig) -> None:

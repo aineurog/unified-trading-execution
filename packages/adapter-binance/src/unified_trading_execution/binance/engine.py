@@ -1,4 +1,4 @@
-"""Async Binance engine scaffold."""
+"""Async Binance engine."""
 
 from __future__ import annotations
 
@@ -21,11 +21,7 @@ from unified_trading_execution.types.instrument import Instrument
 
 
 class BinanceEngine(Engine):
-    """All-in-one async engine for Binance.
-
-    The inherited core API is available, but exchange operations raise
-    ``NotImplementedError`` until their dedicated implementation branches.
-    """
+    """All-in-one async engine for Binance."""
 
     def __init__(
         self,

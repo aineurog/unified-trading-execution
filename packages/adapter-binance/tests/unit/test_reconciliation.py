@@ -341,6 +341,24 @@ async def test_fetch_fills_paginates_after_exactly_1000_trades(
 
 
 @pytest.mark.asyncio
+async def test_fetch_fills_deduplicates_overlapping_trade_pages(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    _connect_fake_client(adapter, binance_client_mock)
+    adapter._known_instruments.add(_spot_instrument())
+    adapter._exchange_info_cache[BinanceProduct.SPOT] = [_spot_metadata()]
+    binance_client_mock.get_my_trades.side_effect = [
+        [_spot_trade(trade_id) for trade_id in range(1, 1001)],
+        [_spot_trade(trade_id) for trade_id in range(501, 1001)],
+    ]
+
+    fills = await adapter.fetch_fills()
+
+    assert len(fills["binance-spot:42"]) == 1000
+
+
+@pytest.mark.asyncio
 async def test_fetch_fills_raises_when_trade_page_limit_is_exceeded(
     adapter,
     binance_client_mock: AsyncMock,
