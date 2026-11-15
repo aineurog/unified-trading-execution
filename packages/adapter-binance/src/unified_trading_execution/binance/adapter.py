@@ -15,8 +15,9 @@ from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import binance  # type: ignore[import-untyped]
 from aiohttp import ClientError
@@ -36,8 +37,19 @@ from unified_trading_execution.adapter import (
     TrailingCapability,
 )
 from unified_trading_execution.binance.config import BinanceConfig
-from unified_trading_execution.binance.enums import BinanceProduct
+from unified_trading_execution.binance.enums import (
+    BinanceProduct,
+    MarginMode,
+    PositionMode,
+)
 from unified_trading_execution.binance.errors import map_binance_error
+from unified_trading_execution.binance.events import (
+    FuturesMarginModeChangedEvent,
+    FuturesPositionModeChangedEvent,
+    FuturesSettingAppliedEvent,
+    FuturesSettingApplyFailedEvent,
+    FuturesSettingDriftEvent,
+)
 from unified_trading_execution.binance.orders import (
     OrderReference,
     _MissingAverageFillPriceError,
@@ -72,6 +84,8 @@ from unified_trading_execution.events import (
     ConnectionStateEvent,
     EventBus,
     FillEvent,
+    HaltClearedEvent,
+    HaltEnteredEvent,
     OrderCancelledEvent,
     OrderPlacedEvent,
     OrderStatusEvent,
@@ -140,6 +154,17 @@ _MAX_TRADE_PAGES = 100
 _MAX_FINAL_ORDER_IDS = 10_000
 _STREAM_RETRY_MAX_SECONDS = 30.0
 _STREAM_START_TIMEOUT_SECONDS = 30.0
+_FUTURES_PRODUCTS = (BinanceProduct.USD_M, BinanceProduct.COIN_M)
+_CONFIG_DRIFT_REASON = "binance_futures_config_drift"
+_ON_DRIFT_VALUES = frozenset({"reapply", "notify", "halt"})
+_LEVERAGE_KIND_PREFIX = "leverage."
+_MARGIN_MODE_KIND_PREFIX = "margin_mode."
+_POSITION_MODE_KIND_PREFIX = "position_mode"
+_CONFIG_KIND_PREFIXES = (
+    _LEVERAGE_KIND_PREFIX,
+    _MARGIN_MODE_KIND_PREFIX,
+    _POSITION_MODE_KIND_PREFIX,
+)
 
 
 class BinanceAdapter(Adapter):
@@ -182,6 +207,7 @@ class BinanceAdapter(Adapter):
         self._event_bus = event_bus if event_bus is not None else EventBus()
         self._connected = False
         self._lifecycle_lock = asyncio.Lock()
+        self._futures_config_lock = asyncio.Lock()
 
         self._client: AsyncClient | None = None
         self._socket_manager: BinanceSocketManager | None = None
@@ -309,6 +335,7 @@ class BinanceAdapter(Adapter):
                 )
                 await self._restore_order_references()
                 await self._start_private_streams()
+                await self._reapply_stored_intent()
             except BaseException:
                 was_connected = self.is_connected
                 await self._stop_private_streams()
@@ -1101,6 +1128,10 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     async def place_order(self, order: UnifiedOrder) -> OrderResult:
+        async with self._futures_config_lock:
+            return await self._place_order_locked(order)
+
+    async def _place_order_locked(self, order: UnifiedOrder) -> OrderResult:
         """Submit a supported order and retain lookup data before network I/O."""
         client = self._require_client()
         product = product_for_instrument(order.instrument)
@@ -1175,6 +1206,10 @@ class BinanceAdapter(Adapter):
         return result
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
+        async with self._futures_config_lock:
+            return await self._modify_order_locked(modification)
+
+    async def _modify_order_locked(self, modification: OrderModification) -> OrderResult:
         """Modify price/quantity for a working Futures LIMIT order only."""
         client = self._require_client()
         reference = self._order_refs.get(modification.client_order_id)
@@ -1573,8 +1608,98 @@ class BinanceAdapter(Adapter):
             raise InvalidSymbolError(f"Binance symbol {symbol} is not trading (status: {status!r})")
 
         spec = parse_instrument_spec(entry)
+
+        # Fetch max leverage for Futures products (requires authentication)
+        if product in _FUTURES_PRODUCTS:
+            max_leverage = await self._fetch_max_leverage(product, symbol)
+            if max_leverage is not None:
+                spec = replace(spec, max_leverage=max_leverage)
+
         self._instrument_spec_cache[cache_key] = (spec, datetime.now(UTC))
         return spec
+
+    async def _fetch_max_leverage(
+        self,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> Decimal | None:
+        """Fetch user-specific max leverage from Binance leverage brackets.
+
+        Returns the initialLeverage from bracket 1 (notionalFloor=0), which
+        is typically the highest leverage tier for the symbol. Returns None
+        if the adapter is not connected or the endpoint is unavailable.
+        """
+        method_name = (
+            "futures_leverage_bracket"
+            if product == BinanceProduct.USD_M
+            else "futures_coin_leverage_bracket"
+        )
+
+        try:
+            client = self._require_client()
+            response = await self._run_order_request(
+                product,
+                partial(getattr(client, method_name), symbol=symbol),
+            )
+        except Exception as exc:
+            logger.warning(
+                "Could not fetch Binance %s leverage bracket for %s: %s",
+                product.value,
+                symbol,
+                exc,
+            )
+            return None
+
+        # Response can be a list of symbol entries or a single object
+        if isinstance(response, dict):
+            response = [response]
+        if not isinstance(response, list):
+            logger.warning(
+                "Binance %s leverage bracket response is not a list for %s",
+                product.value,
+                symbol,
+            )
+            return None
+
+        # Find the entry for our symbol
+        for entry in response:
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("symbol") != symbol:
+                continue
+
+            brackets = entry.get("brackets")
+            if not isinstance(brackets, list) or not brackets:
+                continue
+
+            # Find bracket with notionalFloor=0 (first tier, highest leverage)
+            for bracket in brackets:
+                if not isinstance(bracket, dict):
+                    continue
+                if bracket.get("notionalFloor") in (0, "0", 0.0, "0.0"):
+                    leverage = bracket.get("initialLeverage")
+                    if leverage is not None:
+                        try:
+                            return Decimal(str(leverage))
+                        except (InvalidOperation, ValueError):
+                            logger.warning(
+                                "Malformed leverage value %r for %s",
+                                leverage,
+                                symbol,
+                            )
+                            return None
+
+            # Fallback: use first bracket if no notionalFloor=0 found
+            first_bracket = brackets[0]
+            if isinstance(first_bracket, dict):
+                leverage = first_bracket.get("initialLeverage")
+                if leverage is not None:
+                    try:
+                        return Decimal(str(leverage))
+                    except (InvalidOperation, ValueError):
+                        pass
+
+        return None
 
     def supported_order_types(self) -> frozenset[OrderType]:
         """Return portable types available on at least one supported product.
@@ -1817,6 +1942,1234 @@ class BinanceAdapter(Adapter):
             balance = translate_futures_balance(entry, product=product, timestamp=updated_at)
             balances[balance.currency] = balance
         return balances
+
+    # ------------------------------------------------------------------
+    # Futures configuration
+    # ------------------------------------------------------------------
+
+    def _require_state_store(self) -> StateStore:
+        if self._state_store is None:
+            raise PlatformError(
+                "BinanceAdapter requires the shared StateStore to manage Futures configuration"
+            )
+        return self._state_store
+
+    async def _resolve_futures_config_target(
+        self,
+        instrument: Instrument,
+    ) -> tuple[BinanceProduct, str]:
+        product = product_for_instrument(instrument)
+        if product == BinanceProduct.SPOT:
+            raise InvalidSymbolError("Binance Futures configuration does not support Spot")
+        symbol = await self._resolve_order_symbol(instrument, product)
+        return product, symbol
+
+    async def _futures_position_risk(
+        self,
+        product: BinanceProduct,
+        *,
+        symbol: str | None = None,
+    ) -> list[dict[str, object]]:
+        client = self._require_client()
+        if product == BinanceProduct.USD_M:
+            # USD-M positionRisk v3 omits leverage; v2 includes it.
+            params: dict[str, object] = {}
+            if symbol is not None:
+                params["symbol"] = symbol
+            response = await self._run_order_request(
+                product,
+                partial(
+                    client._request_futures_api, "get", "positionRisk", True, version=2, data=params
+                ),
+            )
+        else:
+            # COIN-M positionRisk uses 'pair' parameter, not 'symbol'.
+            # Convert symbol like 'BTCUSD_PERP' or 'BTCUSD_260626' to pair 'BTCUSD'.
+            method = client.futures_coin_position_information
+            if symbol is not None:
+                # Extract pair by removing contract suffix (_PERP, _YYMMDD, etc.)
+                pair = symbol.split("_")[0] if "_" in symbol else symbol
+                request = partial(method, pair=pair)
+            else:
+                request = method
+            response = await self._run_order_request(product, request)
+        entries = self._response_list(response, product, "position risk")
+        if symbol is None:
+            return entries
+        if any(not entry.get("symbol") for entry in entries):
+            raise PlatformError(
+                f"Binance {product.value} position risk response has no symbol",
+                platform_error=entries,
+            )
+        return [entry for entry in entries if entry.get("symbol") == symbol]
+
+    @staticmethod
+    def _parse_leverage(entries: list[dict[str, object]], product: BinanceProduct) -> int | None:
+        values: set[int] = set()
+        for entry in entries:
+            raw = entry.get("leverage")
+            if raw in (None, ""):
+                continue
+            try:
+                value = int(str(raw))
+            except ValueError as exc:
+                raise PlatformError(
+                    f"Malformed Binance {product.value} leverage response",
+                    platform_error=entry,
+                ) from exc
+            if value <= 0:
+                raise PlatformError(
+                    f"Invalid Binance {product.value} leverage response",
+                    platform_error=entry,
+                )
+            values.add(value)
+        if len(values) > 1:
+            raise PlatformError(
+                f"Binance {product.value} returned conflicting leverage values",
+                platform_error=entries,
+            )
+        return next(iter(values), None)
+
+    @staticmethod
+    def _parse_margin_mode(
+        entries: list[dict[str, object]],
+        product: BinanceProduct,
+    ) -> MarginMode | None:
+        values: set[MarginMode] = set()
+        for entry in entries:
+            raw = entry.get("marginType")
+            if raw in (None, ""):
+                raw = entry.get("isolated")
+                if isinstance(raw, bool):
+                    raw = "isolated" if raw else "cross"
+                elif isinstance(raw, str) and raw.lower() in {"true", "false"}:
+                    raw = "isolated" if raw.lower() == "true" else "cross"
+            if raw in (None, ""):
+                continue
+            normalized = str(raw).lower()
+            if normalized in {"cross", "crossed"}:
+                values.add(MarginMode.CROSS)
+            elif normalized == "isolated":
+                values.add(MarginMode.ISOLATED)
+            else:
+                raise PlatformError(
+                    f"Unknown Binance {product.value} margin mode {raw!r}",
+                    platform_error=entry,
+                )
+        if len(values) > 1:
+            raise PlatformError(
+                f"Binance {product.value} returned conflicting margin modes",
+                platform_error=entries,
+            )
+        return next(iter(values), None)
+
+    # ---- Futures account configuration (leverage / margin / position mode) ----
+
+    @staticmethod
+    def _leverage_key(product: BinanceProduct, symbol: str) -> str:
+        """adapter_config key for stored symbol leverage intent."""
+        return f"leverage.{product.value}.{symbol}"
+
+    @staticmethod
+    def _margin_mode_key(product: BinanceProduct, symbol: str) -> str:
+        """adapter_config key for stored symbol margin-mode intent."""
+        return f"margin_mode.{product.value}.{symbol}"
+
+    @staticmethod
+    def _leverage_policy_key(
+        setting: str,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> str:
+        """adapter_config key for one symbol leverage behavior knob."""
+        return f"leverage.policy.{setting}.{product.value}.{symbol}"
+
+    @staticmethod
+    def _margin_mode_policy_key(
+        setting: str,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> str:
+        """adapter_config key for one symbol margin-mode behavior knob."""
+        return f"margin_mode.policy.{setting}.{product.value}.{symbol}"
+
+    @staticmethod
+    def _position_mode_key() -> str:
+        """adapter_config key for stored account position-mode intent."""
+        return "position_mode"
+
+    @staticmethod
+    def _position_mode_policy_key(setting: str) -> str:
+        """adapter_config key for one account position-mode behavior knob."""
+        return f"position_mode.policy.{setting}"
+
+    async def get_leverage(self, instrument: Instrument) -> int | None:
+        """Read the symbol's current leverage for USDⓈ-M or COIN-M Futures."""
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        return self._parse_leverage(
+            await self._futures_position_risk(product, symbol=symbol),
+            product,
+        )
+
+    async def set_leverage(
+        self,
+        instrument: Instrument,
+        leverage: int,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        async with self._futures_config_lock:
+            await self._set_leverage(
+                instrument,
+                leverage,
+                on_drift=on_drift,
+                auto_apply_on_connect=auto_apply_on_connect,
+            )
+
+    async def _set_leverage(
+        self,
+        instrument: Instrument,
+        leverage: int,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        """Set and persist symbol-scoped Futures leverage.
+
+        A live change is refused while the symbol has open orders or a
+        non-flat position. The desired value is persisted only after Binance
+        accepts the change.
+        """
+        if type(leverage) is not int or leverage <= 0:
+            raise ValueError("leverage must be a positive integer")
+        self._validate_config_policy(on_drift, auto_apply_on_connect)
+        self._require_state_store()
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        current = await self.get_leverage(instrument)
+        if current != leverage:
+            await self._assert_futures_config_change_safe(
+                product=product,
+                symbol=symbol,
+                setting="leverage",
+            )
+            client = self._require_client()
+            method_name = (
+                "futures_change_leverage"
+                if product == BinanceProduct.USD_M
+                else "futures_coin_change_leverage"
+            )
+            try:
+                response = await self._run_order_request(
+                    product,
+                    partial(getattr(client, method_name), symbol=symbol, leverage=leverage),
+                )
+            except PlatformError as exc:
+                if self._is_ambiguous_config_error(exc):
+                    self._report_config_failure(
+                        "leverage",
+                        instrument,
+                        str(leverage),
+                        exc,
+                    )
+                raise
+            except TimeoutError as exc:
+                self._report_config_failure("leverage", instrument, str(leverage), exc)
+                raise
+            if not isinstance(response, dict):
+                error = PlatformError(
+                    f"Binance {product.value} leverage response is not an object",
+                    platform_error=response,
+                )
+                self._report_config_failure("leverage", instrument, str(leverage), error)
+                raise error
+            try:
+                returned = self._parse_leverage([response], product)
+            except PlatformError as exc:
+                self._report_config_failure("leverage", instrument, str(leverage), exc)
+                raise
+            if returned is not None and returned != leverage:
+                error = PlatformError(
+                    f"Binance applied leverage {returned}, expected {leverage}",
+                    platform_error=response,
+                )
+                self._report_config_failure("leverage", instrument, str(leverage), error)
+                raise error
+        await self._persist_futures_setting(
+            "leverage",
+            instrument,
+            str(leverage),
+            [
+                (self._leverage_key(product, symbol), str(leverage)),
+                (self._leverage_policy_key("on_drift", product, symbol), on_drift),
+                (
+                    self._leverage_policy_key("auto_apply_on_connect", product, symbol),
+                    "1" if auto_apply_on_connect else "0",
+                ),
+            ],
+        )
+        self._publish_setting_applied("leverage", instrument, str(leverage))
+
+    async def remove_leverage(self, instrument: Instrument) -> None:
+        async with self._futures_config_lock:
+            await self._remove_leverage(instrument)
+
+    async def _remove_leverage(self, instrument: Instrument) -> None:
+        """Stop managing leverage without changing the Binance-side value."""
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        store = self._require_state_store()
+        await store.delete_adapter_config(self._leverage_key(product, symbol))
+        await store.delete_adapter_config(self._leverage_policy_key("on_drift", product, symbol))
+        await store.delete_adapter_config(
+            self._leverage_policy_key("auto_apply_on_connect", product, symbol)
+        )
+
+    async def get_margin_mode(self, instrument: Instrument) -> MarginMode | None:
+        """Read symbol-scoped Futures margin mode when Binance returns it."""
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        return self._parse_margin_mode(
+            await self._futures_position_risk(product, symbol=symbol),
+            product,
+        )
+
+    async def set_margin_mode(
+        self,
+        instrument: Instrument,
+        mode: MarginMode | str,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        async with self._futures_config_lock:
+            await self._set_margin_mode(
+                instrument,
+                mode,
+                on_drift=on_drift,
+                auto_apply_on_connect=auto_apply_on_connect,
+            )
+
+    async def _set_margin_mode(
+        self,
+        instrument: Instrument,
+        mode: MarginMode | str,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        """Set and persist symbol-scoped Cross or Isolated margin mode.
+
+        Binance's REST parameter values are ``CROSSED`` and ``ISOLATED``.
+        Changes are refused while the symbol has open orders or a non-flat
+        position.
+        """
+        try:
+            mode = MarginMode(mode)
+        except ValueError as exc:
+            raise ValueError(f"unsupported Binance margin mode {mode!r}") from exc
+        self._validate_config_policy(on_drift, auto_apply_on_connect)
+        self._require_state_store()
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        current = await self.get_margin_mode(instrument)
+        if current is not mode:
+            await self._assert_futures_config_change_safe(
+                product=product,
+                symbol=symbol,
+                setting="margin mode",
+            )
+            client = self._require_client()
+            method_name = (
+                "futures_change_margin_type"
+                if product == BinanceProduct.USD_M
+                else "futures_coin_change_margin_type"
+            )
+            unchanged = False
+            try:
+                response = await self._run_order_request(
+                    product,
+                    partial(
+                        getattr(client, method_name),
+                        symbol=symbol,
+                        marginType="CROSSED" if mode is MarginMode.CROSS else "ISOLATED",
+                    ),
+                )
+            except PlatformError as exc:
+                if not self._is_binance_error_code(exc, -4046):
+                    if self._is_ambiguous_config_error(exc):
+                        self._report_config_failure("margin_mode", instrument, mode.value, exc)
+                    raise
+                response = {"code": -4046}
+                unchanged = True
+            except TimeoutError as exc:
+                self._report_config_failure("margin_mode", instrument, mode.value, exc)
+                raise
+            if not isinstance(response, dict):
+                error = PlatformError(
+                    f"Binance {product.value} margin-mode response is not an object",
+                    platform_error=response,
+                )
+                self._report_config_failure("margin_mode", instrument, mode.value, error)
+                raise error
+            try:
+                applied_mode = await self.get_margin_mode(instrument)
+            except Exception as exc:
+                self._report_config_failure("margin_mode", instrument, mode.value, exc)
+                raise
+            if applied_mode is not mode:
+                error = PlatformError(
+                    f"Binance {product.value} margin-mode read-back did not confirm {mode.value}",
+                    platform_error=response,
+                )
+                self._report_config_failure("margin_mode", instrument, mode.value, error)
+                raise error
+            if not unchanged:
+                self._event_bus.publish(
+                    FuturesMarginModeChangedEvent(
+                        event_id=str(uuid7()),
+                        timestamp=datetime.now(UTC),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        instrument=instrument,
+                        previous=current,
+                        current=mode,
+                    )
+                )
+        await self._persist_futures_setting(
+            "margin_mode",
+            instrument,
+            mode.value,
+            [
+                (self._margin_mode_key(product, symbol), mode.value),
+                (self._margin_mode_policy_key("on_drift", product, symbol), on_drift),
+                (
+                    self._margin_mode_policy_key("auto_apply_on_connect", product, symbol),
+                    "1" if auto_apply_on_connect else "0",
+                ),
+            ],
+        )
+        self._publish_setting_applied("margin_mode", instrument, mode.value)
+
+    async def remove_margin_mode(self, instrument: Instrument) -> None:
+        async with self._futures_config_lock:
+            await self._remove_margin_mode(instrument)
+
+    async def _remove_margin_mode(self, instrument: Instrument) -> None:
+        """Stop managing margin mode without changing the Binance-side value."""
+        product, symbol = await self._resolve_futures_config_target(instrument)
+        store = self._require_state_store()
+        await store.delete_adapter_config(self._margin_mode_key(product, symbol))
+        await store.delete_adapter_config(self._margin_mode_policy_key("on_drift", product, symbol))
+        await store.delete_adapter_config(
+            self._margin_mode_policy_key("auto_apply_on_connect", product, symbol)
+        )
+
+    @staticmethod
+    def _parse_position_mode(response: object) -> PositionMode:
+        if not isinstance(response, dict):
+            raise PlatformError(
+                "Binance position-mode response is not an object",
+                platform_error=response,
+            )
+        raw = response.get("dualSidePosition")
+        if isinstance(raw, bool):
+            hedge = raw
+        elif isinstance(raw, str) and raw.lower() in {"true", "false"}:
+            hedge = raw.lower() == "true"
+        else:
+            raise PlatformError(
+                "Binance position-mode response has no valid dualSidePosition value",
+                platform_error=response,
+            )
+        return PositionMode.HEDGE if hedge else PositionMode.ONE_WAY
+
+    async def get_position_mode(self) -> PositionMode:
+        """Read the account-wide Binance Futures One-way or Hedge mode.
+
+        USD-M and COIN-M expose separate ``positionSide/dual`` endpoints, but
+        the platform treats position mode as a single account setting. Both
+        endpoints are read and must agree; divergence is surfaced as an error
+        rather than silently picking one product's value.
+        """
+        client = self._require_client()
+        usd_m_response, coin_m_response = await asyncio.gather(
+            self._run_order_request(
+                BinanceProduct.USD_M,
+                client.futures_get_position_mode,
+            ),
+            self._run_order_request(
+                BinanceProduct.COIN_M,
+                client.futures_coin_get_position_mode,
+            ),
+        )
+        usd_m_mode = self._parse_position_mode(usd_m_response)
+        coin_m_mode = self._parse_position_mode(coin_m_response)
+        if usd_m_mode is not coin_m_mode:
+            raise PlatformError(
+                "Binance USD-M and COIN-M position modes disagree",
+                platform_error={
+                    "usd_m": usd_m_response,
+                    "coin_m": coin_m_response,
+                },
+            )
+        return usd_m_mode
+
+    @staticmethod
+    def _is_binance_error_code(error: PlatformError, code: int) -> bool:
+        platform_error = error.platform_error
+        return isinstance(platform_error, dict) and platform_error.get("code") == code
+
+    @staticmethod
+    def _is_ambiguous_config_error(error: PlatformError) -> bool:
+        if isinstance(error, PlatformConnectionError):
+            return True
+        platform_error = error.platform_error
+        return (
+            isinstance(platform_error, dict)
+            and platform_error.get("exception") == "BinanceRequestException"
+        )
+
+    async def set_position_mode(
+        self,
+        mode: PositionMode | str,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        async with self._futures_config_lock:
+            await self._set_position_mode(
+                mode,
+                on_drift=on_drift,
+                auto_apply_on_connect=auto_apply_on_connect,
+            )
+
+    async def _set_position_mode(
+        self,
+        mode: PositionMode | str,
+        *,
+        on_drift: Literal["reapply", "notify", "halt"] = "halt",
+        auto_apply_on_connect: bool = True,
+    ) -> None:
+        """Set account-wide Futures position mode and persist its intent.
+
+        Position mode is not stored per symbol. Binance changes this setting
+        for every symbol; therefore this adapter also refuses a change while
+        either Futures product has open orders or a non-flat position.
+        """
+        try:
+            mode = PositionMode(mode)
+        except ValueError as exc:
+            raise ValueError(f"unsupported Binance position mode {mode!r}") from exc
+        self._validate_config_policy(on_drift, auto_apply_on_connect)
+        self._require_state_store()
+        current = await self.get_position_mode()
+        if current is not mode:
+            await self._assert_futures_config_change_safe(
+                setting="position mode",
+            )
+            client = self._require_client()
+            unchanged = False
+            try:
+                response = await self._run_order_request(
+                    BinanceProduct.USD_M,
+                    partial(
+                        client.futures_change_position_mode,
+                        dualSidePosition=mode is PositionMode.HEDGE,
+                    ),
+                )
+            except PlatformError as exc:
+                if not self._is_binance_error_code(exc, -4059):
+                    if self._is_ambiguous_config_error(exc):
+                        self._report_config_failure("position_mode", None, mode.value, exc)
+                    raise
+                response = {"code": -4059}
+                unchanged = True
+            except TimeoutError as exc:
+                self._report_config_failure("position_mode", None, mode.value, exc)
+                raise
+            if not isinstance(response, dict):
+                error = PlatformError(
+                    "Binance position-mode change response is not an object",
+                    platform_error=response,
+                )
+                self._report_config_failure("position_mode", None, mode.value, error)
+                raise error
+            try:
+                applied_mode = await self.get_position_mode()
+            except Exception as exc:
+                self._report_config_failure("position_mode", None, mode.value, exc)
+                raise
+            if applied_mode is not mode:
+                error = PlatformError(
+                    f"Binance position-mode read-back did not confirm {mode.value}",
+                    platform_error=response,
+                )
+                self._report_config_failure("position_mode", None, mode.value, error)
+                raise error
+            if not unchanged:
+                self._event_bus.publish(
+                    FuturesPositionModeChangedEvent(
+                        event_id=str(uuid7()),
+                        timestamp=datetime.now(UTC),
+                        adapter_name=self.platform_name,
+                        account_id=self.account_id,
+                        correlation_id=None,
+                        previous=current,
+                        current=mode,
+                    )
+                )
+        await self._persist_futures_setting(
+            "position_mode",
+            None,
+            mode.value,
+            [
+                (self._position_mode_key(), mode.value),
+                (self._position_mode_policy_key("on_drift"), on_drift),
+                (
+                    self._position_mode_policy_key("auto_apply_on_connect"),
+                    "1" if auto_apply_on_connect else "0",
+                ),
+            ],
+        )
+        self._publish_setting_applied("position_mode", None, mode.value)
+
+    async def remove_position_mode(self) -> None:
+        async with self._futures_config_lock:
+            await self._remove_position_mode()
+
+    async def _remove_position_mode(self) -> None:
+        """Stop managing position mode without changing Binance's live value."""
+        store = self._require_state_store()
+        await store.delete_adapter_config(self._position_mode_key())
+        await store.delete_adapter_config(self._position_mode_policy_key("on_drift"))
+        await store.delete_adapter_config(self._position_mode_policy_key("auto_apply_on_connect"))
+
+    @staticmethod
+    def _validate_config_policy(
+        on_drift: str,
+        auto_apply_on_connect: bool,
+    ) -> None:
+        if on_drift not in _ON_DRIFT_VALUES:
+            raise ValueError(f"on_drift must be one of {sorted(_ON_DRIFT_VALUES)}")
+        if type(auto_apply_on_connect) is not bool:
+            raise TypeError("auto_apply_on_connect must be a bool")
+
+    async def _persist_futures_setting(
+        self,
+        setting: Literal["leverage", "margin_mode", "position_mode"],
+        instrument: Instrument | None,
+        value: str,
+        rows: list[tuple[str, str]],
+    ) -> None:
+        store = self._require_state_store()
+        try:
+            for key, row_value in rows:
+                await store.set_adapter_config(key, row_value)
+        except Exception as exc:
+            self._publish_setting_failed(setting, instrument, value, exc)
+            scope: Literal["instrument", "account"] = (
+                "account" if instrument is None else "instrument"
+            )
+            self._enter_config_halt(
+                scope,
+                instrument,
+                f"Binance {setting} changed but its intent could not be persisted: {exc}",
+            )
+            raise PlatformError(
+                f"Binance {setting} changed but its intent could not be fully persisted"
+            ) from exc
+
+    async def _assert_futures_config_change_safe(
+        self,
+        *,
+        setting: str,
+        product: BinanceProduct | None = None,
+        symbol: str | None = None,
+    ) -> None:
+        client = self._require_client()
+        products = (product,) if product is not None else _FUTURES_PRODUCTS
+        for current_product in products:
+            order_method = (
+                "futures_get_open_orders"
+                if current_product == BinanceProduct.USD_M
+                else "futures_coin_get_open_orders"
+            )
+            request = getattr(client, order_method)
+            if symbol is not None:
+                response = await self._run_order_request(
+                    current_product,
+                    partial(request, symbol=symbol),
+                )
+            else:
+                response = await self._run_order_request(current_product, request)
+            open_orders = self._response_list(response, current_product, "open orders")
+            if open_orders:
+                product_label = "USDⓈ-M" if current_product == BinanceProduct.USD_M else "COIN-M"
+                raise PlatformError(
+                    f"Cannot change Binance {setting} while {product_label} open orders exist"
+                )
+
+            if current_product == BinanceProduct.USD_M:
+                algo_request = client.futures_get_open_algo_orders
+                if symbol is not None:
+                    algo_response = await self._run_order_request(
+                        current_product,
+                        partial(algo_request, symbol=symbol),
+                    )
+                else:
+                    algo_response = await self._run_order_request(
+                        current_product,
+                        algo_request,
+                    )
+                algo_orders = self._response_list(
+                    algo_response,
+                    current_product,
+                    "open algo orders",
+                )
+                if algo_orders:
+                    raise PlatformError(
+                        f"Cannot change Binance {setting} while USDⓈ-M open algo orders exist"
+                    )
+
+            positions = await self._futures_position_risk(
+                current_product,
+                symbol=symbol if current_product == product else None,
+            )
+            for entry in positions:
+                raw_quantity = entry.get("positionAmt")
+                if raw_quantity in (None, ""):
+                    raise PlatformError(
+                        f"Binance {current_product.value} position risk entry has no positionAmt",
+                        platform_error=entry,
+                    )
+                try:
+                    quantity = Decimal(str(raw_quantity))
+                except InvalidOperation as exc:
+                    raise PlatformError(
+                        f"Malformed Binance {current_product.value} positionAmt",
+                        platform_error=entry,
+                    ) from exc
+                if not quantity.is_finite():
+                    raise PlatformError(
+                        f"Malformed Binance {current_product.value} positionAmt",
+                        platform_error=entry,
+                    )
+                if quantity != 0:
+                    product_label = (
+                        "USDⓈ-M" if current_product == BinanceProduct.USD_M else "COIN-M"
+                    )
+                    raise PlatformError(
+                        f"Cannot change Binance {setting} while a {product_label} position is open"
+                    )
+
+    async def _list_futures_config_rows(self) -> dict[str, str]:
+        """Return all persisted Futures config rows across the kind prefixes."""
+        store = self._require_state_store()
+        rows: dict[str, str] = {}
+        for prefix in _CONFIG_KIND_PREFIXES:
+            rows.update(await store.list_adapter_config(prefix))
+        return rows
+
+    async def _reapply_stored_intent(self) -> None:
+        """Safely apply eligible persisted Futures configuration after connect."""
+        store = self._state_store
+        if store is None:
+            return
+        rows = await self._list_futures_config_rows()
+
+        for key, value in rows.items():
+            target = self._stored_symbol_target(key, "leverage.")
+            if target is not None:
+                product, symbol, instrument = target
+                auto_apply = await self._stored_auto_apply(
+                    self._leverage_policy_key("auto_apply_on_connect", product, symbol)
+                )
+                if not auto_apply:
+                    continue
+                try:
+                    leverage = int(value)
+                    on_drift = await self._stored_on_drift(
+                        self._leverage_policy_key("on_drift", product, symbol)
+                    )
+                    await self.set_leverage(
+                        instrument,
+                        leverage,
+                        on_drift=on_drift,
+                        auto_apply_on_connect=True,
+                    )
+                except Exception as exc:
+                    logger.exception("Could not reapply stored Binance leverage for %s", symbol)
+                    self._publish_setting_failed("leverage", instrument, value, exc)
+                    self._enter_config_halt(
+                        "instrument",
+                        instrument,
+                        f"Stored leverage could not be applied for {symbol}: {exc}",
+                    )
+                continue
+
+            target = self._stored_symbol_target(key, "margin_mode.")
+            if target is not None:
+                product, symbol, instrument = target
+                auto_apply = await self._stored_auto_apply(
+                    self._margin_mode_policy_key("auto_apply_on_connect", product, symbol)
+                )
+                if not auto_apply:
+                    continue
+                try:
+                    margin_mode = MarginMode(value)
+                    on_drift = await self._stored_on_drift(
+                        self._margin_mode_policy_key("on_drift", product, symbol)
+                    )
+                    await self.set_margin_mode(
+                        instrument,
+                        margin_mode,
+                        on_drift=on_drift,
+                        auto_apply_on_connect=True,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Could not reapply stored Binance margin mode for %s",
+                        symbol,
+                    )
+                    self._publish_setting_failed("margin_mode", instrument, value, exc)
+                    self._enter_config_halt(
+                        "instrument",
+                        instrument,
+                        f"Stored margin mode could not be applied for {symbol}: {exc}",
+                    )
+
+        stored_mode = rows.get(self._position_mode_key())
+        if stored_mode is not None and await self._stored_auto_apply(
+            self._position_mode_policy_key("auto_apply_on_connect")
+        ):
+            try:
+                position_mode = PositionMode(stored_mode)
+                on_drift = await self._stored_on_drift(self._position_mode_policy_key("on_drift"))
+                await self.set_position_mode(
+                    position_mode,
+                    on_drift=on_drift,
+                    auto_apply_on_connect=True,
+                )
+            except Exception as exc:
+                logger.exception("Could not reapply stored Binance position mode")
+                self._publish_setting_failed("position_mode", None, stored_mode, exc)
+                self._enter_config_halt(
+                    "account",
+                    None,
+                    f"Stored position mode could not be applied: {exc}",
+                )
+
+    def _stored_symbol_target(
+        self,
+        key: str,
+        setting_prefix: str,
+    ) -> tuple[BinanceProduct, str, Instrument] | None:
+        prefix = setting_prefix
+        if not key.startswith(prefix) or ".policy." in key:
+            return None
+        remainder = key.removeprefix(prefix)
+        product_value, separator, symbol = remainder.partition(".")
+        if not separator or not symbol:
+            logger.error("Ignoring malformed Binance Futures config key %r", key)
+            return None
+        try:
+            product = BinanceProduct(product_value)
+        except ValueError:
+            logger.error("Ignoring Binance Futures config key with unknown product %r", key)
+            return None
+        if product not in _FUTURES_PRODUCTS:
+            logger.error("Ignoring non-Futures Binance config key %r", key)
+            return None
+        instrument = self._symbol_instruments.get((product, symbol))
+        if instrument is None:
+            logger.warning(
+                "Keeping stored Binance Futures intent for unknown or delisted %s symbol %s",
+                product.value,
+                symbol,
+            )
+            return None
+        return product, symbol, instrument
+
+    async def _stored_auto_apply(self, key: str) -> bool:
+        store = self._require_state_store()
+        raw = await store.get_adapter_config(key)
+        if raw is None:
+            return True
+        if raw not in {"0", "1"}:
+            raise PlatformError(f"Invalid stored Binance auto-apply policy {key!r}={raw!r}")
+        return raw == "1"
+
+    async def _stored_on_drift(
+        self,
+        key: str,
+    ) -> Literal["reapply", "notify", "halt"]:
+        store = self._require_state_store()
+        raw = await store.get_adapter_config(key)
+        if raw is None:
+            return "halt"
+        if raw not in _ON_DRIFT_VALUES:
+            raise PlatformError(f"Invalid stored Binance drift policy {key!r}={raw!r}")
+        return raw  # type: ignore[return-value]
+
+    async def reconcile_user_intent(self) -> None:
+        """Compare persisted Futures configuration with Binance and resolve drift."""
+        store = self._state_store
+        if store is None:
+            return
+        rows = await self._list_futures_config_rows()
+        unresolved_instruments: set[Instrument] = set()
+        configured_instruments: set[Instrument] = set()
+        account_configured = self._position_mode_key() in rows
+        account_unresolved = account_configured
+
+        for key, value in rows.items():
+            target = self._stored_symbol_target(key, "leverage.")
+            if target is not None:
+                product, symbol, instrument = target
+                configured_instruments.add(instrument)
+                try:
+                    stored = int(value)
+                    platform = await self.get_leverage(instrument)
+                    if platform is None:
+                        unresolved_instruments.add(instrument)
+                        continue
+                    if platform == stored:
+                        continue
+                    policy = await self._stored_on_drift(
+                        self._leverage_policy_key("on_drift", product, symbol)
+                    )
+                    resolved = await self._reconcile_setting_drift(
+                        "leverage",
+                        instrument,
+                        str(stored),
+                        str(platform),
+                        policy,
+                    )
+                    if not resolved:
+                        unresolved_instruments.add(instrument)
+                except Exception as exc:
+                    logger.exception("Binance leverage reconciliation failed for %s", symbol)
+                    unresolved_instruments.add(instrument)
+                    self._publish_setting_failed("leverage", instrument, value, exc)
+                    self._enter_config_halt(
+                        "instrument",
+                        instrument,
+                        f"Could not reconcile stored leverage for {symbol}: {exc}",
+                    )
+                continue
+
+            target = self._stored_symbol_target(key, "margin_mode.")
+            if target is not None:
+                product, symbol, instrument = target
+                configured_instruments.add(instrument)
+                try:
+                    stored_margin_mode = MarginMode(value)
+                    platform_margin_mode = await self.get_margin_mode(instrument)
+                    if platform_margin_mode is None:
+                        unresolved_instruments.add(instrument)
+                        continue
+                    if platform_margin_mode is stored_margin_mode:
+                        continue
+                    policy = await self._stored_on_drift(
+                        self._margin_mode_policy_key("on_drift", product, symbol)
+                    )
+                    resolved = await self._reconcile_setting_drift(
+                        "margin_mode",
+                        instrument,
+                        stored_margin_mode.value,
+                        platform_margin_mode.value,
+                        policy,
+                    )
+                    if not resolved:
+                        unresolved_instruments.add(instrument)
+                except Exception as exc:
+                    logger.exception("Binance margin-mode reconciliation failed for %s", symbol)
+                    unresolved_instruments.add(instrument)
+                    self._publish_setting_failed("margin_mode", instrument, value, exc)
+                    self._enter_config_halt(
+                        "instrument",
+                        instrument,
+                        f"Could not reconcile stored margin mode for {symbol}: {exc}",
+                    )
+
+        stored_position_mode = rows.get(self._position_mode_key())
+        if stored_position_mode is not None:
+            try:
+                expected_mode = PositionMode(stored_position_mode)
+                platform_position_mode = await self.get_position_mode()
+                if platform_position_mode is not expected_mode:
+                    policy = await self._stored_on_drift(self._position_mode_policy_key("on_drift"))
+                    account_unresolved = not await self._reconcile_setting_drift(
+                        "position_mode",
+                        None,
+                        expected_mode.value,
+                        platform_position_mode.value,
+                        policy,
+                    )
+                else:
+                    account_unresolved = False
+            except Exception as exc:
+                logger.exception("Binance position-mode reconciliation failed")
+                account_unresolved = True
+                self._publish_setting_failed(
+                    "position_mode",
+                    None,
+                    stored_position_mode,
+                    exc,
+                )
+                self._enter_config_halt(
+                    "account",
+                    None,
+                    f"Could not reconcile stored position mode: {exc}",
+                )
+
+        if account_configured and not account_unresolved:
+            self._try_clear_config_halt("account", None)
+        for instrument in configured_instruments.intersection(
+            self._instruments_with_config_halts()
+        ):
+            if instrument not in unresolved_instruments:
+                self._try_clear_config_halt("instrument", instrument)
+
+    async def _reconcile_setting_drift(
+        self,
+        setting: Literal["leverage", "margin_mode", "position_mode"],
+        instrument: Instrument | None,
+        stored: str,
+        platform: str,
+        policy: Literal["reapply", "notify", "halt"],
+    ) -> bool:
+        action: Literal["reapplied", "notified", "halted"]
+        if policy == "notify":
+            action = "notified"
+        elif policy == "halt":
+            action = "halted"
+        else:
+            action = "reapplied"
+
+        self._event_bus.publish(
+            FuturesSettingDriftEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                setting=setting,
+                instrument=instrument,
+                stored_value=stored,
+                platform_value=platform,
+                action_taken=action,
+            )
+        )
+        if policy == "halt":
+            scope: Literal["instrument", "account"] = (
+                "account" if instrument is None else "instrument"
+            )
+            self._enter_config_halt(
+                scope,
+                instrument,
+                f"Binance {setting} drift: stored={stored}, platform={platform}",
+            )
+            return False
+        if policy == "notify":
+            return False
+
+        try:
+            if setting == "position_mode":
+                auto_apply = await self._stored_auto_apply(
+                    self._position_mode_policy_key("auto_apply_on_connect")
+                )
+            else:
+                if instrument is None:
+                    raise PlatformError(f"{setting} drift has no instrument")
+                product, symbol = await self._resolve_futures_config_target(instrument)
+                policy_key = (
+                    self._leverage_policy_key("auto_apply_on_connect", product, symbol)
+                    if setting == "leverage"
+                    else self._margin_mode_policy_key("auto_apply_on_connect", product, symbol)
+                )
+                auto_apply = await self._stored_auto_apply(policy_key)
+            if setting == "leverage":
+                if instrument is None:
+                    raise PlatformError("Leverage drift has no instrument")
+                await self.set_leverage(
+                    instrument,
+                    int(stored),
+                    on_drift=policy,
+                    auto_apply_on_connect=auto_apply,
+                )
+                actual = await self.get_leverage(instrument)
+                resolved = actual is not None and str(actual) == stored
+            elif setting == "margin_mode":
+                if instrument is None:
+                    raise PlatformError("Margin-mode drift has no instrument")
+                await self.set_margin_mode(
+                    instrument,
+                    MarginMode(stored),
+                    on_drift=policy,
+                    auto_apply_on_connect=auto_apply,
+                )
+                actual_mode = await self.get_margin_mode(instrument)
+                resolved = actual_mode is not None and actual_mode.value == stored
+            else:
+                await self.set_position_mode(
+                    PositionMode(stored),
+                    on_drift=policy,
+                    auto_apply_on_connect=auto_apply,
+                )
+                resolved = (await self.get_position_mode()).value == stored
+        except Exception as exc:
+            self._publish_setting_failed(setting, instrument, stored, exc)
+            scope = "account" if instrument is None else "instrument"
+            self._enter_config_halt(
+                scope,
+                instrument,
+                f"Could not reapply Binance {setting} intent: {exc}",
+            )
+            return False
+
+        if not resolved:
+            scope = "account" if instrument is None else "instrument"
+            self._enter_config_halt(
+                scope,
+                instrument,
+                f"Binance {setting} read-back does not match stored intent {stored}",
+            )
+        return resolved
+
+    def _publish_setting_applied(
+        self,
+        setting: Literal["leverage", "margin_mode", "position_mode"],
+        instrument: Instrument | None,
+        value: str,
+    ) -> None:
+        self._event_bus.publish(
+            FuturesSettingAppliedEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                setting=setting,
+                instrument=instrument,
+                value=value,
+            )
+        )
+
+    def _publish_setting_failed(
+        self,
+        setting: Literal["leverage", "margin_mode", "position_mode"],
+        instrument: Instrument | None,
+        value: str,
+        error: Exception,
+    ) -> None:
+        self._event_bus.publish(
+            FuturesSettingApplyFailedEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                setting=setting,
+                instrument=instrument,
+                value=value,
+                reason=str(error),
+            )
+        )
+
+    def _report_config_failure(
+        self,
+        setting: Literal["leverage", "margin_mode", "position_mode"],
+        instrument: Instrument | None,
+        value: str,
+        error: Exception,
+    ) -> None:
+        self._publish_setting_failed(setting, instrument, value, error)
+        scope: Literal["instrument", "account"] = "account" if instrument is None else "instrument"
+        self._enter_config_halt(
+            scope,
+            instrument,
+            f"Binance {setting} could not be confirmed or persisted: {error}",
+        )
+
+    def _enter_config_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+        detail: str,
+    ) -> None:
+        halt_machine = self._halt_machine
+        if halt_machine is None:
+            logger.error("Cannot halt Binance %s configuration drift: %s", scope, detail)
+            return
+        if not halt_machine.enter_halt(
+            scope,
+            instrument,
+            _CONFIG_DRIFT_REASON,
+            detail,
+        ):
+            return
+        self._event_bus.publish(
+            HaltEnteredEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                scope=scope,
+                instrument=instrument,
+                reason=_CONFIG_DRIFT_REASON,
+                detail=detail,
+            )
+        )
+
+    def _instruments_with_config_halts(self) -> set[Instrument]:
+        halt_machine = self._halt_machine
+        if halt_machine is None:
+            return set()
+        return {
+            entry.instrument
+            for entry in halt_machine.active_halts()
+            if entry.scope == "instrument"
+            and entry.instrument is not None
+            and entry.reason == _CONFIG_DRIFT_REASON
+        }
+
+    def _try_clear_config_halt(
+        self,
+        scope: Literal["instrument", "account"],
+        instrument: Instrument | None,
+    ) -> None:
+        halt_machine = self._halt_machine
+        if halt_machine is None:
+            return
+        entry = next(
+            (
+                active
+                for active in halt_machine.active_halts()
+                if active.scope == scope
+                and active.instrument == instrument
+                and active.reason == _CONFIG_DRIFT_REASON
+            ),
+            None,
+        )
+        if entry is None or not halt_machine.try_clear_halt(
+            scope,
+            instrument=instrument,
+            reconciliation_is_clean=True,
+        ):
+            return
+        self._event_bus.publish(
+            HaltClearedEvent(
+                event_id=str(uuid7()),
+                timestamp=datetime.now(UTC),
+                adapter_name=self.platform_name,
+                account_id=self.account_id,
+                correlation_id=None,
+                scope=scope,
+                instrument=instrument,
+                cleared_by="automatic",
+            )
+        )
 
     async def fetch_open_orders(self) -> dict[str, OrderRecord]:
         """Fetch user-owned open orders keyed by core client order ID."""
@@ -2063,11 +3416,5 @@ class BinanceAdapter(Adapter):
         self._event_bus = event_bus
 
     def attach_state_store(self, state_store: StateStore) -> None:
-        """Retain the core state store for adapter-owned durable metadata only."""
+        """Retain the core state store for durable Binance Futures intent."""
         self._state_store = state_store
-
-    async def reconcile_user_intent(self) -> None:
-        """Reconcile adapter-owned user intent when Binance-specific intent exists."""
-        raise NotImplementedError(
-            "Binance adapter scaffold: reconcile_user_intent is not implemented"
-        )
