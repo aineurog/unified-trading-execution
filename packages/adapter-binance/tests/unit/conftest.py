@@ -6,6 +6,7 @@ Binance. Keep exchange behavior configurable through the returned mocks.
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import binance  # type: ignore[import-untyped]
@@ -14,6 +15,14 @@ from binance import AsyncClient
 
 from unified_trading_execution.binance import BinanceAdapter, BinanceConfig
 from unified_trading_execution.events import EventBus
+
+
+def _blocked_socket() -> MagicMock:
+    socket = MagicMock()
+    socket.__aenter__ = AsyncMock(return_value=socket)
+    socket.__aexit__ = AsyncMock(return_value=False)
+    socket.recv = AsyncMock(side_effect=asyncio.Event().wait)
+    return socket
 
 
 @pytest.fixture
@@ -29,6 +38,9 @@ def binance_client_mock() -> AsyncMock:
     client._create_futures_coin_api_url = MagicMock(
         return_value="https://testnet.binancefuture.com/dapi/v1/ping"
     )
+    client.get_exchange_info.return_value = {"symbols": []}
+    client.futures_exchange_info.return_value = {"symbols": []}
+    client.futures_coin_exchange_info.return_value = {"symbols": []}
     client.close_connection = AsyncMock()
     return client
 
@@ -36,7 +48,11 @@ def binance_client_mock() -> AsyncMock:
 @pytest.fixture
 def binance_socket_manager_mock() -> MagicMock:
     """A socket-manager mock that cannot open a real WebSocket."""
-    return MagicMock()
+    manager = MagicMock()
+    manager.user_socket.return_value = _blocked_socket()
+    manager.futures_user_socket.return_value = _blocked_socket()
+    manager.coin_futures_socket.return_value = _blocked_socket()
+    return manager
 
 
 @pytest.fixture(autouse=True)
@@ -46,6 +62,7 @@ def prevent_binance_network(
     binance_socket_manager_mock: MagicMock,
 ) -> None:
     """Route SDK client and socket construction through local mocks."""
+
     monkeypatch.setattr(
         AsyncClient,
         "create",

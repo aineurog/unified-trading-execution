@@ -111,25 +111,21 @@ def binance_demo_opt_in() -> None:
     _require_demo_opt_in()
 
 
+@pytest.fixture
+def binance_account_stream_order_opt_in() -> None:
+    """Require a separate opt-in before stream tests create sandbox orders."""
+    if os.getenv("BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION", "true").strip().lower() != "true":
+        pytest.skip(
+            "Set BINANCE_ACCOUNT_STREAM_ORDER_INTEGRATION=true to opt in to "
+            "Binance account-stream order tests"
+        )
+
+
 def _require_env(name: str) -> str:
     value = os.getenv(name, "").strip()
     if not value:
         pytest.skip(f"{name} not set — skipping Binance integration test")
     return value
-
-
-@pytest.fixture(scope="session")
-def binance_testnet_api_key() -> str:
-    """Return the dedicated testnet API key or skip the integration test."""
-    _require_testnet_opt_in()
-    return _require_env("BINANCE_TESTNET_API_KEY")
-
-
-@pytest.fixture(scope="session")
-def binance_testnet_api_secret() -> str:
-    """Return the dedicated testnet API secret or skip the integration test."""
-    _require_testnet_opt_in()
-    return _require_env("BINANCE_TESTNET_API_SECRET")
 
 
 @pytest.fixture
@@ -139,17 +135,29 @@ def event_bus() -> EventBus:
 
 
 @pytest.fixture
-def binance_config(
-    binance_testnet_api_key: str,
-    binance_testnet_api_secret: str,
-) -> BinanceConfig:
-    """A config explicitly pinned to Testnet, never Demo or production."""
-    return BinanceConfig(
-        api_key=binance_testnet_api_key,
-        api_secret=binance_testnet_api_secret,
-        testnet=True,
-        demo=False,
-    )
+def binance_config() -> BinanceConfig:
+    """Select an explicitly enabled sandbox config, never production."""
+    testnet = os.getenv("BINANCE_TESTNET", "").strip().lower() == "true"
+    demo = os.getenv("BINANCE_DEMO", "").strip().lower() == "true"
+    if testnet and demo:
+        pytest.fail("Choose only one Binance integration environment")
+    if testnet:
+        _require_testnet_opt_in()
+        return BinanceConfig(
+            api_key=_require_env("BINANCE_TESTNET_API_KEY"),
+            api_secret=_require_env("BINANCE_TESTNET_API_SECRET"),
+            testnet=True,
+            demo=False,
+        )
+    if demo:
+        _require_demo_opt_in()
+        return BinanceConfig(
+            api_key=_require_env("BINANCE_DEMO_API_KEY"),
+            api_secret=_require_env("BINANCE_DEMO_API_SECRET"),
+            testnet=False,
+            demo=True,
+        )
+    pytest.skip("Set BINANCE_TESTNET=true or BINANCE_DEMO=true to select a sandbox")
 
 
 @pytest.fixture
@@ -157,7 +165,7 @@ async def connected_adapter(
     binance_config: BinanceConfig,
     event_bus: EventBus,
 ) -> AsyncIterator[BinanceAdapter]:
-    """Connect to Binance Testnet and always disconnect after the test."""
+    """Connect to the selected Binance sandbox and always disconnect afterward."""
     adapter = BinanceAdapter(binance_config, event_bus=event_bus)
     try:
         await adapter.connect()
