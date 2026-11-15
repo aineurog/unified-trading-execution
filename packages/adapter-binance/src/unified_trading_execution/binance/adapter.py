@@ -1,9 +1,9 @@
 """Binance adapter implementation.
 
-The adapter will translate the core's product-neutral contract into Binance
-Spot, USDⓈ-M Futures, and COIN-M Futures APIs. Symbol and instrument metadata
-mapping, REST client lifecycle, order operations, account streams, and
-reconciliation snapshots are implemented. Market data is handled separately.
+Translates the core's product-neutral contract into Binance Spot, USDⓈ-M
+Futures, and COIN-M Futures APIs, covering symbol and instrument metadata,
+the REST client lifecycle, order operations, account streams, reconciliation
+snapshots, Futures configuration intent, and market data reads.
 """
 
 from __future__ import annotations
@@ -938,15 +938,15 @@ class BinanceAdapter(Adapter):
         if exchange_order_id in (None, ""):
             raise PlatformError("Binance order update is missing exchange order id")
         order_identity = self._order_identity(product, str(symbol), str(exchange_order_id))
-        raw_client_id = (
-            entry.get("c")
-            or entry.get("clientOrderId")
-            or entry.get("clientAlgoId")
-            or entry.get("caid")
+        raw_client_id: object = self._platform_order_keys.get(
+            (product, str(symbol), str(exchange_order_id))
         )
         if raw_client_id in (None, ""):
-            raw_client_id = self._platform_order_keys.get(
-                (product, str(symbol), str(exchange_order_id))
+            raw_client_id = (
+                entry.get("c")
+                or entry.get("clientOrderId")
+                or entry.get("clientAlgoId")
+                or entry.get("caid")
             )
         if raw_client_id in (None, ""):
             raw_client_id = f"binance-{product.value}:{exchange_order_id}"
@@ -3438,6 +3438,7 @@ class BinanceAdapter(Adapter):
             BinanceProduct.COIN_M: "futures_coin_account_trades",
         }
         fills_by_order: dict[str, list[FillRecord]] = {}
+        seen_fill_ids: set[str] = set()
         for instrument in known_instruments:
             product = product_for_instrument(instrument)
             try:
@@ -3485,7 +3486,8 @@ class BinanceAdapter(Adapter):
                         instrument=instrument,
                         client_order_id=client_order_id,
                     )
-                    if fill is not None:
+                    if fill is not None and fill.platform_fill_id not in seen_fill_ids:
+                        seen_fill_ids.add(fill.platform_fill_id)
                         fills_by_order.setdefault(client_order_id, []).append(fill)
                 if len(trade_entries) < 1000:
                     break
@@ -3605,7 +3607,7 @@ class BinanceAdapter(Adapter):
     # ------------------------------------------------------------------
 
     def attach_halt_machine(self, halt_machine: HaltStateMachine | None) -> None:
-        """Retain the core halt machine for future adapter-owned intent work."""
+        """Retain the core halt machine for adapter-owned Futures intent work."""
         self._halt_machine = halt_machine
 
     def attach_event_bus(self, event_bus: EventBus) -> None:

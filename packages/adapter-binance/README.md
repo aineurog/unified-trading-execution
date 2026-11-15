@@ -5,7 +5,7 @@ Partially implemented Binance adapter for
 Product and instrument metadata translation, a limited REST rate-limit
 observation path, the async REST client lifecycle, and core order operations
 are implemented, along with private account streams and reconciliation
-snapshots. Market data, position protection, and trailing stops remain
+snapshots and market data reads. Position protection and trailing stops remain
 unimplemented. Futures leverage, margin mode, and position mode are managed as
 persisted adapter intent.
 
@@ -66,8 +66,8 @@ COIN-M instruments carry the venue `contractSize` as their `multiplier`.
 
 Specs are cached per instrument and re-parsed after
 `instrument_spec_cache_ttl` seconds (default one day); `None` caches
-indefinitely. `max_leverage` is left `None` because exchange info does not
-publish leverage; the authenticated client branch will populate it.
+indefinitely. `max_leverage` is populated from the signed leverage brackets
+when the authenticated client is available.
 
 ### REST rate-limit observations
 
@@ -149,7 +149,8 @@ local intent only.
 
 Unit tests cover product resolution, symbol conversion, metadata parsing,
 error and order translation, account streams, reconciliation snapshots, order
-lookup, and Futures configuration safety/persistence/recovery. They mock SDK
+lookup, market data reads, and Futures configuration
+safety/persistence/recovery. They mock SDK
 client and socket construction and never reach the network:
 
 ```bash

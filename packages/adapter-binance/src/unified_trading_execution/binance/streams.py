@@ -193,12 +193,15 @@ def translate_order_entry(
     if time_in_force is None:
         raise PlatformError(f"Unsupported Binance time in force {raw_tif!r}")
 
+    # A caller that already resolved the core ID through the platform order key
+    # map overrides the venue ID, which for conditional child orders is not the
+    # clientAlgoId passed at placement.
     raw_id = (
-        entry.get("c")
+        client_order_id
+        or entry.get("c")
         or entry.get("clientOrderId")
         or entry.get("clientAlgoId")
         or entry.get("caid")
-        or client_order_id
     )
     order_id = entry.get("i", entry.get("orderId", entry.get("algoId", entry.get("aid"))))
     if raw_id is None or raw_id == "":
