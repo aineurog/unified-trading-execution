@@ -13,6 +13,7 @@ import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -72,6 +73,17 @@ from unified_trading_execution.binance.orders import (
     parse_order_result,
     to_binance_client_order_id,
 )
+from unified_trading_execution.binance.protection import (
+    PROTECTION_CLIENT_ID_PREFIX,
+    PositionLeg,
+    ProtectionOrder,
+    ProtectionSide,
+    build_algo_order_payload,
+    is_protection_client_id,
+    parse_position_id,
+    parse_protection_entry,
+    protection_client_id,
+)
 from unified_trading_execution.binance.rate_limits import BinanceRateLimitTracker
 from unified_trading_execution.binance.streams import (
     translate_fill_entry,
@@ -87,6 +99,7 @@ from unified_trading_execution.binance.symbols import (
     resolve_binance_symbol,
 )
 from unified_trading_execution.errors import (
+    InvalidOrderError,
     InvalidSymbolError,
     OrderNotFoundError,
     PlatformConnectionError,
@@ -951,6 +964,10 @@ class BinanceAdapter(Adapter):
         if raw_client_id in (None, ""):
             raw_client_id = f"binance-{product.value}:{exchange_order_id}"
         client_order_id = str(raw_client_id)
+        if conditional and is_protection_client_id(client_order_id):
+            # Adapter-owned position protection is not an ordinary order:
+            # its lifecycle stays out of the order mirror entirely.
+            return
         if order_identity in self._final_order_ids:
             return
 
@@ -1148,11 +1165,16 @@ class BinanceAdapter(Adapter):
     async def _place_order_locked(self, order: UnifiedOrder) -> OrderResult:
         """Submit a supported order and retain lookup data before network I/O."""
         client = self._require_client()
-        product = product_for_instrument(order.instrument)
-        symbol = await self._resolve_order_symbol(order.instrument, product)
         core_client_order_id = order.client_order_id
         if core_client_order_id is None:
             raise PlatformError("Core must assign client_order_id before Binance order placement")
+        if is_protection_client_id(core_client_order_id):
+            raise InvalidOrderError(
+                f"Binance client_order_id prefix {PROTECTION_CLIENT_ID_PREFIX!r} "
+                "is reserved for position protection"
+            )
+        product = product_for_instrument(order.instrument)
+        symbol = await self._resolve_order_symbol(order.instrument, product)
         binance_client_order_id = to_binance_client_order_id(core_client_order_id)
         payload, conditional = build_place_order_payload(
             order,
@@ -1773,13 +1795,34 @@ class BinanceAdapter(Adapter):
     def position_protection_capability(
         self, instrument: Instrument
     ) -> PositionProtectionCapability:
-        """Report position TP/SL operations actually supported for a product.
+        """Declare static position TP/SL support for USDⓈ-M Futures.
 
-        The scaffold inherits the core's fully unsupported default. Override
-        only after per-leg identity, preservation of unmentioned sides, and
-        read-back behavior are implemented and verified.
+        Binance has no position-attached TP/SL field, so protection is a
+        pair of conditional algo orders identified by deterministic
+        ``clientAlgoId`` values. Writes preserve the unmentioned side and
+        trigger on ``CONTRACT_PRICE`` (last) or ``MARK_PRICE``. Repricing
+        cancels then places, so ``reprice_gap`` is true. Spot has no
+        position legs and COIN-M has no public algo-order route in the
+        pinned SDK, so both report the unsupported default.
         """
-        return super().position_protection_capability(instrument)
+        try:
+            product = product_for_instrument(instrument)
+        except InvalidSymbolError:
+            return super().position_protection_capability(instrument)
+        if product is not BinanceProduct.USD_M:
+            return super().position_protection_capability(instrument)
+
+        return PositionProtectionCapability(
+            supported=True,
+            can_set_stop=True,
+            can_set_take_profit=True,
+            can_clear_stop=True,
+            can_clear_take_profit=True,
+            preserves_unmentioned_side=True,
+            trigger_bases=frozenset({TrailingBasis.LAST, TrailingBasis.MARK}),
+            min_reprice_interval_seconds=0.0,
+            reprice_gap=True,
+        )
 
     def trailing_capability(self, instrument: Instrument) -> TrailingCapability:
         """Report native trailing features verified for this instrument.
@@ -1985,6 +2028,51 @@ class BinanceAdapter(Adapter):
     # Position protection and native trailing
     # ------------------------------------------------------------------
 
+    async def _resolve_protection_target(
+        self,
+        instrument: Instrument,
+        position_id: str,
+    ) -> tuple[str, PositionLeg]:
+        """Resolve the venue symbol and parsed leg for a protection call."""
+        product = product_for_instrument(instrument)
+        if product is not BinanceProduct.USD_M:
+            raise UnsupportedOrderTypeError(
+                f"Binance {product.value} position protection is not supported; "
+                "only USDⓈ-M Futures exposes a public conditional-order route"
+            )
+        _, symbol, _ = await self._resolve_market_symbol(instrument)
+        leg = parse_position_id(product, position_id)
+        if leg.symbol != symbol:
+            raise PlatformError(
+                f"Binance position id {position_id!r} addresses {leg.symbol}, "
+                f"not {symbol} for {instrument.symbol}"
+            )
+        return symbol, leg
+
+    async def _position_leg_quantity(
+        self,
+        instrument: Instrument,
+        position_id: str,
+        *,
+        symbol: str,
+    ) -> Decimal | None:
+        """Return the signed quantity of the open leg, ``None`` when flat."""
+        product = product_for_instrument(instrument)
+        client = self._require_client()
+        response = await self._run_order_request(
+            product,
+            partial(client.futures_position_information, symbol=symbol),
+        )
+        for entry in self._response_list(response, product, "position information"):
+            position = translate_position(
+                entry,
+                product=product,
+                instrument=instrument,
+            )
+            if position.position_id == position_id and position.quantity != 0:
+                return position.quantity
+        return None
+
     async def modify_position_tpsl(
         self,
         instrument: Instrument,
@@ -1994,18 +2082,121 @@ class BinanceAdapter(Adapter):
         stop_loss: TpSlAttachment | None = None,
         trigger_basis: TrailingBasis | None = None,
     ) -> None:
-        """Modify TP/SL for one exact Futures position leg."""
-        raise NotImplementedError(
-            "Binance adapter scaffold: modify_position_tpsl is not implemented"
-        )
+        """Attach or replace TP/SL on one USDⓈ-M position leg.
+
+        Each mentioned side is replaced by cancel-then-place of its
+        deterministic ``clientAlgoId`` conditional order; unmentioned sides
+        are never touched. Market-on-trigger attachments use
+        ``closePosition`` so the venue tracks live leg size; limit
+        attachments snapshot the current quantity. ``trigger_basis`` maps
+        ``LAST`` to ``CONTRACT_PRICE`` and ``MARK`` to ``MARK_PRICE``.
+        """
+        if take_profit is None and stop_loss is None:
+            raise ValueError("at least one of take_profit or stop_loss must be provided")
+        symbol, leg = await self._resolve_protection_target(instrument, position_id)
+        quantity = await self._position_leg_quantity(instrument, position_id, symbol=symbol)
+        if quantity is None:
+            raise OrderNotFoundError(f"No open USDⓈ-M position {position_id!r} for {symbol}")
+
+        client = self._require_client()
+        product = BinanceProduct.USD_M
+        writes: list[tuple[str, dict[str, object]]] = []
+        for side, attachment in (
+            (ProtectionSide.TAKE_PROFIT, take_profit),
+            (ProtectionSide.STOP_LOSS, stop_loss),
+        ):
+            if attachment is None:
+                continue
+            client_algo_id = protection_client_id(leg, side)
+            payload = build_algo_order_payload(
+                symbol=symbol,
+                position_side=leg.position_side,
+                leg_quantity=quantity,
+                attachment=attachment,
+                side=side,
+                trigger_basis=trigger_basis,
+                client_algo_id=client_algo_id,
+            )
+            writes.append((client_algo_id, payload))
+
+        for client_algo_id, payload in writes:
+            with suppress(OrderNotFoundError):
+                await self._run_order_request(
+                    product,
+                    partial(client.futures_cancel_algo_order, clientAlgoId=client_algo_id),
+                )
+            response = await self._run_order_request(
+                product,
+                partial(client.futures_create_algo_order, **payload),
+            )
+            result = parse_order_result(
+                _order_response(response),
+                client_order_id=client_algo_id,
+                conditional=True,
+            )
+            if result.status not in LIVE_ORDER_STATUSES:
+                raise PlatformError(
+                    f"Binance protection order {client_algo_id} was not accepted: "
+                    f"status {result.status.value}"
+                )
 
     async def get_position_tpsl(
         self,
         instrument: Instrument,
         position_id: str,
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
-        """Read TP/SL for a Futures leg, or return ``None`` if it is absent."""
-        raise NotImplementedError("Binance adapter scaffold: get_position_tpsl is not implemented")
+        """Read adapter-owned TP/SL on one USDⓈ-M position leg.
+
+        Returns ``(take_profit, stop_loss)`` with ``None`` per absent side,
+        or ``None`` when the leg is flat or the product cannot serve
+        protection reads. Only orders carrying this adapter's deterministic
+        ``clientAlgoId`` prefix count; externally placed Binance TP/SL is
+        not visible here.
+        """
+        try:
+            product = product_for_instrument(instrument)
+        except InvalidSymbolError:
+            return None
+        if product is not BinanceProduct.USD_M:
+            return None
+        symbol, leg = await self._resolve_protection_target(instrument, position_id)
+        quantity = await self._position_leg_quantity(instrument, position_id, symbol=symbol)
+        if quantity is None:
+            return None
+
+        client = self._require_client()
+        response = await self._run_order_request(
+            product,
+            partial(client.futures_get_open_algo_orders, symbol=symbol),
+        )
+        expected = {
+            protection_client_id(leg, ProtectionSide.TAKE_PROFIT),
+            protection_client_id(leg, ProtectionSide.STOP_LOSS),
+        }
+        found: dict[ProtectionSide, ProtectionOrder] = {}
+        for entry in self._response_list(response, product, "open algo orders"):
+            client_algo_id = entry.get("clientAlgoId")
+            if not isinstance(client_algo_id, str) or client_algo_id not in expected:
+                continue
+            order = parse_protection_entry(entry)
+            if order is None:
+                continue
+            if order.side in found:
+                raise PlatformError(
+                    f"Binance returned duplicate open protection orders for {client_algo_id}"
+                )
+            found[order.side] = order
+
+        def attachment(side: ProtectionSide) -> TpSlAttachment | None:
+            order = found.get(side)
+            if order is None:
+                return None
+            return TpSlAttachment(
+                trigger_price=order.trigger_price,
+                limit_price=order.limit_price,
+            )
+
+        return attachment(ProtectionSide.TAKE_PROFIT), attachment(ProtectionSide.STOP_LOSS)
 
     async def clear_position_tpsl(
         self,
@@ -2015,12 +2206,29 @@ class BinanceAdapter(Adapter):
         take_profit: bool = False,
         stop_loss: bool = False,
     ) -> None:
-        """Clear only named, adapter-owned protection sides on one leg."""
+        """Cancel the named adapter-owned protection sides on one leg.
+
+        Works even when the leg is flat: Binance protection orders are
+        separate conditional orders, so owned orders are cancelled rather
+        than assumed gone with the position. Unmentioned sides stay working.
+        """
         if not take_profit and not stop_loss:
             raise ValueError("at least one of take_profit or stop_loss must be true")
-        raise NotImplementedError(
-            "Binance adapter scaffold: clear_position_tpsl is not implemented"
-        )
+        _, leg = await self._resolve_protection_target(instrument, position_id)
+        client = self._require_client()
+        product = BinanceProduct.USD_M
+        sides = []
+        if take_profit:
+            sides.append(ProtectionSide.TAKE_PROFIT)
+        if stop_loss:
+            sides.append(ProtectionSide.STOP_LOSS)
+        for side in sides:
+            client_algo_id = protection_client_id(leg, side)
+            with suppress(OrderNotFoundError):
+                await self._run_order_request(
+                    product,
+                    partial(client.futures_cancel_algo_order, clientAlgoId=client_algo_id),
+                )
 
     async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
         """Place native trailing protection for exactly one Futures position leg."""
@@ -3588,6 +3796,9 @@ class BinanceAdapter(Adapter):
             instrument=instrument,
             conditional=conditional,
         )
+        if conditional and is_protection_client_id(order.client_order_id):
+            # Adapter-owned position protection stays out of the order mirror.
+            return None
         reference = OrderReference(
             product=product,
             symbol=str(entry.get("symbol")),

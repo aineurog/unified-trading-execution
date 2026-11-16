@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
-from decimal import Decimal, InvalidOperation
+from collections.abc import Awaitable, Callable
 from functools import partial
 
 import pytest
@@ -59,48 +59,6 @@ def futures_config_mutation_opt_in(binance_config: BinanceConfig) -> None:
         pytest.fail("Futures configuration integration tests must never use production")
 
 
-async def _require_clean_symbol(
-    adapter: BinanceAdapter,
-    product: BinanceProduct,
-    symbol: str,
-) -> None:
-    client = adapter._require_client()
-    open_orders_method = (
-        "futures_get_open_orders"
-        if product == BinanceProduct.USD_M
-        else "futures_coin_get_open_orders"
-    )
-    open_orders = await adapter._run_order_request(
-        product,
-        partial(getattr(client, open_orders_method), symbol=symbol),
-    )
-    if not isinstance(open_orders, list):
-        raise AssertionError(f"Unexpected open-orders response: {open_orders!r}")
-    if open_orders:
-        pytest.skip(f"Refusing to mutate {symbol}: sandbox has open Futures orders")
-
-    if product == BinanceProduct.USD_M:
-        algo_orders = await adapter._run_order_request(
-            product,
-            partial(client.futures_get_open_algo_orders, symbol=symbol),
-        )
-        if not isinstance(algo_orders, list):
-            raise AssertionError(f"Unexpected open algo-orders response: {algo_orders!r}")
-        if algo_orders:
-            pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
-
-    positions = await adapter._futures_position_risk(product, symbol=symbol)
-    for row in positions:
-        try:
-            position_amount = Decimal(str(row.get("positionAmt")))
-        except InvalidOperation as exc:
-            raise AssertionError(f"Malformed position amount in Binance response: {row!r}") from exc
-        if not position_amount.is_finite():
-            raise AssertionError(f"Non-finite position amount in Binance response: {row!r}")
-        if position_amount != 0:
-            pytest.skip(f"Refusing to mutate {symbol}: sandbox has a non-flat Futures position")
-
-
 async def _change_remote_leverage(
     adapter: BinanceAdapter,
     product: BinanceProduct,
@@ -148,6 +106,7 @@ async def test_futures_config_mutations_reconcile_drift_and_reapply_on_connect(
     binance_config: BinanceConfig,
     event_bus: EventBus,
     futures_config_mutation_opt_in: None,
+    require_clean_futures_symbol: Callable[[BinanceAdapter, BinanceProduct, str], Awaitable[None]],
 ) -> None:
     """Exercise real Binance sandbox changes, recovery, and state persistence."""
     store = SQLiteStateStore(":memory:")
@@ -171,7 +130,7 @@ async def test_futures_config_mutations_reconcile_drift_and_reapply_on_connect(
         if not client.testnet and not client.demo:
             raise AssertionError("Refusing to change Futures settings on production")
 
-        await _require_clean_symbol(adapter, product, symbol)
+        await require_clean_futures_symbol(adapter, product, symbol)
         original_leverage = await adapter.get_leverage(instrument)
         original_margin_mode = await adapter.get_margin_mode(instrument)
         if original_leverage is None or original_margin_mode is None:
