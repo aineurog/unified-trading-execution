@@ -101,6 +101,7 @@ from unified_trading_execution.binance.streams import (
 from unified_trading_execution.binance.symbols import (
     from_binance_symbol,
     parse_instrument_spec,
+    parse_tick_size,
     product_for_instrument,
     resolve_binance_symbol,
 )
@@ -2317,6 +2318,42 @@ class BinanceAdapter(Adapter):
                 return position.quantity
         return None
 
+    async def _validate_protection_price_ticks(
+        self,
+        instrument: Instrument,
+        product: BinanceProduct,
+        symbol: str,
+        *,
+        take_profit: TpSlAttachment | None,
+        stop_loss: TpSlAttachment | None,
+    ) -> None:
+        """Reject prices the venue would refuse with ``-1111`` precision errors.
+
+        Binance enforces each symbol's ``PRICE_FILTER`` ``tickSize`` on both
+        ``triggerPrice`` and ``price``; the venue does not round for us.
+        Exchange info is already cached by ``_resolve_protection_target``, so
+        this adds no network call and avoids the signed leverage-bracket
+        lookup inside ``fetch_instrument_spec``.
+        """
+        entries = await self._load_exchange_info(product)
+        _, entry = resolve_binance_symbol(instrument, product, entries)
+        tick_size = parse_tick_size(entry)
+        for side_name, attachment in (
+            ("take_profit", take_profit),
+            ("stop_loss", stop_loss),
+        ):
+            if attachment is None:
+                continue
+            for field_name, price in (
+                ("trigger_price", attachment.trigger_price),
+                ("limit_price", attachment.limit_price),
+            ):
+                if price is not None and price % tick_size != 0:
+                    raise InvalidOrderError(
+                        f"Binance {side_name} {field_name} {price} is not aligned "
+                        f"to tick size {tick_size} for {symbol}"
+                    )
+
     async def modify_position_tpsl(
         self,
         instrument: Instrument,
@@ -2339,6 +2376,13 @@ class BinanceAdapter(Adapter):
         if take_profit is None and stop_loss is None:
             raise ValueError("at least one of take_profit or stop_loss must be provided")
         symbol, leg = await self._resolve_protection_target(instrument, position_id)
+        await self._validate_protection_price_ticks(
+            instrument,
+            leg.product,
+            symbol,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+        )
         quantity = await self._position_leg_quantity(instrument, position_id, symbol=symbol)
         if quantity is None:
             product_label = "USDⓈ-M" if leg.product == BinanceProduct.USD_M else "COIN-M"

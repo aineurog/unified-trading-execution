@@ -102,7 +102,10 @@ The adapter supports Spot and Futures MARKET/LIMIT orders, Spot STOP/STOP_LIMIT,
 and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. Ordinary
 COIN-M conditional orders, Spot order modification, conditional-order
 modification, and order-level TP/SL attachments are unsupported. Position-level
-TP/SL is supported separately on both Futures products. USDⓈ-M and COIN-M
+TP/SL is supported separately on both Futures products. Protection
+`trigger_price`/`limit_price` values must align to the symbol's `tickSize`;
+`modify_position_tpsl` rejects unaligned prices with `InvalidOrderError`
+before any venue call. USDⓈ-M and COIN-M
 ordinary LIMIT orders can be modified by price and/or quantity.
 Order routing references are restored from persisted orders and refreshed from
 live open-order snapshots.

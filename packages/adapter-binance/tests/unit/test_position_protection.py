@@ -87,6 +87,15 @@ def _exchange_info() -> dict[str, object]:
         "marginAsset": "USDT",
         "contractType": "PERPETUAL",
         "status": "TRADING",
+        "filters": [
+            {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+            {
+                "filterType": "LOT_SIZE",
+                "stepSize": "0.001",
+                "minQty": "0.001",
+                "maxQty": "1000",
+            },
+        ],
     }
 
 
@@ -209,6 +218,15 @@ def _wire_coinm(adapter: BinanceAdapter, client: AsyncMock) -> None:
             "contractType": "PERPETUAL",
             "status": "TRADING",
             "contractSize": 100,
+            "filters": [
+                {"filterType": "PRICE_FILTER", "tickSize": "0.1"},
+                {
+                    "filterType": "LOT_SIZE",
+                    "stepSize": "1",
+                    "minQty": "1",
+                    "maxQty": "1000",
+                },
+            ],
         }
     ]
     client.futures_coin_position_information.return_value = [_coin_m_position_entry()]
@@ -624,6 +642,50 @@ class TestModifyPositionTpsl:
             await adapter.modify_position_tpsl(
                 instrument, _POSITION_ID, stop_loss=TpSlAttachment(trigger_price=Decimal("1"))
             )
+
+    @pytest.mark.parametrize(
+        "attachment",
+        [
+            TpSlAttachment(trigger_price=Decimal("55000.05")),
+            TpSlAttachment(trigger_price=Decimal("55000"), limit_price=Decimal("54999.95")),
+        ],
+        ids=("off_tick_trigger", "off_tick_limit"),
+    )
+    async def test_off_tick_prices_rejected_before_venue_calls(
+        self,
+        adapter: BinanceAdapter,
+        binance_client_mock: AsyncMock,
+        attachment: TpSlAttachment,
+    ) -> None:
+        _wire_usdm(adapter, binance_client_mock)
+
+        with pytest.raises(InvalidOrderError, match="not aligned to tick size"):
+            await adapter.modify_position_tpsl(
+                _usd_m_instrument(),
+                _POSITION_ID,
+                stop_loss=attachment,
+            )
+
+        binance_client_mock.futures_position_information.assert_not_awaited()
+        binance_client_mock.futures_create_algo_order.assert_not_awaited()
+
+    async def test_coin_m_off_tick_trigger_rejected(
+        self,
+        adapter: BinanceAdapter,
+        binance_client_mock: AsyncMock,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        _wire_coinm(adapter, binance_client_mock)
+        _wire_coinm_algo_transport(adapter, monkeypatch)
+
+        with pytest.raises(InvalidOrderError, match="not aligned to tick size"):
+            await adapter.modify_position_tpsl(
+                _coin_m_instrument(),
+                _COIN_M_POSITION_ID,
+                stop_loss=TpSlAttachment(trigger_price=Decimal("32456.05")),
+            )
+
+        binance_client_mock.futures_coin_position_information.assert_not_awaited()
 
     async def test_stop_loss_write_cancels_then_places(
         self, adapter: BinanceAdapter, binance_client_mock: AsyncMock

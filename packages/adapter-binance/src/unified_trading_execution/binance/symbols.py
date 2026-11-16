@@ -197,22 +197,7 @@ def resolve_binance_symbol(
 
 def parse_instrument_spec(entry: _Metadata) -> InstrumentSpec:
     """Parse Binance PRICE_FILTER, LOT_SIZE, and notional filters exactly."""
-    symbol = _required_string(entry, "symbol")
-    filters_raw = entry.get("filters")
-    if not isinstance(filters_raw, list):
-        raise PlatformError(f"Malformed Binance filters for {symbol}")
-
-    filters: dict[str, _Metadata] = {}
-    for raw_filter in filters_raw:
-        if not isinstance(raw_filter, dict):
-            raise PlatformError(f"Malformed Binance filter for {symbol}")
-        filter_type = raw_filter.get("filterType")
-        if not isinstance(filter_type, str):
-            raise PlatformError(f"Binance filter for {symbol} has no filterType")
-        if filter_type in filters:
-            raise PlatformError(f"Duplicate Binance {filter_type} filter for {symbol}")
-        filters[filter_type] = raw_filter
-
+    symbol, filters = _symbol_filters(entry)
     price_filter = _required_filter(filters, "PRICE_FILTER", symbol)
     lot_filter = _required_filter(filters, "LOT_SIZE", symbol)
     tick_size = _positive_decimal(price_filter, "tickSize", symbol)
@@ -250,6 +235,32 @@ def parse_instrument_spec(entry: _Metadata) -> InstrumentSpec:
         max_leverage=None,
         min_stop_distance=None,
     )
+
+
+def parse_tick_size(entry: _Metadata) -> Decimal:
+    """Parse only the PRICE_FILTER ``tickSize`` from an exchange-info row."""
+    symbol, filters = _symbol_filters(entry)
+    price_filter = _required_filter(filters, "PRICE_FILTER", symbol)
+    return _positive_decimal(price_filter, "tickSize", symbol)
+
+
+def _symbol_filters(entry: _Metadata) -> tuple[str, dict[str, _Metadata]]:
+    symbol = _required_string(entry, "symbol")
+    filters_raw = entry.get("filters")
+    if not isinstance(filters_raw, list):
+        raise PlatformError(f"Malformed Binance filters for {symbol}")
+
+    filters: dict[str, _Metadata] = {}
+    for raw_filter in filters_raw:
+        if not isinstance(raw_filter, dict):
+            raise PlatformError(f"Malformed Binance filter for {symbol}")
+        filter_type = raw_filter.get("filterType")
+        if not isinstance(filter_type, str):
+            raise PlatformError(f"Binance filter for {symbol} has no filterType")
+        if filter_type in filters:
+            raise PlatformError(f"Duplicate Binance {filter_type} filter for {symbol}")
+        filters[filter_type] = raw_filter
+    return symbol, filters
 
 
 def _same_instrument(left: Instrument, right: Instrument) -> bool:
