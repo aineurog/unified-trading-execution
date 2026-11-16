@@ -204,7 +204,6 @@ async def test_fetch_positions_excludes_zero_quantity_both_sides(
 async def test_fetch_open_orders_includes_futures_algo_orders(
     adapter,
     binance_client_mock: AsyncMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _connect_fake_client(adapter, binance_client_mock)
     adapter._exchange_info_cache = {
@@ -241,38 +240,13 @@ async def test_fetch_open_orders_includes_futures_algo_orders(
             "algoStatus": "NEW",
         }
     ]
-    monkeypatch.setattr(
-        adapter,
-        "_run_coin_m_algo_request",
-        AsyncMock(
-            return_value=[
-                {
-                    "symbol": "BTCUSD_PERP",
-                    "algoId": 30,
-                    "clientAlgoId": "coin-algo-order",
-                    "side": "SELL",
-                    "orderType": "STOP_MARKET",
-                    "timeInForce": "GTE_GTC",
-                    "quantity": "1",
-                    "triggerPrice": "55000",
-                    "algoStatus": "NEW",
-                }
-            ]
-        ),
-    )
-
     orders = await adapter.fetch_open_orders()
 
-    assert set(orders) == {"spot-order", "algo-order", "coin-algo-order"}
+    assert set(orders) == {"spot-order", "algo-order"}
     assert orders["spot-order"].status == OrderStatus.OPEN
     assert orders["algo-order"].stop_price == Decimal("55000")
     assert adapter._order_refs["algo-order"].conditional is True
-    assert adapter._order_refs["coin-algo-order"].conditional is True
-    assert adapter._open_order_ids == {
-        "spot:BTCUSDT:10",
-        "usd_m:BTCUSDT:20",
-        "coin_m:BTCUSD_PERP:30",
-    }
+    assert adapter._open_order_ids == {"spot:BTCUSDT:10", "usd_m:BTCUSDT:20"}
 
 
 @pytest.mark.asyncio

@@ -159,11 +159,6 @@ async def _require_clean_futures_symbol(
             raise AssertionError(f"Unexpected open algo-orders response: {algo_orders!r}")
         if algo_orders:
             pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
-    elif product == BinanceProduct.COIN_M:
-        algo_orders = await adapter._coin_m_open_algo_orders(symbol)
-        if algo_orders:
-            pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
-
     positions = await adapter._futures_position_risk(product, symbol=symbol)
     for row in positions:
         try:

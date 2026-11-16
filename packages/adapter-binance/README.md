@@ -110,7 +110,8 @@ ordinary LIMIT orders can be modified by price and/or quantity.
 COIN-M position TP/SL uses regular conditional orders through the public
 python-binance order methods, matching Binance's Positions TP/SL panel.
 Changing a COIN-M protection side cancels and replaces that side; the
-unmentioned side remains untouched.
+unmentioned side remains untouched. COIN-M algo orders left by older adapter
+versions are not managed; cancel them directly on Binance before upgrading.
 Order routing references are restored from persisted orders and refreshed from
 live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
@@ -150,10 +151,10 @@ default, and reconciles drift using `halt` (default), `notify`, or `reapply`
 policies.
 
 Changes are refused when the affected scope has open orders or non-flat
-positions; algo orders on both Futures products are checked too. The adapter
-does not cancel orders or close positions. Checks are serialized with its own
-order operations, but external activity can race the Binance request. Removing
-a setting removes local intent only.
+positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
+orders or close positions. Checks are serialized with its own order operations,
+but external activity can race the Binance request. Removing a setting removes
+local intent only.
 
 ## Tests
 
