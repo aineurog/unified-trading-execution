@@ -107,6 +107,10 @@ TP/SL is supported separately on both Futures products. Protection
 `modify_position_tpsl` rejects unaligned prices with `InvalidOrderError`
 before any venue call. USDⓈ-M and COIN-M
 ordinary LIMIT orders can be modified by price and/or quantity.
+COIN-M position TP/SL uses regular conditional orders through the public
+python-binance order methods, matching Binance's Positions TP/SL panel.
+Changing a COIN-M protection side cancels and replaces that side; the
+unmentioned side remains untouched.
 Order routing references are restored from persisted orders and refreshed from
 live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
@@ -121,8 +125,9 @@ provide the average.
 The adapter translates Spot execution and balance updates, USDⓈ-M and COIN-M
 order/position updates, and USDⓈ-M algo-order updates into core events. REST
 snapshots provide balances, derivative positions, open orders (including
-USDⓈ-M algo orders), and account trades. Reconnects use bounded backoff; final
-order and fill events are deduplicated in memory.
+USDⓈ-M algo orders), and account trades. Adapter-owned position-protection
+orders are excluded from the ordinary order mirror. Reconnects use bounded
+backoff; final order and fill events are deduplicated in memory.
 
 Balance keys are product-qualified (for example, `SPOT:USDT` and
 `USD_M:USDT`) because Binance maintains separate product wallets while the core
@@ -145,10 +150,10 @@ default, and reconciles drift using `halt` (default), `notify`, or `reapply`
 policies.
 
 Changes are refused when the affected scope has open orders or non-flat
-positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
-orders or close positions. Checks are serialized with its own order operations,
-but external activity can race the Binance request. Removing a setting removes
-local intent only. 
+positions; algo orders on both Futures products are checked too. The adapter
+does not cancel orders or close positions. Checks are serialized with its own
+order operations, but external activity can race the Binance request. Removing
+a setting removes local intent only.
 
 ## Tests
 

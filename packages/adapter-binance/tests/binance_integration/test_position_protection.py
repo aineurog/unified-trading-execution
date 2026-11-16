@@ -1,9 +1,9 @@
 """Opt-in Futures Demo/Testnet coverage for position TP/SL protection.
 
 Places one tiny test-owned position, attaches market-on-trigger TP/SL
-through the adapter's conditional algo orders, verifies read-back,
-repricing, side-preserving clears, and mirror exclusion, then flattens the
-position and removes every protection order it created.
+through the adapter's product-specific conditional-order routes, verifies
+read-back, repricing, side-preserving clears, and mirror exclusion, then
+flattens the position and removes every protection order it created.
 """
 
 from __future__ import annotations
@@ -19,8 +19,10 @@ import pytest
 from unified_trading_execution.binance import BinanceAdapter, BinanceConfig, BinanceProduct
 from unified_trading_execution.binance.enums import PositionMode
 from unified_trading_execution.binance.protection import (
+    ProtectionSide,
     is_protection_client_id,
     parse_position_id,
+    protection_client_id,
 )
 from unified_trading_execution.errors import OrderNotFoundError
 from unified_trading_execution.trailing.types import TrailingBasis
@@ -209,6 +211,33 @@ async def test_position_tpsl_lifecycle(
             trigger_basis=TrailingBasis.MARK,
         )
 
+        if product == BinanceProduct.COIN_M:
+            regular_orders = await client.futures_coin_get_open_orders(symbol=symbol)
+            assert isinstance(regular_orders, list)
+            expected_orders = {
+                protection_client_id(leg_side, ProtectionSide.TAKE_PROFIT): (
+                    "TAKE_PROFIT_MARKET",
+                    tp_trigger,
+                ),
+                protection_client_id(leg_side, ProtectionSide.STOP_LOSS): (
+                    "STOP_MARKET",
+                    stop_trigger,
+                ),
+            }
+            found = {
+                row.get("clientOrderId"): row
+                for row in regular_orders
+                if isinstance(row, dict) and row.get("clientOrderId") in expected_orders
+            }
+            assert set(found) == set(expected_orders)
+            for client_order_id, (expected_type, expected_trigger) in expected_orders.items():
+                order = found[client_order_id]
+                assert order.get("type") == expected_type
+                assert Decimal(str(order.get("stopPrice"))) == expected_trigger
+                assert order.get("closePosition") in (True, "true", "TRUE")
+                assert order.get("workingType") == "MARK_PRICE"
+                assert order.get("priceProtect") in (True, "true", "TRUE")
+
         confirmed = await adapter.get_position_tpsl(instrument, position_id)
         assert confirmed is not None
         tp, sl = confirmed
@@ -299,7 +328,7 @@ async def test_position_tpsl_lifecycle(
                         )
                         if remaining_protections not in (None, (None, None)):
                             raise AssertionError(
-                                f"{product.value} protection cleanup left algo orders: "
+                                f"{product.value} protection cleanup left open orders: "
                                 f"{remaining_protections!r}"
                             )
                 finally:

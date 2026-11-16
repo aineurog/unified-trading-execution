@@ -1,10 +1,9 @@
-"""Binance position TP/SL protection via Futures conditional algo orders.
+"""Binance position TP/SL protection via Futures conditional orders.
 
-Binance Futures has no position-attached TP/SL field: protection is a
-separate conditional algo order. Adapter-owned protection is identified by
-a deterministic ``clientAlgoId`` derived from the position leg id, so reads,
-repricing, and clearing never touch orders the adapter did not place. Spot
-has no position legs.
+USDⓈ-M protection uses conditional algo orders; COIN-M protection uses regular
+conditional orders. Adapter-owned protection is identified by a deterministic
+client order ID derived from the position leg id, so reads, repricing, and
+clearing never touch orders the adapter did not place. Spot has no position legs.
 """
 
 from __future__ import annotations
@@ -25,13 +24,13 @@ from unified_trading_execution.types.order import TpSlAttachment
 
 _Metadata: TypeAlias = dict[str, object]
 
-# Prefix marking adapter-owned protection algo orders. Entries carrying it
-# are excluded from the ordinary order mirror; it is also the ownership
-# proof for reads and clears.
+# Prefix marking adapter-owned protection orders. Entries carrying it are
+# excluded from the ordinary order mirror and identify ownership for reads
+# and clears.
 PROTECTION_CLIENT_ID_PREFIX = "tpsl-"
 
 _POSITION_SIDES = frozenset({"BOTH", "LONG", "SHORT"})
-_OPEN_ALGO_STATUSES = frozenset({"NEW", "TRIGGERING", "TRIGGERED"})
+_OPEN_PROTECTION_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED", "TRIGGERING", "TRIGGERED"})
 
 # Algo order types that close a leg, mapped to the protection side they
 # implement. ``*_MARKET`` variants execute at market on trigger;
@@ -66,12 +65,12 @@ class PositionLeg:
 
 @dataclass(frozen=True, slots=True)
 class ProtectionOrder:
-    """One open adapter-owned conditional order read from ``openAlgoOrders``."""
+    """One open adapter-owned conditional order."""
 
     side: ProtectionSide
     trigger_price: Decimal
     limit_price: Decimal | None
-    algo_status: str
+    status: str
 
 
 def parse_position_id(product: BinanceProduct, position_id: str) -> PositionLeg:
@@ -106,12 +105,11 @@ def parse_position_id(product: BinanceProduct, position_id: str) -> PositionLeg:
 
 
 def protection_client_id(leg: PositionLeg, side: ProtectionSide) -> str:
-    """Derive the deterministic ``clientAlgoId`` for one protection side.
+    """Derive the deterministic client ID for one protection side.
 
     The id embeds symbol and position side rather than the full position id.
     Product markers keep USDⓈ-M and COIN-M IDs distinct. The generated ID
-    uses URL-safe characters because python-binance 1.0.37 does not encode
-    punctuation consistently when signing Futures requests.
+    uses URL-safe characters for compatibility with Binance Futures requests.
     """
     product_marker = "c" if leg.product is BinanceProduct.COIN_M else "u"
     return to_binance_client_order_id(
@@ -135,7 +133,7 @@ def close_order_side(quantity: Decimal) -> str:
 
 
 def algo_order_type(side: ProtectionSide, *, market: bool) -> str:
-    """Map a protection side and execution style to a Binance algo type."""
+    """Map a protection side and execution style to a Binance conditional type."""
     if side is ProtectionSide.STOP_LOSS:
         return "STOP_MARKET" if market else "STOP"
     return "TAKE_PROFIT_MARKET" if market else "TAKE_PROFIT"
@@ -174,15 +172,12 @@ def build_algo_order_payload(
     trigger_basis: TrailingBasis | None,
     client_algo_id: str,
 ) -> dict[str, object]:
-    """Build parameters for one product's conditional protection order.
+    """Build parameters for a USDⓈ-M algo protection order.
 
     Market-on-trigger attachments use ``closePosition`` so the venue tracks
     the live leg size. Limit attachments snapshot the current leg quantity
     and rest at ``price``; ``reduceOnly`` is sent only in one-way mode where
     the venue accepts it (hedge mode scopes the leg via ``positionSide``).
-    The COIN-M limit-trigger parameter set was verified against Demo
-    ``/dapi/v1/algoOrder`` (``price``/``quantity``/``timeInForce``/
-    ``reduceOnly`` round-trip through create, query, and open orders).
     """
     market = attachment.limit_price is None
     order_type = algo_order_type(side, market=market)
@@ -211,32 +206,64 @@ def build_algo_order_payload(
     return payload
 
 
+def build_coin_m_order_payload(
+    *,
+    symbol: str,
+    position_side: str,
+    leg_quantity: Decimal,
+    attachment: TpSlAttachment,
+    side: ProtectionSide,
+    trigger_basis: TrailingBasis | None,
+    client_order_id: str,
+) -> dict[str, object]:
+    """Build a regular COIN-M conditional-order payload for position protection."""
+    market = attachment.limit_price is None
+    payload: dict[str, object] = {
+        "symbol": symbol,
+        "side": close_order_side(leg_quantity),
+        "positionSide": position_side,
+        "type": algo_order_type(side, market=market),
+        "stopPrice": _decimal_string(attachment.trigger_price),
+        "newClientOrderId": client_order_id,
+        "workingType": working_type(trigger_basis) or "CONTRACT_PRICE",
+        "priceProtect": "TRUE",
+    }
+    if market:
+        payload["closePosition"] = "true"
+    else:
+        payload["price"] = _decimal_string(attachment.limit_price)
+        payload["quantity"] = _decimal_string(abs(leg_quantity))
+        payload["timeInForce"] = "GTC"
+        if position_side == "BOTH":
+            payload["reduceOnly"] = "true"
+    return payload
+
+
 def parse_protection_entry(entry: _Metadata) -> ProtectionOrder | None:
-    """Translate one ``openAlgoOrders`` row into a ``ProtectionOrder``.
+    """Translate one open algo or regular order row into a ``ProtectionOrder``.
 
-    Returns ``None`` for rows that are not adapter-owned protection or are
-    no longer in an open algo status. Raises ``PlatformError`` on malformed
-    protection rows — silently dropping one would misreport coverage.
+    Returns ``None`` for rows that are not adapter-owned protection or are no
+    longer open. Raises ``PlatformError`` on malformed protection rows.
     """
-    client_algo_id = entry.get("clientAlgoId")
-    if not isinstance(client_algo_id, str) or not is_protection_client_id(client_algo_id):
+    client_order_id = entry.get("clientAlgoId") or entry.get("clientOrderId")
+    if not isinstance(client_order_id, str) or not is_protection_client_id(client_order_id):
         return None
 
-    raw_status = entry.get("algoStatus")
+    raw_status = entry.get("algoStatus") or entry.get("status")
     status = str(raw_status).upper() if raw_status is not None else ""
-    if status not in _OPEN_ALGO_STATUSES:
+    if status not in _OPEN_PROTECTION_STATUSES:
         return None
 
-    raw_type = entry.get("type", entry.get("orderType"))
+    raw_type = entry.get("type") or entry.get("orderType")
     if not isinstance(raw_type, str):
         raise PlatformError(
-            f"Binance protection order {client_algo_id} has no type",
+            f"Binance protection order {client_order_id} has no type",
             platform_error=entry,
         )
     side = protection_side_for_type(raw_type)
     if side is None:
         raise PlatformError(
-            f"Binance protection order {client_algo_id} has unsupported type {raw_type!r}",
+            f"Binance protection order {client_order_id} has unsupported type {raw_type!r}",
             platform_error=entry,
         )
 
@@ -245,12 +272,12 @@ def parse_protection_entry(entry: _Metadata) -> ProtectionOrder | None:
         trigger_price = Decimal(str(raw_trigger))
     except (InvalidOperation, ValueError) as exc:
         raise PlatformError(
-            f"Binance protection order {client_algo_id} has invalid triggerPrice {raw_trigger!r}",
+            f"Binance protection order {client_order_id} has invalid triggerPrice {raw_trigger!r}",
             platform_error=entry,
         ) from exc
     if not trigger_price.is_finite() or trigger_price <= 0:
         raise PlatformError(
-            f"Binance protection order {client_algo_id} has invalid triggerPrice {raw_trigger!r}",
+            f"Binance protection order {client_order_id} has invalid triggerPrice {raw_trigger!r}",
             platform_error=entry,
         )
 
@@ -261,12 +288,12 @@ def parse_protection_entry(entry: _Metadata) -> ProtectionOrder | None:
             parsed_price = Decimal(str(raw_price))
         except (InvalidOperation, ValueError) as exc:
             raise PlatformError(
-                f"Binance protection order {client_algo_id} has invalid price {raw_price!r}",
+                f"Binance protection order {client_order_id} has invalid price {raw_price!r}",
                 platform_error=entry,
             ) from exc
         if not parsed_price.is_finite() or parsed_price <= 0:
             raise PlatformError(
-                f"Binance protection order {client_algo_id} has invalid price {raw_price!r}",
+                f"Binance protection order {client_order_id} has invalid price {raw_price!r}",
                 platform_error=entry,
             )
         limit_price = parsed_price
@@ -275,5 +302,5 @@ def parse_protection_entry(entry: _Metadata) -> ProtectionOrder | None:
         side=side,
         trigger_price=trigger_price,
         limit_price=limit_price,
-        algo_status=status,
+        status=status,
     )
