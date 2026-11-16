@@ -216,7 +216,15 @@ def build_coin_m_order_payload(
     trigger_basis: TrailingBasis | None,
     client_order_id: str,
 ) -> dict[str, object]:
-    """Build a regular COIN-M conditional-order payload for position protection."""
+    """Build a regular COIN-M conditional-order payload for position protection.
+
+    Market-on-trigger attachments send ``placeType="position"`` — the same
+    field the Binance UI uses for position TP/SL — which links the order to
+    the position leg so the venue auto-cancels it when the leg closes and
+    surfaces it in the Positions TP/SL panel. Verified against Demo
+    ``/dapi/v1/order``. Limit attachments snapshot quantity instead and do
+    not carry ``placeType``.
+    """
     market = attachment.limit_price is None
     payload: dict[str, object] = {
         "symbol": symbol,
@@ -230,6 +238,7 @@ def build_coin_m_order_payload(
     }
     if market:
         payload["closePosition"] = "true"
+        payload["placeType"] = "position"
     else:
         payload["price"] = _decimal_string(attachment.limit_price)
         payload["quantity"] = _decimal_string(abs(leg_quantity))

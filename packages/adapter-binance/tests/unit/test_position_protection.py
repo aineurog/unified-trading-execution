@@ -465,6 +465,7 @@ class TestPayloadBuilders:
             "newClientOrderId": _COIN_M_SL_ID,
             "priceProtect": "TRUE",
             "closePosition": "true",
+            "placeType": "position",
             "workingType": "CONTRACT_PRICE",
         }
 
@@ -706,6 +707,7 @@ class TestModifyPositionTpsl:
             "workingType": "MARK_PRICE",
             "priceProtect": "TRUE",
             "closePosition": "true",
+            "placeType": "position",
         }
         binance_client_mock.futures_coin_position_information.assert_awaited_once_with(
             symbol="BTCUSD_PERP"
