@@ -13,7 +13,6 @@ import hashlib
 import logging
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable, Mapping
-from contextlib import suppress
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
@@ -36,6 +35,13 @@ from unified_trading_execution.adapter import (
     PositionProtectionCapability,
     RateLimits,
     TrailingCapability,
+)
+from unified_trading_execution.binance.coin_m_algo import (
+    COIN_M_ALGO_ENDPOINTS,
+    COIN_M_ALGO_METHODS,
+    COIN_M_ALGO_ORDER_PATH,
+    COIN_M_ALL_ALGO_ORDERS_PATH,
+    COIN_M_OPEN_ALGO_ORDERS_PATH,
 )
 from unified_trading_execution.binance.config import BinanceConfig
 from unified_trading_execution.binance.enums import (
@@ -585,7 +591,7 @@ class BinanceAdapter(Adapter):
         product: BinanceProduct,
         symbol: str,
     ) -> OrderReference:
-        conditional = product == BinanceProduct.USD_M and record.order_type in (
+        conditional = product in _FUTURES_PRODUCTS and record.order_type in (
             OrderType.STOP,
             OrderType.STOP_LIMIT,
         )
@@ -876,10 +882,10 @@ class BinanceAdapter(Adapter):
                 await self._handle_order_update(product, order, timestamp)
                 return
 
-            if product == BinanceProduct.USD_M and event_type == "ALGO_UPDATE":
+            if product in _FUTURES_PRODUCTS and event_type == "ALGO_UPDATE":
                 order = message.get("o")
                 if not isinstance(order, dict):
-                    raise PlatformError("Binance USDⓈ-M ALGO_UPDATE has no order object")
+                    raise PlatformError("Binance Futures ALGO_UPDATE has no order object")
                 await self._handle_order_update(
                     product,
                     order,
@@ -1324,10 +1330,25 @@ class BinanceAdapter(Adapter):
                 params["orderId"] = reference.platform_order_id
         if reference.conditional:
             try:
-                await self._run_order_request(
-                    reference.product,
-                    lambda: getattr(client, method_names[reference.product])(**params),
-                )
+                if reference.product == BinanceProduct.COIN_M:
+                    algo_id = reference.platform_order_id
+                    if algo_id is None:
+                        algo_id = await self._coin_m_algo_id_for_client_order(
+                            symbol=reference.symbol,
+                            client_algo_id=client_order_id,
+                        )
+                    if algo_id is None:
+                        raise OrderNotFoundError(f"COIN-M algo order {client_order_id} is not open")
+                    await self._run_coin_m_algo_request(
+                        "DELETE",
+                        COIN_M_ALGO_ORDER_PATH,
+                        {"symbol": reference.symbol, "algoId": algo_id},
+                    )
+                else:
+                    await self._run_order_request(
+                        reference.product,
+                        lambda: getattr(client, method_names[reference.product])(**params),
+                    )
             except OrderNotFoundError:
                 current = await self._wait_for_conditional_terminal_order(client_order_id)
                 if current is None:
@@ -1435,57 +1456,96 @@ class BinanceAdapter(Adapter):
                 params["origClientOrderId"] = client_order_id
             else:
                 params["orderId"] = reference.platform_order_id
-        try:
-            response = await self._run_order_request(
-                reference.product,
-                lambda: getattr(client, method_names[reference.product])(**params),
-            )
-        except OrderNotFoundError:
-            history_methods = {
-                (BinanceProduct.SPOT, False): "get_all_orders",
-                (BinanceProduct.USD_M, False): "futures_get_all_orders",
-                (BinanceProduct.USD_M, True): "futures_get_all_algo_orders",
-                (BinanceProduct.COIN_M, False): "futures_coin_get_all_orders",
-            }
-            history_method = history_methods.get((reference.product, reference.conditional))
-            if history_method is None:
+        if reference.product == BinanceProduct.COIN_M and reference.conditional:
+            algo_id = reference.platform_order_id
+            if algo_id is None:
+                algo_id = await self._coin_m_algo_id_for_client_order(
+                    symbol=reference.symbol,
+                    client_algo_id=client_order_id,
+                    include_history=True,
+                )
+            if algo_id is None:
                 return None
-            history = await self._run_order_request(
-                reference.product,
-                lambda: getattr(client, history_method)(symbol=reference.symbol),
-            )
-            if not isinstance(history, list):
-                raise PlatformError(
-                    f"Binance {reference.product.value} order history response is not a list"
-                ) from None
-            for entry in history:
-                if not isinstance(entry, dict):
+            try:
+                response = await self._run_coin_m_algo_request(
+                    "GET",
+                    COIN_M_ALGO_ORDER_PATH,
+                    {"symbol": reference.symbol, "algoId": algo_id},
+                )
+            except OrderNotFoundError:
+                history = await self._run_coin_m_algo_request(
+                    "GET",
+                    COIN_M_ALL_ALGO_ORDERS_PATH,
+                    {"symbol": reference.symbol},
+                )
+                entries = self._response_list(
+                    history,
+                    BinanceProduct.COIN_M,
+                    "algo order history",
+                )
+                response = next(
+                    (
+                        entry
+                        for entry in entries
+                        if str(entry.get("algoId")) == algo_id
+                        or entry.get("clientAlgoId") == client_order_id
+                    ),
+                    None,
+                )
+                if response is None:
+                    return None
+        else:
+            try:
+                response = await self._run_order_request(
+                    reference.product,
+                    lambda: getattr(client, method_names[reference.product])(**params),
+                )
+            except OrderNotFoundError:
+                history_methods = {
+                    (BinanceProduct.SPOT, False): "get_all_orders",
+                    (BinanceProduct.USD_M, False): "futures_get_all_orders",
+                    (BinanceProduct.USD_M, True): "futures_get_all_algo_orders",
+                    (BinanceProduct.COIN_M, False): "futures_coin_get_all_orders",
+                }
+                history_method = history_methods.get((reference.product, reference.conditional))
+                if history_method is None:
+                    return None
+                history = await self._run_order_request(
+                    reference.product,
+                    lambda: getattr(client, history_method)(symbol=reference.symbol),
+                )
+                if not isinstance(history, list):
                     raise PlatformError(
-                        f"Binance {reference.product.value} order history "
-                        "contains a non-object entry"
+                        f"Binance {reference.product.value} order history response is not a list"
                     ) from None
-            id_field = "algoId" if reference.conditional else "orderId"
-            client_id_field = "clientAlgoId" if reference.conditional else "clientOrderId"
-            response = next(
-                (
-                    entry
-                    for entry in history
-                    if isinstance(entry, dict)
-                    and (
-                        (
-                            reference.platform_order_id is not None
-                            and str(entry.get(id_field)) == reference.platform_order_id
+                for entry in history:
+                    if not isinstance(entry, dict):
+                        raise PlatformError(
+                            f"Binance {reference.product.value} order history "
+                            "contains a non-object entry"
+                        ) from None
+                id_field = "algoId" if reference.conditional else "orderId"
+                client_id_field = "clientAlgoId" if reference.conditional else "clientOrderId"
+                response = next(
+                    (
+                        entry
+                        for entry in history
+                        if isinstance(entry, dict)
+                        and (
+                            (
+                                reference.platform_order_id is not None
+                                and str(entry.get(id_field)) == reference.platform_order_id
+                            )
+                            or (
+                                reference.platform_order_id is None
+                                and entry.get(client_id_field) == client_order_id
+                            )
                         )
-                        or (
-                            reference.platform_order_id is None
-                            and entry.get(client_id_field) == client_order_id
-                        )
-                    )
-                ),
-                None,
-            )
-            if response is None:
-                return None
+                    ),
+                    None,
+                )
+                if response is None:
+                    return None
         response_entry = _order_response(response)
         if reference.conditional:
             resolved = await self._resolve_conditional_actual_order(
@@ -1528,14 +1588,19 @@ class BinanceAdapter(Adapter):
             or actual_order_id in (None, "")
         ):
             return None
-        if reference.product != BinanceProduct.USD_M:
+        if reference.product not in _FUTURES_PRODUCTS:
             raise PlatformError(
-                "Binance conditional actual-order lookup is only supported for USDⓈ-M Futures"
+                "Binance conditional actual-order lookup requires a Futures product"
             )
+        actual_order_method = (
+            client.futures_get_order
+            if reference.product == BinanceProduct.USD_M
+            else client.futures_coin_get_order
+        )
         try:
             response = await self._run_order_request(
                 reference.product,
-                lambda: client.futures_get_order(
+                lambda: actual_order_method(
                     symbol=reference.symbol,
                     orderId=str(actual_order_id),
                 ),
@@ -1608,6 +1673,34 @@ class BinanceAdapter(Adapter):
         request: Callable[[], Awaitable[object]],
     ) -> object:
         return await self._dispatch_request(product, self._require_client(), request)
+
+    async def _run_coin_m_algo_request(
+        self,
+        method: str,
+        path: str,
+        params: Mapping[str, str | int],
+    ) -> object:
+        """Call an allowlisted COIN-M algo endpoint through the SDK's signer."""
+        normalized_method = method.upper()
+        if normalized_method not in COIN_M_ALGO_METHODS:
+            raise ValueError(f"Unsupported COIN-M algo method {method!r}")
+        if path not in COIN_M_ALGO_ENDPOINTS:
+            raise ValueError(f"Unsupported COIN-M algo endpoint {path!r}")
+
+        client = self._require_client()
+        request = partial(
+            client._request_futures_coin_api,
+            normalized_method.lower(),
+            path,
+            signed=True,
+            version=1,
+            data=dict(params),
+        )
+        return await self._dispatch_request(
+            BinanceProduct.COIN_M,
+            client,
+            request,
+        )
 
     async def _run_market_data_request(
         self,
@@ -1795,21 +1888,20 @@ class BinanceAdapter(Adapter):
     def position_protection_capability(
         self, instrument: Instrument
     ) -> PositionProtectionCapability:
-        """Declare static position TP/SL support for USDⓈ-M Futures.
+        """Declare static position TP/SL support for Binance Futures.
 
         Binance has no position-attached TP/SL field, so protection is a
         pair of conditional algo orders identified by deterministic
         ``clientAlgoId`` values. Writes preserve the unmentioned side and
         trigger on ``CONTRACT_PRICE`` (last) or ``MARK_PRICE``. Repricing
-        cancels then places, so ``reprice_gap`` is true. Spot has no
-        position legs and COIN-M has no public algo-order route in the
-        pinned SDK, so both report the unsupported default.
+        cancels then places, so ``reprice_gap`` is true. COIN-M uses signed
+        REST calls because the pinned SDK does not expose public algo wrappers.
         """
         try:
             product = product_for_instrument(instrument)
         except InvalidSymbolError:
             return super().position_protection_capability(instrument)
-        if product is not BinanceProduct.USD_M:
+        if product not in _FUTURES_PRODUCTS:
             return super().position_protection_capability(instrument)
 
         return PositionProtectionCapability(
@@ -2028,6 +2120,154 @@ class BinanceAdapter(Adapter):
     # Position protection and native trailing
     # ------------------------------------------------------------------
 
+    async def _coin_m_open_algo_orders(
+        self,
+        symbol: str | None = None,
+    ) -> list[dict[str, object]]:
+        params: dict[str, str | int] = {} if symbol is None else {"symbol": symbol}
+        response = await self._run_coin_m_algo_request(
+            "GET",
+            COIN_M_OPEN_ALGO_ORDERS_PATH,
+            params,
+        )
+        return self._response_list(response, BinanceProduct.COIN_M, "open algo orders")
+
+    async def _coin_m_algo_id_for_client_order(
+        self,
+        *,
+        symbol: str,
+        client_algo_id: str,
+        include_history: bool = False,
+    ) -> str | None:
+        rows = await self._coin_m_open_algo_orders(symbol)
+        matching = next(
+            (row for row in rows if row.get("clientAlgoId") == client_algo_id),
+            None,
+        )
+        if matching is None and include_history:
+            response = await self._run_coin_m_algo_request(
+                "GET",
+                COIN_M_ALL_ALGO_ORDERS_PATH,
+                {"symbol": symbol},
+            )
+            history = self._response_list(
+                response,
+                BinanceProduct.COIN_M,
+                "algo order history",
+            )
+            matching = next(
+                (row for row in history if row.get("clientAlgoId") == client_algo_id),
+                None,
+            )
+        if matching is None:
+            return None
+        algo_id = matching.get("algoId")
+        if not isinstance(algo_id, (str, int)) or not str(algo_id):
+            raise PlatformError(
+                f"COIN-M algo order {client_algo_id} has no algoId",
+                platform_error=matching,
+            )
+        return str(algo_id)
+
+    async def _cancel_coin_m_protection_order(
+        self,
+        *,
+        symbol: str,
+        client_algo_id: str,
+    ) -> None:
+        matching = [
+            row
+            for row in await self._coin_m_open_algo_orders(symbol)
+            if row.get("clientAlgoId") == client_algo_id
+        ]
+        for row in matching:
+            algo_id = row.get("algoId")
+            if not isinstance(algo_id, (str, int)) or not str(algo_id):
+                raise PlatformError(
+                    "COIN-M protection algo order has no algoId",
+                    platform_error=row,
+                )
+            try:
+                await self._run_coin_m_algo_request(
+                    "DELETE",
+                    COIN_M_ALGO_ORDER_PATH,
+                    {"symbol": symbol, "algoId": str(algo_id)},
+                )
+            except OrderNotFoundError:
+                if any(
+                    open_row.get("clientAlgoId") == client_algo_id
+                    for open_row in await self._coin_m_open_algo_orders(symbol)
+                ):
+                    raise
+
+        if not matching:
+            return
+
+        if any(
+            row.get("clientAlgoId") == client_algo_id
+            for row in await self._coin_m_open_algo_orders(symbol)
+        ):
+            raise PlatformError(
+                f"Binance accepted cancellation but COIN-M protection for {symbol} is still open"
+            )
+
+    async def _cancel_usd_m_protection_order(
+        self,
+        *,
+        symbol: str,
+        client_algo_id: str,
+    ) -> None:
+        """Cancel an owned USDⓈ-M algo by numeric algoId, not clientAlgoId."""
+        product = BinanceProduct.USD_M
+        client = self._require_client()
+        response = await self._run_order_request(
+            product,
+            partial(client.futures_get_open_algo_orders, symbol=symbol),
+        )
+        entries = self._response_list(response, product, "open algo orders")
+        matching = [entry for entry in entries if entry.get("clientAlgoId") == client_algo_id]
+        if not matching:
+            return
+        for entry in matching:
+            algo_id = entry.get("algoId")
+            if not isinstance(algo_id, (str, int)) or not str(algo_id):
+                raise PlatformError(
+                    "USDⓈ-M protection algo order has no algoId",
+                    platform_error=entry,
+                )
+
+            try:
+                await self._run_order_request(
+                    product,
+                    partial(
+                        client.futures_cancel_algo_order,
+                        symbol=symbol,
+                        algoId=algo_id,
+                    ),
+                )
+            except OrderNotFoundError:
+                remaining = await self._run_order_request(
+                    product,
+                    partial(client.futures_get_open_algo_orders, symbol=symbol),
+                )
+                if any(
+                    row.get("clientAlgoId") == client_algo_id
+                    for row in self._response_list(remaining, product, "open algo orders")
+                ):
+                    raise
+
+        remaining = await self._run_order_request(
+            product,
+            partial(client.futures_get_open_algo_orders, symbol=symbol),
+        )
+        if any(
+            entry.get("clientAlgoId") == client_algo_id
+            for entry in self._response_list(remaining, product, "open algo orders")
+        ):
+            raise PlatformError(
+                f"Binance accepted cancellation but USDⓈ-M protection for {symbol} is still open"
+            )
+
     async def _resolve_protection_target(
         self,
         instrument: Instrument,
@@ -2035,10 +2275,9 @@ class BinanceAdapter(Adapter):
     ) -> tuple[str, PositionLeg]:
         """Resolve the venue symbol and parsed leg for a protection call."""
         product = product_for_instrument(instrument)
-        if product is not BinanceProduct.USD_M:
+        if product not in _FUTURES_PRODUCTS:
             raise UnsupportedOrderTypeError(
-                f"Binance {product.value} position protection is not supported; "
-                "only USDⓈ-M Futures exposes a public conditional-order route"
+                f"Binance {product.value} position protection is not supported"
             )
         _, symbol, _ = await self._resolve_market_symbol(instrument)
         leg = parse_position_id(product, position_id)
@@ -2059,9 +2298,14 @@ class BinanceAdapter(Adapter):
         """Return the signed quantity of the open leg, ``None`` when flat."""
         product = product_for_instrument(instrument)
         client = self._require_client()
+        method_name = (
+            "futures_position_information"
+            if product == BinanceProduct.USD_M
+            else "futures_coin_position_information"
+        )
         response = await self._run_order_request(
             product,
-            partial(client.futures_position_information, symbol=symbol),
+            partial(getattr(client, method_name), symbol=symbol),
         )
         for entry in self._response_list(response, product, "position information"):
             position = translate_position(
@@ -2082,24 +2326,28 @@ class BinanceAdapter(Adapter):
         stop_loss: TpSlAttachment | None = None,
         trigger_basis: TrailingBasis | None = None,
     ) -> None:
-        """Attach or replace TP/SL on one USDⓈ-M position leg.
+        """Attach or replace TP/SL on one USDⓈ-M or COIN-M position leg.
 
         Each mentioned side is replaced by cancel-then-place of its
         deterministic ``clientAlgoId`` conditional order; unmentioned sides
         are never touched. Market-on-trigger attachments use
         ``closePosition`` so the venue tracks live leg size; limit
-        attachments snapshot the current quantity. ``trigger_basis`` maps
-        ``LAST`` to ``CONTRACT_PRICE`` and ``MARK`` to ``MARK_PRICE``.
+        attachments snapshot the current quantity on both products.
+        ``trigger_basis`` maps ``LAST`` to ``CONTRACT_PRICE`` and ``MARK``
+        to ``MARK_PRICE``.
         """
         if take_profit is None and stop_loss is None:
             raise ValueError("at least one of take_profit or stop_loss must be provided")
         symbol, leg = await self._resolve_protection_target(instrument, position_id)
         quantity = await self._position_leg_quantity(instrument, position_id, symbol=symbol)
         if quantity is None:
-            raise OrderNotFoundError(f"No open USDⓈ-M position {position_id!r} for {symbol}")
+            product_label = "USDⓈ-M" if leg.product == BinanceProduct.USD_M else "COIN-M"
+            raise OrderNotFoundError(
+                f"No open {product_label} position {position_id!r} for {symbol}"
+            )
 
         client = self._require_client()
-        product = BinanceProduct.USD_M
+        product = leg.product
         writes: list[tuple[str, dict[str, object]]] = []
         for side, attachment in (
             (ProtectionSide.TAKE_PROFIT, take_profit),
@@ -2109,6 +2357,7 @@ class BinanceAdapter(Adapter):
                 continue
             client_algo_id = protection_client_id(leg, side)
             payload = build_algo_order_payload(
+                product=product,
                 symbol=symbol,
                 position_side=leg.position_side,
                 leg_quantity=quantity,
@@ -2120,15 +2369,25 @@ class BinanceAdapter(Adapter):
             writes.append((client_algo_id, payload))
 
         for client_algo_id, payload in writes:
-            with suppress(OrderNotFoundError):
-                await self._run_order_request(
-                    product,
-                    partial(client.futures_cancel_algo_order, clientAlgoId=client_algo_id),
+            if product == BinanceProduct.USD_M:
+                await self._cancel_usd_m_protection_order(
+                    symbol=symbol,
+                    client_algo_id=client_algo_id,
                 )
-            response = await self._run_order_request(
-                product,
-                partial(client.futures_create_algo_order, **payload),
-            )
+                response = await self._run_order_request(
+                    product,
+                    partial(client.futures_create_algo_order, **payload),
+                )
+            else:
+                await self._cancel_coin_m_protection_order(
+                    symbol=symbol,
+                    client_algo_id=client_algo_id,
+                )
+                response = await self._run_coin_m_algo_request(
+                    "POST",
+                    COIN_M_ALGO_ORDER_PATH,
+                    {key: value for key, value in payload.items() if isinstance(value, (str, int))},
+                )
             result = parse_order_result(
                 _order_response(response),
                 client_order_id=client_algo_id,
@@ -2145,36 +2404,40 @@ class BinanceAdapter(Adapter):
         instrument: Instrument,
         position_id: str,
     ) -> tuple[TpSlAttachment | None, TpSlAttachment | None] | None:
-        """Read adapter-owned TP/SL on one USDⓈ-M position leg.
+        """Read adapter-owned TP/SL on one Futures position leg.
 
         Returns ``(take_profit, stop_loss)`` with ``None`` per absent side,
         or ``None`` when the leg is flat or the product cannot serve
         protection reads. Only orders carrying this adapter's deterministic
-        ``clientAlgoId`` prefix count; externally placed Binance TP/SL is
-        not visible here.
+        ``clientAlgoId`` count; externally placed Binance TP/SL is not
+        visible here. COIN-M reads use its signed algo REST endpoint.
         """
         try:
             product = product_for_instrument(instrument)
         except InvalidSymbolError:
             return None
-        if product is not BinanceProduct.USD_M:
+        if product not in _FUTURES_PRODUCTS:
             return None
         symbol, leg = await self._resolve_protection_target(instrument, position_id)
         quantity = await self._position_leg_quantity(instrument, position_id, symbol=symbol)
         if quantity is None:
             return None
 
-        client = self._require_client()
-        response = await self._run_order_request(
-            product,
-            partial(client.futures_get_open_algo_orders, symbol=symbol),
-        )
+        if product == BinanceProduct.USD_M:
+            client = self._require_client()
+            response = await self._run_order_request(
+                product,
+                partial(client.futures_get_open_algo_orders, symbol=symbol),
+            )
+            entries = self._response_list(response, product, "open algo orders")
+        else:
+            entries = await self._coin_m_open_algo_orders(symbol)
         expected = {
             protection_client_id(leg, ProtectionSide.TAKE_PROFIT),
             protection_client_id(leg, ProtectionSide.STOP_LOSS),
         }
         found: dict[ProtectionSide, ProtectionOrder] = {}
-        for entry in self._response_list(response, product, "open algo orders"):
+        for entry in entries:
             client_algo_id = entry.get("clientAlgoId")
             if not isinstance(client_algo_id, str) or client_algo_id not in expected:
                 continue
@@ -2215,8 +2478,7 @@ class BinanceAdapter(Adapter):
         if not take_profit and not stop_loss:
             raise ValueError("at least one of take_profit or stop_loss must be true")
         _, leg = await self._resolve_protection_target(instrument, position_id)
-        client = self._require_client()
-        product = BinanceProduct.USD_M
+        product = leg.product
         sides = []
         if take_profit:
             sides.append(ProtectionSide.TAKE_PROFIT)
@@ -2224,10 +2486,15 @@ class BinanceAdapter(Adapter):
             sides.append(ProtectionSide.STOP_LOSS)
         for side in sides:
             client_algo_id = protection_client_id(leg, side)
-            with suppress(OrderNotFoundError):
-                await self._run_order_request(
-                    product,
-                    partial(client.futures_cancel_algo_order, clientAlgoId=client_algo_id),
+            if product == BinanceProduct.USD_M:
+                await self._cancel_usd_m_protection_order(
+                    symbol=leg.symbol,
+                    client_algo_id=client_algo_id,
+                )
+            else:
+                await self._cancel_coin_m_protection_order(
+                    symbol=leg.symbol,
+                    client_algo_id=client_algo_id,
                 )
 
     async def place_trailing_stop(self, request: NativeTrailingRequest) -> NativeTrailingResult:
@@ -3034,6 +3301,12 @@ class BinanceAdapter(Adapter):
                     raise PlatformError(
                         f"Cannot change Binance {setting} while USDⓈ-M open algo orders exist"
                     )
+            else:
+                algo_orders = await self._coin_m_open_algo_orders(symbol)
+                if algo_orders:
+                    raise PlatformError(
+                        f"Cannot change Binance {setting} while COIN-M open algo orders exist"
+                    )
 
             positions = await self._futures_position_risk(
                 current_product,
@@ -3624,6 +3897,24 @@ class BinanceAdapter(Adapter):
                             reference.platform_order_id,
                         )
                     )
+        coin_m_algo_orders = await self._coin_m_open_algo_orders()
+        for entry in coin_m_algo_orders:
+            order = await self._translate_snapshot_order(
+                BinanceProduct.COIN_M,
+                entry,
+                conditional=True,
+            )
+            if order is not None:
+                orders[order.client_order_id] = order
+                reference = self._order_refs[order.client_order_id]
+                if reference.platform_order_id is not None:
+                    open_ids.add(
+                        self._order_identity(
+                            BinanceProduct.COIN_M,
+                            reference.symbol,
+                            reference.platform_order_id,
+                        )
+                    )
         self._open_order_ids = open_ids
         for client_order_id in previous_order_references.difference(orders):
             self._forget_order_reference(client_order_id)
@@ -3784,6 +4075,13 @@ class BinanceAdapter(Adapter):
         *,
         conditional: bool = False,
     ) -> OrderRecord | None:
+        raw_client_id = entry.get("clientAlgoId", entry.get("clientOrderId"))
+        if (
+            conditional
+            and isinstance(raw_client_id, str)
+            and is_protection_client_id(raw_client_id)
+        ):
+            return None
         instrument = await self._resolve_stream_instrument(
             product,
             entry.get("symbol"),
@@ -3796,9 +4094,6 @@ class BinanceAdapter(Adapter):
             instrument=instrument,
             conditional=conditional,
         )
-        if conditional and is_protection_client_id(order.client_order_id):
-            # Adapter-owned position protection stays out of the order mirror.
-            return None
         reference = OrderReference(
             product=product,
             symbol=str(entry.get("symbol")),

@@ -1,4 +1,4 @@
-"""Opt-in USDⓈ-M Demo/Testnet coverage for position TP/SL protection.
+"""Opt-in Futures Demo/Testnet coverage for position TP/SL protection.
 
 Places one tiny test-owned position, attaches market-on-trigger TP/SL
 through the adapter's conditional algo orders, verifies read-back,
@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import Awaitable, Callable
-from decimal import ROUND_CEILING, Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from uuid import uuid4
 
 import pytest
@@ -22,7 +22,7 @@ from unified_trading_execution.binance.protection import (
     is_protection_client_id,
     parse_position_id,
 )
-from unified_trading_execution.errors import OrderNotFoundError, UnsupportedOrderTypeError
+from unified_trading_execution.errors import OrderNotFoundError
 from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
@@ -34,30 +34,65 @@ from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import TpSlAttachment, UnifiedOrder
 from unified_trading_execution.types.position import Position
 
-_SYMBOL = "BTCUSDT"
-_INSTRUMENT = Instrument(
-    symbol="BTC",
-    quote_currency="USDT",
-    currency="USDT",
-    asset_class=AssetClass.FUTURES,
-    multiplier=1,
-    platform_symbol=_SYMBOL,
+_FUTURES_CASES = (
+    pytest.param(
+        "usd_m",
+        BinanceProduct.USD_M,
+        "BTCUSDT",
+        "usd_m:BTCUSDT:BOTH",
+        "usd_m",
+        id="usd-m",
+    ),
+    pytest.param(
+        "coin_m",
+        BinanceProduct.COIN_M,
+        "BTCUSD_PERP",
+        "coin_m:BTCUSD_PERP:BOTH",
+        "coin_m",
+        id="coin-m",
+    ),
 )
-_MAX_TEST_NOTIONAL_USD = Decimal("25")
+_USD_M_TEST_NOTIONAL_TARGET = Decimal("60")
+_USD_M_TEST_NOTIONAL_CAP = Decimal("75")
+_COIN_M_TEST_NOTIONAL_CAP = Decimal("150")
+
+
+def _instrument(product: BinanceProduct, symbol: str) -> Instrument:
+    if product == BinanceProduct.USD_M:
+        return Instrument(
+            symbol="BTC",
+            quote_currency="USDT",
+            currency="USDT",
+            asset_class=AssetClass.FUTURES,
+            multiplier=1,
+            platform_symbol=symbol,
+        )
+    return Instrument(
+        symbol="BTC",
+        quote_currency="USD",
+        currency="BTC",
+        asset_class=AssetClass.FUTURES,
+        multiplier=100,
+        platform_symbol=symbol,
+    )
 
 
 def _ceil_to_step(value: Decimal, step: Decimal) -> Decimal:
     return (value / step).to_integral_value(rounding=ROUND_CEILING) * step
 
 
-async def _wait_for_position(adapter: BinanceAdapter) -> Position:
+def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
+    return (value / step).to_integral_value(rounding=ROUND_FLOOR) * step
+
+
+async def _wait_for_position(adapter: BinanceAdapter, position_id: str) -> Position:
     for _ in range(20):
         positions = await adapter.fetch_positions()
         for position in positions:
-            if position.position_id == "usd_m:BTCUSDT:BOTH" and position.quantity != 0:
+            if position.position_id == position_id and position.quantity != 0:
                 return position
         await asyncio.sleep(0.5)
-    raise AssertionError(f"No open one-way {_SYMBOL} position appeared after order placement")
+    raise AssertionError(f"No open one-way {position_id} position appeared after order placement")
 
 
 async def _wait_for_flat(adapter: BinanceAdapter, position_id: str) -> None:
@@ -72,47 +107,70 @@ async def _wait_for_flat(adapter: BinanceAdapter, position_id: str) -> None:
 
 
 @pytest.mark.parametrize(
-    ("binance_order_config"),
-    ["usd_m"],
+    ("product_key", "product", "symbol", "position_id", "binance_order_config"),
+    _FUTURES_CASES,
     indirect=["binance_order_config"],
 )
 async def test_position_tpsl_lifecycle(
+    product_key: str,
+    product: BinanceProduct,
+    symbol: str,
+    position_id: str,
     binance_order_config: BinanceConfig,
     require_clean_futures_symbol: Callable[[BinanceAdapter, BinanceProduct, str], Awaitable[None]],
 ) -> None:
     adapter = BinanceAdapter(binance_order_config)
-    position_id: str | None = None
+    instrument = _instrument(product, symbol)
     entry_client_order_id: str | None = None
     entry_order_attempted = False
     entry_filled_quantity = Decimal("0")
+    protection_write_attempted = False
     try:
         await adapter.connect()
         client = adapter._client
         if client is None:
             raise AssertionError("Connected adapter has no Binance REST client")
-        await require_clean_futures_symbol(adapter, BinanceProduct.USD_M, _SYMBOL)
+        await require_clean_futures_symbol(adapter, product, symbol)
         if await adapter.get_position_mode() is not PositionMode.ONE_WAY:
             pytest.skip(
                 "Position protection integration test requires one-way mode for safe cleanup"
             )
-        position_id = "usd_m:BTCUSDT:BOTH"
 
-        spec = await adapter.fetch_instrument_spec(_INSTRUMENT)
-        ticker = await adapter.fetch_ticker(_INSTRUMENT)
+        spec = await adapter.fetch_instrument_spec(instrument)
+        ticker = await adapter.fetch_ticker(instrument)
         assert ticker is not None and ticker.mark is not None
         mark = ticker.mark
-        quantity = max(
-            spec.min_qty,
-            _ceil_to_step(_MAX_TEST_NOTIONAL_USD / mark, spec.lot_size),
-        )
-        if quantity * mark > _MAX_TEST_NOTIONAL_USD * Decimal("1.5"):
-            pytest.skip("Minimum USDⓈ-M quantity exceeds the test notional cap")
+        if product == BinanceProduct.COIN_M:
+            contract_value = Decimal(str(instrument.multiplier))
+            minimum_notional_quantity = (
+                spec.min_notional / contract_value if spec.min_notional > 0 else Decimal("0")
+            )
+            quantity = _ceil_to_step(
+                max(spec.min_qty, minimum_notional_quantity),
+                spec.lot_size,
+            )
+            test_notional = quantity * contract_value
+            notional_cap = _COIN_M_TEST_NOTIONAL_CAP
+        else:
+            quantity = max(
+                spec.min_qty,
+                _ceil_to_step(
+                    max(_USD_M_TEST_NOTIONAL_TARGET, spec.min_notional) / mark,
+                    spec.lot_size,
+                ),
+            )
+            test_notional = quantity * mark
+            notional_cap = _USD_M_TEST_NOTIONAL_CAP
+        if test_notional > notional_cap:
+            pytest.skip(
+                f"Minimum {product.value} position exceeds the {notional_cap} USD test notional cap"
+            )
 
-        entry_client_order_id = f"pptp-entry-{uuid4().hex[:20]}"
+        entry_client_order_id = f"pptp-{product_key[0]}-entry-{uuid4().hex[:16]}"
         entry_order_attempted = True
         entry_result = await adapter.place_order(
             UnifiedOrder(
-                instrument=_INSTRUMENT,
+                instrument=instrument,
                 order_type=OrderType.MARKET,
                 side=OrderSide.BUY,
                 quantity=quantity,
@@ -121,29 +179,37 @@ async def test_position_tpsl_lifecycle(
             )
         )
         entry_filled_quantity = entry_result.filled_quantity
-        leg = await _wait_for_position(adapter)
-        leg_side = parse_position_id(BinanceProduct.USD_M, position_id)
-        assert leg_side.symbol == _SYMBOL
+        leg = await _wait_for_position(adapter, position_id)
+        leg_side = parse_position_id(product, position_id)
+        assert leg_side.symbol == symbol
         long_leg = leg.quantity > 0
 
-        # Flat-leg read reports no position.
-        assert await adapter.get_position_tpsl(_INSTRUMENT, "usd_m:BTCUSDT:BOTH") in (
-            None,
-            (None, None),
-        )
+        # Position read reports no protection before attachment.
+        assert await adapter.get_position_tpsl(instrument, position_id) in (None, (None, None))
 
         # Attach market-on-trigger protection far from mark.
-        stop_trigger = mark * (Decimal("0.5") if long_leg else Decimal("2"))
-        tp_trigger = mark * (Decimal("2") if long_leg else Decimal("0.5"))
+        raw_stop_trigger = mark * (Decimal("0.5") if long_leg else Decimal("2"))
+        raw_tp_trigger = mark * (Decimal("2") if long_leg else Decimal("0.5"))
+        stop_trigger = (
+            _floor_to_step(raw_stop_trigger, spec.tick_size)
+            if long_leg
+            else _ceil_to_step(raw_stop_trigger, spec.tick_size)
+        )
+        tp_trigger = (
+            _ceil_to_step(raw_tp_trigger, spec.tick_size)
+            if long_leg
+            else _floor_to_step(raw_tp_trigger, spec.tick_size)
+        )
+        protection_write_attempted = True
         await adapter.modify_position_tpsl(
-            _INSTRUMENT,
+            instrument,
             position_id,
             stop_loss=TpSlAttachment(trigger_price=stop_trigger),
             take_profit=TpSlAttachment(trigger_price=tp_trigger),
             trigger_basis=TrailingBasis.MARK,
         )
 
-        confirmed = await adapter.get_position_tpsl(_INSTRUMENT, position_id)
+        confirmed = await adapter.get_position_tpsl(instrument, position_id)
         assert confirmed is not None
         tp, sl = confirmed
         assert tp is not None and tp.trigger_price == tp_trigger
@@ -151,25 +217,55 @@ async def test_position_tpsl_lifecycle(
         assert tp.limit_price is None and sl.limit_price is None
 
         # Reprice the stop; take profit must be preserved untouched.
-        new_stop = stop_trigger * Decimal("0.9") if long_leg else stop_trigger * Decimal("1.1")
+        raw_new_stop = stop_trigger * Decimal("0.9") if long_leg else stop_trigger * Decimal("1.1")
+        new_stop = (
+            _floor_to_step(raw_new_stop, spec.tick_size)
+            if long_leg
+            else _ceil_to_step(raw_new_stop, spec.tick_size)
+        )
         await adapter.modify_position_tpsl(
-            _INSTRUMENT,
+            instrument,
             position_id,
             stop_loss=TpSlAttachment(trigger_price=new_stop),
         )
-        confirmed = await adapter.get_position_tpsl(_INSTRUMENT, position_id)
+        confirmed = await adapter.get_position_tpsl(instrument, position_id)
         assert confirmed is not None
         tp, sl = confirmed
         assert sl is not None and sl.trigger_price == new_stop
         assert tp is not None and tp.trigger_price == tp_trigger
 
         # Clearing one side preserves the other.
-        await adapter.clear_position_tpsl(_INSTRUMENT, position_id, stop_loss=True)
-        confirmed = await adapter.get_position_tpsl(_INSTRUMENT, position_id)
+        await adapter.clear_position_tpsl(instrument, position_id, stop_loss=True)
+        confirmed = await adapter.get_position_tpsl(instrument, position_id)
         assert confirmed is not None
         tp, sl = confirmed
         assert sl is None
         assert tp is not None and tp.trigger_price == tp_trigger
+
+        # A limit-trigger attachment round-trips both prices. Values stay
+        # inside the venue price band and far enough from mark to never fill.
+        round_step = _floor_to_step if long_leg else _ceil_to_step
+        limit_trigger = round_step(mark * Decimal("0.8" if long_leg else "1.25"), spec.tick_size)
+        limit_price = round_step(mark * Decimal("0.78" if long_leg else "1.28"), spec.tick_size)
+        await adapter.modify_position_tpsl(
+            instrument,
+            position_id,
+            stop_loss=TpSlAttachment(
+                trigger_price=limit_trigger,
+                limit_price=limit_price,
+            ),
+        )
+        confirmed = await adapter.get_position_tpsl(instrument, position_id)
+        assert confirmed is not None
+        tp, sl = confirmed
+        assert sl is not None
+        assert sl.trigger_price == limit_trigger
+        assert sl.limit_price == limit_price
+        assert tp is not None and tp.trigger_price == tp_trigger
+        await adapter.clear_position_tpsl(instrument, position_id, stop_loss=True)
+        confirmed = await adapter.get_position_tpsl(instrument, position_id)
+        assert confirmed is not None
+        assert confirmed[1] is None
 
         # Protection orders stay out of the ordinary order mirror.
         open_orders = await adapter.fetch_open_orders()
@@ -180,35 +276,11 @@ async def test_position_tpsl_lifecycle(
         ]
         assert protection_leaks == []
 
-        # Unsupported surfaces stay explicit.
-        with pytest.raises(UnsupportedOrderTypeError):
-            await adapter.modify_position_tpsl(
-                _INSTRUMENT,
-                "coin_m:BTCUSD_PERP:BOTH",
-                stop_loss=TpSlAttachment(trigger_price=Decimal("1")),
-            )
-        assert (
-            await adapter.get_position_tpsl(
-                Instrument(
-                    symbol="BTC",
-                    quote_currency="USD",
-                    currency="BTC",
-                    asset_class=AssetClass.FUTURES,
-                    multiplier=100,
-                    platform_symbol="BTCUSD_PERP",
-                ),
-                "coin_m:BTCUSD_PERP:BOTH",
-            )
-            is None
-        )
+        await adapter.clear_position_tpsl(instrument, position_id, take_profit=True)
+        assert await adapter.get_position_tpsl(instrument, position_id) == (None, None)
     finally:
         try:
-            if (
-                adapter.is_connected
-                and position_id is not None
-                and entry_order_attempted
-                and entry_client_order_id is not None
-            ):
+            if adapter.is_connected and entry_order_attempted and entry_client_order_id is not None:
                 if entry_client_order_id in adapter._order_refs:
                     with contextlib.suppress(OrderNotFoundError):
                         entry_result = await adapter.get_order_by_client_id(entry_client_order_id)
@@ -217,41 +289,52 @@ async def test_position_tpsl_lifecycle(
                                 entry_filled_quantity,
                                 entry_result.filled_quantity,
                             )
-                await adapter.clear_position_tpsl(
-                    _INSTRUMENT, position_id, take_profit=True, stop_loss=True
-                )
-                positions = await adapter.fetch_positions()
-                open_leg = next(
-                    (
-                        position
-                        for position in positions
-                        if position.position_id == position_id and position.quantity != 0
-                    ),
-                    None,
-                )
-                if open_leg is not None:
-                    close_quantity = min(abs(open_leg.quantity), entry_filled_quantity)
-                    if close_quantity == 0:
-                        raise AssertionError(
-                            "Found an open sandbox position but could not confirm any fill "
-                            "for the test entry; refusing to close unowned exposure"
+                try:
+                    if protection_write_attempted:
+                        await adapter.clear_position_tpsl(
+                            instrument, position_id, take_profit=True, stop_loss=True
                         )
-                    await adapter.place_order(
-                        UnifiedOrder(
-                            instrument=_INSTRUMENT,
-                            order_type=OrderType.MARKET,
-                            side=(OrderSide.SELL if open_leg.quantity > 0 else OrderSide.BUY),
-                            quantity=close_quantity,
-                            time_in_force=TimeInForce.GTC,
-                            reduce_only=True,
-                            client_order_id=f"pptp-close-{uuid4().hex[:20]}",
+                        remaining_protections = await adapter.get_position_tpsl(
+                            instrument, position_id
                         )
+                        if remaining_protections not in (None, (None, None)):
+                            raise AssertionError(
+                                f"{product.value} protection cleanup left algo orders: "
+                                f"{remaining_protections!r}"
+                            )
+                finally:
+                    positions = await adapter.fetch_positions()
+                    open_leg = next(
+                        (
+                            position
+                            for position in positions
+                            if position.position_id == position_id and position.quantity != 0
+                        ),
+                        None,
                     )
-                    if close_quantity < abs(open_leg.quantity):
-                        raise AssertionError(
-                            f"Refusing to close sandbox exposure {abs(open_leg.quantity)} "
-                            f"beyond the test entry fill {entry_filled_quantity}"
+                    if open_leg is not None:
+                        if abs(open_leg.quantity) > entry_filled_quantity:
+                            raise AssertionError(
+                                f"Refusing to close sandbox exposure {abs(open_leg.quantity)} "
+                                f"beyond the test entry fill {entry_filled_quantity}"
+                            )
+                        close_quantity = abs(open_leg.quantity)
+                        if close_quantity == 0:
+                            raise AssertionError(
+                                "Found an open sandbox position but could not confirm any fill "
+                                "for the test entry; refusing to close unowned exposure"
+                            )
+                        await adapter.place_order(
+                            UnifiedOrder(
+                                instrument=instrument,
+                                order_type=OrderType.MARKET,
+                                side=(OrderSide.SELL if open_leg.quantity > 0 else OrderSide.BUY),
+                                quantity=close_quantity,
+                                time_in_force=TimeInForce.GTC,
+                                reduce_only=True,
+                                client_order_id=f"pptp-close-{uuid4().hex[:20]}",
+                            )
                         )
-                    await _wait_for_flat(adapter, position_id)
+                        await _wait_for_flat(adapter, position_id)
         finally:
             await adapter.disconnect()

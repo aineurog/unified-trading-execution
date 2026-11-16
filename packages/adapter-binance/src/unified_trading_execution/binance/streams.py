@@ -23,6 +23,7 @@ from unified_trading_execution.types.position import Balance, Position
 _SIDES = {"BUY": OrderSide.BUY, "SELL": OrderSide.SELL}
 _TIME_IN_FORCE = {
     "GTC": TimeInForce.GTC,
+    "GTE_GTC": TimeInForce.GTC,
     "IOC": TimeInForce.IOC,
     "FOK": TimeInForce.FOK,
     "DAY": TimeInForce.DAY,
@@ -186,7 +187,7 @@ def translate_order_entry(
     if side is None:
         raise PlatformError(f"Unknown Binance order side {side_raw!r}")
 
-    raw_type = entry.get("o", entry.get("type"))
+    raw_type = entry.get("o", entry.get("type", entry.get("orderType")))
     order_type = _order_type(raw_type, product)
     raw_tif = entry.get("f", entry.get("timeInForce")) or "GTC"
     time_in_force = _TIME_IN_FORCE.get(str(raw_tif).upper())

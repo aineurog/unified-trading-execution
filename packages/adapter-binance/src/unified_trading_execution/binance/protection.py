@@ -1,11 +1,10 @@
-"""Binance position TP/SL protection via USDⓈ-M conditional algo orders.
+"""Binance position TP/SL protection via Futures conditional algo orders.
 
 Binance Futures has no position-attached TP/SL field: protection is a
-separate conditional order on ``/fapi/v1/algoOrder``. Adapter-owned
-protection is identified by a deterministic ``clientAlgoId`` derived from
-the position leg id, so reads, repricing, and clearing never touch orders
-the adapter did not place. COIN-M exposes no public algo-order methods in
-the pinned SDK and Spot has no position legs, so only USDⓈ-M is served.
+separate conditional algo order. Adapter-owned protection is identified by
+a deterministic ``clientAlgoId`` derived from the position leg id, so reads,
+repricing, and clearing never touch orders the adapter did not place. Spot
+has no position legs.
 """
 
 from __future__ import annotations
@@ -29,7 +28,7 @@ _Metadata: TypeAlias = dict[str, object]
 # Prefix marking adapter-owned protection algo orders. Entries carrying it
 # are excluded from the ordinary order mirror; it is also the ownership
 # proof for reads and clears.
-PROTECTION_CLIENT_ID_PREFIX = "tpsl:"
+PROTECTION_CLIENT_ID_PREFIX = "tpsl-"
 
 _POSITION_SIDES = frozenset({"BOTH", "LONG", "SHORT"})
 _OPEN_ALGO_STATUSES = frozenset({"NEW", "TRIGGERING", "TRIGGERED"})
@@ -109,12 +108,15 @@ def parse_position_id(product: BinanceProduct, position_id: str) -> PositionLeg:
 def protection_client_id(leg: PositionLeg, side: ProtectionSide) -> str:
     """Derive the deterministic ``clientAlgoId`` for one protection side.
 
-    The id embeds symbol and position side rather than the full position id
-    so it stays within Binance's 36-character ``clientAlgoId`` limit; the
-    product is implied because only USDⓈ-M protection is supported.
+    The id embeds symbol and position side rather than the full position id.
+    Product markers keep USDⓈ-M and COIN-M IDs distinct. The generated ID
+    uses URL-safe characters because python-binance 1.0.37 does not encode
+    punctuation consistently when signing Futures requests.
     """
+    product_marker = "c" if leg.product is BinanceProduct.COIN_M else "u"
     return to_binance_client_order_id(
-        f"{PROTECTION_CLIENT_ID_PREFIX}{leg.symbol}:{leg.position_side}:{side.value}"
+        f"{PROTECTION_CLIENT_ID_PREFIX}{product_marker}-{leg.symbol}-"
+        f"{leg.position_side}-{side.value}"
     )
 
 
@@ -163,6 +165,7 @@ def working_type(trigger_basis: TrailingBasis | None) -> str | None:
 
 def build_algo_order_payload(
     *,
+    product: BinanceProduct,
     symbol: str,
     position_side: str,
     leg_quantity: Decimal,
@@ -171,12 +174,15 @@ def build_algo_order_payload(
     trigger_basis: TrailingBasis | None,
     client_algo_id: str,
 ) -> dict[str, object]:
-    """Build ``POST /fapi/v1/algoOrder`` parameters for one protection side.
+    """Build parameters for one product's conditional protection order.
 
     Market-on-trigger attachments use ``closePosition`` so the venue tracks
     the live leg size. Limit attachments snapshot the current leg quantity
     and rest at ``price``; ``reduceOnly`` is sent only in one-way mode where
     the venue accepts it (hedge mode scopes the leg via ``positionSide``).
+    The COIN-M limit-trigger parameter set was verified against Demo
+    ``/dapi/v1/algoOrder`` (``price``/``quantity``/``timeInForce``/
+    ``reduceOnly`` round-trip through create, query, and open orders).
     """
     market = attachment.limit_price is None
     order_type = algo_order_type(side, market=market)
@@ -188,8 +194,9 @@ def build_algo_order_payload(
         "algoType": "CONDITIONAL",
         "triggerPrice": _decimal_string(attachment.trigger_price),
         "clientAlgoId": client_algo_id,
-        "newOrderRespType": "RESULT",
     }
+    if product is BinanceProduct.USD_M:
+        payload["newOrderRespType"] = "RESULT"
     if market:
         payload["closePosition"] = "true"
     else:
