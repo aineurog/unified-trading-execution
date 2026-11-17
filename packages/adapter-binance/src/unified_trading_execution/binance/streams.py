@@ -8,9 +8,14 @@ from typing import Any
 
 from unified_trading_execution.binance.enums import BinanceProduct
 from unified_trading_execution.binance.orders import map_order_status
+from unified_trading_execution.binance.protection import (
+    ProtectionSide,
+    is_protection_client_id,
+)
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.types.enums import (
     FillEntry,
+    FillReason,
     OrderSide,
     OrderStatus,
     OrderType,
@@ -300,6 +305,21 @@ def translate_order_entry(
     )
 
 
+def _fill_reason(client_order_id: str, entry: FillEntry | None) -> FillReason | None:
+    """Classify adapter-owned protection fills as TP/SL triggers.
+
+    ``tpsl-`` client ids end in ``-tp`` or ``-sl``, so a closing fill on one
+    of those orders is by definition a take-profit or stop-loss trigger.
+    """
+    if entry is not FillEntry.OUT or not is_protection_client_id(client_order_id):
+        return None
+    if client_order_id.endswith(f"-{ProtectionSide.TAKE_PROFIT.value}"):
+        return FillReason.TAKE_PROFIT
+    if client_order_id.endswith(f"-{ProtectionSide.STOP_LOSS.value}"):
+        return FillReason.STOP_LOSS
+    return None
+
+
 def translate_fill_entry(
     entry: dict[str, Any],
     *,
@@ -347,6 +367,7 @@ def translate_fill_entry(
         entry.get(key) in (True, "true", "TRUE")
         for key in ("R", "reduceOnly", "cp", "closePosition")
     )
+    entry_direction = FillEntry.OUT if reduce_only else None
 
     return FillRecord(
         client_order_id=client_order_id,
@@ -359,5 +380,6 @@ def translate_fill_entry(
         fee_amount=commission,
         correlation_id=client_order_id,
         position_id=position_id,
-        entry=FillEntry.OUT if reduce_only else None,
+        entry=entry_direction,
+        reason=_fill_reason(client_order_id, entry_direction),
     )

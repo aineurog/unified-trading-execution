@@ -1275,6 +1275,7 @@ class BinanceAdapter(Adapter):
                 position_id,
                 take_profit=order.take_profit,
                 stop_loss=order.stop_loss,
+                trigger_basis=TrailingBasis.MARK,
             )
         except Exception as exc:
             raise PlatformError(
