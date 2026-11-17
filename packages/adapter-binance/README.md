@@ -100,8 +100,13 @@ derives a stable, non-secret label from the API key.
 
 The adapter supports Spot and Futures MARKET/LIMIT orders, Spot STOP/STOP_LIMIT,
 and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. Ordinary
-COIN-M conditional orders, Spot order modification, conditional-order
-modification, and order-level TP/SL attachments are unsupported. Position-level
+COIN-M conditional orders, Spot order modification, and conditional-order
+modification are unsupported. Order-level ``take_profit``/``stop_loss``
+attachments are supported only on Futures MARKET entries: the adapter waits
+for the synchronous fill, resolves the resulting position leg, and attaches
+MARK-basis position protection, failing loudly if the fill is not synchronous
+or no leg remains. Spot, LIMIT/STOP, and ``reduce_only`` attachment
+combinations are rejected. Position-level
 TP/SL is supported separately on both Futures products. Protection
 `trigger_price`/`limit_price` values must align to the symbol's `tickSize`;
 `modify_position_tpsl` rejects unaligned prices with `InvalidOrderError`
