@@ -1,9 +1,8 @@
-"""Binance position TP/SL protection via Futures conditional orders.
+"""Binance position TP/SL protection via Futures conditional algo orders.
 
-USDⓈ-M protection uses conditional algo orders; COIN-M protection uses regular
-conditional orders. Adapter-owned protection is identified by a deterministic
-client order ID derived from the position leg id, so reads, repricing, and
-clearing never touch orders the adapter did not place. Spot has no position legs.
+Adapter-owned protection is identified by a deterministic client algo ID
+derived from the position leg id, so reads, repricing, and clearing never
+touch orders the adapter did not place. Spot has no position legs.
 """
 
 from __future__ import annotations
@@ -172,12 +171,13 @@ def build_algo_order_payload(
     trigger_basis: TrailingBasis | None,
     client_algo_id: str,
 ) -> dict[str, object]:
-    """Build parameters for a USDⓈ-M algo protection order.
+    """Build parameters for a Futures algo protection order.
 
     Market-on-trigger attachments use ``closePosition`` so the venue tracks
     the live leg size. Limit attachments snapshot the current leg quantity
     and rest at ``price``; ``reduceOnly`` is sent only in one-way mode where
     the venue accepts it (hedge mode scopes the leg via ``positionSide``).
+    COIN-M retains the regular-order default trigger basis when none is set.
     """
     market = attachment.limit_price is None
     order_type = algo_order_type(side, market=market)
@@ -194,6 +194,10 @@ def build_algo_order_payload(
         payload["newOrderRespType"] = "RESULT"
     if market:
         payload["closePosition"] = "true"
+        # GTE_GTC ("good till event") makes the venue cancel the protection
+        # order when the position closes; plain GTC would leave it armed on
+        # a flat leg. This matches the field the Binance UI sends.
+        payload["timeInForce"] = "GTE_GTC"
     else:
         payload["price"] = _decimal_string(attachment.limit_price)
         payload["quantity"] = _decimal_string(abs(leg_quantity))
@@ -203,52 +207,8 @@ def build_algo_order_payload(
     basis = working_type(trigger_basis)
     if basis is not None:
         payload["workingType"] = basis
-    return payload
-
-
-def build_coin_m_order_payload(
-    *,
-    symbol: str,
-    position_side: str,
-    leg_quantity: Decimal,
-    attachment: TpSlAttachment,
-    side: ProtectionSide,
-    trigger_basis: TrailingBasis | None,
-    client_order_id: str,
-) -> dict[str, object]:
-    """Build a regular COIN-M conditional-order payload for position protection.
-
-    Market-on-trigger attachments send ``placeType="position"`` — the same
-    field the Binance UI uses for position TP/SL — which links the order to
-    the position leg so the venue auto-cancels it when the leg closes and
-    surfaces it in the Positions TP/SL panel. Verified against Demo
-    ``/dapi/v1/order``. Limit attachments snapshot quantity instead and do
-    not carry ``placeType``.
-    """
-    market = attachment.limit_price is None
-    payload: dict[str, object] = {
-        "symbol": symbol,
-        "side": close_order_side(leg_quantity),
-        "positionSide": position_side,
-        "type": algo_order_type(side, market=market),
-        "stopPrice": _decimal_string(attachment.trigger_price),
-        "newClientOrderId": client_order_id,
-        "workingType": working_type(trigger_basis) or "CONTRACT_PRICE",
-        "priceProtect": "TRUE",
-    }
-    if market:
-        payload["closePosition"] = "true"
-        payload["placeType"] = "position"
-        # GTE_GTC ("good till event") makes the venue cancel the order when the
-        # position closes - plain GTC leaves it armed on a flat leg. This is
-        # the timeInForce the Binance UI sends for position TP/SL orders.
-        payload["timeInForce"] = "GTE_GTC"
-    else:
-        payload["price"] = _decimal_string(attachment.limit_price)
-        payload["quantity"] = _decimal_string(abs(leg_quantity))
-        payload["timeInForce"] = "GTC"
-        if position_side == "BOTH":
-            payload["reduceOnly"] = "true"
+    elif product is BinanceProduct.COIN_M:
+        payload["workingType"] = "CONTRACT_PRICE"
     return payload
 
 

@@ -155,10 +155,16 @@ async def _require_clean_futures_symbol(
             product,
             partial(client.futures_get_open_algo_orders, symbol=symbol),
         )
-        if not isinstance(algo_orders, list):
-            raise AssertionError(f"Unexpected open algo-orders response: {algo_orders!r}")
-        if algo_orders:
-            pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
+    else:
+        algo_orders = await adapter._coin_m_algo_request(
+            "get",
+            "openAlgoOrders",
+            {"symbol": symbol},
+        )
+    if not isinstance(algo_orders, list):
+        raise AssertionError(f"Unexpected open algo-orders response: {algo_orders!r}")
+    if algo_orders:
+        pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
     positions = await adapter._futures_position_risk(product, symbol=symbol)
     for row in positions:
         try:

@@ -117,12 +117,13 @@ def build_place_order_payload(
         raise UnsupportedOrderTypeError("Binance Spot does not support reduce_only orders")
 
     is_stop_order = order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
-    if is_stop_order and product == BinanceProduct.COIN_M:
-        raise UnsupportedOrderTypeError(
-            "COIN-M conditional orders are not supported through python-binance's public "
-            "order methods"
-        )
-    conditional = is_stop_order and product == BinanceProduct.USD_M
+    # Post-migration both Futures margin types place conditional orders through
+    # the algo-order surface: USDⓈ-M via the SDK's auto-routing order methods,
+    # COIN-M via the adapter's signed /dapi/v1/algoOrder transport.
+    conditional = is_stop_order and product in (
+        BinanceProduct.USD_M,
+        BinanceProduct.COIN_M,
+    )
 
     if order.time_in_force not in _TIME_IN_FORCE:
         raise UnsupportedOrderTypeError(
@@ -144,9 +145,13 @@ def build_place_order_payload(
         binance_type = "STOP_LOSS"
     elif product == BinanceProduct.SPOT and order.order_type == OrderType.STOP_LIMIT:
         binance_type = "STOP_LOSS_LIMIT"
-    elif product == BinanceProduct.USD_M and order.order_type == OrderType.STOP:
+    elif product in (BinanceProduct.USD_M, BinanceProduct.COIN_M) and (
+        order.order_type == OrderType.STOP
+    ):
         binance_type = "STOP_MARKET"
-    elif product == BinanceProduct.USD_M and order.order_type == OrderType.STOP_LIMIT:
+    elif product in (BinanceProduct.USD_M, BinanceProduct.COIN_M) and (
+        order.order_type == OrderType.STOP_LIMIT
+    ):
         binance_type = "STOP"
     else:
         raise UnsupportedOrderTypeError(
@@ -168,7 +173,14 @@ def build_place_order_payload(
         payload["price"] = _decimal_string(order.price)
         payload["timeInForce"] = _TIME_IN_FORCE[order.time_in_force]
     if order.order_type in (OrderType.STOP, OrderType.STOP_LIMIT):
-        payload["stopPrice"] = _decimal_string(order.stop_price)
+        if conditional:
+            # Algo orders trigger on triggerPrice; the USDⓈ-M SDK would also
+            # accept stopPrice and convert it, but COIN-M goes through the raw
+            # /dapi/v1/algoOrder transport which requires triggerPrice.
+            payload["triggerPrice"] = _decimal_string(order.stop_price)
+            payload["algoType"] = "CONDITIONAL"
+        else:
+            payload["stopPrice"] = _decimal_string(order.stop_price)
     if order.reduce_only:
         payload["reduceOnly"] = "true"
     if not conditional:

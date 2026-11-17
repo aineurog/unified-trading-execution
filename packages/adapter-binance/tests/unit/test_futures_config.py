@@ -239,6 +239,27 @@ async def test_leverage_change_is_blocked_by_open_order_without_persisting(
     )
 
 
+async def test_coin_m_algo_orders_block_futures_config_changes(
+    config_adapter: tuple[Any, SQLiteStateStore, Instrument],
+    binance_client_mock: Any,
+) -> None:
+    adapter, _, _ = config_adapter
+    binance_client_mock.futures_coin_get_open_orders.return_value = []
+    binance_client_mock._request_futures_coin_api.return_value = [{"algoId": 123}]
+
+    with pytest.raises(PlatformError, match="COIN-M open algo orders"):
+        await adapter._assert_futures_config_change_safe(
+            setting="position mode",
+            product=BinanceProduct.COIN_M,
+            symbol="BTCUSD_PERP",
+        )
+
+    binance_client_mock.futures_coin_change_position_mode.assert_not_awaited()
+    request = binance_client_mock._request_futures_coin_api.await_args
+    assert request.args[:2] == ("get", "openAlgoOrders")
+    assert request.kwargs["data"] == {"symbol": "BTCUSD_PERP"}
+
+
 async def test_leverage_change_is_blocked_by_non_flat_position(
     config_adapter: tuple[Any, SQLiteStateStore, Instrument],
     binance_client_mock: Any,
