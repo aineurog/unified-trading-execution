@@ -1240,7 +1240,77 @@ class BinanceAdapter(Adapter):
             order_type=order.order_type,
             platform_order_id=result.platform_order_id,
         )
+        if order.take_profit is not None or order.stop_loss is not None:
+            await self._attach_order_level_protection(order, product, symbol, result)
         return result
+
+    async def _attach_order_level_protection(
+        self,
+        order: UnifiedOrder,
+        product: BinanceProduct,
+        symbol: str,
+        result: OrderResult,
+    ) -> None:
+        """Attach order-level TP/SL to the leg opened by a filled MARKET entry.
+
+        Binance has no order-scoped TP/SL field, so attachments become
+        position protection on the resulting leg via the same machinery as
+        modify_position_tpsl. Only Futures MARKET orders reach here —
+        build_place_order_payload rejects every other combination.
+        """
+        if result.status != OrderStatus.FILLED:
+            raise PlatformError(
+                f"Binance order {order.client_order_id} with TP/SL attachments "
+                f"did not fill synchronously (status {result.status.value})"
+            )
+        position_id = await self._open_position_id_for_symbol(order.instrument, product, symbol)
+        if position_id is None:
+            raise PlatformError(
+                f"Binance order {order.client_order_id} filled but left no open "
+                f"{product.value} position leg for {symbol} to protect"
+            )
+        try:
+            await self.modify_position_tpsl(
+                order.instrument,
+                position_id,
+                take_profit=order.take_profit,
+                stop_loss=order.stop_loss,
+            )
+        except Exception as exc:
+            raise PlatformError(
+                f"Binance order {order.client_order_id} filled but TP/SL protection "
+                f"failed on {position_id}: {exc}"
+            ) from exc
+
+    async def _open_position_id_for_symbol(
+        self,
+        instrument: Instrument,
+        product: BinanceProduct,
+        symbol: str,
+    ) -> str | None:
+        """Return the position id of the single open leg for symbol, if any."""
+        client = self._require_client()
+        method_name = (
+            "futures_position_information"
+            if product == BinanceProduct.USD_M
+            else "futures_coin_position_information"
+        )
+        response = await self._run_order_request(
+            product,
+            partial(getattr(client, method_name), symbol=symbol),
+        )
+        open_ids: list[str] = []
+        for entry in self._response_list(response, product, "position information"):
+            position = translate_position(
+                entry,
+                product=product,
+                instrument=instrument,
+            )
+            if position.quantity != 0 and position.position_id is not None:
+                open_ids.append(position.position_id)
+        if len(open_ids) > 1:
+            raise PlatformError(f"Ambiguous open {product.value} legs for {symbol}: {open_ids}")
+        return open_ids[0] if open_ids else None
 
     async def modify_order(self, modification: OrderModification) -> OrderResult:
         async with self._futures_config_lock:
