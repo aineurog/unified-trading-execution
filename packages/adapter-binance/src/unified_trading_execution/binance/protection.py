@@ -239,6 +239,10 @@ def build_coin_m_order_payload(
     if market:
         payload["closePosition"] = "true"
         payload["placeType"] = "position"
+        # GTE_GTC ("good till event") makes the venue cancel the order when the
+        # position closes - plain GTC leaves it armed on a flat leg. This is
+        # the timeInForce the Binance UI sends for position TP/SL orders.
+        payload["timeInForce"] = "GTE_GTC"
     else:
         payload["price"] = _decimal_string(attachment.limit_price)
         payload["quantity"] = _decimal_string(abs(leg_quantity))

@@ -466,6 +466,7 @@ class TestPayloadBuilders:
             "priceProtect": "TRUE",
             "closePosition": "true",
             "placeType": "position",
+            "timeInForce": "GTE_GTC",
             "workingType": "CONTRACT_PRICE",
         }
 
@@ -708,6 +709,7 @@ class TestModifyPositionTpsl:
             "priceProtect": "TRUE",
             "closePosition": "true",
             "placeType": "position",
+            "timeInForce": "GTE_GTC",
         }
         binance_client_mock.futures_coin_position_information.assert_awaited_once_with(
             symbol="BTCUSD_PERP"
