@@ -522,7 +522,7 @@ class TestPositionUpdateForwarding:
 
 
 class TestRateLimitReservation:
-    async def test_unknown_window_schedules_refresh_and_denies(self, store):
+    async def test_unknown_window_refreshes_and_grants(self, store):
         bus = EventBus()
         adapter = build_adapter(bus, [])
         adapter.set_rate_limits(
@@ -536,22 +536,16 @@ class TestRateLimitReservation:
         engine = await make_engine(store, adapter, bus)
         try:
             engine._rate_limit_reset_at = None
-            engine._rate_limit_refresh_pending = False
 
-            assert engine.reserve_rate_limit() is False
-            assert engine._rate_limit_refresh_pending is True
-
-            await drain(engine)
-
-            assert engine._rate_limit_refresh_pending is False
-            assert engine._rate_limit_reset_at == FUTURE_RESET
-            assert engine._rate_limit_budget == 7
-            assert engine.reserve_rate_limit() is True
+            assert await engine.reserve_rate_limit() is True
             assert engine._rate_limit_budget == 6
+            assert engine._rate_limit_reset_at == FUTURE_RESET
+            assert await engine.reserve_rate_limit() is True
+            assert engine._rate_limit_budget == 5
         finally:
             await engine.ashutdown()
 
-    async def test_stale_window_schedules_refresh_and_denies(self, store):
+    async def test_stale_window_refreshes_before_reserving_positive_cached_budget(self, store):
         bus = EventBus()
         adapter = build_adapter(bus, [])
         adapter.set_rate_limits(
@@ -565,18 +559,48 @@ class TestRateLimitReservation:
         engine = await make_engine(store, adapter, bus)
         try:
             engine._rate_limit_reset_at = NOW
-            engine._rate_limit_budget = 0
-            engine._rate_limit_refresh_pending = False
+            engine._rate_limit_budget = 1
 
-            assert engine.reserve_rate_limit() is False
-            assert engine._rate_limit_refresh_pending is True
-
-            await drain(engine)
-
-            assert engine._rate_limit_budget == 5
-            assert engine._rate_limit_reset_at == FUTURE_RESET
-            assert engine.reserve_rate_limit() is True
+            assert await engine.reserve_rate_limit() is True
             assert engine._rate_limit_budget == 4
+            assert engine._rate_limit_reset_at == FUTURE_RESET
+        finally:
+            await engine.ashutdown()
+
+    async def test_stale_window_denies_when_refresh_reports_exhaustion(self, store):
+        bus = EventBus()
+        adapter = build_adapter(bus, [])
+        adapter.set_rate_limits(
+            RateLimits(
+                requests_per_interval=100,
+                interval_seconds=60.0,
+                remaining=0,
+                reset_at=FUTURE_RESET,
+            )
+        )
+        engine = await make_engine(store, adapter, bus)
+        try:
+            engine._rate_limit_reset_at = NOW
+            engine._rate_limit_budget = 1
+
+            assert await engine.reserve_rate_limit() is False
+            assert engine._rate_limit_budget == 0
+            assert engine._rate_limit_reset_at == FUTURE_RESET
+        finally:
+            await engine.ashutdown()
+
+    async def test_stale_window_fails_closed_when_refresh_fails(self, store):
+        bus = EventBus()
+        adapter = build_adapter(bus, [])
+        engine = await make_engine(store, adapter, bus)
+        try:
+            engine._rate_limit_reset_at = NOW
+            engine._rate_limit_budget = 5
+            adapter.set_next_error(RuntimeError("rate-limit snapshot unavailable"))
+
+            assert await engine.reserve_rate_limit() is False
+            assert engine._rate_limit_budget == 5
+            assert engine._rate_limit_reset_at == NOW
         finally:
             await engine.ashutdown()
 
@@ -586,10 +610,25 @@ class TestRateLimitReservation:
         try:
             engine._rate_limit_reset_at = FUTURE_RESET
             engine._rate_limit_budget = 0
-            engine._rate_limit_refresh_pending = False
 
-            assert engine.reserve_rate_limit() is False
-            assert engine._rate_limit_refresh_pending is False
+            assert await engine.reserve_rate_limit() is False
+            assert engine._rate_limit_budget == 0
+        finally:
+            await engine.ashutdown()
+
+    async def test_concurrent_reservations_do_not_overspend_budget(self, store):
+        bus = EventBus()
+        engine = await make_engine(store, build_adapter(bus, []), bus)
+        try:
+            engine._rate_limit_reset_at = FUTURE_RESET
+            engine._rate_limit_budget = 1
+
+            reservations = await asyncio.gather(
+                engine.reserve_rate_limit(),
+                engine.reserve_rate_limit(),
+            )
+
+            assert sorted(reservations) == [False, True]
             assert engine._rate_limit_budget == 0
         finally:
             await engine.ashutdown()
@@ -605,11 +644,9 @@ class TestRateLimitReservation:
         try:
             engine._rate_limit_reset_at = None
             engine._rate_limit_budget = 0
-            engine._rate_limit_refresh_pending = False
 
-            assert engine.reserve_rate_limit() is True
-            assert engine.reserve_rate_limit() is True
-            assert engine._rate_limit_refresh_pending is False
+            assert await engine.reserve_rate_limit() is True
+            assert await engine.reserve_rate_limit() is True
             assert engine._rate_limit_budget == 0
         finally:
             await engine.ashutdown()
@@ -624,10 +661,8 @@ class TestRateLimitReservation:
         )
         try:
             engine._rate_limit_reset_at = None
-            engine._rate_limit_refresh_pending = False
 
-            assert engine.reserve_rate_limit() is False
-            assert engine._rate_limit_refresh_pending is False
+            assert await engine.reserve_rate_limit() is False
         finally:
             await engine.ashutdown()
 

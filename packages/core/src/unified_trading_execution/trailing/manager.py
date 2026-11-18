@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -494,7 +494,7 @@ class TrailingManager:
         state_store: StateStore,
         *,
         halt_machine: HaltStateMachine,
-        reserve_rate_limit: Callable[[], bool],
+        reserve_rate_limit: Callable[[], Awaitable[bool]],
         event_bus: EventBus | None = None,
         config: TrailingConfig | None = None,
         id_factory: Callable[[], str] | None = None,
@@ -623,7 +623,7 @@ class TrailingManager:
             raise InstrumentHaltedError(
                 f"cannot attach trailing on {instrument.symbol}: instrument or account is halted"
             )
-        if will_write and not self._reserve_rate_limit():
+        if will_write and not await self._reserve_rate_limit():
             raise RateLimitError(
                 f"cannot attach trailing on {instrument.symbol}: rate limit budget exhausted"
             )
@@ -775,7 +775,7 @@ class TrailingManager:
             raise InstrumentHaltedError(
                 f"cannot attach trailing on {instrument.symbol}: instrument or account is halted"
             )
-        if not self._reserve_rate_limit():
+        if not await self._reserve_rate_limit():
             raise RateLimitError(
                 f"cannot attach trailing on {instrument.symbol}: rate limit budget exhausted"
             )
@@ -848,7 +848,7 @@ class TrailingManager:
                 )
                 await self._degrade_attach(armed, f"protection: native take profit: {error}")
                 raise error
-            if not self._reserve_rate_limit():
+            if not await self._reserve_rate_limit():
                 error = RateLimitError(
                     f"native trail is armed on {instrument.symbol} but the rate limit "
                     "budget is exhausted"
@@ -1215,7 +1215,7 @@ class TrailingManager:
 
             if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
                 return state
-            if not self._reserve_rate_limit():
+            if not await self._reserve_rate_limit():
                 return state
 
             attempt_state = replace(state, last_reprice_at=now, updated_at=now)
@@ -1539,7 +1539,7 @@ class TrailingManager:
             if write_stop is not None or write_take_profit is not None:
                 if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
                     return await self._record_protection_failure(state, "integrity: halted")
-                if not self._reserve_rate_limit():
+                if not await self._reserve_rate_limit():
                     return state
                 try:
                     await self._modify_protection(
@@ -1713,7 +1713,7 @@ class TrailingManager:
 
         if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
             return await self._degrade_now(state, "halted: native trail missing")
-        if not self._reserve_rate_limit():
+        if not await self._reserve_rate_limit():
             return state
         try:
             result = await self._adapter.place_trailing_stop(self._native_request(state, open_leg))
@@ -1947,7 +1947,7 @@ class TrailingManager:
                 return await self._rehydrate_degraded(
                     state, "halted: rehydrate protection", now=now
                 )
-            if not self._reserve_rate_limit():
+            if not await self._reserve_rate_limit():
                 return await self._rehydrate_degraded(
                     state, "rate limit budget exhausted: rehydrate protection", now=now
                 )
@@ -2058,7 +2058,7 @@ class TrailingManager:
                     return await self._rehydrate_degraded(
                         base, "halted: rehydrate first stop", now=now
                     )
-                if not self._reserve_rate_limit():
+                if not await self._reserve_rate_limit():
                     return await self._rehydrate_degraded(
                         base,
                         "rate limit budget exhausted: rehydrate first stop",
@@ -2134,7 +2134,7 @@ class TrailingManager:
                 )
                 and reprice_interval_elapsed
                 and self._halt_machine.can_place_order(base.instrument, reduce_only=True)
-                and self._reserve_rate_limit()
+                and await self._reserve_rate_limit()
             ):
                 if capability.reprice_gap:
                     await self._write_audit(
@@ -2256,7 +2256,7 @@ class TrailingManager:
         if result is None:
             if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
                 return await self._rehydrate_degraded(state, "halted: native rearm", now=now)
-            if not self._reserve_rate_limit():
+            if not await self._reserve_rate_limit():
                 return await self._rehydrate_degraded(
                     state, "rate limit budget exhausted: native rearm", now=now
                 )
@@ -2348,7 +2348,7 @@ class TrailingManager:
             return state
         if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
             return await self._degrade_now(state, "halted: protection not resized")
-        if not self._reserve_rate_limit():
+        if not await self._reserve_rate_limit():
             return await self._degrade_now(
                 state, "rate limit budget exhausted: protection not resized"
             )
@@ -2702,7 +2702,7 @@ class TrailingManager:
         note = ", ".join(dict.fromkeys(notes)) or None
         if not clear_tp and not clear_sl:
             return note, False
-        if not self._reserve_rate_limit():
+        if not await self._reserve_rate_limit():
             return "rate limit budget exhausted; protection left in place", False
 
         try:
@@ -2721,7 +2721,7 @@ class TrailingManager:
             return None, False
         if not self._halt_machine.can_place_order(state.instrument, reduce_only=True):
             return "halted: native trail left in place", False
-        if not self._reserve_rate_limit():
+        if not await self._reserve_rate_limit():
             return "rate limit budget exhausted; native trail left in place", False
         try:
             await self._adapter.cancel_trailing_stop(state.native_id, state.instrument)

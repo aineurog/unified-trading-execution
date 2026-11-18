@@ -35,6 +35,7 @@ from unified_trading_execution.dispatch import (
 from unified_trading_execution.errors import (
     EngineShutdownError,
     PlatformConnectionError,
+    RateLimitError,
     ReconciliationError,
 )
 from unified_trading_execution.events import (
@@ -217,7 +218,6 @@ class Engine:
         self._trailing_worker: TrailingWorker | None = None
         self._trailing_worker_lock = asyncio.Lock()
         self._trailing_ready = False
-        self._rate_limit_refresh_pending = False
 
         # Periodic reconciliation (on by default; None disables it).
         if reconcile_interval_seconds is not None and reconcile_interval_seconds <= 0:
@@ -579,7 +579,8 @@ class Engine:
 
         instrument_spec = await self._get_or_fetch_spec(order.instrument)
         reference_price = self._resolve_reference_price(order.instrument)
-        await self._refresh_rate_limits_if_stale()
+        if not await self._refresh_rate_limits_if_stale():
+            raise RateLimitError("Unable to refresh the venue rate-limit budget")
 
         # Capture the ID that will be used — dispatch may generate it
         client_order_id = order.client_order_id
@@ -635,7 +636,8 @@ class Engine:
             raise OrderNotFoundError(modification.client_order_id)
 
         reference_price = self._resolve_reference_price(existing.instrument)
-        await self._refresh_rate_limits_if_stale()
+        if not await self._refresh_rate_limits_if_stale():
+            raise RateLimitError("Unable to refresh the venue rate-limit budget")
 
         # Exclude the order being modified from the duplicate check
         mod_known_ids = self._known_order_ids - {modification.client_order_id}
@@ -1398,50 +1400,42 @@ class Engine:
             return self._risk_config.rate_limit_budget_override
         return self._rate_limit_budget
 
-    async def _refresh_rate_limits(self) -> None:
+    async def _refresh_rate_limits(self) -> bool:
         try:
             rl = await self._adapter.get_rate_limits()
-        except Exception:
-            logger.warning("Failed to fetch rate limits from adapter")
-            return
+        except Exception as exc:
+            logger.warning("Failed to fetch rate limits from adapter: %s", exc)
+            return False
         self._rate_limit_budget = rl.remaining
         self._rate_limit_reset_at = rl.reset_at
-
-    async def _refresh_rate_limits_if_stale(self) -> None:
-        if self._rate_limit_reset_at is None:
-            await self._refresh_rate_limits()
-            return
-        if self._rate_limit_budget > 0:
-            return
-        if _utcnow() >= self._rate_limit_reset_at:
-            await self._refresh_rate_limits()
-
-    def reserve_rate_limit(self) -> bool:
-        """Reserve one venue action from the shared rate-limit budget.
-
-        Trailing protection writes and cancels call this synchronously before
-        every venue action.  When the current window has elapsed, a background
-        refresh is scheduled and the caller is told to retry on the next tick
-        rather than blocking or spinning.
-        """
-        if self._risk_config.rate_limit_budget_override is None and (
-            self._rate_limit_reset_at is None or _utcnow() >= self._rate_limit_reset_at
-        ):
-            if not self._rate_limit_refresh_pending:
-                self._rate_limit_refresh_pending = True
-                self._schedule(self._refresh_rate_limits_pending())
-            return False
-        if self._effective_budget() <= 0:
-            return False
-        if self._risk_config.rate_limit_budget_override is None:
-            self._rate_limit_budget -= 1
         return True
 
-    async def _refresh_rate_limits_pending(self) -> None:
-        try:
-            await self._refresh_rate_limits()
-        finally:
-            self._rate_limit_refresh_pending = False
+    async def _refresh_rate_limits_if_stale(self) -> bool:
+        if self._risk_config.rate_limit_budget_override is not None:
+            return True
+        async with self._rate_limit_refresh_lock:
+            if self._rate_limit_reset_at is not None and _utcnow() < self._rate_limit_reset_at:
+                return True
+            return await self._refresh_rate_limits()
+
+    async def reserve_rate_limit(self) -> bool:
+        """Reserve one venue action from the shared rate-limit budget.
+
+        Refresh an unknown or expired window before making the reservation so
+        the decision uses current adapter observations and cannot be undone by
+        a racing background refresh.
+        """
+        if self._risk_config.rate_limit_budget_override is not None:
+            return self._risk_config.rate_limit_budget_override > 0
+        async with self._rate_limit_refresh_lock:
+            if (
+                self._rate_limit_reset_at is None or _utcnow() >= self._rate_limit_reset_at
+            ) and not await self._refresh_rate_limits():
+                return False
+            if self._rate_limit_budget <= 0:
+                return False
+            self._rate_limit_budget -= 1
+            return True
 
     # ── Internal: EventBus subscribers (state mirror) ──────────────
 
