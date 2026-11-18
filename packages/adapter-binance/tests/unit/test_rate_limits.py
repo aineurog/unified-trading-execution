@@ -109,7 +109,7 @@ class TestBinanceRateLimitTracker:
         assert limits.remaining == 0
         assert limits.reset_at == now + timedelta(minutes=1)
 
-    @pytest.mark.parametrize("used", ["-1", "1.5", "", "  ", "NaN"])
+    @pytest.mark.parametrize("used", ["1.5", "", "  ", "NaN"])
     def test_negative_or_noninteger_counters_fail_closed(self, used: str) -> None:
         now = datetime.now(UTC)
         tracker = BinanceRateLimitTracker()
@@ -122,20 +122,76 @@ class TestBinanceRateLimitTracker:
 
         assert tracker.snapshot(now=now).remaining == 0
 
-    def test_unmatched_header_interval_fails_closed(self) -> None:
+    def test_negative_counter_is_an_exempt_bucket_sentinel(self) -> None:
+        # Algo-order endpoints report ``-1`` for buckets they do not consume;
+        # the tracker must retain the last real observation, not fail closed.
+        now = datetime(2026, 11, 5, 10, tzinfo=UTC)
+        tracker = BinanceRateLimitTracker()
+        tracker.update(
+            BinanceProduct.USD_M,
+            headers={"X-MBX-USED-WEIGHT-1M": "100"},
+            rate_limits=[_RATE_LIMITS[0]],
+            now=now,
+        )
+        tracker.update(
+            BinanceProduct.USD_M,
+            headers={
+                "X-MBX-USED-WEIGHT-1M": "-1",
+                "X-MBX-ORDER-COUNT-10S": "3",
+            },
+            rate_limits=_RATE_LIMITS,
+            now=now + timedelta(seconds=1),
+        )
+
+        limits = tracker.snapshot(now=now + timedelta(seconds=1))
+
+        # ORDERS 10s bucket: limit 10, used 3 -> remaining 7 is tightest.
+        assert limits.remaining == 7
+        assert limits.interval_seconds == 10.0
+
+    def test_undefined_bucket_headers_do_not_constrain_configured_product(self) -> None:
+        # COIN-M emits ``order-count-10s`` but exchangeInfo defines no such
+        # bucket (verified unenforced on Demo and mainnet). Once a product's
+        # enforced limiters are known, headers for undefined buckets are
+        # informational and must not zero the budget — even while order
+        # responses keep refreshing the observation.
+        now = datetime(2026, 11, 5, 10, tzinfo=UTC)
+        tracker = BinanceRateLimitTracker()
+        tracker.update(
+            BinanceProduct.COIN_M,
+            headers={
+                "X-MBX-USED-WEIGHT-1M": "100",
+                "X-MBX-ORDER-COUNT-10S": "4",
+            },
+            rate_limits=[_RATE_LIMITS[0]],
+            now=now,
+        )
+
+        limits = tracker.snapshot(now=now + timedelta(seconds=30))
+
+        # Only the defined REQUEST_WEIGHT bucket constrains: 1200 - 100.
+        assert limits.remaining == 1100
+        assert limits.interval_seconds == 60.0
+
+    def test_unmatched_header_interval_does_not_constrain_configured_product(self) -> None:
         now = datetime.now(UTC)
         tracker = BinanceRateLimitTracker()
         tracker.update(
             BinanceProduct.SPOT,
-            headers={"X-MBX-USED-WEIGHT-2M": "1"},
+            headers={
+                "X-MBX-USED-WEIGHT-1M": "10",
+                "X-MBX-USED-WEIGHT-2M": "1",
+            },
             rate_limits=[_RATE_LIMITS[0]],
             now=now,
         )
 
         limits = tracker.snapshot(now=now)
 
-        assert limits.remaining == 0
-        assert limits.reset_at == now + timedelta(minutes=2)
+        # The defined 1M bucket reports remaining 1190; the undefined 2M
+        # header is ignored rather than failing the whole budget closed.
+        assert limits.remaining == 1190
+        assert limits.interval_seconds == 60.0
 
     def test_header_without_rate_limit_configuration_fails_closed(self) -> None:
         now = datetime.now(UTC)

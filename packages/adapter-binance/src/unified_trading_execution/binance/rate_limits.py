@@ -147,6 +147,11 @@ class BinanceRateLimitTracker:
                 continue
             key = (rate_limit_type, interval_num, interval_letter.upper())
             used = _nonnegative_int(raw_value)
+            if used is None and _is_negative_int(raw_value):
+                # Algo-order endpoints report ``-1`` for buckets they do not
+                # consume; that is a venue sentinel, not an observation, so the
+                # last known usage is retained instead of failing closed.
+                continue
             usage[key] = _Usage(used, moment)
 
         if status_code in (418, 429):
@@ -227,10 +232,19 @@ class BinanceRateLimitTracker:
                 )
 
             for key, usage in usage_by_key.items():
-                if key in definitions:
+                if key in definitions or definitions:
+                    # Defined buckets are handled above. Once exchangeInfo has
+                    # published a product's enforced limiters, headers for
+                    # undefined buckets are informational — e.g. COIN-M emits
+                    # ``order-count-10s`` with no enforced limit behind it.
                     continue
                 _, interval_num, interval_letter = key
                 interval_seconds = float(interval_num * _INTERVAL_SECONDS.get(interval_letter, 60))
+                interval_end = usage.observed_at + timedelta(seconds=interval_seconds)
+                if moment >= interval_end:
+                    # The venue-side window has reset, so stale usage for an
+                    # undefined bucket no longer constrains the budget.
+                    continue
                 candidates.append(
                     _Candidate(
                         limit=1,
@@ -338,6 +352,17 @@ def _nonnegative_int(raw_value: object) -> int | None:
     if str(parsed) != normalized or parsed < 0:
         return None
     return parsed
+
+
+def _is_negative_int(raw_value: object) -> bool:
+    if not isinstance(raw_value, str):
+        return False
+    normalized = raw_value.strip()
+    try:
+        parsed = int(normalized)
+    except ValueError:
+        return False
+    return parsed < 0 and str(parsed) == normalized
 
 
 def _positive_int(raw_value: object) -> int | None:
