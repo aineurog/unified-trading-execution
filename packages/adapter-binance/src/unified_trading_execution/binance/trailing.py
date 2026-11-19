@@ -18,6 +18,7 @@ from __future__ import annotations
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from unified_trading_execution.binance.enums import BinanceProduct
 from unified_trading_execution.binance.orders import to_binance_client_order_id
 from unified_trading_execution.binance.protection import PositionLeg, working_type
 from unified_trading_execution.errors import PlatformError, UnsupportedOrderTypeError
@@ -37,7 +38,7 @@ _OPEN_TRAILING_STATUSES = frozenset({"NEW", "PARTIALLY_FILLED", "TRIGGERING", "T
 
 def trailing_client_id(leg: PositionLeg) -> str:
     """Derive the deterministic client algo ID for one leg's trail."""
-    product_marker = "c" if leg.product.value == "coin_m" else "u"
+    product_marker = "c" if leg.product is BinanceProduct.COIN_M else "u"
     return to_binance_client_order_id(
         f"{TRAILING_CLIENT_ID_PREFIX}{product_marker}-{leg.symbol}-{leg.position_side}"
     )
@@ -90,7 +91,7 @@ def build_trailing_algo_payload(
         # GTC would leave the trail armed on a flat leg.
         "timeInForce": "GTE_GTC",
     }
-    if leg.product.value == "usd_m":
+    if leg.product is BinanceProduct.USD_M:
         # USDⓈ-M honors RESULT acks; the COIN-M algo route was verified
         # without it, so only send it where it is known to be accepted.
         payload["newOrderRespType"] = "RESULT"
@@ -123,7 +124,7 @@ def parse_trailing_entry(
     *,
     position_side: str | None = None,
 ) -> NativeTrailingResult | None:
-    """Translate one open USDⓈ-M algo row into a ``NativeTrailingResult``.
+    """Translate one open Futures algo row into a ``NativeTrailingResult``.
 
     Returns ``None`` for non-trailing rows, rows that are no longer open, or
     rows on a different position side when ``position_side`` is given. The

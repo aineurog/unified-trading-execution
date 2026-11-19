@@ -305,11 +305,16 @@ async def make_manager(
             adapter.set_ticker(instrument, Ticker(last=position.average_entry_price))
     adapter.add_instrument_spec(instrument, make_instrument_spec())
     adapter.queue_candles_response(make_candles())
+    reserve = reserve_rate_limit or (lambda: True)
+
+    async def reserve_async() -> bool:
+        return reserve()
+
     manager = TrailingManager(
         adapter,
         store,
         halt_machine=HaltStateMachine(),
-        reserve_rate_limit=reserve_rate_limit or (lambda: True),
+        reserve_rate_limit=reserve_async,
         event_bus=bus,
         config=config,
         id_factory=lambda: f"id-{next(_IDS)}",

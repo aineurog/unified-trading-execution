@@ -193,6 +193,8 @@ _MAX_FINAL_ORDER_IDS = 10_000
 _STREAM_RETRY_MAX_SECONDS = 30.0
 _STREAM_START_TIMEOUT_SECONDS = 30.0
 _FUTURES_PRODUCTS = (BinanceProduct.USD_M, BinanceProduct.COIN_M)
+# Algo statuses after which the venue sends no further updates for an order.
+_TERMINAL_ALGO_STATUSES = frozenset({"FINISHED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"})
 _COIN_M_ALGO_ENDPOINTS = frozenset({"algoOrder", "openAlgoOrders", "allAlgoOrders"})
 _COIN_M_ALGO_METHODS = frozenset({"get", "post", "delete"})
 _CONFIG_DRIFT_REASON = "binance_futures_config_drift"
@@ -982,6 +984,19 @@ class BinanceAdapter(Adapter):
             # not ordinary orders: their lifecycle stays out of the order
             # mirror entirely. Executions are still real fills, though, so a
             # triggered TP/SL or trailing stop must reach the fills table.
+            # The venue reports the triggered child under its own order id,
+            # so remember the ``actualOrderId`` mapping for the child trade
+            # that follows. Each trigger gets a fresh child id, so dropping
+            # the mapping once the algo is terminal never disturbs a later
+            # algo that reuses the same deterministic client id.
+            actual_order_id = entry.get("ai")
+            if actual_order_id not in (None, ""):
+                child_key = (product, str(symbol), str(actual_order_id))
+                algo_status = str(entry.get("algoStatus", entry.get("X", ""))).upper()
+                if algo_status in _TERMINAL_ALGO_STATUSES:
+                    self._platform_order_keys.pop(child_key, None)
+                else:
+                    self._platform_order_keys[child_key] = client_order_id
             if entry.get("x", entry.get("executionType")) == "TRADE":
                 fill = translate_fill_entry(
                     entry,
@@ -1915,7 +1930,8 @@ class BinanceAdapter(Adapter):
         """Return portable types available on at least one supported product.
 
         Product-specific constraints are enforced in the payload builder; in
-        particular, COIN-M conditional orders are not exposed by the pinned SDK.
+        particular, COIN-M conditionals reach the venue through the SDK's
+        signed request transport because the pinned SDK has no wrapper.
         """
         return frozenset(
             {
@@ -1932,10 +1948,9 @@ class BinanceAdapter(Adapter):
         """Declare static position TP/SL support for Binance Futures.
 
         Binance has no position-attached TP/SL field, so protection is a
-        pair of conditional orders identified by deterministic client IDs.
-        USDⓈ-M uses algo orders; COIN-M uses regular orders surfaced in the
-        Positions TP/SL panel. Writes preserve the unmentioned side and
-        trigger on ``CONTRACT_PRICE`` (last) or ``MARK_PRICE``. Repricing
+        pair of conditional algo orders identified by deterministic client
+        IDs on both Futures products. Writes preserve the unmentioned side
+        and trigger on ``CONTRACT_PRICE`` (last) or ``MARK_PRICE``. Repricing
         cancels then places, so ``reprice_gap`` is true.
         """
         try:
@@ -2444,11 +2459,9 @@ class BinanceAdapter(Adapter):
         """Attach or replace TP/SL on one USDⓈ-M or COIN-M position leg.
 
         Each mentioned side is replaced by cancel-then-place of its
-        deterministic conditional order; unmentioned sides are never touched.
-        COIN-M protection uses the regular order endpoint because Binance
-        surfaces those orders in the position TP/SL panel.
-        ``trigger_basis`` maps ``LAST`` to ``CONTRACT_PRICE`` and ``MARK``
-        to ``MARK_PRICE``.
+        deterministic conditional algo order; unmentioned sides are never
+        touched. ``trigger_basis`` maps ``LAST`` to ``CONTRACT_PRICE`` and
+        ``MARK`` to ``MARK_PRICE``.
         """
         if take_profit is None and stop_loss is None:
             raise ValueError("at least one of take_profit or stop_loss must be provided")
@@ -2477,28 +2490,16 @@ class BinanceAdapter(Adapter):
             if attachment is None:
                 continue
             client_order_id = protection_client_id(leg, side)
-            if product == BinanceProduct.USD_M:
-                payload = build_algo_order_payload(
-                    product=product,
-                    symbol=symbol,
-                    position_side=leg.position_side,
-                    leg_quantity=quantity,
-                    attachment=attachment,
-                    side=side,
-                    trigger_basis=trigger_basis,
-                    client_algo_id=client_order_id,
-                )
-            else:
-                payload = build_algo_order_payload(
-                    product=product,
-                    symbol=symbol,
-                    position_side=leg.position_side,
-                    leg_quantity=quantity,
-                    attachment=attachment,
-                    side=side,
-                    trigger_basis=trigger_basis,
-                    client_algo_id=client_order_id,
-                )
+            payload = build_algo_order_payload(
+                product=product,
+                symbol=symbol,
+                position_side=leg.position_side,
+                leg_quantity=quantity,
+                attachment=attachment,
+                side=side,
+                trigger_basis=trigger_basis,
+                client_algo_id=client_order_id,
+            )
             writes.append((client_order_id, payload))
 
         for client_order_id, payload in writes:

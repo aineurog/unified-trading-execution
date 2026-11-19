@@ -606,6 +606,28 @@ class TestRateLimitTracking:
         finally:
             await eng.ashutdown()
 
+    async def test_refresh_failure_blocks_dispatch(self, mock_adapter, event_bus, monkeypatch):
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+            get_reference_price=_ref_price,
+        )
+        await eng.connect()
+        try:
+
+            async def _fail() -> RateLimits:
+                raise RuntimeError("rate-limit snapshot unavailable")
+
+            monkeypatch.setattr(mock_adapter, "get_rate_limits", _fail)
+            eng._rate_limit_reset_at = datetime(2000, 1, 1, tzinfo=UTC)
+
+            with pytest.raises(RateLimitError, match="Unable to refresh"):
+                await eng.place_order(_order(client_order_id="rl-refresh-fail"))
+        finally:
+            await eng.ashutdown()
+
     async def test_budget_override_takes_precedence(self, mock_adapter, event_bus):
         store = SQLiteStateStore(":memory:")
         cfg = RiskConfig(rate_limit_budget_override=999)
