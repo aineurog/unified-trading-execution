@@ -2691,13 +2691,9 @@ class BinanceAdapter(Adapter):
             ticker = await self.fetch_ticker(request.instrument)
             if ticker is not None:
                 if request.basis is TrailingBasis.MARK:
-                    immediate_reference = (
-                        ticker.mark if ticker.mark is not None else ticker.last
-                    )
+                    immediate_reference = ticker.mark if ticker.mark is not None else ticker.last
                 else:
-                    immediate_reference = (
-                        ticker.last if ticker.last is not None else ticker.mark
-                    )
+                    immediate_reference = ticker.last if ticker.last is not None else ticker.mark
             if immediate_reference is None:
                 raise PlatformError(
                     f"Cannot place COIN-M trailing stop for {symbol}: "

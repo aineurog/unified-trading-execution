@@ -1110,16 +1110,12 @@ async def test_terminal_order_reference_remains_queryable(
     assert "done-order" not in adapter._order_refs
     assert adapter._terminal_order_refs["done-order"].symbol == "BTCUSDT"
 
-    binance_client_mock.get_order.return_value = _order_response(
-        order_id="555", status="CANCELED"
-    )
+    binance_client_mock.get_order.return_value = _order_response(order_id="555", status="CANCELED")
     result = await adapter.get_order_by_client_id("done-order")
 
     assert result is not None
     assert result.status == OrderStatus.CANCELLED
-    binance_client_mock.get_order.assert_awaited_once_with(
-        symbol="BTCUSDT", orderId="555"
-    )
+    binance_client_mock.get_order.assert_awaited_once_with(symbol="BTCUSDT", orderId="555")
 
 
 async def test_order_operations_recover_routing_from_state_store_cache_miss(

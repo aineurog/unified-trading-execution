@@ -497,13 +497,9 @@ async def test_auto_native_param_matrix(
         # activates when price rises to the target, a short trail when it
         # falls.  Targets already satisfied make the venue reject the order.
         if side is OrderSide.BUY:
-            activation_price = _ceil_to_step(
-                ticker.mark * Decimal("1.05"), spec_info.tick_size
-            )
+            activation_price = _ceil_to_step(ticker.mark * Decimal("1.05"), spec_info.tick_size)
         else:
-            activation_price = _floor_to_step(
-                ticker.mark * Decimal("0.95"), spec_info.tick_size
-            )
+            activation_price = _floor_to_step(ticker.mark * Decimal("0.95"), spec_info.tick_size)
 
         cases = [
             _spec(offset=Decimal("0.1"), basis=TrailingBasis.LAST),
