@@ -5,9 +5,10 @@ Partially implemented Binance adapter for
 Product and instrument metadata translation, a limited REST rate-limit
 observation path, the async REST client lifecycle, and core order operations
 are implemented, along with private account streams and reconciliation
-snapshots and market data reads. Position protection and trailing stops remain
-unimplemented. Futures leverage, margin mode, and position mode are managed as
-persisted adapter intent.
+snapshots and market data reads. Position-level TP/SL protection is implemented
+for USDⓈ-M and COIN-M Futures, including market-on-trigger and limit-trigger
+attachments. Native trailing stops remain unsupported. Futures leverage,
+margin mode, and position mode are managed as persisted adapter intent.
 
 ## Installation
 
@@ -98,10 +99,24 @@ derives a stable, non-secret label from the API key.
 ### Order operations
 
 The adapter supports Spot and Futures MARKET/LIMIT orders, Spot STOP/STOP_LIMIT,
-and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. COIN-M
-conditional orders, Spot order modification, conditional-order modification,
-and order-level TP/SL attachments are explicitly unsupported. USDⓈ-M and
-COIN-M ordinary LIMIT orders can be modified by price and/or quantity.
+and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. Ordinary
+COIN-M conditional orders, Spot order modification, and conditional-order
+modification are unsupported. Order-level ``take_profit``/``stop_loss``
+attachments are supported only on Futures MARKET entries: the adapter waits
+for the synchronous fill, resolves the resulting position leg, and attaches
+MARK-basis position protection, failing loudly if the fill is not synchronous
+or no leg remains. Spot, LIMIT/STOP, and ``reduce_only`` attachment
+combinations are rejected. Position-level
+TP/SL is supported separately on both Futures products. Protection
+`trigger_price`/`limit_price` values must align to the symbol's `tickSize`;
+`modify_position_tpsl` rejects unaligned prices with `InvalidOrderError`
+before any venue call. USDⓈ-M and COIN-M
+ordinary LIMIT orders can be modified by price and/or quantity.
+COIN-M position TP/SL uses regular conditional orders through the public
+python-binance order methods, matching Binance's Positions TP/SL panel.
+Changing a COIN-M protection side cancels and replaces that side; the
+unmentioned side remains untouched. COIN-M algo orders left by older adapter
+versions are not managed; cancel them directly on Binance before upgrading.
 Order routing references are restored from persisted orders and refreshed from
 live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
@@ -116,8 +131,9 @@ provide the average.
 The adapter translates Spot execution and balance updates, USDⓈ-M and COIN-M
 order/position updates, and USDⓈ-M algo-order updates into core events. REST
 snapshots provide balances, derivative positions, open orders (including
-USDⓈ-M algo orders), and account trades. Reconnects use bounded backoff; final
-order and fill events are deduplicated in memory.
+USDⓈ-M algo orders), and account trades. Adapter-owned position-protection
+orders are excluded from the ordinary order mirror. Reconnects use bounded
+backoff; final order and fill events are deduplicated in memory.
 
 Balance keys are product-qualified (for example, `SPOT:USDT` and
 `USD_M:USDT`) because Binance maintains separate product wallets while the core
@@ -143,7 +159,7 @@ Changes are refused when the affected scope has open orders or non-flat
 positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
 orders or close positions. Checks are serialized with its own order operations,
 but external activity can race the Binance request. Removing a setting removes
-local intent only. 
+local intent only.
 
 ## Tests
 
@@ -204,6 +220,19 @@ set `BINANCE_DEMO_ORDER_INTEGRATION=false` to skip them. Set
 them on Testnet instead, using `BINANCE_SPOT_TESTNET_API_KEY`,
 `BINANCE_USDM_TESTNET_API_KEY`, and `BINANCE_COINM_TESTNET_API_KEY` with
 their matching secrets.
+
+The position-protection lifecycle test covers both USDⓈ-M `BTCUSDT` and COIN-M
+`BTCUSD_PERP`: it opens a small sandbox position, attaches and reads back TP/SL,
+reprices and clears each side, checks open-order reconciliation, and cleans up
+the protection orders and position. The COIN-M case uses a minimum valid
+contract quantity and a USD notional cap. Both cases require a clean symbol and
+one-way position mode; do not run them concurrently with other trades on those
+symbols. Run them with the same explicit Demo or Testnet order opt-in:
+
+```bash
+BINANCE_DEMO=true pytest packages/adapter-binance/tests/binance_integration/test_position_protection.py
+BINANCE_TESTNET=true BINANCE_TESTNET_ORDER_INTEGRATION=true pytest packages/adapter-binance/tests/binance_integration/test_position_protection.py
+```
 
 Copy `.env.example` to `.env` only when preparing local sandbox work. Never
 commit API credentials.

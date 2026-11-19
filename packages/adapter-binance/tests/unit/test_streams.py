@@ -26,7 +26,13 @@ from unified_trading_execution.events import (
     OrderStatusEvent,
     PositionUpdateEvent,
 )
-from unified_trading_execution.types.enums import AssetClass, FillEntry, OrderStatus, OrderType
+from unified_trading_execution.types.enums import (
+    AssetClass,
+    FillEntry,
+    FillReason,
+    OrderStatus,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import Instrument
 
 _EVENT_TIME = 1_684_738_540_559
@@ -490,3 +496,50 @@ async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_b
 
     assert len(fills) == 1
     assert fills[0].fill.client_order_id == "algo-client"
+
+
+def _futures_fill_entry(client_order_id: str) -> dict[str, object]:
+    return {
+        "e": "ORDER_TRADE_UPDATE",
+        "E": _EVENT_TIME,
+        "s": "BTCUSDT",
+        "c": client_order_id,
+        "i": 987,
+        "S": "SELL",
+        "o": "MARKET",
+        "f": "GTC",
+        "q": "0.001",
+        "l": "0.001",
+        "L": "62000",
+        "x": "TRADE",
+        "X": "FILLED",
+        "R": True,
+        "ps": "BOTH",
+        "T": _EVENT_TIME,
+        "t": 789,
+        "n": "0.01",
+        "N": "USDT",
+    }
+
+
+@pytest.mark.parametrize(
+    ("client_order_id", "expected_reason"),
+    [
+        ("tpsl-u-BTCUSDT-BOTH-tp", FillReason.TAKE_PROFIT),
+        ("tpsl-c-BTCUSD_PERP-BOTH-sl", FillReason.STOP_LOSS),
+        ("phase-entry-1", None),
+    ],
+)
+def test_fill_reason_maps_protection_client_ids(
+    client_order_id: str, expected_reason: FillReason | None
+) -> None:
+    fill = translate_fill_entry(
+        _futures_fill_entry(client_order_id),
+        product=BinanceProduct.USD_M,
+        instrument=_usd_m_instrument(),
+        client_order_id=client_order_id,
+    )
+
+    assert fill is not None
+    assert fill.entry == FillEntry.OUT
+    assert fill.reason == expected_reason

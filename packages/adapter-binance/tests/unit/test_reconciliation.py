@@ -201,7 +201,7 @@ async def test_fetch_positions_excludes_zero_quantity_both_sides(
 
 
 @pytest.mark.asyncio
-async def test_fetch_open_orders_includes_usd_m_algo_orders(
+async def test_fetch_open_orders_includes_futures_algo_orders(
     adapter,
     binance_client_mock: AsyncMock,
 ) -> None:
@@ -240,7 +240,6 @@ async def test_fetch_open_orders_includes_usd_m_algo_orders(
             "algoStatus": "NEW",
         }
     ]
-
     orders = await adapter.fetch_open_orders()
 
     assert set(orders) == {"spot-order", "algo-order"}

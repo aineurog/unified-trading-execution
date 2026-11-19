@@ -35,7 +35,12 @@ from unified_trading_execution.types.enums import (
     TimeInForce,
 )
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
-from unified_trading_execution.types.order import OrderModification, OrderRecord, UnifiedOrder
+from unified_trading_execution.types.order import (
+    OrderModification,
+    OrderRecord,
+    TpSlAttachment,
+    UnifiedOrder,
+)
 
 _TIMESTAMP = 1_684_738_540_559
 
@@ -830,7 +835,6 @@ async def test_conditional_actual_order_lookup_rejects_non_usdm_product(
         order_type=OrderType.STOP,
         platform_order_id="45",
     )
-
     with pytest.raises(PlatformError, match="only supported for USDⓈ-M Futures"):
         await adapter._resolve_conditional_actual_order(
             binance_client_mock,
@@ -1119,3 +1123,210 @@ async def test_order_operations_recover_routing_from_state_store_cache_miss(
     assert store.get_order.await_count == 2
     assert cancelled_events == []
     assert "core-order" not in adapter._order_refs
+
+
+_TP = TpSlAttachment(trigger_price=Decimal("110"), limit_price=None)
+_SL = TpSlAttachment(trigger_price=Decimal("90"), limit_price=None)
+
+
+@pytest.mark.parametrize(
+    ("product", "symbol"),
+    [
+        (BinanceProduct.USD_M, "BTCUSDT"),
+        (BinanceProduct.COIN_M, "BTCUSD_PERP"),
+    ],
+)
+def test_futures_market_order_accepts_tp_sl_attachments(
+    product: BinanceProduct, symbol: str
+) -> None:
+    payload, conditional = build_place_order_payload(
+        _order(product, OrderType.MARKET, take_profit=_TP, stop_loss=_SL),
+        product=product,
+        symbol=symbol,
+        client_order_id="ute-123",
+    )
+
+    assert conditional is False
+    assert "takeProfit" not in payload
+    assert "stopLoss" not in payload
+
+
+@pytest.mark.parametrize(
+    ("order", "product", "symbol", "match"),
+    [
+        (
+            _order(BinanceProduct.SPOT, OrderType.MARKET, take_profit=_TP),
+            BinanceProduct.SPOT,
+            "BTCUSDT",
+            "Spot",
+        ),
+        (
+            _order(BinanceProduct.USD_M, OrderType.LIMIT, price=Decimal("100"), take_profit=_TP),
+            BinanceProduct.USD_M,
+            "BTCUSDT",
+            "MARKET",
+        ),
+        (
+            _order(BinanceProduct.USD_M, OrderType.STOP, stop_price=Decimal("90"), stop_loss=_SL),
+            BinanceProduct.USD_M,
+            "BTCUSDT",
+            "MARKET",
+        ),
+        (
+            _order(
+                BinanceProduct.USD_M,
+                OrderType.MARKET,
+                take_profit=_TP,
+                reduce_only=True,
+            ),
+            BinanceProduct.USD_M,
+            "BTCUSDT",
+            "reduce_only",
+        ),
+    ],
+)
+def test_tp_sl_attachments_reject_unsupported_combinations(
+    order: UnifiedOrder,
+    product: BinanceProduct,
+    symbol: str,
+    match: str,
+) -> None:
+    with pytest.raises(UnsupportedOrderTypeError, match=match):
+        build_place_order_payload(
+            order,
+            product=product,
+            symbol=symbol,
+            client_order_id="ute-123",
+        )
+
+
+async def _prepare_market_placement(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+    product: BinanceProduct,
+    create_method: str,
+    position_method: str,
+) -> None:
+    await adapter.connect()
+    adapter._exchange_info_cache[product] = [_metadata(product)]
+    monkeypatch.setattr(
+        adapter,
+        "fetch_instrument_spec",
+        AsyncMock(
+            return_value=InstrumentSpec(
+                tick_size=Decimal("0.1"),
+                lot_size=Decimal("0.001"),
+                min_qty=Decimal("0.001"),
+                max_qty=Decimal("100"),
+                min_notional=Decimal("5"),
+                price_precision=1,
+                qty_precision=3,
+            )
+        ),
+    )
+    getattr(binance_client_mock, create_method).return_value = _order_response(
+        status="FILLED", executedQty="0.001", avgPrice="100"
+    )
+    symbol = "BTCUSD_PERP" if product == BinanceProduct.COIN_M else "BTCUSDT"
+    getattr(binance_client_mock, position_method).return_value = [
+        {
+            "symbol": symbol,
+            "positionAmt": "0.001",
+            "positionSide": "BOTH",
+            "entryPrice": "100",
+            "updateTime": _TIMESTAMP,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("product", "create_method", "position_method", "position_id"),
+    [
+        (
+            BinanceProduct.USD_M,
+            "futures_create_order",
+            "futures_position_information",
+            "usd_m:BTCUSDT:BOTH",
+        ),
+        (
+            BinanceProduct.COIN_M,
+            "futures_coin_create_order",
+            "futures_coin_position_information",
+            "coin_m:BTCUSD_PERP:BOTH",
+        ),
+    ],
+    ids=("usd-m", "coin-m"),
+)
+async def test_place_order_with_attachments_protects_resulting_leg(
+    product: BinanceProduct,
+    create_method: str,
+    position_method: str,
+    position_id: str,
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _prepare_market_placement(
+        adapter, binance_client_mock, monkeypatch, product, create_method, position_method
+    )
+    attach = AsyncMock()
+    monkeypatch.setattr(adapter, "modify_position_tpsl", attach)
+    order = _order(
+        product,
+        OrderType.MARKET,
+        take_profit=_TP,
+        stop_loss=_SL,
+    )
+
+    result = await adapter.place_order(order)
+
+    assert result.status is OrderStatus.FILLED
+    attach.assert_awaited_once()
+    args, kwargs = attach.await_args
+    assert args[1] == position_id
+    assert kwargs["take_profit"] == _TP
+    assert kwargs["stop_loss"] == _SL
+
+
+async def test_place_order_attachments_fail_when_no_leg_remains(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _prepare_market_placement(
+        adapter,
+        binance_client_mock,
+        monkeypatch,
+        BinanceProduct.USD_M,
+        "futures_create_order",
+        "futures_position_information",
+    )
+    binance_client_mock.futures_position_information.return_value = []
+    monkeypatch.setattr(adapter, "modify_position_tpsl", AsyncMock())
+
+    with pytest.raises(PlatformError, match="left no open"):
+        await adapter.place_order(_order(BinanceProduct.USD_M, OrderType.MARKET, take_profit=_TP))
+
+
+async def test_place_order_attachments_fail_when_attach_fails(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _prepare_market_placement(
+        adapter,
+        binance_client_mock,
+        monkeypatch,
+        BinanceProduct.USD_M,
+        "futures_create_order",
+        "futures_position_information",
+    )
+    monkeypatch.setattr(
+        adapter,
+        "modify_position_tpsl",
+        AsyncMock(side_effect=RuntimeError("boom")),
+    )
+
+    with pytest.raises(PlatformError, match="protection failed"):
+        await adapter.place_order(_order(BinanceProduct.USD_M, OrderType.MARKET, take_profit=_TP))

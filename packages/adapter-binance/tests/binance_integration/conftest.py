@@ -8,14 +8,16 @@ set ``BINANCE_TESTNET=true`` to select Testnet instead.
 from __future__ import annotations
 
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 from typing import cast
 
 import pytest
 from binance import AsyncClient  # type: ignore[import-untyped]
 
-from unified_trading_execution.binance import BinanceAdapter, BinanceConfig
+from unified_trading_execution.binance import BinanceAdapter, BinanceConfig, BinanceProduct
 from unified_trading_execution.events import EventBus
 
 
@@ -126,6 +128,54 @@ def _require_env(name: str) -> str:
     if not value:
         pytest.skip(f"{name} not set — skipping Binance integration test")
     return value
+
+
+async def _require_clean_futures_symbol(
+    adapter: BinanceAdapter,
+    product: BinanceProduct,
+    symbol: str,
+) -> None:
+    client = adapter._require_client()
+    open_orders_method = (
+        "futures_get_open_orders"
+        if product == BinanceProduct.USD_M
+        else "futures_coin_get_open_orders"
+    )
+    open_orders = await adapter._run_order_request(
+        product,
+        partial(getattr(client, open_orders_method), symbol=symbol),
+    )
+    if not isinstance(open_orders, list):
+        raise AssertionError(f"Unexpected open-orders response: {open_orders!r}")
+    if open_orders:
+        pytest.skip(f"Refusing to mutate {symbol}: sandbox has open Futures orders")
+
+    if product == BinanceProduct.USD_M:
+        algo_orders = await adapter._run_order_request(
+            product,
+            partial(client.futures_get_open_algo_orders, symbol=symbol),
+        )
+        if not isinstance(algo_orders, list):
+            raise AssertionError(f"Unexpected open algo-orders response: {algo_orders!r}")
+        if algo_orders:
+            pytest.skip(f"Refusing to mutate {symbol}: sandbox has open algo orders")
+    positions = await adapter._futures_position_risk(product, symbol=symbol)
+    for row in positions:
+        try:
+            position_amount = Decimal(str(row.get("positionAmt")))
+        except (InvalidOperation, ValueError) as exc:
+            raise AssertionError(f"Malformed position amount in Binance response: {row!r}") from exc
+        if not position_amount.is_finite():
+            raise AssertionError(f"Non-finite position amount in Binance response: {row!r}")
+        if position_amount != 0:
+            pytest.skip(f"Refusing to mutate {symbol}: sandbox has a non-flat Futures position")
+
+
+@pytest.fixture
+def require_clean_futures_symbol() -> Callable[
+    [BinanceAdapter, BinanceProduct, str], Awaitable[None]
+]:
+    return _require_clean_futures_symbol
 
 
 @pytest.fixture

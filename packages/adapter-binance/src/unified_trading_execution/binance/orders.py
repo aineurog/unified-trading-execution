@@ -91,10 +91,24 @@ def build_place_order_payload(
     client_order_id: str,
 ) -> tuple[dict[str, Any], bool]:
     """Translate a validated unified order to product-specific SDK parameters."""
-    if order.take_profit is not None or order.stop_loss is not None:
-        raise UnsupportedOrderTypeError(
-            "Binance order-level take_profit/stop_loss attachments are not supported"
-        )
+    has_attachments = order.take_profit is not None or order.stop_loss is not None
+    if has_attachments:
+        # Order-level TP/SL is orchestrated by the adapter after a synchronous
+        # Futures MARKET fill via position protection; everything else stays
+        # rejected (Spot has no position legs, resting orders fill later, and
+        # reduce-only orders close rather than open exposure).
+        if product == BinanceProduct.SPOT:
+            raise UnsupportedOrderTypeError(
+                "Binance Spot order-level take_profit/stop_loss attachments are not supported"
+            )
+        if order.order_type != OrderType.MARKET:
+            raise UnsupportedOrderTypeError(
+                "Binance order-level take_profit/stop_loss attachments require a MARKET order"
+            )
+        if order.reduce_only:
+            raise UnsupportedOrderTypeError(
+                "Binance reduce_only orders cannot carry take_profit/stop_loss attachments"
+            )
     if order.position_id is not None:
         raise UnsupportedOrderTypeError(
             "Binance order placement cannot target a position_id through the unified order API"

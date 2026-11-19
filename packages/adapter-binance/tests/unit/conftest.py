@@ -55,6 +55,7 @@ def binance_client_mock() -> AsyncMock:
         return []
 
     client._request_futures_api = AsyncMock(side_effect=mock_request_futures_api)
+    client._request_futures_coin_api = AsyncMock(return_value=[])
     return client
 
 
