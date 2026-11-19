@@ -522,6 +522,127 @@ async def test_triggered_algo_child_trade_reuses_core_client_id(
     assert fills[0].fill.client_order_id == "algo-client"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("product", "symbol", "instrument", "client_algo_id", "order_type", "expected_reason"),
+    [
+        (
+            BinanceProduct.USD_M,
+            "BTCUSDT",
+            _usd_m_instrument(),
+            "tpsl-u-BTCUSDT-BOTH-sl",
+            "STOP_MARKET",
+            FillReason.STOP_LOSS,
+        ),
+        (
+            BinanceProduct.COIN_M,
+            "BTCUSD_PERP",
+            _coin_m_instrument(),
+            "tpsl-c-BTCUSD_PERP-BOTH-tp",
+            "TAKE_PROFIT_MARKET",
+            FillReason.TAKE_PROFIT,
+        ),
+        (
+            BinanceProduct.USD_M,
+            "BTCUSDT",
+            _usd_m_instrument(),
+            "trl-u-BTCUSDT-BOTH",
+            "TRAILING_STOP_MARKET",
+            FillReason.TRAILING_STOP,
+        ),
+    ],
+)
+async def test_triggered_protection_child_trade_reuses_core_client_id(
+    adapter,
+    event_bus,
+    product: BinanceProduct,
+    symbol: str,
+    instrument: Instrument,
+    client_algo_id: str,
+    order_type: str,
+    expected_reason: FillReason,
+) -> None:
+    adapter._symbol_instruments[(product, symbol)] = instrument
+    published: list[object] = []
+    event_bus.subscribe(FillEvent, published.append)
+    event_bus.subscribe(OrderPlacedEvent, published.append)
+    event_bus.subscribe(OrderStatusEvent, published.append)
+    event_bus.subscribe(OrderCancelledEvent, published.append)
+    algo_entry: dict[str, object] = {
+        "caid": client_algo_id,
+        "aid": 987,
+        "at": "CONDITIONAL",
+        "o": order_type,
+        "s": symbol,
+        "S": "SELL",
+        "ps": "BOTH",
+        "f": "GTE_GTC",
+        "q": "0.25",
+        "X": "TRIGGERED",
+        "ai": "12345",
+        "ap": "0",
+        "aq": "0",
+        "tp": "65000",
+        "p": "0",
+        "R": True,
+    }
+
+    await adapter._handle_user_stream_message(
+        product,
+        {"e": "ALGO_UPDATE", "E": _EVENT_TIME, "o": algo_entry},
+    )
+
+    assert adapter._platform_order_keys[(product, symbol, "12345")] == client_algo_id
+
+    await adapter._handle_user_stream_message(
+        product,
+        {
+            "e": "ORDER_TRADE_UPDATE",
+            "E": _EVENT_TIME,
+            "o": {
+                "s": symbol,
+                "c": "venue-generated-child",
+                "i": 12345,
+                "S": "SELL",
+                "o": order_type,
+                "f": "GTE_GTC",
+                "q": "0.25",
+                "z": "0.25",
+                "X": "FILLED",
+                "p": "0",
+                "ap": "65000",
+                "l": "0.25",
+                "L": "65000",
+                "T": _EVENT_TIME,
+                "t": 555,
+                "n": "0.01",
+                "N": "USDT",
+                "R": True,
+                "x": "TRADE",
+            },
+        },
+    )
+
+    assert len(published) == 1
+    assert isinstance(published[0], FillEvent)
+    assert published[0].fill.client_order_id == client_algo_id
+    assert published[0].fill.reason == expected_reason
+    assert client_algo_id not in adapter._order_refs
+    assert "venue-generated-child" not in adapter._order_refs
+
+    await adapter._handle_user_stream_message(
+        product,
+        {
+            "e": "ALGO_UPDATE",
+            "E": _EVENT_TIME,
+            "o": {**algo_entry, "X": "FINISHED"},
+        },
+    )
+
+    assert (product, symbol, "12345") not in adapter._platform_order_keys
+    assert len(published) == 1
+
+
 def _futures_fill_entry(client_order_id: str) -> dict[str, object]:
     return {
         "e": "ORDER_TRADE_UPDATE",
