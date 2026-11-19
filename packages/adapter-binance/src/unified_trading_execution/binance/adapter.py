@@ -135,7 +135,12 @@ from unified_trading_execution.trailing.types import (
     TrailingBasis,
     TrailingOffsetType,
 )
-from unified_trading_execution.types.enums import LIVE_ORDER_STATUSES, OrderStatus, OrderType
+from unified_trading_execution.types.enums import (
+    LIVE_ORDER_STATUSES,
+    OrderSide,
+    OrderStatus,
+    OrderType,
+)
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
@@ -231,6 +236,8 @@ class BinanceAdapter(Adapter):
         _socket_manager: Binance private-stream manager for Spot and USDⓈ-M.
         _stream_tasks: Background account-stream tasks keyed by product.
         _order_refs: Product/symbol routing references for known orders.
+        _terminal_order_refs: Bounded LRU of routing references for orders that
+            reached a terminal state; keeps them queryable by the venue.
         _instrument_spec_cache: Successful instrument specs keyed by canonical
             instrument identity.
         _exchange_info_cache: Product-wide exchange metadata, fetched once per
@@ -258,6 +265,7 @@ class BinanceAdapter(Adapter):
         self._stream_ready: dict[BinanceProduct, asyncio.Event] = {}
 
         self._order_refs: dict[str, OrderReference] = {}
+        self._terminal_order_refs: OrderedDict[str, OrderReference] = OrderedDict()
         self._symbol_instruments: dict[tuple[BinanceProduct, str], Instrument] = {}
         self._known_instruments: set[Instrument] = set()
         self._platform_order_keys: dict[tuple[BinanceProduct, str, str], str] = {}
@@ -435,6 +443,7 @@ class BinanceAdapter(Adapter):
 
     def _clear_session_order_state(self) -> None:
         self._order_refs.clear()
+        self._terminal_order_refs.clear()
         self._platform_order_keys.clear()
         self._open_order_ids.clear()
         self._final_order_ids.clear()
@@ -641,6 +650,9 @@ class BinanceAdapter(Adapter):
         client_order_id: str,
     ) -> OrderReference | None:
         reference = self._order_refs.get(client_order_id)
+        if reference is not None:
+            return reference
+        reference = self._terminal_order_refs.get(client_order_id)
         if reference is not None:
             return reference
         if self._state_store is None:
@@ -1133,13 +1145,13 @@ class BinanceAdapter(Adapter):
             )
             self._open_order_ids.discard(order_identity)
             self._remember_final_order_id(order_identity)
-            self._forget_order_reference(order.client_order_id)
+            self._demote_order_reference(order.client_order_id)
         elif order.status == OrderStatus.FILLED:
             if already_open:
                 self._publish_order_status(order, timestamp)
             self._open_order_ids.discard(order_identity)
             self._remember_final_order_id(order_identity)
-            self._forget_order_reference(order.client_order_id)
+            self._demote_order_reference(order.client_order_id)
         elif already_open:
             self._publish_order_status(order, timestamp)
 
@@ -1169,15 +1181,20 @@ class BinanceAdapter(Adapter):
         while len(self._final_order_ids) > _MAX_FINAL_ORDER_IDS:
             self._final_order_ids.popitem(last=False)
 
-    def _forget_order_reference(self, client_order_id: str) -> None:
-        """Remove all routing metadata for a terminal or cancelled order.
+    def _demote_order_reference(self, client_order_id: str) -> None:
+        """Move a terminal order's routing reference into the bounded LRU.
 
-        Intentionally does *not* touch ``_open_order_ids``; callers are
-        responsible for discarding the order identity from that set before
-        calling this method.  Mixing the two responsibilities here would
-        create silent double-discard races in the stream handler path.
+        Terminal orders remain queryable on the venue for some time, so the
+        reference is kept for ``get_order_by_client_id`` and cancel
+        verification instead of being deleted outright.  Platform order keys
+        are still dropped: no further fills are expected once an order is
+        terminal.  Intentionally does *not* touch ``_open_order_ids``;
+        callers are responsible for discarding the order identity from that
+        set before calling this method.
         """
-        self._order_refs.pop(client_order_id, None)
+        reference = self._order_refs.pop(client_order_id, None)
+        if reference is None:
+            reference = self._terminal_order_refs.get(client_order_id)
         stale_platform_keys = [
             key
             for key, mapped_client_order_id in self._platform_order_keys.items()
@@ -1185,6 +1202,11 @@ class BinanceAdapter(Adapter):
         ]
         for key in stale_platform_keys:
             del self._platform_order_keys[key]
+        if reference is not None:
+            self._terminal_order_refs[client_order_id] = reference
+            self._terminal_order_refs.move_to_end(client_order_id)
+            while len(self._terminal_order_refs) > _MAX_FINAL_ORDER_IDS:
+                self._terminal_order_refs.popitem(last=False)
 
     def _schedule_balance_refresh(self, product: BinanceProduct) -> None:
         task = self._balance_refresh_tasks.get(product)
@@ -1542,7 +1564,7 @@ class BinanceAdapter(Adapter):
                     instrument=instrument,
                 )
             )
-        self._forget_order_reference(client_order_id)
+        self._demote_order_reference(client_order_id)
 
     async def get_order_by_client_id(self, client_order_id: str) -> OrderResult | None:
         """Query a known order; return ``None`` only for confirmed absence."""
@@ -1640,7 +1662,7 @@ class BinanceAdapter(Adapter):
             )
             if resolved is not None:
                 if resolved.status not in LIVE_ORDER_STATUSES and self._state_store is not None:
-                    self._forget_order_reference(client_order_id)
+                    self._demote_order_reference(client_order_id)
                 return resolved
         result = parse_order_result(
             response_entry,
@@ -1648,7 +1670,7 @@ class BinanceAdapter(Adapter):
             conditional=reference.conditional,
         )
         if result.status not in LIVE_ORDER_STATUSES and self._state_store is not None:
-            self._forget_order_reference(client_order_id)
+            self._demote_order_reference(client_order_id)
         return result
 
     async def _resolve_conditional_actual_order(
@@ -2660,12 +2682,56 @@ class BinanceAdapter(Adapter):
 
         client_algo_id = trailing_client_id(leg)
         await self._cancel_trailing_order(leg.product, symbol=symbol, native_id=client_algo_id)
+        activation_price = request.activation_price
+        immediate_reference: Decimal | None = None
+        if leg.product is BinanceProduct.COIN_M and activation_price is None:
+            # /dapi/v1/algoOrder mandates activatePrice even for immediate
+            # activation.  Derive it from the price the trail monitors so the
+            # venue's activation check sees the same basis as workingType.
+            ticker = await self.fetch_ticker(request.instrument)
+            if ticker is not None:
+                if request.basis is TrailingBasis.MARK:
+                    immediate_reference = (
+                        ticker.mark if ticker.mark is not None else ticker.last
+                    )
+                else:
+                    immediate_reference = (
+                        ticker.last if ticker.last is not None else ticker.mark
+                    )
+            if immediate_reference is None:
+                raise PlatformError(
+                    f"Cannot place COIN-M trailing stop for {symbol}: "
+                    "no ticker price available for mandatory activatePrice"
+                )
+            activation_price = immediate_reference
+        if activation_price is not None:
+            # Binance rejects activatePrice values that exceed the symbol's
+            # price precision (-1102), so snap to the tick.  Use the cached
+            # exchange-info row rather than fetch_instrument_spec, which
+            # would add a signed leverage-bracket lookup.
+            entries = await self._load_exchange_info(leg.product)
+            _, entry = resolve_binance_symbol(request.instrument, leg.product, entries)
+            tick_size = parse_tick_size(entry)
+            if immediate_reference is not None:
+                # Nudge off the activation boundary: a sell-side trail is
+                # already armed when price is at/above activatePrice and a
+                # buy-side trail when it is at/below.  Sitting exactly on the
+                # current price lets the venue read the order as an immediate
+                # trigger (-2021), and mark/contract divergence can flip the
+                # comparison, so pad by a fraction of a percent.
+                pad = immediate_reference * Decimal("0.005")
+                activation_price = (
+                    immediate_reference - pad
+                    if request.side is OrderSide.BUY
+                    else immediate_reference + pad
+                )
+            activation_price = activation_price.quantize(tick_size)
         payload = build_trailing_algo_payload(
             leg=leg,
             leg_quantity=quantity,
             request_side=request.side,
             offset=request.offset,
-            activation_price=request.activation_price,
+            activation_price=activation_price,
             basis=request.basis,
         )
         await self._create_trailing_algo_order(leg.product, payload)
@@ -4225,7 +4291,7 @@ class BinanceAdapter(Adapter):
                         )
         self._open_order_ids = open_ids
         for client_order_id in previous_order_references.difference(orders):
-            self._forget_order_reference(client_order_id)
+            self._demote_order_reference(client_order_id)
         return orders
 
     async def fetch_fills(self, *, since: datetime | None = None) -> dict[str, list[FillRecord]]:

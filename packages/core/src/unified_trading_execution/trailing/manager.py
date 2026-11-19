@@ -1665,7 +1665,7 @@ class TrailingManager:
             )
 
         identity, _ = _recovery_identity(state, open_leg, instrument_spec.tick_size)
-        if identity is not None:
+        if identity == "position_replaced":
             return await self._degrade_now(state, identity)
 
         result: NativeTrailingResult | None = None

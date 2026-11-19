@@ -203,11 +203,19 @@ async def test_connect_and_disconnect_publish_state_and_use_configured_environme
     adapter._open_order_ids.add("spot:BTCUSDT:10")
     adapter._remember_final_order_id("spot:BTCUSDT:9")
     adapter._seen_fill_ids["spot:BTCUSDT:8"] = None
+    adapter._terminal_order_refs["done-order"] = OrderReference(
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        conditional=False,
+        order_type=OrderType.LIMIT,
+        platform_order_id="7",
+    )
 
     await adapter.disconnect()
 
     assert adapter.is_connected is False
     assert adapter._order_refs == {}
+    assert adapter._terminal_order_refs == {}
     assert adapter._platform_order_keys == {}
     assert adapter._open_order_ids == set()
     assert adapter._final_order_ids == {}

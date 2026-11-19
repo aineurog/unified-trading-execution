@@ -368,6 +368,7 @@ def _coin_m_metadata() -> dict[str, object]:
         "contractType": "PERPETUAL",
         "marginAsset": "BTC",
         "contractSize": "100",
+        "filters": [{"filterType": "PRICE_FILTER", "tickSize": "0.1"}],
     }
 
 
@@ -421,6 +422,21 @@ async def test_place_trailing_stop_coin_m_uses_dapi_algo_endpoint(
         return [] if args[0] == "get" else {}
 
     binance_client_mock._request_futures_coin_api.side_effect = _coin_api
+    # COIN-M algo orders mandate activatePrice; the adapter fills it from the
+    # mark ticker for immediate activation.
+    binance_client_mock.futures_coin_symbol_ticker.return_value = {
+        "symbol": "BTCUSD_PERP",
+        "price": "60800",
+    }
+    binance_client_mock.futures_coin_orderbook_ticker.return_value = {
+        "symbol": "BTCUSD_PERP",
+        "bidPrice": "60790",
+        "askPrice": "60810",
+    }
+    binance_client_mock.futures_coin_mark_price.return_value = {
+        "symbol": "BTCUSD_PERP",
+        "markPrice": "60805",
+    }
 
     result = await adapter.place_trailing_stop(
         _request(
@@ -440,6 +456,9 @@ async def test_place_trailing_stop_coin_m_uses_dapi_algo_endpoint(
     assert payload["callbackRate"] == "5"
     assert payload["quantity"] == "1"
     assert payload["reduceOnly"] == "true"
+    # Immediate activation is padded 0.5% below the mark reference so the
+    # sell-side trail is unambiguously already armed.
+    assert payload["activatePrice"] == "60501"
     assert "newOrderRespType" not in payload
 
 
