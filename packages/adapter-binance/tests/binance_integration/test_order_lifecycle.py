@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime, timedelta
 from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from uuid import uuid4
 
@@ -115,15 +116,21 @@ async def _exchange_order_history(
     symbol: str,
     conditional: bool,
 ) -> list[dict[str, object]]:
-    if product == BinanceProduct.SPOT:
-        method_name = "get_all_orders"
-    elif product == BinanceProduct.USD_M and conditional:
-        method_name = "futures_get_all_algo_orders"
-    elif product == BinanceProduct.USD_M:
-        method_name = "futures_get_all_orders"
+    if product == BinanceProduct.COIN_M and conditional:
+        method_name = "allAlgoOrders"
+        response = await client._request_futures_coin_api(
+            "get", "allAlgoOrders", True, data={"symbol": symbol}
+        )
     else:
-        method_name = "futures_coin_get_all_orders"
-    response = await getattr(client, method_name)(symbol=symbol)
+        if product == BinanceProduct.SPOT:
+            method_name = "get_all_orders"
+        elif product == BinanceProduct.USD_M and conditional:
+            method_name = "futures_get_all_algo_orders"
+        elif product == BinanceProduct.USD_M:
+            method_name = "futures_get_all_orders"
+        else:
+            method_name = "futures_coin_get_all_orders"
+        response = await getattr(client, method_name)(symbol=symbol)
     if not isinstance(response, list) or not all(isinstance(row, dict) for row in response):
         raise AssertionError(
             f"Binance {product.value} returned invalid {method_name} history: {response!r}"
@@ -193,6 +200,69 @@ def _history_entry(
     )
 
 
+@pytest.mark.parametrize(
+    ("product_key", "product", "symbol", "binance_order_config"),
+    [pytest.param(*case, case[0], id=case[0]) for case in _PRODUCT_CASES],
+    indirect=["binance_order_config"],
+)
+@pytest.mark.parametrize(
+    ("order_type", "time_in_force"),
+    tuple(
+        (order_type, time_in_force)
+        for order_type in (
+            OrderType.MARKET,
+            OrderType.LIMIT,
+            OrderType.STOP,
+            OrderType.STOP_LIMIT,
+        )
+        for time_in_force in (TimeInForce.DAY, TimeInForce.GTD)
+    ),
+    ids=[
+        f"{order_type.value.lower()}-{time_in_force.value.lower()}"
+        for order_type in (
+            OrderType.MARKET,
+            OrderType.LIMIT,
+            OrderType.STOP,
+            OrderType.STOP_LIMIT,
+        )
+        for time_in_force in (TimeInForce.DAY, TimeInForce.GTD)
+    ],
+)
+async def test_unsupported_time_in_force_rejected(
+    product_key: str,
+    product: BinanceProduct,
+    symbol: str,
+    binance_order_config: BinanceConfig,
+    order_type: OrderType,
+    time_in_force: TimeInForce,
+) -> None:
+    """DAY/GTD are core TIFs Binance cannot express; every product must reject."""
+    adapter = BinanceAdapter(binance_order_config)
+    try:
+        await adapter.connect()
+        order = UnifiedOrder(
+            instrument=_instrument(product, symbol),
+            order_type=order_type,
+            side=OrderSide.BUY,
+            quantity=Decimal("0.001"),
+            time_in_force=time_in_force,
+            client_order_id=f"{product_key[0]}tif-{uuid4().hex[:24]}",
+            price=(
+                Decimal("101") if order_type in (OrderType.LIMIT, OrderType.STOP_LIMIT) else None
+            ),
+            stop_price=(
+                Decimal("100") if order_type in (OrderType.STOP, OrderType.STOP_LIMIT) else None
+            ),
+            expire_at=(
+                datetime.now(UTC) + timedelta(hours=1) if time_in_force is TimeInForce.GTD else None
+            ),
+        )
+        with pytest.raises(UnsupportedOrderTypeError):
+            await adapter.place_order(order)
+    finally:
+        await adapter.disconnect()
+
+
 def test_coinm_book_ticker_list_response_is_normalized() -> None:
     ticker = {
         "symbol": "BTCUSD_PERP",
@@ -224,11 +294,6 @@ def _is_expected_unsupported(
     order_type: OrderType,
     time_in_force: TimeInForce,
 ) -> bool:
-    if product == BinanceProduct.COIN_M and order_type in (
-        OrderType.STOP,
-        OrderType.STOP_LIMIT,
-    ):
-        return True
     return order_type in (OrderType.MARKET, OrderType.STOP) and (time_in_force != TimeInForce.GTC)
 
 
@@ -405,10 +470,10 @@ async def test_order_type_and_time_in_force_matrix(
         assert result.platform_order_id is not None
         assert result.status != OrderStatus.REJECTED
 
-        conditional = product == BinanceProduct.USD_M and order_type in (
-            OrderType.STOP,
-            OrderType.STOP_LIMIT,
-        )
+        conditional = product in (
+            BinanceProduct.USD_M,
+            BinanceProduct.COIN_M,
+        ) and order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
         queried = await _wait_for_order(adapter, client_order_id)
         history_entry = await _wait_for_history_entry(
             client,
@@ -440,10 +505,10 @@ async def test_order_type_and_time_in_force_matrix(
                     cleanup_client = adapter._client
                     if cleanup_client is None:
                         raise AssertionError("Connected adapter has no Binance REST client")
-                    conditional = product == BinanceProduct.USD_M and order_type in (
-                        OrderType.STOP,
-                        OrderType.STOP_LIMIT,
-                    )
+                    conditional = product in (
+                        BinanceProduct.USD_M,
+                        BinanceProduct.COIN_M,
+                    ) and order_type in (OrderType.STOP, OrderType.STOP_LIMIT)
                     history_entry = await _wait_for_history_entry(
                         cleanup_client,
                         product=product,

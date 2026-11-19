@@ -1092,6 +1092,32 @@ async def test_confirmed_absence_returns_none_but_unknown_ids_do_not_probe(
     assert await adapter.get_order_by_client_id("missing") is None
 
 
+async def test_terminal_order_reference_remains_queryable(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    """Demoted terminal orders stay resolvable for venue queries."""
+    await adapter.connect()
+    adapter._order_refs["done-order"] = OrderReference(
+        product=BinanceProduct.SPOT,
+        symbol="BTCUSDT",
+        conditional=False,
+        order_type=OrderType.LIMIT,
+        platform_order_id="555",
+    )
+    adapter._demote_order_reference("done-order")
+
+    assert "done-order" not in adapter._order_refs
+    assert adapter._terminal_order_refs["done-order"].symbol == "BTCUSDT"
+
+    binance_client_mock.get_order.return_value = _order_response(order_id="555", status="CANCELED")
+    result = await adapter.get_order_by_client_id("done-order")
+
+    assert result is not None
+    assert result.status == OrderStatus.CANCELLED
+    binance_client_mock.get_order.assert_awaited_once_with(symbol="BTCUSDT", orderId="555")
+
+
 async def test_order_operations_recover_routing_from_state_store_cache_miss(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
@@ -1141,7 +1167,8 @@ async def test_order_operations_recover_routing_from_state_store_cache_miss(
     )
     assert adapter._order_refs["core-order"].symbol == "BTCUSDT"
 
-    adapter._forget_order_reference("core-order")
+    adapter._order_refs.pop("core-order")
+    adapter._terminal_order_refs.pop("core-order", None)
     cancelled = await adapter.cancel_order("core-order")
 
     assert cancelled.status is OrderStatus.CANCELLED
