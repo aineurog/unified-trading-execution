@@ -351,6 +351,21 @@ async def test_place_trailing_stop_replaces_existing_trail(
     binance_client_mock.futures_create_algo_order.assert_awaited_once()
 
 
+async def test_place_trailing_stop_payload_failure_keeps_existing_trail(
+    adapter: BinanceAdapter, binance_client_mock: AsyncMock
+) -> None:
+    """Resolve and validate the replacement before canceling the old trail."""
+    await _connected_adapter(adapter, binance_client_mock)
+    binance_client_mock.futures_position_information.return_value = [_position_entry()]
+    binance_client_mock.futures_get_open_algo_orders.return_value = [_algo_entry(algoId=111)]
+
+    with pytest.raises(UnsupportedOrderTypeError, match="callbackRate"):
+        await adapter.place_trailing_stop(_request(offset=Decimal("20")))
+
+    binance_client_mock.futures_cancel_algo_order.assert_not_awaited()
+    binance_client_mock.futures_create_algo_order.assert_not_awaited()
+
+
 async def test_place_trailing_stop_rejects_non_percent_offset(
     adapter: BinanceAdapter, binance_client_mock: AsyncMock
 ) -> None:
@@ -460,6 +475,28 @@ async def test_place_trailing_stop_coin_m_uses_dapi_algo_endpoint(
     # sell-side trail is unambiguously already armed.
     assert payload["activatePrice"] == "60501"
     assert "newOrderRespType" not in payload
+
+
+async def test_place_trailing_stop_coin_m_ticker_failure_keeps_existing_trail(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed activatePrice lookup must not cancel the trail it would replace."""
+    await _coin_m_connected_adapter(adapter, binance_client_mock)
+    binance_client_mock._request_futures_coin_api.return_value = [_coin_m_algo_entry()]
+    monkeypatch.setattr(adapter, "fetch_ticker", AsyncMock(return_value=None))
+
+    with pytest.raises(PlatformError, match="activatePrice"):
+        await adapter.place_trailing_stop(
+            _request(
+                instrument=_coin_m_instrument(),
+                position_id="coin_m:BTCUSD_PERP:BOTH",
+            )
+        )
+
+    calls = binance_client_mock._request_futures_coin_api.await_args_list
+    assert [call.args[0] for call in calls if call.args and call.args[0] == "delete"] == []
 
 
 async def test_coin_m_open_algo_orders_dispatch(

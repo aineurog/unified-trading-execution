@@ -1918,6 +1918,35 @@ class TestNativeExecution:
         ]
         assert audits[-1].payload["reason"] == "native_rearmed"
 
+    async def test_native_integrity_degrades_when_position_is_replaced(self, store):
+        await store.upsert_position(make_position())
+        manager, _, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+        await store.upsert_position(make_position(opened_at=NOW + timedelta(hours=1)))
+
+        degraded = await manager.check_integrity(state.trailing_id)
+
+        assert degraded is not None
+        assert degraded.phase is TrailingPhase.DEGRADED
+        assert degraded.last_error is not None
+        assert degraded.last_error.endswith("position_replaced")
+
+    async def test_native_integrity_tolerates_unverified_position_identity(self, store):
+        await store.upsert_position(make_position())
+        manager, adapter, _ = await make_manager(store, native=make_native_exact())
+        state = await manager.attach(TrailingRequest(make_inst(), make_spec()))
+        assert state.native_id is not None
+        requests_before = len(adapter.native_requests)
+        await store.upsert_position(make_position(opened_at=None))
+
+        checked = await manager.check_integrity(state.trailing_id)
+
+        assert checked is not None
+        assert checked.phase is TrailingPhase.ARMED
+        assert checked.native_id == state.native_id
+        assert len(adapter.native_requests) == requests_before
+
     async def test_native_integrity_degrades_when_rearm_fails(self, store):
         await store.upsert_position(make_position())
         manager, adapter, _ = await make_manager(store, native=make_native_exact())

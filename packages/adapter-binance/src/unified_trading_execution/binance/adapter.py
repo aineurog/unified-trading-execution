@@ -2680,8 +2680,6 @@ class BinanceAdapter(Adapter):
                 f"No open {leg.product.value} position {request.position_id!r} for {symbol}"
             )
 
-        client_algo_id = trailing_client_id(leg)
-        await self._cancel_trailing_order(leg.product, symbol=symbol, native_id=client_algo_id)
         activation_price = request.activation_price
         immediate_reference: Decimal | None = None
         if leg.product is BinanceProduct.COIN_M and activation_price is None:
@@ -2730,6 +2728,11 @@ class BinanceAdapter(Adapter):
             activation_price=activation_price,
             basis=request.basis,
         )
+        # Cancel only once the replacement is fully resolved and validated:
+        # ticker, exchange info, or payload failures must leave the existing
+        # trail armed rather than silently removing protection.
+        client_algo_id = trailing_client_id(leg)
+        await self._cancel_trailing_order(leg.product, symbol=symbol, native_id=client_algo_id)
         await self._create_trailing_algo_order(leg.product, payload)
         return NativeTrailingResult(
             native_id=client_algo_id,
