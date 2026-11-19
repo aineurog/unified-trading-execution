@@ -328,16 +328,26 @@ async def test_cancelled_order_stream_updates_publish_once(
 
 
 @pytest.mark.asyncio
-async def test_usdm_algo_update_stream_schema_is_normalized(
+@pytest.mark.parametrize(
+    ("product", "symbol", "instrument"),
+    [
+        (BinanceProduct.USD_M, "BTCUSDT", _usd_m_instrument()),
+        (BinanceProduct.COIN_M, "BTCUSD_PERP", _coin_m_instrument()),
+    ],
+)
+async def test_futures_algo_update_stream_schema_is_normalized(
     adapter,
     event_bus,
+    product: BinanceProduct,
+    symbol: str,
+    instrument: Instrument,
 ) -> None:
-    adapter._symbol_instruments[(BinanceProduct.USD_M, "BTCUSDT")] = _usd_m_instrument()
+    adapter._symbol_instruments[(product, symbol)] = instrument
     published: list[OrderPlacedEvent] = []
     event_bus.subscribe(OrderPlacedEvent, published.append)
 
     await adapter._handle_user_stream_message(
-        BinanceProduct.USD_M,
+        product,
         {
             "e": "ALGO_UPDATE",
             "E": _EVENT_TIME,
@@ -346,7 +356,7 @@ async def test_usdm_algo_update_stream_schema_is_normalized(
                 "aid": 987,
                 "at": "CONDITIONAL",
                 "o": "TAKE_PROFIT",
-                "s": "BTCUSDT",
+                "s": symbol,
                 "S": "SELL",
                 "ps": "BOTH",
                 "f": "GTC",
@@ -371,7 +381,7 @@ async def test_usdm_algo_update_stream_schema_is_normalized(
     assert order.stop_price == Decimal("65000")
     assert order.status == OrderStatus.OPEN
     assert adapter._order_refs["algo-client"].conditional is True
-    assert adapter._platform_order_keys[(BinanceProduct.USD_M, "BTCUSDT", "12345")] == "algo-client"
+    assert adapter._platform_order_keys[(product, symbol, "12345")] == "algo-client"
 
 
 @pytest.mark.asyncio
@@ -435,13 +445,27 @@ async def test_coin_m_private_stream_uses_sdk_coin_futures_socket(
 
 
 @pytest.mark.asyncio
-async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_bus) -> None:
-    adapter._symbol_instruments[(BinanceProduct.USD_M, "BTCUSDT")] = _usd_m_instrument()
+@pytest.mark.parametrize(
+    ("product", "symbol", "instrument", "fee_asset"),
+    [
+        (BinanceProduct.USD_M, "BTCUSDT", _usd_m_instrument(), "USDT"),
+        (BinanceProduct.COIN_M, "BTCUSD_PERP", _coin_m_instrument(), "BTC"),
+    ],
+)
+async def test_triggered_algo_child_trade_reuses_core_client_id(
+    adapter,
+    event_bus,
+    product: BinanceProduct,
+    symbol: str,
+    instrument: Instrument,
+    fee_asset: str,
+) -> None:
+    adapter._symbol_instruments[(product, symbol)] = instrument
     fills: list[FillEvent] = []
     event_bus.subscribe(FillEvent, fills.append)
 
     await adapter._handle_user_stream_message(
-        BinanceProduct.USD_M,
+        product,
         {
             "e": "ALGO_UPDATE",
             "E": _EVENT_TIME,
@@ -450,7 +474,7 @@ async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_b
                 "aid": 987,
                 "at": "CONDITIONAL",
                 "o": "TAKE_PROFIT_MARKET",
-                "s": "BTCUSDT",
+                "s": symbol,
                 "S": "SELL",
                 "ps": "BOTH",
                 "f": "GTC",
@@ -466,12 +490,12 @@ async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_b
         },
     )
     await adapter._handle_user_stream_message(
-        BinanceProduct.USD_M,
+        product,
         {
             "e": "ORDER_TRADE_UPDATE",
             "E": _EVENT_TIME,
             "o": {
-                "s": "BTCUSDT",
+                "s": symbol,
                 "c": "venue-generated-child",
                 "i": 12345,
                 "S": "SELL",
@@ -487,7 +511,7 @@ async def test_triggered_algo_child_trade_reuses_core_client_id(adapter, event_b
                 "T": _EVENT_TIME,
                 "t": 555,
                 "n": "0.01",
-                "N": "USDT",
+                "N": fee_asset,
                 "R": True,
                 "x": "TRADE",
             },

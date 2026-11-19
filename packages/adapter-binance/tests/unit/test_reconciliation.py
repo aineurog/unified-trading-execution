@@ -233,20 +233,62 @@ async def test_fetch_open_orders_includes_futures_algo_orders(
             "algoId": 20,
             "clientAlgoId": "algo-order",
             "side": "SELL",
-            "type": "STOP_MARKET",
-            "timeInForce": "GTC",
+            "orderType": "STOP_MARKET",
+            "timeInForce": "GTE_GTC",
             "quantity": "0.2",
             "triggerPrice": "55000",
             "algoStatus": "NEW",
         }
     ]
+    binance_client_mock._request_futures_coin_api.return_value = [
+        {
+            "symbol": "BTCUSD_PERP",
+            "algoId": 30,
+            "clientAlgoId": "coinm-algo-order",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "orderType": "STOP_MARKET",
+            "timeInForce": "GTE_GTC",
+            "quantity": "1",
+            "triggerPrice": "55000",
+            "algoStatus": "NEW",
+        },
+        {
+            "symbol": "BTCUSD_PERP",
+            "algoId": 31,
+            "clientAlgoId": "foreign-coinm-trail",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "orderType": "TRAILING_STOP_MARKET",
+            "timeInForce": "GTE_GTC",
+            "quantity": "1",
+            "triggerPrice": "54000",
+            "algoStatus": "NEW",
+        },
+    ]
     orders = await adapter.fetch_open_orders()
 
-    assert set(orders) == {"spot-order", "algo-order"}
+    assert set(orders) == {
+        "spot-order",
+        "algo-order",
+        "coinm-algo-order",
+        "foreign-coinm-trail",
+    }
     assert orders["spot-order"].status == OrderStatus.OPEN
     assert orders["algo-order"].stop_price == Decimal("55000")
+    assert orders["algo-order"].time_in_force is TimeInForce.GTC
     assert adapter._order_refs["algo-order"].conditional is True
-    assert adapter._open_order_ids == {"spot:BTCUSDT:10", "usd_m:BTCUSDT:20"}
+    assert orders["coinm-algo-order"].stop_price == Decimal("55000")
+    assert adapter._order_refs["coinm-algo-order"].conditional is True
+    assert orders["foreign-coinm-trail"].order_type is OrderType.STOP
+    assert orders["foreign-coinm-trail"].time_in_force is TimeInForce.GTC
+    assert adapter._order_refs["foreign-coinm-trail"].conditional is True
+    assert adapter._open_order_ids == {
+        "spot:BTCUSDT:10",
+        "usd_m:BTCUSDT:20",
+        "coin_m:BTCUSD_PERP:30",
+        "coin_m:BTCUSD_PERP:31",
+    }
 
 
 @pytest.mark.asyncio

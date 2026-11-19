@@ -7,7 +7,10 @@ observation path, the async REST client lifecycle, and core order operations
 are implemented, along with private account streams and reconciliation
 snapshots and market data reads. Position-level TP/SL protection is implemented
 for USDⓈ-M and COIN-M Futures, including market-on-trigger and limit-trigger
-attachments. Native trailing stops remain unsupported. Futures leverage,
+attachments. Native USDⓈ-M and COIN-M trailing stops are implemented via
+`TRAILING_STOP_MARKET` algo orders; Spot native trailing remains
+unsupported, so `TrailingMode.AUTO` falls back to synthetic
+position protection there. Futures leverage,
 margin mode, and position mode are managed as persisted adapter intent.
 
 ## Installation
@@ -99,9 +102,9 @@ derives a stable, non-secret label from the API key.
 ### Order operations
 
 The adapter supports Spot and Futures MARKET/LIMIT orders, Spot STOP/STOP_LIMIT,
-and USDⓈ-M STOP/STOP_LIMIT via the SDK's public algo-order route. Ordinary
-COIN-M conditional orders, Spot order modification, and conditional-order
-modification are unsupported. Order-level ``take_profit``/``stop_loss``
+and USDⓈ-M/COIN-M STOP/STOP_LIMIT via the Futures algo-order endpoints. Spot
+order modification and conditional-order modification are unsupported.
+Order-level ``take_profit``/``stop_loss``
 attachments are supported only on Futures MARKET entries: the adapter waits
 for the synchronous fill, resolves the resulting position leg, and attaches
 MARK-basis position protection, failing loudly if the fill is not synchronous
@@ -112,11 +115,13 @@ TP/SL is supported separately on both Futures products. Protection
 `modify_position_tpsl` rejects unaligned prices with `InvalidOrderError`
 before any venue call. USDⓈ-M and COIN-M
 ordinary LIMIT orders can be modified by price and/or quantity.
-COIN-M position TP/SL uses regular conditional orders through the public
-python-binance order methods, matching Binance's Positions TP/SL panel.
-Changing a COIN-M protection side cancels and replaces that side; the
-unmentioned side remains untouched. COIN-M algo orders left by older adapter
-versions are not managed; cancel them directly on Binance before upgrading.
+Position TP/SL on both Futures products uses conditional algo orders. COIN-M
+algo requests use python-binance's signed request transport because the library
+has no public COIN-M algo-order wrappers. Changing a COIN-M protection side
+cancels and replaces that side; the unmentioned side remains untouched.
+Existing COIN-M regular-order protection is still readable and is cancelled
+when that side is replaced or cleared; new protection is never placed through
+the regular order endpoint.
 Order routing references are restored from persisted orders and refreshed from
 live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
@@ -129,11 +134,13 @@ provide the average.
 ### Account streams and reconciliation
 
 The adapter translates Spot execution and balance updates, USDⓈ-M and COIN-M
-order/position updates, and USDⓈ-M algo-order updates into core events. REST
+order/position and algo-order updates into core events. REST
 snapshots provide balances, derivative positions, open orders (including
-USDⓈ-M algo orders), and account trades. Adapter-owned position-protection
-orders are excluded from the ordinary order mirror. Reconnects use bounded
-backoff; final order and fill events are deduplicated in memory.
+USDⓈ-M and COIN-M algo orders), and account trades. Adapter-owned position
+protection and trailing orders are excluded from the ordinary order mirror.
+Foreign `TRAILING_STOP_MARKET` algo orders are represented as core `STOP`
+orders because the portable order model has no trailing order type. Reconnects
+use bounded backoff; final order and fill events are deduplicated in memory.
 
 Balance keys are product-qualified (for example, `SPOT:USDT` and
 `USD_M:USDT`) because Binance maintains separate product wallets while the core
@@ -147,6 +154,25 @@ disconnected order references are evicted. Historical order-to-platform-ID
 mapping for fill snapshots is read from the existing state store rather than
 retained for the lifetime of the adapter.
 
+### Trailing stops
+
+Native trailing is implemented for USDⓈ-M and COIN-M Futures, via
+`TRAILING_STOP_MARKET` conditional algo orders (`/fapi/v1/algoOrder` and
+`/dapi/v1/algoOrder`).
+Supported requests: `TrailingOffsetType.PERCENT` offsets in Binance's
+0.1%-10% `callbackRate` range, `LAST`/`MARK` working type, and `IMMEDIATE` or
+`PRICE` activation. Orders are position-leg scoped (`symbol` +
+`positionSide`), carry deterministic `trl-` client algo IDs, reduce-only,
+and stay out of the order mirror. Placing over an existing trail cancels
+and replaces it; foreign trails on the same leg are detected for takeover
+protection. COIN-M algo orders have no public python-binance wrapper, so
+the adapter calls the SDK's own signed `_request_futures_coin_api`
+transport for the documented `/dapi/v1/algoOrder` endpoints (Binance's
+unified UM/CM migration, notice C.5) — same signing, session, and
+rate-limit handling as every `futures_coin_*` method. Spot reports
+native trailing as unsupported, so `TrailingMode.AUTO` falls back to
+synthetic position protection there.
+
 ### Futures configuration intent
 
 The adapter manages leverage and `MarginMode` (`CROSS`, `ISOLATED`) per
@@ -155,8 +181,8 @@ It persists desired settings in the StateStore, reapplies them on connect by
 default, and reconciles drift using `halt` (default), `notify`, or `reapply`
 policies.
 
-Changes are refused when the affected scope has open orders or non-flat
-positions; USDⓈ-M algo orders are checked too. The adapter does not cancel
+Changes are refused when the affected scope has open orders, open algo orders,
+or non-flat positions. The adapter does not cancel
 orders or close positions. Checks are serialized with its own order operations,
 but external activity can race the Binance request. Removing a setting removes
 local intent only.

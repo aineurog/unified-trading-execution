@@ -12,6 +12,7 @@ from unified_trading_execution.binance.protection import (
     ProtectionSide,
     is_protection_client_id,
 )
+from unified_trading_execution.binance.trailing import is_trailing_client_id
 from unified_trading_execution.errors import PlatformError
 from unified_trading_execution.types.enums import (
     FillEntry,
@@ -28,6 +29,7 @@ from unified_trading_execution.types.position import Balance, Position
 _SIDES = {"BUY": OrderSide.BUY, "SELL": OrderSide.SELL}
 _TIME_IN_FORCE = {
     "GTC": TimeInForce.GTC,
+    "GTE_GTC": TimeInForce.GTC,
     "IOC": TimeInForce.IOC,
     "FOK": TimeInForce.FOK,
     "DAY": TimeInForce.DAY,
@@ -48,6 +50,9 @@ _FUTURES_TYPES = {
     # take-profit orders. Collapse TAKE_PROFIT_MARKET to STOP for now; add a dedicated
     # OrderType.TAKE_PROFIT and update order/fill translation when that core API is introduced.
     "TAKE_PROFIT_MARKET": OrderType.STOP,
+    # The core order model has no native trailing type; represent foreign
+    # trailing algo orders as stops in the generic order mirror.
+    "TRAILING_STOP_MARKET": OrderType.STOP,
     "STOP": OrderType.STOP_LIMIT,
     "TAKE_PROFIT": OrderType.STOP_LIMIT,
 }
@@ -191,7 +196,7 @@ def translate_order_entry(
     if side is None:
         raise PlatformError(f"Unknown Binance order side {side_raw!r}")
 
-    raw_type = entry.get("o", entry.get("type"))
+    raw_type = entry.get("o") or entry.get("type") or entry.get("orderType")
     order_type = _order_type(raw_type, product)
     raw_tif = entry.get("f", entry.get("timeInForce")) or "GTC"
     time_in_force = _TIME_IN_FORCE.get(str(raw_tif).upper())
@@ -306,12 +311,17 @@ def translate_order_entry(
 
 
 def _fill_reason(client_order_id: str, entry: FillEntry | None) -> FillReason | None:
-    """Classify adapter-owned protection fills as TP/SL triggers.
+    """Classify adapter-owned protection fills by trigger kind.
 
     ``tpsl-`` client ids end in ``-tp`` or ``-sl``, so a closing fill on one
     of those orders is by definition a take-profit or stop-loss trigger.
+    ``trl-`` ids are native trailing stops.
     """
-    if entry is not FillEntry.OUT or not is_protection_client_id(client_order_id):
+    if entry is not FillEntry.OUT:
+        return None
+    if is_trailing_client_id(client_order_id):
+        return FillReason.TRAILING_STOP
+    if not is_protection_client_id(client_order_id):
         return None
     if client_order_id.endswith(f"-{ProtectionSide.TAKE_PROFIT.value}"):
         return FillReason.TAKE_PROFIT

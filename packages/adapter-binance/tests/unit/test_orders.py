@@ -134,6 +134,8 @@ def _order_response(
         (BinanceProduct.USD_M, OrderType.STOP_LIMIT, "STOP", True),
         (BinanceProduct.COIN_M, OrderType.MARKET, "MARKET", False),
         (BinanceProduct.COIN_M, OrderType.LIMIT, "LIMIT", False),
+        (BinanceProduct.COIN_M, OrderType.STOP, "STOP_MARKET", True),
+        (BinanceProduct.COIN_M, OrderType.STOP_LIMIT, "STOP", True),
     ],
 )
 def test_builds_product_specific_order_payloads(
@@ -164,26 +166,35 @@ def test_builds_product_specific_order_payloads(
 
 
 @pytest.mark.parametrize(
-    ("order_type", "kwargs"),
+    ("order_type", "expected_type", "kwargs"),
     [
-        (OrderType.STOP, {"stop_price": Decimal("95")}),
+        (OrderType.STOP, "STOP_MARKET", {"stop_price": Decimal("95")}),
         (
             OrderType.STOP_LIMIT,
+            "STOP",
             {"price": Decimal("100"), "stop_price": Decimal("95")},
         ),
     ],
 )
-def test_coin_m_conditional_orders_fail_closed(
+def test_coin_m_conditional_orders_build_algo_payload(
     order_type: OrderType,
+    expected_type: str,
     kwargs: dict[str, object],
 ) -> None:
-    with pytest.raises(UnsupportedOrderTypeError, match="COIN-M conditional"):
-        build_place_order_payload(
-            _order(BinanceProduct.COIN_M, order_type, **kwargs),
-            product=BinanceProduct.COIN_M,
-            symbol="BTCUSD_PERP",
-            client_order_id="ute-123",
-        )
+    payload, conditional = build_place_order_payload(
+        _order(BinanceProduct.COIN_M, order_type, **kwargs),
+        product=BinanceProduct.COIN_M,
+        symbol="BTCUSD_PERP",
+        client_order_id="ute-123",
+    )
+
+    assert conditional is True
+    assert payload["type"] == expected_type
+    assert payload["clientAlgoId"] == "ute-123"
+    assert payload["algoType"] == "CONDITIONAL"
+    assert payload["triggerPrice"] == "95"
+    assert "stopPrice" not in payload
+    assert "newClientOrderId" not in payload
 
 
 @pytest.mark.parametrize(
@@ -662,7 +673,8 @@ async def test_usdm_conditional_order_uses_public_algo_order_lifecycle(
         type="STOP_MARKET",
         quantity="0.001",
         clientAlgoId=venue_id,
-        stopPrice="95",
+        triggerPrice="95",
+        algoType="CONDITIONAL",
     )
     assert result.platform_order_id == "45"
 
@@ -824,10 +836,12 @@ async def test_usdm_finished_conditional_order_follows_actual_order(
     assert fallback.platform_order_id == "45"
 
 
-async def test_conditional_actual_order_lookup_rejects_non_usdm_product(
+async def test_coin_m_conditional_actual_order_lookup_uses_coin_m_order_api(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
 ) -> None:
+    adapter._client = binance_client_mock
+    adapter._connected = True
     reference = OrderReference(
         product=BinanceProduct.COIN_M,
         symbol="BTCUSD_PERP",
@@ -835,15 +849,30 @@ async def test_conditional_actual_order_lookup_rejects_non_usdm_product(
         order_type=OrderType.STOP,
         platform_order_id="45",
     )
-    with pytest.raises(PlatformError, match="only supported for USDⓈ-M Futures"):
-        await adapter._resolve_conditional_actual_order(
-            binance_client_mock,
-            reference=reference,
-            entry={"algoStatus": "FINISHED", "actualOrderId": "7001"},
-            client_order_id="test-order-1",
-        )
+    binance_client_mock.futures_coin_get_order.return_value = {
+        "orderId": 7001,
+        "symbol": "BTCUSD_PERP",
+        "status": "FILLED",
+        "executedQty": "1",
+        "avgPrice": "65000",
+        "time": 1_700_000_000_000,
+        "updateTime": 1_700_000_000_000,
+    }
 
-    binance_client_mock.futures_get_order.assert_not_awaited()
+    result = await adapter._resolve_conditional_actual_order(
+        binance_client_mock,
+        reference=reference,
+        entry={"algoStatus": "FINISHED", "actualOrderId": "7001", "algoId": 45},
+        client_order_id="test-order-1",
+    )
+
+    assert result is not None
+    assert result.status is OrderStatus.FILLED
+    assert result.platform_order_id == "45"
+    binance_client_mock.futures_coin_get_order.assert_awaited_once_with(
+        symbol="BTCUSD_PERP",
+        orderId="7001",
+    )
 
 
 async def test_coinm_limit_order_routes_through_public_coinm_methods(

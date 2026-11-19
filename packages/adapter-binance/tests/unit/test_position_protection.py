@@ -16,7 +16,6 @@ from unified_trading_execution.binance.protection import (
     ProtectionSide,
     algo_order_type,
     build_algo_order_payload,
-    build_coin_m_order_payload,
     close_order_side,
     is_protection_client_id,
     parse_position_id,
@@ -31,10 +30,12 @@ from unified_trading_execution.errors import (
     PlatformError,
     UnsupportedOrderTypeError,
 )
-from unified_trading_execution.events import OrderPlacedEvent
+from unified_trading_execution.events import FillEvent, OrderPlacedEvent
 from unified_trading_execution.trailing.types import TrailingBasis
 from unified_trading_execution.types.enums import (
     AssetClass,
+    FillEntry,
+    FillReason,
     OrderSide,
     OrderType,
     TimeInForce,
@@ -174,6 +175,35 @@ def _coin_m_order_entry(
         "closePosition": True,
         "workingType": "CONTRACT_PRICE",
         "priceProtect": True,
+    }
+    if price is not None:
+        entry["price"] = price
+    return entry
+
+
+def _coin_m_algo_entry(
+    client_algo_id: str = _COIN_M_SL_ID,
+    *,
+    order_type: str = "STOP_MARKET",
+    trigger: str = "32456",
+    price: str | None = None,
+    algo_id: int = 1234,
+    status: str = "NEW",
+) -> dict[str, object]:
+    entry: dict[str, object] = {
+        "algoId": algo_id,
+        "clientAlgoId": client_algo_id,
+        "algoType": "CONDITIONAL",
+        "algoStatus": status,
+        "type": order_type,
+        "symbol": "BTCUSD_PERP",
+        "side": "SELL",
+        "positionSide": "BOTH",
+        "triggerPrice": trigger,
+        "closePosition": True,
+        "workingType": "CONTRACT_PRICE",
+        "createTime": 1_700_000_000_000,
+        "updateTime": 1_700_000_000_000,
     }
     if price is not None:
         entry["price"] = price
@@ -444,16 +474,17 @@ class TestPayloadBuilders:
                 client_algo_id=_SL_ID,
             )
 
-    def test_coin_m_market_protection_matches_verified_regular_order_payload(self) -> None:
+    def test_coin_m_market_protection_uses_algo_order_payload(self) -> None:
         leg = parse_position_id(BinanceProduct.COIN_M, _COIN_M_POSITION_ID)
-        payload = build_coin_m_order_payload(
+        payload = build_algo_order_payload(
+            product=BinanceProduct.COIN_M,
             symbol="BTCUSD_PERP",
             position_side=leg.position_side,
             leg_quantity=Decimal("1"),
             attachment=TpSlAttachment(trigger_price=Decimal("32456.0")),
             side=ProtectionSide.STOP_LOSS,
             trigger_basis=None,
-            client_order_id=_COIN_M_SL_ID,
+            client_algo_id=_COIN_M_SL_ID,
         )
 
         assert payload == {
@@ -461,18 +492,18 @@ class TestPayloadBuilders:
             "side": "SELL",
             "positionSide": "BOTH",
             "type": "STOP_MARKET",
-            "stopPrice": "32456.0",
-            "newClientOrderId": _COIN_M_SL_ID,
-            "priceProtect": "TRUE",
+            "algoType": "CONDITIONAL",
+            "triggerPrice": "32456.0",
+            "clientAlgoId": _COIN_M_SL_ID,
             "closePosition": "true",
-            "placeType": "position",
             "timeInForce": "GTE_GTC",
             "workingType": "CONTRACT_PRICE",
         }
 
-    def test_coin_m_limit_trigger_uses_regular_order_fields(self) -> None:
+    def test_coin_m_limit_trigger_uses_algo_order_fields(self) -> None:
         leg = parse_position_id(BinanceProduct.COIN_M, _COIN_M_POSITION_ID)
-        payload = build_coin_m_order_payload(
+        payload = build_algo_order_payload(
+            product=BinanceProduct.COIN_M,
             symbol="BTCUSD_PERP",
             position_side=leg.position_side,
             leg_quantity=Decimal("1"),
@@ -482,7 +513,7 @@ class TestPayloadBuilders:
             ),
             side=ProtectionSide.STOP_LOSS,
             trigger_basis=TrailingBasis.MARK,
-            client_order_id=_COIN_M_SL_ID,
+            client_algo_id=_COIN_M_SL_ID,
         )
 
         assert payload == {
@@ -490,14 +521,14 @@ class TestPayloadBuilders:
             "side": "SELL",
             "positionSide": "BOTH",
             "type": "STOP",
-            "stopPrice": "38560.6",
-            "newClientOrderId": _COIN_M_SL_ID,
+            "algoType": "CONDITIONAL",
+            "triggerPrice": "38560.6",
+            "clientAlgoId": _COIN_M_SL_ID,
             "price": "35347.2",
             "quantity": "1",
             "timeInForce": "GTC",
             "reduceOnly": "true",
             "workingType": "MARK_PRICE",
-            "priceProtect": "TRUE",
         }
 
 
@@ -520,8 +551,8 @@ class TestParseProtectionEntry:
         assert order.side is ProtectionSide.TAKE_PROFIT
         assert order.limit_price == Decimal("69900")
 
-    def test_coin_m_regular_order_fields_are_parsed(self) -> None:
-        order = parse_protection_entry(_coin_m_order_entry())
+    def test_coin_m_algo_order_fields_are_parsed(self) -> None:
+        order = parse_protection_entry(_coin_m_algo_entry())
 
         assert order is not None
         assert order.side is ProtectionSide.STOP_LOSS
@@ -676,15 +707,19 @@ class TestModifyPositionTpsl:
         assert payload["clientAlgoId"] == _SL_ID
         assert payload["positionSide"] == "LONG"
 
-    async def test_coin_m_market_stop_uses_regular_order_lifecycle(
+    async def test_coin_m_market_stop_uses_algo_order_lifecycle(
         self,
         adapter: BinanceAdapter,
         binance_client_mock: AsyncMock,
     ) -> None:
         _wire_coinm(adapter, binance_client_mock)
-        existing = _coin_m_order_entry()
-        binance_client_mock.futures_coin_get_open_orders.side_effect = [[existing], []]
-        binance_client_mock.futures_coin_create_order.return_value = _coin_m_order_entry()
+        existing = _coin_m_algo_entry()
+        binance_client_mock._request_futures_coin_api.side_effect = [
+            [existing],
+            {"code": "200", "msg": "success"},
+            [],
+            _coin_m_algo_entry(),
+        ]
 
         await adapter.modify_position_tpsl(
             _coin_m_instrument(),
@@ -693,28 +728,34 @@ class TestModifyPositionTpsl:
             trigger_basis=TrailingBasis.MARK,
         )
 
-        binance_client_mock.futures_coin_cancel_order.assert_awaited_once_with(
-            symbol="BTCUSD_PERP",
-            orderId=1234,
-        )
-        payload = binance_client_mock.futures_coin_create_order.await_args.kwargs
+        calls = binance_client_mock._request_futures_coin_api.await_args_list
+        assert [(call.args[0], call.args[1]) for call in calls] == [
+            ("get", "openAlgoOrders"),
+            ("delete", "algoOrder"),
+            ("get", "openAlgoOrders"),
+            ("post", "algoOrder"),
+        ]
+        assert calls[1].kwargs["data"] == {"symbol": "BTCUSD_PERP", "algoId": 1234}
+        payload = calls[-1].kwargs["data"]
         assert payload == {
             "symbol": "BTCUSD_PERP",
             "side": "SELL",
             "positionSide": "BOTH",
             "type": "STOP_MARKET",
-            "stopPrice": "32456",
-            "newClientOrderId": _COIN_M_SL_ID,
+            "algoType": "CONDITIONAL",
+            "triggerPrice": "32456",
+            "clientAlgoId": _COIN_M_SL_ID,
             "workingType": "MARK_PRICE",
-            "priceProtect": "TRUE",
             "closePosition": "true",
-            "placeType": "position",
             "timeInForce": "GTE_GTC",
         }
         binance_client_mock.futures_coin_position_information.assert_awaited_once_with(
             symbol="BTCUSD_PERP"
         )
-        binance_client_mock._request_futures_coin_api.assert_not_awaited()
+        binance_client_mock.futures_coin_create_order.assert_not_awaited()
+        binance_client_mock.futures_coin_get_open_orders.assert_awaited_once_with(
+            symbol="BTCUSD_PERP"
+        )
 
     async def test_coin_m_reprice_preserves_unmentioned_protection_side(
         self,
@@ -722,21 +763,22 @@ class TestModifyPositionTpsl:
         binance_client_mock: AsyncMock,
     ) -> None:
         _wire_coinm(adapter, binance_client_mock)
-        stop = _coin_m_order_entry()
-        take_profit = _coin_m_order_entry(
+        stop = _coin_m_algo_entry()
+        take_profit = _coin_m_algo_entry(
             _COIN_M_TP_ID,
             order_type="TAKE_PROFIT_MARKET",
             trigger="70000",
         )
-        binance_client_mock.futures_coin_get_open_orders.side_effect = [
+        binance_client_mock._request_futures_coin_api.side_effect = [
             [stop, take_profit],
+            {"code": "200", "msg": "success"},
             [stop],
+            _coin_m_algo_entry(
+                _COIN_M_TP_ID,
+                order_type="TAKE_PROFIT_MARKET",
+                trigger="71000",
+            ),
         ]
-        binance_client_mock.futures_coin_create_order.return_value = _coin_m_order_entry(
-            _COIN_M_TP_ID,
-            order_type="TAKE_PROFIT_MARKET",
-            trigger="71000",
-        )
 
         await adapter.modify_position_tpsl(
             _coin_m_instrument(),
@@ -744,25 +786,25 @@ class TestModifyPositionTpsl:
             take_profit=TpSlAttachment(trigger_price=Decimal("71000")),
         )
 
-        binance_client_mock.futures_coin_cancel_order.assert_awaited_once_with(
-            symbol="BTCUSD_PERP",
-            orderId=1234,
-        )
-        assert binance_client_mock.futures_coin_create_order.await_args.kwargs[
-            "newClientOrderId"
-        ].endswith("-tp")
+        calls = binance_client_mock._request_futures_coin_api.await_args_list
+        assert calls[1].args[:2] == ("delete", "algoOrder")
+        assert calls[1].kwargs["data"] == {"symbol": "BTCUSD_PERP", "algoId": 1234}
+        assert calls[-1].kwargs["data"]["clientAlgoId"] == _COIN_M_TP_ID
 
-    async def test_coin_m_limit_attachment_uses_regular_order_payload(
+    async def test_coin_m_limit_attachment_uses_algo_order_payload(
         self,
         adapter: BinanceAdapter,
         binance_client_mock: AsyncMock,
     ) -> None:
         _wire_coinm(adapter, binance_client_mock)
-        binance_client_mock.futures_coin_create_order.return_value = _coin_m_order_entry(
-            order_type="STOP",
-            trigger="38560.6",
-            price="35347.2",
-        )
+        binance_client_mock._request_futures_coin_api.side_effect = [
+            [],
+            _coin_m_algo_entry(
+                order_type="STOP",
+                trigger="38560.6",
+                price="35347.2",
+            ),
+        ]
 
         await adapter.modify_position_tpsl(
             _coin_m_instrument(),
@@ -773,20 +815,21 @@ class TestModifyPositionTpsl:
             ),
         )
 
-        assert binance_client_mock.futures_coin_create_order.await_args.kwargs == {
+        assert binance_client_mock._request_futures_coin_api.await_args_list[-1].kwargs["data"] == {
             "symbol": "BTCUSD_PERP",
             "side": "SELL",
             "positionSide": "BOTH",
             "type": "STOP",
-            "stopPrice": "38560.6",
-            "newClientOrderId": _COIN_M_SL_ID,
+            "algoType": "CONDITIONAL",
+            "triggerPrice": "38560.6",
+            "clientAlgoId": _COIN_M_SL_ID,
             "price": "35347.2",
             "quantity": "1",
             "timeInForce": "GTC",
             "reduceOnly": "true",
             "workingType": "CONTRACT_PRICE",
-            "priceProtect": "TRUE",
         }
+        binance_client_mock.futures_coin_create_order.assert_not_awaited()
 
     async def test_unmentioned_side_is_preserved(
         self, adapter: BinanceAdapter, binance_client_mock: AsyncMock
@@ -913,10 +956,30 @@ class TestGetPositionTpsl:
         assert stop_loss is not None
         assert stop_loss.trigger_price == Decimal("55000")
 
-    async def test_coin_m_reads_regular_open_order_response_shape(
+    async def test_coin_m_reads_algo_order_response_shape(
         self, adapter: BinanceAdapter, binance_client_mock: AsyncMock
     ) -> None:
         _wire_coinm(adapter, binance_client_mock)
+        binance_client_mock._request_futures_coin_api.return_value = [_coin_m_algo_entry()]
+
+        result = await adapter.get_position_tpsl(
+            _coin_m_instrument(),
+            _COIN_M_POSITION_ID,
+        )
+
+        call = binance_client_mock._request_futures_coin_api.await_args
+        assert call.args[:2] == ("get", "openAlgoOrders")
+        assert call.kwargs["data"] == {"symbol": "BTCUSD_PERP"}
+        assert result == (
+            None,
+            TpSlAttachment(trigger_price=Decimal("32456")),
+        )
+
+    async def test_coin_m_reads_legacy_regular_protection_until_cleared(
+        self, adapter: BinanceAdapter, binance_client_mock: AsyncMock
+    ) -> None:
+        _wire_coinm(adapter, binance_client_mock)
+        binance_client_mock._request_futures_coin_api.return_value = []
         binance_client_mock.futures_coin_get_open_orders.return_value = [_coin_m_order_entry()]
 
         result = await adapter.get_position_tpsl(
@@ -924,9 +987,6 @@ class TestGetPositionTpsl:
             _COIN_M_POSITION_ID,
         )
 
-        binance_client_mock.futures_coin_get_open_orders.assert_awaited_once_with(
-            symbol="BTCUSD_PERP"
-        )
         assert result == (
             None,
             TpSlAttachment(trigger_price=Decimal("32456")),
@@ -1011,10 +1071,40 @@ class TestClearPositionTpsl:
         # Flat or not, clear never needs the position read.
         binance_client_mock.futures_position_information.assert_not_awaited()
 
-    async def test_coin_m_clear_cancels_matching_regular_order(
+    async def test_coin_m_clear_cancels_matching_algo_order(
         self, adapter: BinanceAdapter, binance_client_mock: AsyncMock
     ) -> None:
         _wire_coinm(adapter, binance_client_mock)
+        binance_client_mock._request_futures_coin_api.side_effect = [
+            [_coin_m_algo_entry()],
+            {"code": "200", "msg": "success"},
+            [],
+        ]
+
+        await adapter.clear_position_tpsl(
+            _coin_m_instrument(),
+            _COIN_M_POSITION_ID,
+            stop_loss=True,
+        )
+
+        calls = binance_client_mock._request_futures_coin_api.await_args_list
+        assert [(call.args[0], call.args[1]) for call in calls] == [
+            ("get", "openAlgoOrders"),
+            ("delete", "algoOrder"),
+            ("get", "openAlgoOrders"),
+        ]
+        assert calls[1].kwargs["data"] == {"symbol": "BTCUSD_PERP", "algoId": 1234}
+        binance_client_mock.futures_coin_get_open_orders.assert_awaited_once_with(
+            symbol="BTCUSD_PERP",
+        )
+        binance_client_mock.futures_coin_cancel_order.assert_not_awaited()
+        binance_client_mock.futures_coin_position_information.assert_not_awaited()
+
+    async def test_coin_m_clear_cancels_legacy_regular_order(
+        self, adapter: BinanceAdapter, binance_client_mock: AsyncMock
+    ) -> None:
+        _wire_coinm(adapter, binance_client_mock)
+        binance_client_mock._request_futures_coin_api.return_value = []
         binance_client_mock.futures_coin_get_open_orders.side_effect = [
             [_coin_m_order_entry()],
             [],
@@ -1030,7 +1120,6 @@ class TestClearPositionTpsl:
             symbol="BTCUSD_PERP",
             orderId=1234,
         )
-        binance_client_mock.futures_coin_position_information.assert_not_awaited()
 
 
 class TestProtectionMirrorExclusion:
@@ -1070,6 +1159,22 @@ class TestProtectionMirrorExclusion:
         assert order is None
         assert _COIN_M_SL_ID not in adapter._order_refs
 
+    async def test_coin_m_algo_snapshot_skips_adapter_protection_before_translation(
+        self,
+        adapter: BinanceAdapter,
+        binance_client_mock: AsyncMock,
+    ) -> None:
+        _wire_coinm(adapter, binance_client_mock)
+
+        order = await adapter._translate_snapshot_order(
+            BinanceProduct.COIN_M,
+            _coin_m_algo_entry(),
+            conditional=True,
+        )
+
+        assert order is None
+        assert _COIN_M_SL_ID not in adapter._order_refs
+
     async def test_stream_update_skips_protection_events(
         self,
         adapter: BinanceAdapter,
@@ -1099,6 +1204,92 @@ class TestProtectionMirrorExclusion:
         assert published == []
         assert _SL_ID not in adapter._order_refs
         assert not any(identity.endswith("9001") for identity in adapter._open_order_ids)
+
+    async def test_stream_trade_update_on_protection_order_publishes_fill(
+        self,
+        adapter: BinanceAdapter,
+        binance_client_mock: AsyncMock,
+        event_bus,
+    ) -> None:
+        """A triggered TP/SL execution is a real fill even though the order
+        itself stays out of the order mirror."""
+        _wire_usdm(adapter, binance_client_mock)
+        published: list[object] = []
+        event_bus.subscribe(FillEvent, published.append)
+        event_bus.subscribe(OrderPlacedEvent, published.append)
+
+        await adapter._handle_order_update(
+            BinanceProduct.USD_M,
+            {
+                "s": "BTCUSDT",
+                "i": 9001,
+                "c": _SL_ID,
+                "caid": _SL_ID,
+                "x": "TRADE",
+                "X": "FILLED",
+                "o": "MARKET",
+                "S": "SELL",
+                "q": "0.001",
+                "z": "0.001",
+                "l": "0.001",
+                "L": "60000.5",
+                "ap": "60000.5",
+                "n": "0.06",
+                "N": "USDT",
+                "t": 12345,
+                "T": 1_700_000_000_000,
+                "R": True,
+                "cp": True,
+                "ps": "BOTH",
+            },
+            datetime.now(UTC),
+            conditional=True,
+        )
+
+        fills = [e for e in published if isinstance(e, FillEvent)]
+        assert len(fills) == 1
+        fill = fills[0].fill
+        assert fill.client_order_id == _SL_ID
+        assert fill.reason is FillReason.STOP_LOSS
+        assert fill.entry is FillEntry.OUT
+        assert fill.fill_quantity == Decimal("0.001")
+        assert fill.fill_price == Decimal("60000.5")
+        assert not any(isinstance(e, OrderPlacedEvent) for e in published)
+        assert _SL_ID not in adapter._order_refs
+
+    async def test_stream_trade_update_on_trailing_order_publishes_trailing_fill(
+        self,
+        adapter: BinanceAdapter,
+        binance_client_mock: AsyncMock,
+        event_bus,
+    ) -> None:
+        _wire_usdm(adapter, binance_client_mock)
+        published: list[object] = []
+        event_bus.subscribe(FillEvent, published.append)
+
+        await adapter._handle_order_update(
+            BinanceProduct.USD_M,
+            {
+                "s": "BTCUSDT",
+                "i": 9002,
+                "c": "trl-u-BTCUSDT-BOTH",
+                "x": "TRADE",
+                "X": "FILLED",
+                "o": "MARKET",
+                "S": "SELL",
+                "q": "0.001",
+                "l": "0.001",
+                "L": "60100",
+                "t": 12346,
+                "T": 1_700_000_000_000,
+                "R": True,
+            },
+            datetime.now(UTC),
+        )
+
+        fills = [e for e in published if isinstance(e, FillEvent)]
+        assert len(fills) == 1
+        assert fills[0].fill.reason is FillReason.TRAILING_STOP
 
     async def test_coin_m_regular_stream_update_is_excluded_from_order_mirror(
         self,
