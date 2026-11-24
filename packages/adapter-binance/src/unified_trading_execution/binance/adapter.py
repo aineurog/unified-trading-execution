@@ -272,6 +272,7 @@ class BinanceAdapter(Adapter):
             tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
         ] = {}
         self._exchange_info_cache: dict[BinanceProduct, list[object]] = {}
+        self._exchange_info_locks: dict[BinanceProduct, asyncio.Lock] = {}
         self._rate_limit_tracker = BinanceRateLimitTracker()
         self._native_trailing_ids: dict[str, str] = {}
 
@@ -375,9 +376,6 @@ class BinanceAdapter(Adapter):
             self._stream_states = dict.fromkeys(_PRODUCT_ORDER, False)
             self._stream_ready = {product: asyncio.Event() for product in _PRODUCT_ORDER}
             try:
-                await asyncio.gather(
-                    *(self._load_exchange_info(product) for product in _PRODUCT_ORDER)
-                )
                 await self._restore_order_references()
                 await self._start_private_streams()
                 await self._reapply_stored_intent()
@@ -501,6 +499,17 @@ class BinanceAdapter(Adapter):
         cached_entries = self._exchange_info_cache.get(product)
         if cached_entries is not None:
             return cached_entries
+        # Catalogs are fetched lazily per product on first use — Spot's
+        # exchangeInfo alone is ~18 MB, so eagerly loading all three at
+        # connect made futures-only sessions hostage to Spot latency.
+        lock = self._exchange_info_locks.setdefault(product, asyncio.Lock())
+        async with lock:
+            cached_entries = self._exchange_info_cache.get(product)
+            if cached_entries is not None:
+                return cached_entries
+            return await self._fetch_exchange_info(product)
+
+    async def _fetch_exchange_info(self, product: BinanceProduct) -> list[object]:
         client = self._client
         if client is None:
             raise PlatformConnectionError(
