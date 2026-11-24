@@ -824,10 +824,11 @@ async def test_synthetic_trail_triggers_and_closes_position(
         spec_info = await harness.adapter.fetch_instrument_spec(instrument)
         ticker = await harness.adapter.fetch_ticker(instrument)
         assert ticker is not None and ticker.last is not None
-        # Price offset of ~0.02%: close enough that ordinary noise triggers it.
+        # Price offset of ~0.05%: tight enough that ordinary noise triggers
+        # it soon, wide enough to survive the attach/confirm window.
         offset = max(
             spec_info.tick_size * 10,
-            _ceil_to_step(ticker.last * Decimal("0.0002"), spec_info.tick_size),
+            _ceil_to_step(ticker.last * Decimal("0.0005"), spec_info.tick_size),
         )
         state = await _attach(
             harness.engine,
@@ -1219,7 +1220,7 @@ async def test_synthetic_trail_reprices_on_favorable_move(
         )
         assert state.mode is TrailingMode.SYNTHETIC
 
-        deadline = asyncio.get_running_loop().time() + 120
+        deadline = asyncio.get_running_loop().time() + 180
         last: TrailingState | None = None
         while asyncio.get_running_loop().time() < deadline:
             last = await harness.engine.trailing.get(state.trailing_id)

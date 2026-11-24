@@ -135,12 +135,7 @@ from unified_trading_execution.trailing.types import (
     TrailingBasis,
     TrailingOffsetType,
 )
-from unified_trading_execution.types.enums import (
-    LIVE_ORDER_STATUSES,
-    OrderSide,
-    OrderStatus,
-    OrderType,
-)
+from unified_trading_execution.types.enums import LIVE_ORDER_STATUSES, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
@@ -2681,45 +2676,16 @@ class BinanceAdapter(Adapter):
             )
 
         activation_price = request.activation_price
-        immediate_reference: Decimal | None = None
-        if leg.product is BinanceProduct.COIN_M and activation_price is None:
-            # /dapi/v1/algoOrder mandates activatePrice even for immediate
-            # activation.  Derive it from the price the trail monitors so the
-            # venue's activation check sees the same basis as workingType.
-            ticker = await self.fetch_ticker(request.instrument)
-            if ticker is not None:
-                if request.basis is TrailingBasis.MARK:
-                    immediate_reference = ticker.mark if ticker.mark is not None else ticker.last
-                else:
-                    immediate_reference = ticker.last if ticker.last is not None else ticker.mark
-            if immediate_reference is None:
-                raise PlatformError(
-                    f"Cannot place COIN-M trailing stop for {symbol}: "
-                    "no ticker price available for mandatory activatePrice"
-                )
-            activation_price = immediate_reference
         if activation_price is not None:
             # Binance rejects activatePrice values that exceed the symbol's
             # price precision (-1102), so snap to the tick.  Use the cached
             # exchange-info row rather than fetch_instrument_spec, which
-            # would add a signed leverage-bracket lookup.
+            # would add a signed leverage-bracket lookup.  Immediate
+            # activation omits the field entirely — verified live that
+            # /dapi/v1/algoOrder accepts the omission on COIN-M.
             entries = await self._load_exchange_info(leg.product)
             _, entry = resolve_binance_symbol(request.instrument, leg.product, entries)
-            tick_size = parse_tick_size(entry)
-            if immediate_reference is not None:
-                # Nudge off the activation boundary: a sell-side trail is
-                # already armed when price is at/above activatePrice and a
-                # buy-side trail when it is at/below.  Sitting exactly on the
-                # current price lets the venue read the order as an immediate
-                # trigger (-2021), and mark/contract divergence can flip the
-                # comparison, so pad by a fraction of a percent.
-                pad = immediate_reference * Decimal("0.005")
-                activation_price = (
-                    immediate_reference - pad
-                    if request.side is OrderSide.BUY
-                    else immediate_reference + pad
-                )
-            activation_price = activation_price.quantize(tick_size)
+            activation_price = activation_price.quantize(parse_tick_size(entry))
         payload = build_trailing_algo_payload(
             leg=leg,
             leg_quantity=quantity,
