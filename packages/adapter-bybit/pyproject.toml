@@ -1,6 +1,6 @@
 [project]
 name = "unified-trading-execution-bybit"
-version = "0.1.0"
+version = "0.0.1"
 description = "Unified Trading Execution — Bybit adapter"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
@@ -8,7 +8,7 @@ authors = [
     {name = "Syed Qaisar Jalil"},
 ]
 dependencies = [
-    "unified-trading-execution",
+    "unified-trading-execution>=0.0.1",
     "pybit>=5.0.0",
     "requests>=2.0",
 ]

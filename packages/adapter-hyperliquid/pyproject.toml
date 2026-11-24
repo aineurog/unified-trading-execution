@@ -1,6 +1,6 @@
 [project]
 name = "unified-trading-execution-hyperliquid"
-version = "0.1.0"
+version = "0.0.1"
 description = "Unified Trading Execution — Hyperliquid adapter"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
@@ -8,7 +8,7 @@ authors = [
     {name = "Syed Qaisar Jalil"},
 ]
 dependencies = [
-    "unified-trading-execution",
+    "unified-trading-execution>=0.0.1",
     "hyperliquid-python-sdk==0.24.0",
     "requests>=2.31,<3.0",
     "websocket-client>=1.5.1,<2.0",
