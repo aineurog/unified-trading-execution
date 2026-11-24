@@ -62,13 +62,6 @@ def _require_demo_opt_in() -> None:
 
 
 @pytest.fixture
-def binance_rest_url_smoke_opt_in() -> None:
-    """Require explicit opt-in before contacting all public Binance environments."""
-    if os.getenv("BINANCE_REST_URL_SMOKE", "").strip().lower() != "true":
-        pytest.skip("Set BINANCE_REST_URL_SMOKE=true to opt in to Binance REST URL smoke tests")
-
-
-@pytest.fixture
 def binance_order_config(request: pytest.FixtureRequest) -> BinanceConfig:
     """Select an explicitly opted-in Testnet or Demo order-test configuration."""
     product = request.param

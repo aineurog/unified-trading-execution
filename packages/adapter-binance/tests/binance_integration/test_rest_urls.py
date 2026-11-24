@@ -24,7 +24,6 @@ async def test_all_rest_ping_urls_are_reachable(
     environment: str,
     testnet: bool,
     demo: bool,
-    binance_rest_url_smoke_opt_in: None,
 ) -> None:
     """Reach each product's public ping endpoint in each explicitly selected environment."""
     config = BinanceConfig(
