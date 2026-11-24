@@ -15,14 +15,17 @@ margin mode, and position mode are managed as persisted adapter intent.
 
 ## Installation
 
-From the monorepo root:
-
 ```bash
-uv pip install -e packages/core
-uv pip install -e packages/adapter-binance
+pip install "unified-trading-execution[binance]"
 ```
 
-The adapter package pins `python-binance==1.0.37`. `connect` creates the SDK
+For a source checkout, the adapter code lives under `packages/core/src`:
+
+```bash
+pip install -e packages/core
+```
+
+The adapter pins `python-binance==1.0.37`. `connect` creates the SDK
 client for the configured environment and verifies that all three REST endpoint
 families resolve to it before retaining the client. `fetch_instrument_spec`
 requires that connected client. Unit fixtures never reach the network; the

@@ -32,10 +32,10 @@ choices:
 
 ```bash
 # On Windows, with a MetaTrader 5 terminal installed:
-pip install unified-trading-execution-metatrader[mt5]
+pip install "unified-trading-execution[metatrader]"
 ```
 
-The `[mt5]` extra installs the `MetaTrader5` package. Without it the adapter
+The `[metatrader]` extra installs the `MetaTrader5` package. Without it the adapter
 is importable but raises a clear `ImportError` at `connect()`.
 
 ---

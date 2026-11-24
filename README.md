@@ -16,13 +16,26 @@ from unified_trading_execution.bybit import BybitAdapter
 ## Installation
 
 ```bash
-# Core only
+# Core only (types, engine, risk checks, state mirror)
 pip install unified-trading-execution
 
-# With platform adapters
-pip install unified-trading-execution-bybit
-pip install unified-trading-execution-ctrader
+# Core plus a platform adapter and its vendor SDK
+pip install "unified-trading-execution[binance]"
+pip install "unified-trading-execution[bybit]"
+pip install "unified-trading-execution[ctrader]"
+pip install "unified-trading-execution[hyperliquid]"
+pip install "unified-trading-execution[ibkr]"
+
+# MetaTrader 5 (Windows)
+pip install "unified-trading-execution[metatrader]"
+
+# Every adapter
+pip install "unified-trading-execution[all]"
 ```
+
+Adapter modules import their vendor SDK when loaded, so install the matching
+extra (or the vendor package yourself) before importing them. cTrader has no
+vendor SDK dependency.
 
 Requires Python 3.11+.
 

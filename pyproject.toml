@@ -1,6 +1,6 @@
 [project]
 name = "unified-trading-execution-workspace"
-version = "0.0.1"
+version = "0.0.2"
 description = "A modular, plug-and-play order execution library for Python"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
@@ -79,7 +79,24 @@ root_package = "unified_trading_execution"
 id = "core-never-imports-adapters"
 name = "Core must never import adapter code"
 type = "forbidden"
-source_modules = ["unified_trading_execution"]
+# Adapters ship inside the distribution, so list core modules explicitly
+# rather than the parent package, which would include the adapters themselves.
+source_modules = [
+    "unified_trading_execution.adapter",
+    "unified_trading_execution.dispatch",
+    "unified_trading_execution.engine",
+    "unified_trading_execution.errors",
+    "unified_trading_execution.events",
+    "unified_trading_execution.history",
+    "unified_trading_execution.logging",
+    "unified_trading_execution.registry",
+    "unified_trading_execution.risk",
+    "unified_trading_execution.state",
+    "unified_trading_execution.sync",
+    "unified_trading_execution.testing",
+    "unified_trading_execution.trailing",
+    "unified_trading_execution.types",
+]
 forbidden_modules = [
     "unified_trading_execution.bybit",
     "unified_trading_execution.ctrader",
