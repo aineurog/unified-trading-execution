@@ -13,6 +13,7 @@ from typing import Any, Literal
 
 import aiosqlite
 
+from unified_trading_execution.errors import StateStoreOwnershipError
 from unified_trading_execution.events import (
     AuditEvent,
     HaltEvent,
@@ -51,6 +52,7 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 # Key under which the reconciliation "clean through" watermark is persisted in
 # the ``reconciliation_state`` singleton table.
 _RECONCILE_WATERMARK_KEY = "last_clean_through"
+_STATE_STORE_OWNER_KEY = "__ute_state_store_owner_v1__"
 
 
 def _slug(component: str) -> str:
@@ -343,6 +345,34 @@ def _row_to_trailing_state(row: aiosqlite.Row) -> TrailingState:
 class StateStore(ABC):
     """Pluggable storage backend for the state mirror and audit trail."""
 
+    async def bind_owner(self, platform_name: str, account_id: str) -> None:
+        """Bind this store to one platform/account pair.
+
+        The default implementation persists the owner through the adapter
+        configuration API. Backends that support multiple concurrent
+        connections should override this with an atomic compare-and-set.
+        """
+        expected = json.dumps(
+            {"platform_name": platform_name, "account_id": account_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        lock = getattr(self, "_owner_binding_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._owner_binding_lock = lock
+        async with lock:
+            existing = await self.get_adapter_config(_STATE_STORE_OWNER_KEY)
+            if existing is None:
+                await self.set_adapter_config(_STATE_STORE_OWNER_KEY, expected)
+                existing = await self.get_adapter_config(_STATE_STORE_OWNER_KEY)
+            if existing != expected:
+                raise StateStoreOwnershipError(
+                    f"State store {self.path!r} is bound to {existing}; "
+                    f"cannot use it for {platform_name!r} account {account_id!r}. "
+                    "Use a separate state store for each platform/account."
+                )
+
     @abstractmethod
     async def upsert_position(self, position: Position) -> None: ...
     @abstractmethod
@@ -606,6 +636,39 @@ class SQLiteStateStore(StateStore):
         self._conn = await aiosqlite.connect(self._path, isolation_level=None)
         self._conn.row_factory = aiosqlite.Row
         await self._run_migrations()
+
+    async def bind_owner(self, platform_name: str, account_id: str) -> None:
+        """Atomically bind this database to one platform/account pair."""
+        expected = json.dumps(
+            {"platform_name": platform_name, "account_id": account_id},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        now = datetime.now(tz=UTC).isoformat()
+        async with self._write_lock:
+            await self.conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await self.conn.execute(
+                    "SELECT value FROM adapter_config WHERE key=?",
+                    (_STATE_STORE_OWNER_KEY,),
+                )
+                row = await cursor.fetchone()
+                if row is None:
+                    await self.conn.execute(
+                        "INSERT INTO adapter_config (key, value, updated_at) VALUES (?, ?, ?)",
+                        (_STATE_STORE_OWNER_KEY, expected, now),
+                    )
+                elif str(row[0]) != expected:
+                    raise StateStoreOwnershipError(
+                        f"State store {self.path!r} is bound to {row[0]}; "
+                        f"cannot use it for {platform_name!r} account {account_id!r}. "
+                        "Use a separate state store for each platform/account."
+                    )
+            except BaseException:
+                await self.conn.rollback()
+                raise
+            else:
+                await self.conn.commit()
 
     async def close(self) -> None:
         if self._conn is not None:

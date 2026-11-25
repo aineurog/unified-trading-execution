@@ -281,14 +281,15 @@ class Engine:
         # identity — so two accounts of the same platform never share a file.
         # The store is attached to the adapter first, so websocket handlers
         # (which may persist intent / halt state) see it from the first message.
+        account_id = await self._resolve_account_id()
         if self._state_store is None:
-            account_id = await self._resolve_account_id()
             self._state_store = SQLiteStateStore(
                 default_state_store_path(self._adapter.platform_name, account_id)
             )
         self._adapter.attach_state_store(self._state_store)
 
         await self._store.initialize()
+        await self._store.bind_owner(self._adapter.platform_name, account_id)
         await self._adapter.connect()
 
         # Seed the position/balance mirror from platform truth so read-throughs

@@ -23,6 +23,7 @@ from unified_trading_execution.errors import (
     OrderNotFoundError,
     RateLimitError,
     ReconciliationError,
+    StateStoreOwnershipError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
@@ -186,6 +187,33 @@ class TestEngineLifecycle:
         results = await engine.get_audit_events()
         assert len(results) == 1
         assert results[0].event_type == "bybit.leverage.applied"
+
+    async def test_connect_rejects_store_owned_by_different_account(
+        self, event_bus, tmp_path
+    ):
+        store_path = str(tmp_path / "account.db")
+        owner_store = SQLiteStateStore(store_path)
+        await owner_store.initialize()
+        await owner_store.bind_owner("mock", "account-one")
+        await owner_store.close()
+
+        other_account = MockAdapter(
+            event_bus=event_bus,
+            platform_name="mock",
+            account_id="account-two",
+        )
+        other_account.add_instrument_spec(_instrument(), _spec())
+        engine = Engine(
+            adapter=other_account,
+            state_store=SQLiteStateStore(store_path),
+            reconcile_interval_seconds=None,
+        )
+        try:
+            with pytest.raises(StateStoreOwnershipError, match="account-two"):
+                await engine.connect()
+            assert not other_account.is_connected
+        finally:
+            await engine.state_store.close()
 
 
 class TestEngineConstruction:

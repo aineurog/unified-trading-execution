@@ -98,6 +98,10 @@ class EngineShutdownError(UteError):
     """Called a method on an engine that has been shut down."""
 
 
+class StateStoreOwnershipError(UteError):
+    """A state store is being reused by a different platform account."""
+
+
 # ---- Reconciliation ----
 
 
