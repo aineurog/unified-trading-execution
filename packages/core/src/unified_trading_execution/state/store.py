@@ -368,6 +368,10 @@ class StateStore(ABC):
         since: datetime | None = None,
         end: datetime | None = None,
     ) -> None: ...
+    @abstractmethod
+    async def delete_fills_by_platform_fill_ids(
+        self, platform_fill_ids: list[str]
+    ) -> None: ...
 
     @abstractmethod
     async def write_audit_event(self, event: AuditEvent) -> None: ...
@@ -1018,6 +1022,22 @@ class SQLiteStateStore(StateStore):
                 await self.conn.execute(
                     f"DELETE FROM fills WHERE {' AND '.join(conditions)}",
                     params,
+                )
+
+    async def delete_fills_by_platform_fill_ids(
+        self, platform_fill_ids: list[str]
+    ) -> None:
+        """Delete fill rows by venue execution id, holding the write lock.
+
+        Fill identity is ``platform_fill_id``, not ``client_order_id`` — the
+        same trade can be filed under different client ids on the WS and REST
+        paths, so deleting by client id would remove unrelated fills.
+        """
+        async with self._write_lock:
+            for platform_fill_id in platform_fill_ids:
+                await self.conn.execute(
+                    "DELETE FROM fills WHERE platform_fill_id = ?",
+                    (platform_fill_id,),
                 )
 
     # ---- Audit trail (append-only) ----

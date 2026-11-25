@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from decimal import Decimal
 
 from unified_trading_execution.events import ReconciliationMismatch
-from unified_trading_execution.types.instrument import Instrument
 from unified_trading_execution.types.order import FillRecord, OrderRecord
 from unified_trading_execution.types.position import Balance, Position
 
@@ -163,25 +162,62 @@ def reconcile(
         # never flagged as orphans.
         orphan_in_local = [cid for cid in local_orders if cid not in platform_orders]
 
-    # Case 5: Partial fill discrepancy.
+    # Case 5: Fill discrepancy, compared by ``platform_fill_id``.
+    #
+    # A fill's identity is the venue execution id, not the client_order_id
+    # under which each side happens to file it: the WS and REST paths can
+    # legitimately resolve different client ids for the same trade (e.g. an
+    # adapter-owned protection order whose deterministic id only the stream
+    # path knows).  Comparing per fill id makes that attribution drift
+    # harmless — the same venue trade is the same fill on both sides.
+    # Per-id quantity/price drift is still flagged.
     partial_fill_discrepancies: list[ReconciliationMismatch] = []
     if platform_fills is not None:
-        for cid in set(local_fills.keys()) | set(platform_fills.keys()):
-            local_total = sum(
-                (f.fill_quantity for f in local_fills.get(cid, [])),
-                start=Decimal("0"),
-            )
-            platform_total = sum(
-                (f.fill_quantity for f in platform_fills.get(cid, [])),
-                start=Decimal("0"),
-            )
-            if local_total != platform_total:
+        local_by_fill_id = {
+            f.platform_fill_id: f for fills in local_fills.values() for f in fills
+        }
+        platform_by_fill_id = {
+            f.platform_fill_id: f for fills in platform_fills.values() for f in fills
+        }
+        for fill_id, platform_fill in platform_by_fill_id.items():
+            local_fill = local_by_fill_id.get(fill_id)
+            if local_fill is None:
                 partial_fill_discrepancies.append(
                     ReconciliationMismatch(
                         mismatch_type="partial_fill",
-                        instrument=None,  # order-id scoped, not instrument scoped
-                        local_value=str(local_total),
-                        platform_value=str(platform_total),
+                        instrument=platform_fill.instrument,
+                        local_value="absent",
+                        platform_value=(
+                            f"{platform_fill.fill_quantity} @ {platform_fill.fill_price}"
+                        ),
+                    )
+                )
+            elif (
+                local_fill.fill_quantity != platform_fill.fill_quantity
+                or local_fill.fill_price != platform_fill.fill_price
+            ):
+                partial_fill_discrepancies.append(
+                    ReconciliationMismatch(
+                        mismatch_type="partial_fill",
+                        instrument=platform_fill.instrument,
+                        local_value=(
+                            f"{local_fill.fill_quantity} @ {local_fill.fill_price}"
+                        ),
+                        platform_value=(
+                            f"{platform_fill.fill_quantity} @ {platform_fill.fill_price}"
+                        ),
+                    )
+                )
+        for fill_id, local_fill in local_by_fill_id.items():
+            if fill_id not in platform_by_fill_id:
+                partial_fill_discrepancies.append(
+                    ReconciliationMismatch(
+                        mismatch_type="partial_fill",
+                        instrument=local_fill.instrument,
+                        local_value=(
+                            f"{local_fill.fill_quantity} @ {local_fill.fill_price}"
+                        ),
+                        platform_value="absent",
                     )
                 )
 

@@ -1279,10 +1279,12 @@ class TestReconcileMismatchCases:
         )
         await engine.state_store.upsert_fill(local_fill)
 
-        # Seed a different platform fill
+        # Seed a different platform fill — same venue execution id, drifted
+        # quantity AND a different client_order_id: correction must take the
+        # platform's values but keep the local attribution.
         platform_fill = FillRecord(
-            client_order_id="fill-disc",
-            platform_fill_id="pf-001",
+            client_order_id="platform-resolved-cid",
+            platform_fill_id="lf-001",
             instrument=_instrument(),
             fill_quantity=Decimal("0.7"),
             fill_price=Decimal("50000"),
@@ -1297,10 +1299,68 @@ class TestReconcileMismatchCases:
         assert len(result.partial_fill_discrepancies) == 1
         assert result.partial_fill_discrepancies[0].mismatch_type == "partial_fill"
 
-        # Resolution: local fills should be overwritten with platform fills
+        # Resolution: the drifted fill is corrected to platform values while
+        # keeping the local client_order_id attribution.
         fills_after = await engine.get_fill_history()
         assert len(fills_after) == 1
         assert fills_after[0].fill_quantity == Decimal("0.7")
+        assert fills_after[0].client_order_id == "fill-disc"
+
+    async def test_fill_attribution_drift_is_not_a_discrepancy(
+        self, engine, mock_adapter
+    ):
+        """The same venue execution filed under different client_order_ids on
+        the WS and REST paths is one fill, not a discrepancy — and correction
+        must not re-key the local attribution."""
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="fill-disc"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+        settled = datetime.now(tz=UTC) - timedelta(minutes=1)
+
+        # WS path attributed the child execution to the protection client id;
+        # the REST fetch resolves the same trade to the fallback order id.
+        await engine.state_store.upsert_fill(
+            FillRecord(
+                client_order_id="tpsl-u-BTCUSDT-BOTH-sl",
+                platform_fill_id="usd_m:BTCUSDT:12345",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=settled,
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-local",
+            )
+        )
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="binance-usd_m:99999",
+                platform_fill_id="usd_m:BTCUSDT:12345",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=settled,
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-platform",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert result.partial_fill_discrepancies == []
+
+        fills_after = await engine.get_fill_history()
+        assert len(fills_after) == 1
+        assert fills_after[0].client_order_id == "tpsl-u-BTCUSDT-BOTH-sl"
 
     async def test_clean_reconcile_clears_existing_halt(self, engine, mock_adapter):
         """A clean reconciliation pass clears an existing halt."""
@@ -1382,7 +1442,7 @@ class TestReconcileHaltScoping:
         mock_adapter.seed_fill(
             FillRecord(
                 client_order_id="fill-disc",
-                platform_fill_id="pf-001",
+                platform_fill_id="lf-001",
                 instrument=_instrument(),
                 fill_quantity=Decimal("0.7"),
                 fill_price=Decimal("50000"),
@@ -1546,7 +1606,9 @@ class TestFillSettleLag:
         )
 
         result = await engine.reconcile()
-        assert len(result.partial_fill_discrepancies) == 1
+        # lf-settled is absent on the platform and pf-settled is absent
+        # locally — two per-fill-id discrepancies.
+        assert len(result.partial_fill_discrepancies) == 2
 
         # The settled discrepancy is corrected to platform truth, and the
         # in-flight fill survives the correction (not deleted by the window).

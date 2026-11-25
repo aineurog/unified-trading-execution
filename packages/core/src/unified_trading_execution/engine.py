@@ -109,21 +109,46 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
-def _fill_discrepant_order_ids(
+def _fill_id_drift(
     local_fills: dict[str, list[FillRecord]],
     platform_fills: dict[str, list[FillRecord]],
-) -> list[str]:
-    """Return the client_order_ids whose summed fill quantity differs between
-    the local mirror and the platform (the partial-fill discrepancy set)."""
-    ids: list[str] = []
-    for cid in set(local_fills.keys()) | set(platform_fills.keys()):
-        local_total = sum((f.fill_quantity for f in local_fills.get(cid, [])), start=Decimal("0"))
-        platform_total = sum(
-            (f.fill_quantity for f in platform_fills.get(cid, [])), start=Decimal("0")
-        )
-        if local_total != platform_total:
-            ids.append(cid)
-    return ids
+) -> tuple[list[FillRecord], list[str], list[FillRecord]]:
+    """Diff the fill snapshots by ``platform_fill_id``.
+
+    Returns ``(missing_locally, extra_locally_ids, drifted)``:
+
+    - ``missing_locally``: platform fills whose venue execution id has no
+      local row — the WS event never landed or was never persisted.
+    - ``extra_locally_ids``: local ``platform_fill_id``s the platform does
+      not report inside the window — stale or fabricated rows to remove.
+    - ``drifted``: fills present on both sides whose quantity or price
+      disagree; the platform record is returned with the *local*
+      ``client_order_id`` preserved so correcting fields does not destroy
+      stream-side attribution.
+    """
+    local_by_id = {
+        f.platform_fill_id: f for fills in local_fills.values() for f in fills
+    }
+    platform_by_id = {
+        f.platform_fill_id: f for fills in platform_fills.values() for f in fills
+    }
+
+    missing_locally: list[FillRecord] = []
+    drifted: list[FillRecord] = []
+    for fill_id, platform_fill in platform_by_id.items():
+        local_fill = local_by_id.get(fill_id)
+        if local_fill is None:
+            missing_locally.append(platform_fill)
+        elif (
+            local_fill.fill_quantity != platform_fill.fill_quantity
+            or local_fill.fill_price != platform_fill.fill_price
+        ):
+            drifted.append(replace(platform_fill, client_order_id=local_fill.client_order_id))
+
+    extra_locally_ids = [
+        fill_id for fill_id in local_by_id if fill_id not in platform_by_id
+    ]
+    return missing_locally, extra_locally_ids, drifted
 
 
 @dataclass(frozen=True, slots=True)
@@ -749,11 +774,17 @@ class Engine:
         platform_orders = await self._fetch_platform_orders()
         platform_fills = await self._fetch_platform_fills(since=window_start)
         if platform_fills is not None:
-            # Bound the platform side to the same settle boundary as the local
-            # side so both snapshots cover the identical window.
+            # Bound the platform side to the same window as the local side so
+            # both snapshots cover the identical range — an adapter that
+            # ignores ``since`` must not have pre-watermark fills inserted as
+            # "missing" or post-lag fills compared as drift.
             settled_fills: dict[str, list[FillRecord]] = {}
             for cid, fills in platform_fills.items():
-                kept = [f for f in fills if f.fill_timestamp <= fill_compare_end]
+                kept = [
+                    f
+                    for f in fills
+                    if window_start <= f.fill_timestamp <= fill_compare_end
+                ]
                 if kept:
                     settled_fills[cid] = kept
             platform_fills = settled_fills
@@ -985,19 +1016,29 @@ class Engine:
                 for client_order_id in result.orphan_orders_in_local:
                     logger.info("Removed orphan order %s from local mirror", client_order_id)
 
-        # Partial fill: surgical correction per discrepant order, bounded to the
-        # watermark window so pre-watermark fills are never disturbed.
+        # Fill discrepancies: surgical correction per venue execution id.  The
+        # snapshots are already bounded to the watermark window, so corrections
+        # never disturb pre-watermark history or the still-in-flight tail.
+        # Attribution drift between the WS and REST paths is a non-event: the
+        # same ``platform_fill_id`` under different client_order_ids matches
+        # and is left untouched.
         if result.partial_fill_discrepancies and context.platform_fills is not None:
-            for cid in _fill_discrepant_order_ids(context.local_fills, context.platform_fills):
+            missing_locally, extra_locally_ids, drifted = _fill_id_drift(
+                context.local_fills, context.platform_fills
+            )
+            for fill in missing_locally + drifted:
                 try:
-                    await self._store.delete_fills_by_client_ids(
-                        [cid], since=context.window_start, end=context.fill_compare_end
-                    )
-                    for fill in context.platform_fills.get(cid, []):
-                        fill = await self._stamp_fill_correlation(fill)
-                        await self._store.upsert_fill(fill)
+                    stamped = await self._stamp_fill_correlation(fill)
+                    await self._store.upsert_fill(stamped)
                 except Exception:
-                    logger.exception("Failed to correct fills for order %s", cid)
+                    logger.exception(
+                        "Failed to correct fill %s", fill.platform_fill_id
+                    )
+            if extra_locally_ids:
+                try:
+                    await self._store.delete_fills_by_platform_fill_ids(extra_locally_ids)
+                except Exception:
+                    logger.exception("Failed to remove stale fills from local mirror")
 
     async def _manage_halt_state(
         self,
