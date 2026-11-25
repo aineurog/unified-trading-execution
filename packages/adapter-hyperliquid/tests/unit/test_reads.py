@@ -300,9 +300,7 @@ async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) ->
     assert len(all_fills["parent-1"]) == 1  # deduped
     streamed: list[FillEvent] = []
     adapter._event_bus.subscribe(FillEvent, streamed.append)
-    await adapter._handle_user_fills_message(
-        {"user": adapter.account_id, "fills": [fill]}
-    )
+    await adapter._handle_user_fills_message({"user": adapter.account_id, "fills": [fill]})
     stream_fill = streamed[0].fill
     assert all_fills["parent-1"][0].platform_fill_id == stream_fill.platform_fill_id
     since = datetime(1970, 1, 1, 0, 0, 2, tzinfo=UTC)

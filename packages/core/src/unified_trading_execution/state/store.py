@@ -399,9 +399,7 @@ class StateStore(ABC):
         end: datetime | None = None,
     ) -> None: ...
     @abstractmethod
-    async def delete_fills_by_platform_fill_ids(
-        self, platform_fill_ids: list[str]
-    ) -> None: ...
+    async def delete_fills_by_platform_fill_ids(self, platform_fill_ids: list[str]) -> None: ...
 
     @abstractmethod
     async def write_audit_event(self, event: AuditEvent) -> None: ...
@@ -1087,9 +1085,7 @@ class SQLiteStateStore(StateStore):
                     params,
                 )
 
-    async def delete_fills_by_platform_fill_ids(
-        self, platform_fill_ids: list[str]
-    ) -> None:
+    async def delete_fills_by_platform_fill_ids(self, platform_fill_ids: list[str]) -> None:
         """Delete fill rows by venue execution id, holding the write lock.
 
         Fill identity is ``platform_fill_id``, not ``client_order_id`` — the

@@ -173,9 +173,7 @@ def reconcile(
     # Per-id quantity/price drift is still flagged.
     partial_fill_discrepancies: list[ReconciliationMismatch] = []
     if platform_fills is not None:
-        local_by_fill_id = {
-            f.platform_fill_id: f for fills in local_fills.values() for f in fills
-        }
+        local_by_fill_id = {f.platform_fill_id: f for fills in local_fills.values() for f in fills}
         platform_by_fill_id = {
             f.platform_fill_id: f for fills in platform_fills.values() for f in fills
         }
@@ -200,9 +198,7 @@ def reconcile(
                     ReconciliationMismatch(
                         mismatch_type="partial_fill",
                         instrument=platform_fill.instrument,
-                        local_value=(
-                            f"{local_fill.fill_quantity} @ {local_fill.fill_price}"
-                        ),
+                        local_value=(f"{local_fill.fill_quantity} @ {local_fill.fill_price}"),
                         platform_value=(
                             f"{platform_fill.fill_quantity} @ {platform_fill.fill_price}"
                         ),
@@ -214,9 +210,7 @@ def reconcile(
                     ReconciliationMismatch(
                         mismatch_type="partial_fill",
                         instrument=local_fill.instrument,
-                        local_value=(
-                            f"{local_fill.fill_quantity} @ {local_fill.fill_price}"
-                        ),
+                        local_value=(f"{local_fill.fill_quantity} @ {local_fill.fill_price}"),
                         platform_value="absent",
                     )
                 )

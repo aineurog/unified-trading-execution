@@ -201,9 +201,7 @@ class TestEngineLifecycle:
         assert len(results) == 1
         assert results[0].event_type == "bybit.leverage.applied"
 
-    async def test_connect_rejects_store_owned_by_different_account(
-        self, event_bus, tmp_path
-    ):
+    async def test_connect_rejects_store_owned_by_different_account(self, event_bus, tmp_path):
         store_path = str(tmp_path / "account.db")
         owner_store = SQLiteStateStore(store_path)
         await owner_store.initialize()
@@ -1356,9 +1354,7 @@ class TestReconcileMismatchCases:
         assert fills_after[0].fill_quantity == Decimal("0.7")
         assert fills_after[0].client_order_id == "fill-disc"
 
-    async def test_fill_attribution_drift_is_not_a_discrepancy(
-        self, engine, mock_adapter
-    ):
+    async def test_fill_attribution_drift_is_not_a_discrepancy(self, engine, mock_adapter):
         """The same venue execution filed under different client_order_ids on
         the WS and REST paths is one fill, not a discrepancy — and correction
         must not re-key the local attribution."""

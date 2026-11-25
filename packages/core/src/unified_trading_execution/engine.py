@@ -126,12 +126,8 @@ def _fill_id_drift(
       ``client_order_id`` preserved so correcting fields does not destroy
       stream-side attribution.
     """
-    local_by_id = {
-        f.platform_fill_id: f for fills in local_fills.values() for f in fills
-    }
-    platform_by_id = {
-        f.platform_fill_id: f for fills in platform_fills.values() for f in fills
-    }
+    local_by_id = {f.platform_fill_id: f for fills in local_fills.values() for f in fills}
+    platform_by_id = {f.platform_fill_id: f for fills in platform_fills.values() for f in fills}
 
     missing_locally: list[FillRecord] = []
     drifted: list[FillRecord] = []
@@ -145,9 +141,7 @@ def _fill_id_drift(
         ):
             drifted.append(replace(platform_fill, client_order_id=local_fill.client_order_id))
 
-    extra_locally_ids = [
-        fill_id for fill_id in local_by_id if fill_id not in platform_by_id
-    ]
+    extra_locally_ids = [fill_id for fill_id in local_by_id if fill_id not in platform_by_id]
     return missing_locally, extra_locally_ids, drifted
 
 
@@ -781,11 +775,7 @@ class Engine:
             # "missing" or post-lag fills compared as drift.
             settled_fills: dict[str, list[FillRecord]] = {}
             for cid, fills in platform_fills.items():
-                kept = [
-                    f
-                    for f in fills
-                    if window_start <= f.fill_timestamp <= fill_compare_end
-                ]
+                kept = [f for f in fills if window_start <= f.fill_timestamp <= fill_compare_end]
                 if kept:
                     settled_fills[cid] = kept
             platform_fills = settled_fills
@@ -1032,9 +1022,7 @@ class Engine:
                     stamped = await self._stamp_fill_correlation(fill)
                     await self._store.upsert_fill(stamped)
                 except Exception:
-                    logger.exception(
-                        "Failed to correct fill %s", fill.platform_fill_id
-                    )
+                    logger.exception("Failed to correct fill %s", fill.platform_fill_id)
             if extra_locally_ids:
                 try:
                     await self._store.delete_fills_by_platform_fill_ids(extra_locally_ids)
