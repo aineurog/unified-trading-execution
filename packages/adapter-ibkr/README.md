@@ -18,9 +18,16 @@ Unified Trading Execution adapter for Interactive Brokers (IBKR) via TWS/Gateway
 ## Installation
 
 ```bash
-uv pip install -e packages/core
-uv pip install -e packages/adapter-ibkr
+pip install "unified-trading-execution[ibkr]"
 ```
+
+For a source checkout, the adapter code lives under `packages/core/src`:
+
+```bash
+pip install -e packages/core
+```
+
+The `ibkr` extra installs `ib-async>=2.1.0`.
 
 ## Configuration
 

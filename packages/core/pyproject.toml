@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "unified-trading-execution"
-version = "0.1.0"
-description = "Unified Trading Execution — core library (platform-agnostic types, dispatch, risk checks, state mirror)"
+version = "0.0.2"
+description = "A modular, plug-and-play order execution library for Python with adapters for Binance, Bybit, cTrader, Hyperliquid, Interactive Brokers and MetaTrader 5"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
@@ -13,10 +17,44 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+binance = [
+    "python-binance==1.0.37",
+    "aiohttp>=3.9,<4.0",
+]
+bybit = [
+    "pybit>=5.0.0",
+    "requests>=2.0",
+]
+ctrader = []
+hyperliquid = [
+    "hyperliquid-python-sdk==0.24.0",
+    "requests>=2.31,<3.0",
+    "websocket-client>=1.5.1,<2.0",
+]
+ibkr = [
+    "ib-async>=2.1.0",
+]
+metatrader = [
+    "MetaTrader5>=5.0.0; sys_platform == 'win32'",
+]
+all = [
+    "python-binance==1.0.37",
+    "aiohttp>=3.9,<4.0",
+    "pybit>=5.0.0",
+    "requests>=2.31,<3.0",
+    "hyperliquid-python-sdk==0.24.0",
+    "websocket-client>=1.5.1,<2.0",
+    "ib-async>=2.1.0",
+    "MetaTrader5>=5.0.0; sys_platform == 'win32'",
+]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
 ]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+unified_trading_execution = ["py.typed"]

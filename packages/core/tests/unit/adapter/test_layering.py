@@ -16,15 +16,9 @@ from pathlib import Path
 import pytest
 
 CORE_SRC = Path(__file__).resolve().parent.parent.parent.parent / "src"
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent.parent
+PACKAGE_ROOT = CORE_SRC / "unified_trading_execution"
 COREMOD = "unified_trading_execution"
-
-FORBIDDEN_ADAPTERS = [
-    f"{COREMOD}.bybit",
-    f"{COREMOD}.ctrader",
-    f"{COREMOD}.mt5",
-    f"{COREMOD}.ibkr",
-]
+ADAPTER_NAMES = ("binance", "bybit", "ctrader", "hyperliquid", "ibkr", "mt5")
 
 
 def _find_py_files(root: Path) -> list[Path]:
@@ -34,6 +28,11 @@ def _find_py_files(root: Path) -> list[Path]:
             if fname.endswith(".py"):
                 py_files.append(Path(dirpath) / fname)
     return py_files
+
+
+def _is_adapter_file(py_file: Path) -> bool:
+    rel = py_file.relative_to(PACKAGE_ROOT)
+    return bool(rel.parts) and rel.parts[0] in ADAPTER_NAMES
 
 
 def _extract_imports(filepath: Path) -> set[str]:
@@ -77,29 +76,19 @@ class TestCoreNeverImportsAdapters:
     @pytest.fixture
     def core_imports(self):
         all_imports: set[str] = set()
-        for py_file in _find_py_files(CORE_SRC):
-            rel = py_file.relative_to(CORE_SRC)
-            # Skip test files, they're not core
-            if "tests" in rel.parts:
+        for py_file in _find_py_files(PACKAGE_ROOT):
+            rel = py_file.relative_to(PACKAGE_ROOT)
+            # Adapter trees live under the package for packaging, not core logic.
+            if "tests" in rel.parts or _is_adapter_file(py_file):
                 continue
             all_imports |= _extract_imports(py_file)
         return all_imports
 
-    def test_no_bybit_imports(self, core_imports):
-        bybit_imports = {i for i in core_imports if "bybit" in i.lower()}
-        assert bybit_imports == set(), f"Core imports bybit: {bybit_imports}"
-
-    def test_no_ctrader_imports(self, core_imports):
-        ctrader_imports = {i for i in core_imports if "ctrader" in i.lower()}
-        assert ctrader_imports == set(), f"Core imports ctrader: {ctrader_imports}"
-
-    def test_no_mt5_imports(self, core_imports):
-        mt5_imports = {i for i in core_imports if "mt5" in i.lower()}
-        assert mt5_imports == set(), f"Core imports mt5: {mt5_imports}"
-
-    def test_no_ibkr_imports(self, core_imports):
-        ibkr_imports = {i for i in core_imports if "ibkr" in i.lower()}
-        assert ibkr_imports == set(), f"Core imports ibkr: {ibkr_imports}"
+    @pytest.mark.parametrize("adapter_name", ADAPTER_NAMES)
+    def test_core_does_not_import_adapter(self, core_imports, adapter_name):
+        prefix = f"{COREMOD}.{adapter_name}"
+        violations = {i for i in core_imports if i == prefix or i.startswith(f"{prefix}.")}
+        assert violations == set(), f"Core imports {adapter_name}: {violations}"
 
 
 # ============================================================
@@ -108,12 +97,15 @@ class TestCoreNeverImportsAdapters:
 
 # Adapter source directories — only check those that exist on disk
 ADAPTER_DIRS: dict[str, Path] = {}
-for adapter_name in ("bybit", "ctrader", "mt5", "ibkr"):
-    candidate = (
-        WORKSPACE_ROOT / "packages" / f"adapter-{adapter_name}" / "src" / COREMOD / adapter_name
-    )
+for adapter_name in ADAPTER_NAMES:
+    candidate = PACKAGE_ROOT / adapter_name
     if candidate.is_dir():
         ADAPTER_DIRS[adapter_name] = candidate
+
+
+def test_all_adapter_source_dirs_are_discovered():
+    # An empty parametrize list silently skips the adapter contracts below.
+    assert sorted(ADAPTER_DIRS) == sorted(ADAPTER_NAMES)
 
 
 def _adapter_imports(adapter_name: str) -> set[str]:

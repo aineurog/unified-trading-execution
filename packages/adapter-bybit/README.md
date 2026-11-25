@@ -25,16 +25,16 @@ inverse perpetual markets.
 ## Installation
 
 ```bash
-# From the monorepo root, with uv:
-uv pip install -e packages/core
-uv pip install -e packages/adapter-bybit
-
-# Or with plain pip:
-pip install -e packages/core
-pip install -e packages/adapter-bybit
+pip install "unified-trading-execution[bybit]"
 ```
 
-The adapter depends on `unified-trading-execution` (core) and `pybit>=5.0.0`.
+For a source checkout, the adapter code lives under `packages/core/src`:
+
+```bash
+pip install -e packages/core
+```
+
+The `bybit` extra installs `pybit>=5.0.0`.
 
 ## Quickstart
 

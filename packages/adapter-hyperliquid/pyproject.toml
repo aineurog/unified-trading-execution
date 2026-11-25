@@ -1,14 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "unified-trading-execution-hyperliquid"
-version = "0.1.0"
-description = "Unified Trading Execution — Hyperliquid adapter"
+version = "0.0.2"
+description = "Development harness for the Hyperliquid adapter shipped in unified-trading-execution"
 requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Syed Qaisar Jalil"},
 ]
 dependencies = [
-    "unified-trading-execution",
+    "unified-trading-execution>=0.0.2",
     "hyperliquid-python-sdk==0.24.0",
     "requests>=2.31,<3.0",
     "websocket-client>=1.5.1,<2.0",
@@ -21,5 +25,5 @@ dev = [
     "pytest-mock>=3.14",
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.setuptools]
+packages = []
