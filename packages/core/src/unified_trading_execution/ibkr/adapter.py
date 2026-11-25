@@ -20,12 +20,13 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
+import hashlib
 import logging
 import math
 import threading
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import TYPE_CHECKING, Any
 
 from ib_async import IB, ExecutionFilter, Order, Trade
@@ -308,6 +309,54 @@ def _parse_commission(commission: Any) -> tuple[Decimal, str | None] | None:
         return amount, str(getattr(commission, "currency", "") or "") or None
     except Exception:
         return None
+
+
+def _execution_identity_decimal(value: object) -> str:
+    if value is None:
+        return ""
+    try:
+        return format(Decimal(str(value)).normalize(), "f")
+    except (InvalidOperation, ValueError):
+        return str(value)
+
+
+def _fill_platform_id(
+    execution: Any,
+    contract: Any,
+    execution_time: datetime,
+) -> str:
+    """Return IBKR's execution ID or a shared deterministic fallback.
+
+    IBKR normally supplies ``execId``. The fallback fingerprints the stable
+    execution fields available to both the stream and historical-fill paths,
+    so a missing ID does not make the same execution appear as two fills.
+    """
+    exec_id = str(getattr(execution, "execId", "") or "")
+    if exec_id:
+        return exec_id
+
+    parts = (
+        str(getattr(execution, "acctNumber", "") or ""),
+        str(getattr(contract, "conId", "") or ""),
+        str(getattr(contract, "secType", "") or ""),
+        str(getattr(contract, "symbol", "") or ""),
+        str(getattr(execution, "clientId", "") or ""),
+        str(getattr(execution, "orderId", "") or ""),
+        str(getattr(execution, "permId", "") or ""),
+        str(getattr(execution, "exchange", "") or ""),
+        str(getattr(execution, "side", "") or ""),
+        _execution_identity_decimal(getattr(execution, "shares", None)),
+        _execution_identity_decimal(getattr(execution, "price", None)),
+        _execution_identity_decimal(getattr(execution, "cumQty", None)),
+        _execution_identity_decimal(getattr(execution, "avgPrice", None)),
+        execution_time.astimezone(UTC).isoformat(timespec="microseconds"),
+    )
+    digest = hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+    logger.warning(
+        "IBKR execution has no execId; using deterministic fingerprint for %s",
+        getattr(execution, "orderId", ""),
+    )
+    return f"ibkr-fallback:{digest}"
 
 
 def _fill_reason_entry(cid: str) -> tuple[FillReason | None, FillEntry | None]:
@@ -1863,13 +1912,15 @@ class IBKRAdapter(Adapter):
                     "Skipping fill without orderRef/execId %r", getattr(execution, "execId", "")
                 )
                 continue
-            exec_id = str(getattr(execution, "execId", "") or "")
-            if not exec_id:
-                exec_id = f"{client_order_id}-{exec_time.isoformat()}"
-            if exec_id in seen_fill_ids:
+            platform_fill_id = _fill_platform_id(
+                execution,
+                contract,
+                exec_time,
+            )
+            if platform_fill_id in seen_fill_ids:
                 # Session and historical sources overlap — keep the first.
                 continue
-            seen_fill_ids.add(exec_id)
+            seen_fill_ids.add(platform_fill_id)
             parsed_fee = _parse_commission(commission)
             fee_amount, fee_currency = parsed_fee if parsed_fee is not None else (None, None)
             # position_id not applicable to IBKR fills — keep None
@@ -1877,7 +1928,7 @@ class IBKRAdapter(Adapter):
             try:
                 record = FillRecord(
                     client_order_id=client_order_id,
-                    platform_fill_id=exec_id,
+                    platform_fill_id=platform_fill_id,
                     instrument=instrument,
                     fill_quantity=qty,
                     fill_price=fill_price,
@@ -2263,9 +2314,6 @@ class IBKRAdapter(Adapter):
                 client_order_id = str(perm) if perm else ""
             if not client_order_id:
                 return
-            exec_id = str(getattr(execution, "execId", "") or "")
-            if not exec_id:
-                exec_id = f"{client_order_id}-{_new_id()[:8]}"
             exec_time_raw = (
                 getattr(execution, "time", None) or getattr(fill, "time", None) or _utcnow()
             )
@@ -2274,13 +2322,18 @@ class IBKRAdapter(Adapter):
                 if getattr(exec_time_raw, "tzinfo", None)
                 else exec_time_raw.replace(tzinfo=UTC)
             )
+            platform_fill_id = _fill_platform_id(
+                execution,
+                contract,
+                exec_time,
+            )
             commission = getattr(fill, "commissionReport", None)
             parsed_fee = _parse_commission(commission)
             fee_amount, fee_currency = parsed_fee if parsed_fee is not None else (None, None)
             reason, entry = _fill_reason_entry(client_order_id)
             fill_record = FillRecord(
                 client_order_id=client_order_id,
-                platform_fill_id=exec_id,
+                platform_fill_id=platform_fill_id,
                 instrument=instrument,
                 fill_quantity=shares,
                 fill_price=exec_price,

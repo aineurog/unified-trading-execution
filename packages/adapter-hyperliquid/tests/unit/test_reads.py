@@ -9,6 +9,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from unified_trading_execution.errors import InvalidSymbolError, PlatformError
+from unified_trading_execution.events import FillEvent
 from unified_trading_execution.hyperliquid import HyperliquidAdapter
 from unified_trading_execution.types.enums import AssetClass
 from unified_trading_execution.types.instrument import Instrument
@@ -297,6 +298,13 @@ async def test_fetch_fills_attribution_and_since(adapter: HyperliquidAdapter) ->
     all_fills = await adapter.fetch_fills()
     assert set(all_fills) == {"parent-1", "6"}
     assert len(all_fills["parent-1"]) == 1  # deduped
+    streamed: list[FillEvent] = []
+    adapter._event_bus.subscribe(FillEvent, streamed.append)
+    await adapter._handle_user_fills_message(
+        {"user": adapter.account_id, "fills": [fill]}
+    )
+    stream_fill = streamed[0].fill
+    assert all_fills["parent-1"][0].platform_fill_id == stream_fill.platform_fill_id
     since = datetime(1970, 1, 1, 0, 0, 2, tzinfo=UTC)
     exchange.info.user_fills_by_time.return_value = [fill, old]
     windowed = await adapter.fetch_fills(since=since)

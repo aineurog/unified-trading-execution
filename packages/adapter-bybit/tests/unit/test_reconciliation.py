@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Any
@@ -12,6 +13,7 @@ from pybit.exceptions import FailedRequestError, InvalidRequestError
 from unified_trading_execution.bybit.adapter import BybitAdapter
 from unified_trading_execution.bybit.symbols import from_bybit_symbol
 from unified_trading_execution.errors import InvalidSymbolError, PlatformConnectionError
+from unified_trading_execution.events import FillEvent
 from unified_trading_execution.types.enums import FillEntry, FillReason, OrderStatus
 from unified_trading_execution.types.instrument import Instrument
 
@@ -414,6 +416,38 @@ class TestFetchFills:
         fills = result["client-1"]
         assert len(fills) == 2
         assert sum(f.fill_quantity for f in fills) == Decimal("0.5")
+
+    async def test_rest_and_stream_fill_ids_match(
+        self,
+        adapter: BybitAdapter,
+        mock_pybit_http: Any,
+    ) -> None:
+        _register(adapter, "BTCUSDT", "BTC", "USDT", "linear")
+        entry = _execution(execId="shared-exec-id")
+        mock_pybit_http.get_executions.side_effect = [
+            _EMPTY,
+            (
+                {
+                    "result": {
+                        "list": [entry],
+                        "nextPageCursor": "",
+                    }
+                },
+                None,
+                {},
+            ),
+            _EMPTY,
+        ]
+
+        rest_fill = (await adapter.fetch_fills())["client-1"][0]
+        streamed: list[FillEvent] = []
+        adapter._event_bus.subscribe(FillEvent, streamed.append)
+        adapter._loop = asyncio.get_running_loop()
+        adapter._on_execution_message({"data": [entry]})
+        await asyncio.sleep(0)
+        stream_fill = streamed[0].fill
+
+        assert rest_fill.platform_fill_id == stream_fill.platform_fill_id
 
     async def test_native_tp_sl_fill_recorded(
         self,
