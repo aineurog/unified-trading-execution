@@ -78,7 +78,7 @@ def default_state_store_path(platform_name: str, account_id: str) -> str:
     ``./unified_trading_execution_data/bybit_acct123.db``.
     """
     filename = f"{_slug(platform_name)}_{_slug(account_id)}.db"
-    return os.path.join("./unified_trading_execution_data", filename)
+    return os.path.join(".", "unified_trading_execution_data", filename)
 
 
 # ============================================================

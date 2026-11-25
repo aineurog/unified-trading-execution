@@ -109,6 +109,19 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+async def _wait_for(check, *, timeout: float = 2.0) -> None:
+    """Poll an async predicate until truthy — event-bus persistence is
+    scheduled on the loop and aiosqlite writes cross a thread boundary, so a
+    fixed ``asyncio.sleep`` is racy on slow/loaded machines."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if await check():
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for persisted state")
+        await asyncio.sleep(0.005)
+
+
 def _ref_price(instrument: Instrument) -> Decimal | None:
     return Decimal("50000")
 
@@ -714,8 +727,7 @@ class TestStateMirrorSubscriptions:
             correlation_id="corr-001",
         )
         mock_adapter.inject_fill(fill)
-        # Allow the asyncio task to run
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_fill_history(instrument=_instrument()))
         fills = await engine.get_fill_history(instrument=_instrument())
         assert len(fills) >= 1
 
@@ -728,7 +740,7 @@ class TestStateMirrorSubscriptions:
             position_id="1",
         )
         mock_adapter.inject_position_update(pos)
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_positions(_instrument()))
         stored = await engine.get_positions(_instrument())
         assert len(stored) == 1
         assert stored[0].quantity == Decimal("1.5")
@@ -743,7 +755,7 @@ class TestStateMirrorSubscriptions:
             updated_at=_utcnow(),
         )
         mock_adapter.inject_balance_update(bal)
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_balance("USDT"))
         stored = await engine.get_balance("USDT")
         assert stored is not None
         assert stored.total == Decimal("10000")
@@ -761,7 +773,12 @@ class TestStateMirrorSubscriptions:
             filled_quantity=stored.quantity,
         )
         mock_adapter.inject_order_status(filled)
-        await asyncio.sleep(0.01)
+
+        async def _filled() -> bool:
+            updated = await engine.state_store.get_order(result.client_order_id)
+            return updated is not None and updated.status == OrderStatus.FILLED
+
+        await _wait_for(_filled)
 
         updated = await engine.state_store.get_order(result.client_order_id)
         assert updated is not None
@@ -785,7 +802,12 @@ class TestStateMirrorSubscriptions:
             correlation_id=stored.client_order_id,
         )
         mock_adapter.inject_order_status(filled)
-        await asyncio.sleep(0.01)
+
+        async def _filled() -> bool:
+            updated = await engine.state_store.get_order(result.client_order_id)
+            return updated is not None and updated.status == OrderStatus.FILLED
+
+        await _wait_for(_filled)
 
         updated = await engine.state_store.get_order(result.client_order_id)
         assert updated is not None
