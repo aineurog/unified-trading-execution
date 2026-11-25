@@ -135,12 +135,7 @@ from unified_trading_execution.trailing.types import (
     TrailingBasis,
     TrailingOffsetType,
 )
-from unified_trading_execution.types.enums import (
-    LIVE_ORDER_STATUSES,
-    OrderSide,
-    OrderStatus,
-    OrderType,
-)
+from unified_trading_execution.types.enums import LIVE_ORDER_STATUSES, OrderStatus, OrderType
 from unified_trading_execution.types.instrument import Instrument, InstrumentSpec
 from unified_trading_execution.types.market_data import Candle, Ticker
 from unified_trading_execution.types.order import (
@@ -273,10 +268,12 @@ class BinanceAdapter(Adapter):
         self._final_order_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_fill_ids: OrderedDict[str, None] = OrderedDict()
         self._balance_refresh_tasks: dict[BinanceProduct, asyncio.Task[None]] = {}
+        self._published_balances: dict[str, Balance] = {}
         self._instrument_spec_cache: dict[
             tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
         ] = {}
         self._exchange_info_cache: dict[BinanceProduct, list[object]] = {}
+        self._exchange_info_locks: dict[BinanceProduct, asyncio.Lock] = {}
         self._rate_limit_tracker = BinanceRateLimitTracker()
         self._native_trailing_ids: dict[str, str] = {}
 
@@ -380,9 +377,6 @@ class BinanceAdapter(Adapter):
             self._stream_states = dict.fromkeys(_PRODUCT_ORDER, False)
             self._stream_ready = {product: asyncio.Event() for product in _PRODUCT_ORDER}
             try:
-                await asyncio.gather(
-                    *(self._load_exchange_info(product) for product in _PRODUCT_ORDER)
-                )
                 await self._restore_order_references()
                 await self._start_private_streams()
                 await self._reapply_stored_intent()
@@ -506,6 +500,17 @@ class BinanceAdapter(Adapter):
         cached_entries = self._exchange_info_cache.get(product)
         if cached_entries is not None:
             return cached_entries
+        # Catalogs are fetched lazily per product on first use — Spot's
+        # exchangeInfo alone is ~18 MB, so eagerly loading all three at
+        # connect made futures-only sessions hostage to Spot latency.
+        lock = self._exchange_info_locks.setdefault(product, asyncio.Lock())
+        async with lock:
+            cached_entries = self._exchange_info_cache.get(product)
+            if cached_entries is not None:
+                return cached_entries
+            return await self._fetch_exchange_info(product)
+
+    async def _fetch_exchange_info(self, product: BinanceProduct) -> list[object]:
         client = self._client
         if client is None:
             raise PlatformConnectionError(
@@ -936,6 +941,12 @@ class BinanceAdapter(Adapter):
         raise PlatformError("Binance account-stream event is missing a valid event timestamp")
 
     def _publish_balance(self, balance: Balance) -> None:
+        previous = self._published_balances.get(balance.currency)
+        if balance.total == 0 and (previous is None or previous.total == 0):
+            # Binance enumerates every account asset, including hundreds of
+            # permanent zero rows; only a nonzero→zero transition is news.
+            return
+        self._published_balances[balance.currency] = balance
         self._event_bus.publish(
             BalanceUpdateEvent(
                 event_id=str(uuid7()),
@@ -2681,45 +2692,16 @@ class BinanceAdapter(Adapter):
             )
 
         activation_price = request.activation_price
-        immediate_reference: Decimal | None = None
-        if leg.product is BinanceProduct.COIN_M and activation_price is None:
-            # /dapi/v1/algoOrder mandates activatePrice even for immediate
-            # activation.  Derive it from the price the trail monitors so the
-            # venue's activation check sees the same basis as workingType.
-            ticker = await self.fetch_ticker(request.instrument)
-            if ticker is not None:
-                if request.basis is TrailingBasis.MARK:
-                    immediate_reference = ticker.mark if ticker.mark is not None else ticker.last
-                else:
-                    immediate_reference = ticker.last if ticker.last is not None else ticker.mark
-            if immediate_reference is None:
-                raise PlatformError(
-                    f"Cannot place COIN-M trailing stop for {symbol}: "
-                    "no ticker price available for mandatory activatePrice"
-                )
-            activation_price = immediate_reference
         if activation_price is not None:
             # Binance rejects activatePrice values that exceed the symbol's
             # price precision (-1102), so snap to the tick.  Use the cached
             # exchange-info row rather than fetch_instrument_spec, which
-            # would add a signed leverage-bracket lookup.
+            # would add a signed leverage-bracket lookup.  Immediate
+            # activation omits the field entirely — verified live that
+            # /dapi/v1/algoOrder accepts the omission on COIN-M.
             entries = await self._load_exchange_info(leg.product)
             _, entry = resolve_binance_symbol(request.instrument, leg.product, entries)
-            tick_size = parse_tick_size(entry)
-            if immediate_reference is not None:
-                # Nudge off the activation boundary: a sell-side trail is
-                # already armed when price is at/above activatePrice and a
-                # buy-side trail when it is at/below.  Sitting exactly on the
-                # current price lets the venue read the order as an immediate
-                # trigger (-2021), and mark/contract divergence can flip the
-                # comparison, so pad by a fraction of a percent.
-                pad = immediate_reference * Decimal("0.005")
-                activation_price = (
-                    immediate_reference - pad
-                    if request.side is OrderSide.BUY
-                    else immediate_reference + pad
-                )
-            activation_price = activation_price.quantize(tick_size)
+            activation_price = activation_price.quantize(parse_tick_size(entry))
         payload = build_trailing_algo_payload(
             leg=leg,
             leg_quantity=quantity,
@@ -2949,8 +2931,16 @@ class BinanceAdapter(Adapter):
         responses = await asyncio.gather(
             *(self._fetch_product_balances(product) for product in _PRODUCT_ORDER)
         )
+        # Spot's account endpoint enumerates every asset on the account —
+        # hundreds of permanent zero rows. Only non-zero wallets are worth
+        # persisting; a drained asset still records its transition because
+        # engine reconcile writes explicit zero rows for currencies missing
+        # from the platform snapshot.
         return {
-            key: value for product_balances in responses for key, value in product_balances.items()
+            key: value
+            for product_balances in responses
+            for key, value in product_balances.items()
+            if value.total != 0
         }
 
     async def _fetch_product_balances(

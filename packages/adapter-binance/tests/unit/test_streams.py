@@ -161,6 +161,50 @@ def test_order_and_fill_translators_accept_execution_report_shape() -> None:
     assert fill.entry == FillEntry.OUT
 
 
+@pytest.mark.parametrize(
+    ("product", "instrument", "symbol"),
+    [
+        (BinanceProduct.SPOT, _spot_instrument(), "BTCUSDT"),
+        (BinanceProduct.USD_M, _usd_m_instrument(), "BTCUSDT"),
+        (BinanceProduct.COIN_M, _coin_m_instrument(), "BTCUSD_PERP"),
+    ],
+)
+def test_rest_trade_and_execution_report_share_fill_identity(
+    product: BinanceProduct,
+    instrument: Instrument,
+    symbol: str,
+) -> None:
+    rest_fill = translate_fill_entry(
+        {
+            "symbol": symbol,
+            "id": 789,
+            "price": "62000",
+            "qty": "0.5",
+            "time": _EVENT_TIME,
+        },
+        product=product,
+        instrument=instrument,
+        client_order_id="rest-client",
+    )
+    stream_fill = translate_fill_entry(
+        {
+            "s": symbol,
+            "t": 789,
+            "L": "62000",
+            "l": "0.5",
+            "T": _EVENT_TIME,
+            "x": "TRADE",
+        },
+        product=product,
+        instrument=instrument,
+        client_order_id="stream-client",
+    )
+
+    assert rest_fill is not None
+    assert stream_fill is not None
+    assert rest_fill.platform_fill_id == stream_fill.platform_fill_id
+
+
 def test_take_profit_market_maps_to_stop_until_core_distinguishes_tp_sl() -> None:
     order = translate_order_entry(
         {
@@ -420,6 +464,32 @@ async def test_spot_balance_event_and_futures_account_update_are_translated(
     assert balances[0].balance.currency == "SPOT:USDT"
     assert positions[0].position.quantity == Decimal("0.2")
     assert positions[0].position.position_id == "usd_m:BTCUSDT:LONG"
+
+
+@pytest.mark.asyncio
+async def test_zero_balances_publish_only_on_nonzero_transition(
+    adapter,
+    event_bus,
+) -> None:
+    # Spot enumerates every account asset; steady-state zero rows must not
+    # become balance events, but a real nonzero→zero transition still must.
+    balances: list[BalanceUpdateEvent] = []
+    event_bus.subscribe(BalanceUpdateEvent, balances.append)
+
+    def _spot_balance(asset: str, free: str) -> None:
+        adapter._publish_balance(
+            translate_spot_balance({"a": asset, "f": free, "l": "0"}, timestamp=_TIMESTAMP)
+        )
+
+    _spot_balance("LTC", "0")
+    assert balances == []
+
+    _spot_balance("LTC", "1")
+    _spot_balance("LTC", "0")
+    _spot_balance("LTC", "0")
+
+    assert [event.balance.total for event in balances] == [Decimal("1"), Decimal("0")]
+    assert all(event.balance.currency == "SPOT:LTC" for event in balances)
 
 
 @pytest.mark.asyncio

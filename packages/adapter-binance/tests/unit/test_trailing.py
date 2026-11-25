@@ -437,21 +437,6 @@ async def test_place_trailing_stop_coin_m_uses_dapi_algo_endpoint(
         return [] if args[0] == "get" else {}
 
     binance_client_mock._request_futures_coin_api.side_effect = _coin_api
-    # COIN-M algo orders mandate activatePrice; the adapter fills it from the
-    # mark ticker for immediate activation.
-    binance_client_mock.futures_coin_symbol_ticker.return_value = {
-        "symbol": "BTCUSD_PERP",
-        "price": "60800",
-    }
-    binance_client_mock.futures_coin_orderbook_ticker.return_value = {
-        "symbol": "BTCUSD_PERP",
-        "bidPrice": "60790",
-        "askPrice": "60810",
-    }
-    binance_client_mock.futures_coin_mark_price.return_value = {
-        "symbol": "BTCUSD_PERP",
-        "markPrice": "60805",
-    }
 
     result = await adapter.place_trailing_stop(
         _request(
@@ -471,27 +456,29 @@ async def test_place_trailing_stop_coin_m_uses_dapi_algo_endpoint(
     assert payload["callbackRate"] == "5"
     assert payload["quantity"] == "1"
     assert payload["reduceOnly"] == "true"
-    # Immediate activation is padded 0.5% below the mark reference so the
-    # sell-side trail is unambiguously already armed.
-    assert payload["activatePrice"] == "60501"
+    # Immediate activation omits activatePrice; the venue accepts the
+    # omission on /dapi/v1/algoOrder (verified live on Demo).
+    assert "activatePrice" not in payload
     assert "newOrderRespType" not in payload
 
 
-async def test_place_trailing_stop_coin_m_ticker_failure_keeps_existing_trail(
+async def test_place_trailing_stop_coin_m_bad_tick_metadata_keeps_existing_trail(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed activatePrice lookup must not cancel the trail it would replace."""
+    """A failed tick-size lookup must not cancel the trail it would replace."""
     await _coin_m_connected_adapter(adapter, binance_client_mock)
     binance_client_mock._request_futures_coin_api.return_value = [_coin_m_algo_entry()]
-    monkeypatch.setattr(adapter, "fetch_ticker", AsyncMock(return_value=None))
+    entry = _coin_m_metadata()
+    del entry["filters"]
+    adapter._exchange_info_cache[BinanceProduct.COIN_M] = [entry]
 
-    with pytest.raises(PlatformError, match="activatePrice"):
+    with pytest.raises(PlatformError, match="Malformed Binance filters"):
         await adapter.place_trailing_stop(
             _request(
                 instrument=_coin_m_instrument(),
                 position_id="coin_m:BTCUSD_PERP:BOTH",
+                activation_price=Decimal("64000"),
             )
         )
 

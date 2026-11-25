@@ -220,8 +220,12 @@ async def test_position_tpsl_lifecycle(
         )
 
         if product == BinanceProduct.COIN_M:
-            regular_orders = await client.futures_coin_get_open_orders(symbol=symbol)
-            assert isinstance(regular_orders, list)
+            # COIN-M protection orders are conditional algo orders; the
+            # regular open-orders endpoint never lists them.
+            algo_orders = await client._request_futures_coin_api(
+                "get", "openAlgoOrders", True, data={"symbol": symbol}
+            )
+            assert isinstance(algo_orders, list)
             expected_orders = {
                 protection_client_id(leg_side, ProtectionSide.TAKE_PROFIT): (
                     "TAKE_PROFIT_MARKET",
@@ -233,18 +237,17 @@ async def test_position_tpsl_lifecycle(
                 ),
             }
             found = {
-                row.get("clientOrderId"): row
-                for row in regular_orders
-                if isinstance(row, dict) and row.get("clientOrderId") in expected_orders
+                row.get("clientAlgoId"): row
+                for row in algo_orders
+                if isinstance(row, dict) and row.get("clientAlgoId") in expected_orders
             }
             assert set(found) == set(expected_orders)
             for client_order_id, (expected_type, expected_trigger) in expected_orders.items():
                 order = found[client_order_id]
-                assert order.get("type") == expected_type
-                assert Decimal(str(order.get("stopPrice"))) == expected_trigger
+                assert (order.get("orderType") or order.get("type")) == expected_type
+                assert Decimal(str(order.get("triggerPrice"))) == expected_trigger
                 assert order.get("closePosition") in (True, "true", "TRUE")
                 assert order.get("workingType") == "MARK_PRICE"
-                assert order.get("priceProtect") in (True, "true", "TRUE")
 
         confirmed = await adapter.get_position_tpsl(instrument, position_id)
         assert confirmed is not None

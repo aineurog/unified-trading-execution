@@ -23,6 +23,7 @@ from unified_trading_execution.errors import (
     OrderNotFoundError,
     RateLimitError,
     ReconciliationError,
+    StateStoreOwnershipError,
     UnsupportedOrderTypeError,
 )
 from unified_trading_execution.events import (
@@ -108,6 +109,19 @@ def _utcnow() -> datetime:
     return datetime.now(tz=UTC)
 
 
+async def _wait_for(check, *, timeout: float = 2.0) -> None:
+    """Poll an async predicate until truthy — event-bus persistence is
+    scheduled on the loop and aiosqlite writes cross a thread boundary, so a
+    fixed ``asyncio.sleep`` is racy on slow/loaded machines."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while True:
+        if await check():
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("timed out waiting for persisted state")
+        await asyncio.sleep(0.005)
+
+
 def _ref_price(instrument: Instrument) -> Decimal | None:
     return Decimal("50000")
 
@@ -186,6 +200,31 @@ class TestEngineLifecycle:
         results = await engine.get_audit_events()
         assert len(results) == 1
         assert results[0].event_type == "bybit.leverage.applied"
+
+    async def test_connect_rejects_store_owned_by_different_account(self, event_bus, tmp_path):
+        store_path = str(tmp_path / "account.db")
+        owner_store = SQLiteStateStore(store_path)
+        await owner_store.initialize()
+        await owner_store.bind_owner("mock", "account-one")
+        await owner_store.close()
+
+        other_account = MockAdapter(
+            event_bus=event_bus,
+            platform_name="mock",
+            account_id="account-two",
+        )
+        other_account.add_instrument_spec(_instrument(), _spec())
+        engine = Engine(
+            adapter=other_account,
+            state_store=SQLiteStateStore(store_path),
+            reconcile_interval_seconds=None,
+        )
+        try:
+            with pytest.raises(StateStoreOwnershipError, match="account-two"):
+                await engine.connect()
+            assert not other_account.is_connected
+        finally:
+            await engine.state_store.close()
 
 
 class TestEngineConstruction:
@@ -686,8 +725,7 @@ class TestStateMirrorSubscriptions:
             correlation_id="corr-001",
         )
         mock_adapter.inject_fill(fill)
-        # Allow the asyncio task to run
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_fill_history(instrument=_instrument()))
         fills = await engine.get_fill_history(instrument=_instrument())
         assert len(fills) >= 1
 
@@ -700,7 +738,7 @@ class TestStateMirrorSubscriptions:
             position_id="1",
         )
         mock_adapter.inject_position_update(pos)
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_positions(_instrument()))
         stored = await engine.get_positions(_instrument())
         assert len(stored) == 1
         assert stored[0].quantity == Decimal("1.5")
@@ -715,7 +753,7 @@ class TestStateMirrorSubscriptions:
             updated_at=_utcnow(),
         )
         mock_adapter.inject_balance_update(bal)
-        await asyncio.sleep(0.01)
+        await _wait_for(lambda: engine.get_balance("USDT"))
         stored = await engine.get_balance("USDT")
         assert stored is not None
         assert stored.total == Decimal("10000")
@@ -733,7 +771,12 @@ class TestStateMirrorSubscriptions:
             filled_quantity=stored.quantity,
         )
         mock_adapter.inject_order_status(filled)
-        await asyncio.sleep(0.01)
+
+        async def _filled() -> bool:
+            updated = await engine.state_store.get_order(result.client_order_id)
+            return updated is not None and updated.status == OrderStatus.FILLED
+
+        await _wait_for(_filled)
 
         updated = await engine.state_store.get_order(result.client_order_id)
         assert updated is not None
@@ -757,7 +800,12 @@ class TestStateMirrorSubscriptions:
             correlation_id=stored.client_order_id,
         )
         mock_adapter.inject_order_status(filled)
-        await asyncio.sleep(0.01)
+
+        async def _filled() -> bool:
+            updated = await engine.state_store.get_order(result.client_order_id)
+            return updated is not None and updated.status == OrderStatus.FILLED
+
+        await _wait_for(_filled)
 
         updated = await engine.state_store.get_order(result.client_order_id)
         assert updated is not None
@@ -1279,10 +1327,12 @@ class TestReconcileMismatchCases:
         )
         await engine.state_store.upsert_fill(local_fill)
 
-        # Seed a different platform fill
+        # Seed a different platform fill — same venue execution id, drifted
+        # quantity AND a different client_order_id: correction must take the
+        # platform's values but keep the local attribution.
         platform_fill = FillRecord(
-            client_order_id="fill-disc",
-            platform_fill_id="pf-001",
+            client_order_id="platform-resolved-cid",
+            platform_fill_id="lf-001",
             instrument=_instrument(),
             fill_quantity=Decimal("0.7"),
             fill_price=Decimal("50000"),
@@ -1297,10 +1347,66 @@ class TestReconcileMismatchCases:
         assert len(result.partial_fill_discrepancies) == 1
         assert result.partial_fill_discrepancies[0].mismatch_type == "partial_fill"
 
-        # Resolution: local fills should be overwritten with platform fills
+        # Resolution: the drifted fill is corrected to platform values while
+        # keeping the local client_order_id attribution.
         fills_after = await engine.get_fill_history()
         assert len(fills_after) == 1
         assert fills_after[0].fill_quantity == Decimal("0.7")
+        assert fills_after[0].client_order_id == "fill-disc"
+
+    async def test_fill_attribution_drift_is_not_a_discrepancy(self, engine, mock_adapter):
+        """The same venue execution filed under different client_order_ids on
+        the WS and REST paths is one fill, not a discrepancy — and correction
+        must not re-key the local attribution."""
+        await engine.state_store.set_reconcile_watermark(
+            datetime.now(tz=UTC) - timedelta(minutes=5)
+        )
+        await engine.place_order(_order(client_order_id="fill-disc"))
+        mock_adapter.seed_position(
+            Position(
+                instrument=_instrument(),
+                quantity=Decimal("0"),
+                average_entry_price=Decimal("0"),
+                updated_at=_utcnow(),
+            )
+        )
+        settled = datetime.now(tz=UTC) - timedelta(minutes=1)
+
+        # WS path attributed the child execution to the protection client id;
+        # the REST fetch resolves the same trade to the fallback order id.
+        await engine.state_store.upsert_fill(
+            FillRecord(
+                client_order_id="tpsl-u-BTCUSDT-BOTH-sl",
+                platform_fill_id="usd_m:BTCUSDT:12345",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=settled,
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-local",
+            )
+        )
+        mock_adapter.seed_fill(
+            FillRecord(
+                client_order_id="binance-usd_m:99999",
+                platform_fill_id="usd_m:BTCUSDT:12345",
+                instrument=_instrument(),
+                fill_quantity=Decimal("0.001"),
+                fill_price=Decimal("50000"),
+                fill_timestamp=settled,
+                fee_currency="USDT",
+                fee_amount=Decimal("1"),
+                correlation_id="corr-platform",
+            )
+        )
+
+        result = await engine.reconcile()
+        assert result.partial_fill_discrepancies == []
+
+        fills_after = await engine.get_fill_history()
+        assert len(fills_after) == 1
+        assert fills_after[0].client_order_id == "tpsl-u-BTCUSDT-BOTH-sl"
 
     async def test_clean_reconcile_clears_existing_halt(self, engine, mock_adapter):
         """A clean reconciliation pass clears an existing halt."""
@@ -1382,7 +1488,7 @@ class TestReconcileHaltScoping:
         mock_adapter.seed_fill(
             FillRecord(
                 client_order_id="fill-disc",
-                platform_fill_id="pf-001",
+                platform_fill_id="lf-001",
                 instrument=_instrument(),
                 fill_quantity=Decimal("0.7"),
                 fill_price=Decimal("50000"),
@@ -1546,7 +1652,9 @@ class TestFillSettleLag:
         )
 
         result = await engine.reconcile()
-        assert len(result.partial_fill_discrepancies) == 1
+        # lf-settled is absent on the platform and pf-settled is absent
+        # locally — two per-fill-id discrepancies.
+        assert len(result.partial_fill_discrepancies) == 2
 
         # The settled discrepancy is corrected to platform truth, and the
         # in-flight fill survives the correction (not deleted by the window).

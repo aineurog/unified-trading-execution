@@ -515,8 +515,12 @@ class TestFetchFills:
 
         assert list(fills) == ["client-abc"]
         fill = fills["client-abc"][0]
+        deal = self._deal()
+        instruments = adapter._resolve_poll_instruments(mock_mt5_module, (), (deal,))
+        poll_fill = adapter._build_fill(deal, instruments, _account())
         assert fill.client_order_id == "client-abc"
         assert fill.platform_fill_id == "3001"
+        assert fill.platform_fill_id == poll_fill.platform_fill_id
         assert fill.instrument.symbol == "EUR"
         assert fill.fill_quantity == Decimal("0.1")
         assert fill.fill_price == Decimal("1.1")

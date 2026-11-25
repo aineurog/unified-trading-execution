@@ -37,7 +37,7 @@ def _is_adapter_file(py_file: Path) -> bool:
 
 def _extract_imports(filepath: Path) -> set[str]:
     """Return the set of module-level import targets in a Python file."""
-    tree = ast.parse(filepath.read_text())
+    tree = ast.parse(filepath.read_text(encoding="utf-8"))
     imports: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):

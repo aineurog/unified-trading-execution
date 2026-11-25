@@ -11,6 +11,7 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
+from unified_trading_execution.errors import StateStoreOwnershipError
 from unified_trading_execution.events import AuditEvent
 from unified_trading_execution.state.halt import HaltConfig, HaltStateMachine
 from unified_trading_execution.state.reconciliation import reconcile
@@ -140,6 +141,42 @@ class TestSQLiteStoreLifecycle:
         s = SQLiteStateStore(":memory:")
         with pytest.raises(RuntimeError, match="not initialised"):
             _ = s.conn
+
+    @pytest.mark.asyncio
+    async def test_owner_binding_is_idempotent_for_same_account(self, store):
+        await store.bind_owner("binance", "account-1")
+        await store.bind_owner("binance", "account-1")
+
+    @pytest.mark.asyncio
+    async def test_owner_binding_rejects_different_account(self, store):
+        await store.bind_owner("binance", "account-1")
+        with pytest.raises(StateStoreOwnershipError, match="separate state store"):
+            await store.bind_owner("binance", "account-2")
+
+    @pytest.mark.asyncio
+    async def test_owner_binding_rejects_different_platform(self, store):
+        await store.bind_owner("binance", "account-1")
+        with pytest.raises(StateStoreOwnershipError, match="separate state store"):
+            await store.bind_owner("bybit", "account-1")
+
+    @pytest.mark.asyncio
+    async def test_owner_binding_is_atomic_across_sqlite_connections(self, tmp_path):
+        path = str(tmp_path / "shared.db")
+        first = SQLiteStateStore(path)
+        second = SQLiteStateStore(path)
+        await first.initialize()
+        await second.initialize()
+        try:
+            results = await asyncio.gather(
+                first.bind_owner("binance", "account-1"),
+                second.bind_owner("bybit", "account-2"),
+                return_exceptions=True,
+            )
+            assert sum(result is None for result in results) == 1
+            assert sum(isinstance(result, StateStoreOwnershipError) for result in results) == 1
+        finally:
+            await first.close()
+            await second.close()
 
 
 # ============================================================

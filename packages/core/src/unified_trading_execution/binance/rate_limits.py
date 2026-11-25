@@ -80,6 +80,7 @@ class BinanceRateLimitTracker:
 
     def __init__(self) -> None:
         self._definitions: dict[BinanceProduct, dict[_RateLimitKey, _LimitDefinition]] = {}
+        self._definitions_observed: set[BinanceProduct] = set()
         self._usage: dict[BinanceProduct, dict[_RateLimitKey, _Usage]] = {}
         self._raw_request_counts: dict[BinanceProduct, dict[_RateLimitKey, _Usage]] = {}
         self._unparseable_header_until: dict[BinanceProduct, datetime] = {}
@@ -97,6 +98,12 @@ class BinanceRateLimitTracker:
         """Record one SDK response, retaining prior counters omitted by it."""
         moment = now or datetime.now(UTC)
         if rate_limits is not None:
+            # Only exchange-info payloads carry ``rateLimits``. Marking the
+            # product observed distinguishes "catalog not fetched yet" —
+            # headers cannot be scored without its published limits — from
+            # "catalog fetched but defines no tracked buckets", which still
+            # fails closed below.
+            self._definitions_observed.add(product)
             definitions = _parse_definitions(rate_limits)
             if definitions:
                 self._definitions[product] = {
@@ -237,6 +244,13 @@ class BinanceRateLimitTracker:
                     # published a product's enforced limiters, headers for
                     # undefined buckets are informational — e.g. COIN-M emits
                     # ``order-count-10s`` with no enforced limit behind it.
+                    continue
+                if product not in self._definitions_observed:
+                    # Exchange info loads lazily, so account-level calls can
+                    # record headers before the catalog arrives. Without
+                    # published limits there is no remaining count to score;
+                    # failing closed here would poison the shared budget for
+                    # the whole header window on every fresh session.
                     continue
                 _, interval_num, interval_letter = key
                 interval_seconds = float(interval_num * _INTERVAL_SECONDS.get(interval_letter, 60))

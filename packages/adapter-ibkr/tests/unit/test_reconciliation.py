@@ -24,6 +24,7 @@ from ib_async.order import OrderStatus as IBOrderStatus
 from ib_async.order import Trade
 
 from unified_trading_execution.errors import PlatformConnectionError
+from unified_trading_execution.events import FillEvent
 from unified_trading_execution.ibkr import IBKRAdapter
 
 
@@ -471,6 +472,7 @@ class TestFetchFills:
         time: datetime | None = None,
         commission: float = 1.0,
         currency: str = "USD",
+        cum_qty: float | None = None,
     ) -> Fill:
         contract = _stock_contract(symbol=symbol, con_id=con_id)
         exec_time = time or datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
@@ -486,7 +488,7 @@ class TestFetchFills:
             clientId=1,
             orderId=1,
             liquidation=0,
-            cumQty=shares,
+            cumQty=shares if cum_qty is None else cum_qty,
             avgPrice=price,
             orderRef=order_ref,
         )
@@ -518,6 +520,33 @@ class TestFetchFills:
         grouped = await adapter.fetch_fills()
         assert set(grouped.keys()) == {"cid-a", "cid-b"}
         assert len(grouped["cid-a"]) == 2
+
+    async def test_missing_exec_id_matches_live_stream_and_distinguishes_executions(
+        self,
+        adapter: IBKRAdapter,
+        mock_ib_async_module: MagicMock,
+        event_bus,
+    ) -> None:
+        await adapter.connect()
+        mock_ib = mock_ib_async_module
+        execution_time = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
+        first = self._fill(exec_id="", time=execution_time, cum_qty=10)
+        second = self._fill(exec_id="", time=execution_time, cum_qty=20)
+        mock_ib.fills.return_value = [first, second]  # type: ignore[attr-defined]
+
+        rest_fills = await adapter.fetch_fills()
+        assert len(rest_fills["cid-1"]) == 2
+        first_rest_fill, second_rest_fill = rest_fills["cid-1"]
+        assert first_rest_fill.platform_fill_id != second_rest_fill.platform_fill_id
+
+        streamed: list[FillEvent] = []
+        event_bus.subscribe(FillEvent, streamed.append)
+        first.execution.orderRef = ""
+        adapter._on_exec_details(_trade_for_order(order_ref="stream-ref"), first)
+
+        assert len(streamed) == 1
+        assert streamed[0].fill.client_order_id == "stream-ref"
+        assert streamed[0].fill.platform_fill_id == first_rest_fill.platform_fill_id
 
     async def test_bracket_child_reason_inferred(
         self, adapter: IBKRAdapter, mock_ib_async_module: MagicMock

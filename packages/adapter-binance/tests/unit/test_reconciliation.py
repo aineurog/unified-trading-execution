@@ -126,6 +126,26 @@ async def test_fetch_balances_qualifies_spot_and_futures_wallets(
 
 
 @pytest.mark.asyncio
+async def test_fetch_balances_omits_zero_wallets(
+    adapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    _connect_fake_client(adapter, binance_client_mock)
+    binance_client_mock.get_account.return_value = {
+        "balances": [
+            {"asset": "BTC", "free": "0.5", "locked": "0"},
+            {"asset": "LTC", "free": "0", "locked": "0"},
+        ]
+    }
+    binance_client_mock.futures_account_balance.return_value = []
+    binance_client_mock.futures_coin_account_balance.return_value = []
+
+    balances = await adapter.fetch_balances()
+
+    assert set(balances) == {"SPOT:BTC"}
+
+
+@pytest.mark.asyncio
 async def test_fetch_positions_reads_usd_m_and_coin_m_legs(
     adapter,
     binance_client_mock: AsyncMock,

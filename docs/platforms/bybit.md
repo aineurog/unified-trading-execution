@@ -958,7 +958,11 @@ engine.shutdown()
 ```
 
 You need the two-object path when:
-- Sharing an `EventBus` or `StateStore` across multiple engine instances.
+- Sharing an `EventBus` across multiple engine instances.
+- Sharing a `StateStore` across engine instances that use the same platform
+  account. A state store is bound to its platform and resolved account when
+  an engine connects; reusing it for a different platform or account raises
+  `StateStoreOwnershipError`. Use a separate store for each account.
 - Calling the adapter's raw HTTP methods (which bypass the risk pipeline and
   state mirror — only needed for debugging or custom tooling).
 - Testing with a `MockAdapter` instead of a real adapter.

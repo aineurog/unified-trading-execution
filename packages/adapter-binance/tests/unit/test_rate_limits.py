@@ -193,12 +193,44 @@ class TestBinanceRateLimitTracker:
         assert limits.remaining == 1190
         assert limits.interval_seconds == 60.0
 
-    def test_header_without_rate_limit_configuration_fails_closed(self) -> None:
+    def test_headers_before_exchange_info_do_not_constrain_budget(self) -> None:
+        # Exchange info loads lazily per product, so account-level calls can
+        # record rate-limit headers before the catalog arrives. Those headers
+        # cannot be scored without published limits and must not poison the
+        # shared budget; once exchange info lands, defined buckets constrain.
+        now = datetime(2026, 11, 5, 10, tzinfo=UTC)
+        tracker = BinanceRateLimitTracker()
+        tracker.update(
+            BinanceProduct.COIN_M,
+            headers={"X-MBX-USED-WEIGHT-1M": "100"},
+            now=now,
+        )
+        tracker.update(
+            BinanceProduct.COIN_M,
+            headers={"X-MBX-USED-WEIGHT-1M": "150"},
+            rate_limits=[_RATE_LIMITS[0]],
+            now=now + timedelta(seconds=1),
+        )
+
+        limits = tracker.snapshot(now=now + timedelta(seconds=1))
+
+        assert limits.remaining == 1050
+        assert limits.interval_seconds == 60.0
+
+    def test_observed_catalog_without_tracked_limits_fails_closed(self) -> None:
         now = datetime.now(UTC)
         tracker = BinanceRateLimitTracker()
         tracker.update(
             BinanceProduct.SPOT,
             headers={"X-MBX-USED-WEIGHT-1M": "1"},
+            rate_limits=[
+                {
+                    "rateLimitType": "CONNECTIONS",
+                    "interval": "MINUTE",
+                    "intervalNum": 1,
+                    "limit": 10,
+                }
+            ],
             now=now,
         )
 
