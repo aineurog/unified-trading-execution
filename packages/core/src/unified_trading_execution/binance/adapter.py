@@ -268,6 +268,7 @@ class BinanceAdapter(Adapter):
         self._final_order_ids: OrderedDict[str, None] = OrderedDict()
         self._seen_fill_ids: OrderedDict[str, None] = OrderedDict()
         self._balance_refresh_tasks: dict[BinanceProduct, asyncio.Task[None]] = {}
+        self._published_balances: dict[str, Balance] = {}
         self._instrument_spec_cache: dict[
             tuple[Instrument, str | None], tuple[InstrumentSpec, datetime]
         ] = {}
@@ -940,6 +941,12 @@ class BinanceAdapter(Adapter):
         raise PlatformError("Binance account-stream event is missing a valid event timestamp")
 
     def _publish_balance(self, balance: Balance) -> None:
+        previous = self._published_balances.get(balance.currency)
+        if balance.total == 0 and (previous is None or previous.total == 0):
+            # Binance enumerates every account asset, including hundreds of
+            # permanent zero rows; only a nonzero→zero transition is news.
+            return
+        self._published_balances[balance.currency] = balance
         self._event_bus.publish(
             BalanceUpdateEvent(
                 event_id=str(uuid7()),
@@ -2924,8 +2931,16 @@ class BinanceAdapter(Adapter):
         responses = await asyncio.gather(
             *(self._fetch_product_balances(product) for product in _PRODUCT_ORDER)
         )
+        # Spot's account endpoint enumerates every asset on the account —
+        # hundreds of permanent zero rows. Only non-zero wallets are worth
+        # persisting; a drained asset still records its transition because
+        # engine reconcile writes explicit zero rows for currencies missing
+        # from the platform snapshot.
         return {
-            key: value for product_balances in responses for key, value in product_balances.items()
+            key: value
+            for product_balances in responses
+            for key, value in product_balances.items()
+            if value.total != 0
         }
 
     async def _fetch_product_balances(

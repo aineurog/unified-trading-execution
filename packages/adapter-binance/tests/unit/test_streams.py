@@ -423,6 +423,32 @@ async def test_spot_balance_event_and_futures_account_update_are_translated(
 
 
 @pytest.mark.asyncio
+async def test_zero_balances_publish_only_on_nonzero_transition(
+    adapter,
+    event_bus,
+) -> None:
+    # Spot enumerates every account asset; steady-state zero rows must not
+    # become balance events, but a real nonzero→zero transition still must.
+    balances: list[BalanceUpdateEvent] = []
+    event_bus.subscribe(BalanceUpdateEvent, balances.append)
+
+    def _spot_balance(asset: str, free: str) -> None:
+        adapter._publish_balance(
+            translate_spot_balance({"a": asset, "f": free, "l": "0"}, timestamp=_TIMESTAMP)
+        )
+
+    _spot_balance("LTC", "0")
+    assert balances == []
+
+    _spot_balance("LTC", "1")
+    _spot_balance("LTC", "0")
+    _spot_balance("LTC", "0")
+
+    assert [event.balance.total for event in balances] == [Decimal("1"), Decimal("0")]
+    assert all(event.balance.currency == "SPOT:LTC" for event in balances)
+
+
+@pytest.mark.asyncio
 async def test_coin_m_private_stream_uses_sdk_coin_futures_socket(
     adapter,
     binance_client_mock,
