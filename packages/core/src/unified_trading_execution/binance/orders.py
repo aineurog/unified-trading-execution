@@ -48,18 +48,15 @@ def _position_side_from_id(
     product_raw, leg_symbol, position_side = parts
     if product_raw != product.value:
         raise UnsupportedOrderTypeError(
-            f"Binance position_id {position_id!r} belongs to {product_raw!r}, "
-            f"not {product.value!r}"
+            f"Binance position_id {position_id!r} belongs to {product_raw!r}, not {product.value!r}"
         )
     if leg_symbol != symbol:
         raise UnsupportedOrderTypeError(
-            f"Binance position_id {position_id!r} addresses {leg_symbol!r}, "
-            f"not {symbol!r}"
+            f"Binance position_id {position_id!r} addresses {leg_symbol!r}, not {symbol!r}"
         )
     if position_side not in _POSITION_SIDES:
         raise UnsupportedOrderTypeError(
-            f"Binance position_id {position_id!r} has unknown position side "
-            f"{position_side!r}"
+            f"Binance position_id {position_id!r} has unknown position side {position_side!r}"
         )
     return position_side
 

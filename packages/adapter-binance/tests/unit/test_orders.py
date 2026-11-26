@@ -276,9 +276,7 @@ def test_position_id_rejects_mismatched_or_malformed_ids(
 ) -> None:
     order = _order(product, OrderType.MARKET, position_id=position_id)
     with pytest.raises(UnsupportedOrderTypeError):
-        build_place_order_payload(
-            order, product=product, symbol=symbol, client_order_id="ute-123"
-        )
+        build_place_order_payload(order, product=product, symbol=symbol, client_order_id="ute-123")
 
 
 @pytest.mark.parametrize(
