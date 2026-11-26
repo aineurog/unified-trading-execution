@@ -232,6 +232,88 @@ def test_rejects_unrepresentable_order_parameters(order: UnifiedOrder) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("product", "symbol", "position_id", "expected_side"),
+    [
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:LONG", "LONG"),
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:SHORT", "SHORT"),
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:BOTH", "BOTH"),
+        (BinanceProduct.COIN_M, "BTCUSD_PERP", "coin_m:BTCUSD_PERP:LONG", "LONG"),
+    ],
+)
+def test_position_id_maps_to_position_side(
+    product: BinanceProduct,
+    symbol: str,
+    position_id: str,
+    expected_side: str,
+) -> None:
+    order = _order(product, OrderType.MARKET, position_id=position_id)
+    payload, _ = build_place_order_payload(
+        order, product=product, symbol=symbol, client_order_id="ute-123"
+    )
+    assert payload["positionSide"] == expected_side
+
+
+@pytest.mark.parametrize(
+    ("product", "symbol", "position_id"),
+    [
+        # Spot never takes a position_id.
+        (BinanceProduct.SPOT, "BTCUSDT", "usd_m:BTCUSDT:LONG"),
+        # Malformed: not a three-part {product}:{symbol}:{side} id.
+        (BinanceProduct.USD_M, "BTCUSDT", "BTCUSDT:LONG"),
+        # Product prefix does not match the order's product.
+        (BinanceProduct.USD_M, "BTCUSDT", "coin_m:BTCUSDT:LONG"),
+        # Symbol part does not match the resolved order symbol.
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:ETHUSDT:LONG"),
+        # Unknown position side.
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:UP"),
+    ],
+)
+def test_position_id_rejects_mismatched_or_malformed_ids(
+    product: BinanceProduct,
+    symbol: str,
+    position_id: str,
+) -> None:
+    order = _order(product, OrderType.MARKET, position_id=position_id)
+    with pytest.raises(UnsupportedOrderTypeError):
+        build_place_order_payload(order, product=product, symbol=symbol, client_order_id="ute-123")
+
+
+@pytest.mark.parametrize(
+    ("position_id", "expected_reduce_only"),
+    [
+        # Hedge legs: side + positionSide already encode the close — the
+        # venue rejects reduceOnly alongside them (-1106).
+        ("usd_m:BTCUSDT:LONG", False),
+        ("usd_m:BTCUSDT:SHORT", False),
+        # One-way BOTH leg keeps reduceOnly.
+        ("usd_m:BTCUSDT:BOTH", True),
+    ],
+)
+def test_reduce_only_omitted_for_hedge_position_sides(
+    position_id: str, expected_reduce_only: bool
+) -> None:
+    order = _order(
+        BinanceProduct.USD_M,
+        OrderType.MARKET,
+        position_id=position_id,
+        reduce_only=True,
+    )
+    payload, _ = build_place_order_payload(
+        order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
+    )
+    assert ("reduceOnly" in payload) is expected_reduce_only
+
+
+def test_reduce_only_still_sent_without_position_id() -> None:
+    order = _order(BinanceProduct.USD_M, OrderType.MARKET, reduce_only=True)
+    payload, _ = build_place_order_payload(
+        order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
+    )
+    assert payload["reduceOnly"] == "true"
+    assert "positionSide" not in payload
+
+
 def test_build_modify_payload_contains_only_supported_fields() -> None:
     assert build_modify_order_payload(
         symbol="BTCUSDT",
@@ -1363,6 +1445,60 @@ async def test_place_order_attachments_fail_when_no_leg_remains(
 
     with pytest.raises(PlatformError, match="left no open"):
         await adapter.place_order(_order(BinanceProduct.USD_M, OrderType.MARKET, take_profit=_TP))
+
+
+@pytest.mark.parametrize(
+    ("product", "create_method", "position_method", "position_id"),
+    [
+        (
+            BinanceProduct.USD_M,
+            "futures_create_order",
+            "futures_position_information",
+            "usd_m:BTCUSDT:LONG",
+        ),
+        (
+            BinanceProduct.COIN_M,
+            "futures_coin_create_order",
+            "futures_coin_position_information",
+            "coin_m:BTCUSD_PERP:SHORT",
+        ),
+    ],
+    ids=("usd-m", "coin-m"),
+)
+async def test_place_order_attachments_use_explicit_position_id(
+    product: BinanceProduct,
+    create_method: str,
+    position_method: str,
+    position_id: str,
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Position info returns nothing — without the explicit position_id the
+    # attach path would fail with "left no open" (or "ambiguous legs" when
+    # both hedge legs exist). The order's own position_id must be used.
+    await _prepare_market_placement(
+        adapter, binance_client_mock, monkeypatch, product, create_method, position_method
+    )
+    getattr(binance_client_mock, position_method).return_value = []
+    attach = AsyncMock()
+    monkeypatch.setattr(adapter, "modify_position_tpsl", attach)
+    order = _order(
+        product,
+        OrderType.MARKET,
+        position_id=position_id,
+        take_profit=_TP,
+        stop_loss=_SL,
+    )
+
+    result = await adapter.place_order(order)
+
+    assert result.status is OrderStatus.FILLED
+    attach.assert_awaited_once()
+    args, kwargs = attach.await_args
+    assert args[1] == position_id
+    assert kwargs["take_profit"] == _TP
+    assert kwargs["stop_loss"] == _SL
 
 
 async def test_place_order_attachments_fail_when_attach_fails(

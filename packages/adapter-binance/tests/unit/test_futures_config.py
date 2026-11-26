@@ -520,6 +520,27 @@ async def test_startup_reapply_halts_when_open_orders_block_stored_leverage(
     binance_client_mock.futures_change_leverage.assert_not_awaited()
 
 
+async def test_startup_reapply_fails_when_exchange_info_cannot_load(
+    config_adapter: tuple[Any, SQLiteStateStore, Instrument],
+    binance_client_mock: Any,
+) -> None:
+    adapter, store, _ = config_adapter
+    await store.set_adapter_config(
+        BinanceAdapter._leverage_key(BinanceProduct.USD_M, "BTCUSDT"), "20"
+    )
+    adapter._exchange_info_cache.pop(BinanceProduct.USD_M, None)
+    adapter._symbol_instruments.pop((BinanceProduct.USD_M, "BTCUSDT"), None)
+    adapter._load_exchange_info = AsyncMock(
+        side_effect=PlatformError("Binance USD-M exchange info unavailable")
+    )
+
+    with pytest.raises(PlatformError, match="exchange info unavailable"):
+        await adapter._reapply_stored_intent()
+
+    adapter._load_exchange_info.assert_awaited_once_with(BinanceProduct.USD_M)
+    binance_client_mock.futures_change_leverage.assert_not_awaited()
+
+
 async def test_reconcile_halts_on_leverage_drift_by_default(
     config_adapter: tuple[Any, SQLiteStateStore, Instrument],
     binance_client_mock: Any,

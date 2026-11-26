@@ -1723,6 +1723,42 @@ class TestPeriodicReconcile:
         finally:
             await eng.ashutdown()
 
+    async def test_ashutdown_cancels_inflight_reconcile_before_disconnect(
+        self, mock_adapter, event_bus
+    ):
+        """A reconcile already in-flight must unwind before the adapter
+        disconnects — otherwise it calls the platform on a dead connector."""
+        store = SQLiteStateStore(":memory:")
+        eng = Engine(
+            adapter=mock_adapter,
+            state_store=store,
+            event_bus=event_bus,
+            get_reference_price=_ref_price,
+            reconcile_interval_seconds=0.05,
+        )
+        await eng.connect()
+
+        started = asyncio.Event()
+        connected_at_unwind: list[bool] = []
+
+        async def blocked_fetch_fills(*, since=None):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                connected_at_unwind.append(mock_adapter.is_connected)
+            return {}
+
+        mock_adapter.fetch_fills = blocked_fetch_fills
+        try:
+            await asyncio.wait_for(started.wait(), timeout=5)
+            await eng.ashutdown()
+            if eng._reconcile_loop_task is not None:
+                await asyncio.gather(eng._reconcile_loop_task, return_exceptions=True)
+            assert connected_at_unwind == [True]
+        finally:
+            await eng.ashutdown()
+
     async def test_no_loop_task_when_disabled(self, mock_adapter, event_bus):
         store = SQLiteStateStore(":memory:")
         eng = Engine(

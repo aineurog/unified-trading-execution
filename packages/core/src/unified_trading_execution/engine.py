@@ -552,18 +552,26 @@ class Engine:
             await self._store.flush()
         except Exception:
             logger.exception("Error during state store flush in shutdown")
-        # Step 2 — disconnect adapter gracefully
+        # Step 2 — stop background loops before disconnecting the adapter so
+        # an in-flight reconcile/integrity pass cannot hit a closed connector.
+        background_tasks = [
+            task
+            for task in (
+                self._reconcile_task,
+                self._reconcile_loop_task,
+                self._trailing_integrity_task,
+            )
+            if task is not None and not task.done()
+        ]
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        # Step 3 — disconnect adapter gracefully
         try:
             await self._adapter.disconnect()
         except Exception:
             logger.exception("Error during adapter disconnect in shutdown")
-        # Step 3 — cancel any pending reconnect reconciliation before closing
-        if self._reconcile_task is not None and not self._reconcile_task.done():
-            self._reconcile_task.cancel()
-        if self._reconcile_loop_task is not None and not self._reconcile_loop_task.done():
-            self._reconcile_loop_task.cancel()
-        if self._trailing_integrity_task is not None and not self._trailing_integrity_task.done():
-            self._trailing_integrity_task.cancel()
         # Step 4 — close state store
         if self._state_store is not None:
             await self._state_store.close()

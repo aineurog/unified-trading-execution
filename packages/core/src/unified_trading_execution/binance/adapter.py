@@ -1355,7 +1355,12 @@ class BinanceAdapter(Adapter):
                 f"Binance order {order.client_order_id} with TP/SL attachments "
                 f"did not fill synchronously (status {result.status.value})"
             )
-        position_id = await self._open_position_id_for_symbol(order.instrument, product, symbol)
+        # An explicit position_id already names the leg this order opened —
+        # required in hedge mode where a symbol can hold LONG and SHORT legs
+        # simultaneously and "the open leg" is ambiguous.
+        position_id = order.position_id or await self._open_position_id_for_symbol(
+            order.instrument, product, symbol
+        )
         if position_id is None:
             raise PlatformError(
                 f"Binance order {order.client_order_id} filled but left no open "
@@ -3720,12 +3725,37 @@ class BinanceAdapter(Adapter):
             rows.update(await store.list_adapter_config(prefix))
         return rows
 
+    async def _ensure_config_symbols_loaded(self, rows: Mapping[str, str]) -> None:
+        """Load exchange info for products named by symbol-scoped config keys.
+
+        ``_symbol_instruments`` is populated lazily by ``_load_exchange_info``.
+        Stored-intent resolution runs before any instrument lookup on a cold
+        connect, so without this preload every ``leverage.{product}.{symbol}``
+        and ``margin_mode.{product}.{symbol}`` row would be skipped as
+        "unknown or delisted".
+        """
+        products: set[BinanceProduct] = set()
+        for key in rows:
+            for prefix in ("leverage.", "margin_mode."):
+                if not key.startswith(prefix) or ".policy." in key:
+                    continue
+                product_value = key.removeprefix(prefix).partition(".")[0]
+                try:
+                    product = BinanceProduct(product_value)
+                except ValueError:
+                    continue
+                if product in _FUTURES_PRODUCTS:
+                    products.add(product)
+        for product in products:
+            await self._load_exchange_info(product)
+
     async def _reapply_stored_intent(self) -> None:
         """Safely apply eligible persisted Futures configuration after connect."""
         store = self._state_store
         if store is None:
             return
         rows = await self._list_futures_config_rows()
+        await self._ensure_config_symbols_loaded(rows)
 
         for key, value in rows.items():
             target = self._stored_symbol_target(key, "leverage.")
@@ -3867,6 +3897,7 @@ class BinanceAdapter(Adapter):
         if store is None:
             return
         rows = await self._list_futures_config_rows()
+        await self._ensure_config_symbols_loaded(rows)
         unresolved_instruments: set[Instrument] = set()
         configured_instruments: set[Instrument] = set()
         account_configured = self._position_mode_key() in rows
