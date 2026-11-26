@@ -222,7 +222,10 @@ def build_place_order_payload(
             payload["algoType"] = "CONDITIONAL"
         else:
             payload["stopPrice"] = _decimal_string(order.stop_price)
-    if order.reduce_only:
+    if order.reduce_only and position_side not in {"LONG", "SHORT"}:
+        # Hedge-mode legs must NOT send reduceOnly: side + positionSide
+        # already encode the close, and the venue rejects the flag with
+        # -1106 "Parameter 'reduceonly' sent when not required".
         payload["reduceOnly"] = "true"
     if position_side is not None:
         payload["positionSide"] = position_side

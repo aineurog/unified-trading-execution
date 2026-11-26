@@ -281,6 +281,41 @@ def test_position_id_rejects_mismatched_or_malformed_ids(
         )
 
 
+@pytest.mark.parametrize(
+    ("position_id", "expected_reduce_only"),
+    [
+        # Hedge legs: side + positionSide already encode the close — the
+        # venue rejects reduceOnly alongside them (-1106).
+        ("usd_m:BTCUSDT:LONG", False),
+        ("usd_m:BTCUSDT:SHORT", False),
+        # One-way BOTH leg keeps reduceOnly.
+        ("usd_m:BTCUSDT:BOTH", True),
+    ],
+)
+def test_reduce_only_omitted_for_hedge_position_sides(
+    position_id: str, expected_reduce_only: bool
+) -> None:
+    order = _order(
+        BinanceProduct.USD_M,
+        OrderType.MARKET,
+        position_id=position_id,
+        reduce_only=True,
+    )
+    payload, _ = build_place_order_payload(
+        order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
+    )
+    assert ("reduceOnly" in payload) is expected_reduce_only
+
+
+def test_reduce_only_still_sent_without_position_id() -> None:
+    order = _order(BinanceProduct.USD_M, OrderType.MARKET, reduce_only=True)
+    payload, _ = build_place_order_payload(
+        order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
+    )
+    assert payload["reduceOnly"] == "true"
+    assert "positionSide" not in payload
+
+
 def test_build_modify_payload_contains_only_supported_fields() -> None:
     assert build_modify_order_payload(
         symbol="BTCUSDT",
