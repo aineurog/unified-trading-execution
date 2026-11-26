@@ -1414,6 +1414,60 @@ async def test_place_order_attachments_fail_when_no_leg_remains(
         await adapter.place_order(_order(BinanceProduct.USD_M, OrderType.MARKET, take_profit=_TP))
 
 
+@pytest.mark.parametrize(
+    ("product", "create_method", "position_method", "position_id"),
+    [
+        (
+            BinanceProduct.USD_M,
+            "futures_create_order",
+            "futures_position_information",
+            "usd_m:BTCUSDT:LONG",
+        ),
+        (
+            BinanceProduct.COIN_M,
+            "futures_coin_create_order",
+            "futures_coin_position_information",
+            "coin_m:BTCUSD_PERP:SHORT",
+        ),
+    ],
+    ids=("usd-m", "coin-m"),
+)
+async def test_place_order_attachments_use_explicit_position_id(
+    product: BinanceProduct,
+    create_method: str,
+    position_method: str,
+    position_id: str,
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Position info returns nothing — without the explicit position_id the
+    # attach path would fail with "left no open" (or "ambiguous legs" when
+    # both hedge legs exist). The order's own position_id must be used.
+    await _prepare_market_placement(
+        adapter, binance_client_mock, monkeypatch, product, create_method, position_method
+    )
+    getattr(binance_client_mock, position_method).return_value = []
+    attach = AsyncMock()
+    monkeypatch.setattr(adapter, "modify_position_tpsl", attach)
+    order = _order(
+        product,
+        OrderType.MARKET,
+        position_id=position_id,
+        take_profit=_TP,
+        stop_loss=_SL,
+    )
+
+    result = await adapter.place_order(order)
+
+    assert result.status is OrderStatus.FILLED
+    attach.assert_awaited_once()
+    args, kwargs = attach.await_args
+    assert args[1] == position_id
+    assert kwargs["take_profit"] == _TP
+    assert kwargs["stop_loss"] == _SL
+
+
 async def test_place_order_attachments_fail_when_attach_fails(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,

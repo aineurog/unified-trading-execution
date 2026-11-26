@@ -1355,7 +1355,12 @@ class BinanceAdapter(Adapter):
                 f"Binance order {order.client_order_id} with TP/SL attachments "
                 f"did not fill synchronously (status {result.status.value})"
             )
-        position_id = await self._open_position_id_for_symbol(order.instrument, product, symbol)
+        # An explicit position_id already names the leg this order opened —
+        # required in hedge mode where a symbol can hold LONG and SHORT legs
+        # simultaneously and "the open leg" is ambiguous.
+        position_id = order.position_id or await self._open_position_id_for_symbol(
+            order.instrument, product, symbol
+        )
         if position_id is None:
             raise PlatformError(
                 f"Binance order {order.client_order_id} filled but left no open "
