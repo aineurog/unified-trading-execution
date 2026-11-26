@@ -232,6 +232,55 @@ def test_rejects_unrepresentable_order_parameters(order: UnifiedOrder) -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("product", "symbol", "position_id", "expected_side"),
+    [
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:LONG", "LONG"),
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:SHORT", "SHORT"),
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:BOTH", "BOTH"),
+        (BinanceProduct.COIN_M, "BTCUSD_PERP", "coin_m:BTCUSD_PERP:LONG", "LONG"),
+    ],
+)
+def test_position_id_maps_to_position_side(
+    product: BinanceProduct,
+    symbol: str,
+    position_id: str,
+    expected_side: str,
+) -> None:
+    order = _order(product, OrderType.MARKET, position_id=position_id)
+    payload, _ = build_place_order_payload(
+        order, product=product, symbol=symbol, client_order_id="ute-123"
+    )
+    assert payload["positionSide"] == expected_side
+
+
+@pytest.mark.parametrize(
+    ("product", "symbol", "position_id"),
+    [
+        # Spot never takes a position_id.
+        (BinanceProduct.SPOT, "BTCUSDT", "usd_m:BTCUSDT:LONG"),
+        # Malformed: not a three-part {product}:{symbol}:{side} id.
+        (BinanceProduct.USD_M, "BTCUSDT", "BTCUSDT:LONG"),
+        # Product prefix does not match the order's product.
+        (BinanceProduct.USD_M, "BTCUSDT", "coin_m:BTCUSDT:LONG"),
+        # Symbol part does not match the resolved order symbol.
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:ETHUSDT:LONG"),
+        # Unknown position side.
+        (BinanceProduct.USD_M, "BTCUSDT", "usd_m:BTCUSDT:UP"),
+    ],
+)
+def test_position_id_rejects_mismatched_or_malformed_ids(
+    product: BinanceProduct,
+    symbol: str,
+    position_id: str,
+) -> None:
+    order = _order(product, OrderType.MARKET, position_id=position_id)
+    with pytest.raises(UnsupportedOrderTypeError):
+        build_place_order_payload(
+            order, product=product, symbol=symbol, client_order_id="ute-123"
+        )
+
+
 def test_build_modify_payload_contains_only_supported_fields() -> None:
     assert build_modify_order_payload(
         symbol="BTCUSDT",

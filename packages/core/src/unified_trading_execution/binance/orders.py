@@ -26,6 +26,44 @@ class _MissingAverageFillPriceError(PlatformError):
     """A filled Binance response lacks its required average execution price."""
 
 
+_POSITION_SIDES = frozenset({"BOTH", "LONG", "SHORT"})
+
+
+def _position_side_from_id(
+    position_id: str,
+    product: BinanceProduct,
+    symbol: str,
+) -> str:
+    """Extract ``positionSide`` from a ``{product}:{symbol}:{side}`` position id.
+
+    Mirrors ``streams.position_identifier`` / ``protection.parse_position_id``;
+    duplicated here because ``protection`` already imports this module.
+    """
+    parts = position_id.split(":")
+    if len(parts) != 3:
+        raise UnsupportedOrderTypeError(
+            f"Malformed Binance position_id {position_id!r}; expected "
+            "'{product}:{symbol}:{positionSide}'"
+        )
+    product_raw, leg_symbol, position_side = parts
+    if product_raw != product.value:
+        raise UnsupportedOrderTypeError(
+            f"Binance position_id {position_id!r} belongs to {product_raw!r}, "
+            f"not {product.value!r}"
+        )
+    if leg_symbol != symbol:
+        raise UnsupportedOrderTypeError(
+            f"Binance position_id {position_id!r} addresses {leg_symbol!r}, "
+            f"not {symbol!r}"
+        )
+    if position_side not in _POSITION_SIDES:
+        raise UnsupportedOrderTypeError(
+            f"Binance position_id {position_id!r} has unknown position side "
+            f"{position_side!r}"
+        )
+    return position_side
+
+
 _TIME_IN_FORCE: dict[TimeInForce, str] = {
     TimeInForce.GTC: "GTC",
     TimeInForce.IOC: "IOC",
@@ -109,10 +147,13 @@ def build_place_order_payload(
             raise UnsupportedOrderTypeError(
                 "Binance reduce_only orders cannot carry take_profit/stop_loss attachments"
             )
+    position_side: str | None = None
     if order.position_id is not None:
-        raise UnsupportedOrderTypeError(
-            "Binance order placement cannot target a position_id through the unified order API"
-        )
+        if product == BinanceProduct.SPOT:
+            raise UnsupportedOrderTypeError(
+                "Binance Spot order placement cannot target a position_id"
+            )
+        position_side = _position_side_from_id(order.position_id, product, symbol)
     if product == BinanceProduct.SPOT and order.reduce_only:
         raise UnsupportedOrderTypeError("Binance Spot does not support reduce_only orders")
 
@@ -183,6 +224,8 @@ def build_place_order_payload(
             payload["stopPrice"] = _decimal_string(order.stop_price)
     if order.reduce_only:
         payload["reduceOnly"] = "true"
+    if position_side is not None:
+        payload["positionSide"] = position_side
     if not conditional:
         payload["newOrderRespType"] = "RESULT"
 
