@@ -467,6 +467,61 @@ async def test_spot_balance_event_and_futures_account_update_are_translated(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"id": "subscription-1", "status": 200, "result": {"subscriptionId": 1}},
+        {"e": {"unexpected": "shape"}},
+        {"event": {"e": "subscriptionAck"}},
+        {"event": {"e": "listenKeyExpired"}},
+    ],
+)
+async def test_user_stream_ignores_control_payload_without_event_timestamp(
+    adapter,
+    event_bus,
+    message: dict[str, object],
+) -> None:
+    events: list[object] = []
+    event_bus.subscribe(BalanceUpdateEvent, events.append)
+
+    await adapter._handle_user_stream_message(BinanceProduct.SPOT, message)
+
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_user_stream_logs_sdk_error_frame_without_parsing_timestamp(
+    adapter,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    await adapter._handle_user_stream_message(
+        BinanceProduct.COIN_M,
+        {"e": "error", "type": "BinanceWebsocketQueueOverflow", "m": "queue full"},
+    )
+
+    assert "Binance coin_m user stream reported SDK error" in caplog.text
+    assert "missing a valid event timestamp" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_user_stream_does_not_propagate_recognized_event_with_invalid_timestamp(
+    adapter,
+    event_bus,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    events: list[BalanceUpdateEvent] = []
+    event_bus.subscribe(BalanceUpdateEvent, events.append)
+
+    await adapter._handle_user_stream_message(
+        BinanceProduct.SPOT,
+        {"e": "outboundAccountPosition", "B": [{"a": "USDT", "f": "4", "l": "1"}]},
+    )
+
+    assert events == []
+    assert "Could not translate Binance spot account-stream event" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_zero_balances_publish_only_on_nonzero_transition(
     adapter,
     event_bus,

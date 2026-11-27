@@ -778,7 +778,12 @@ class BinanceAdapter(Adapter):
                             raise PlatformError(
                                 f"Binance {product.value} user stream payload is not an object"
                             )
-                        if payload.get("e") == "listenKeyExpired":
+                        event = payload.get("event")
+                        if isinstance(event, dict):
+                            payload_event_type = event.get("e")
+                        else:
+                            payload_event_type = payload.get("e")
+                        if payload_event_type == "listenKeyExpired":
                             break
                         await self._handle_user_stream_message(product, payload)
 
@@ -850,9 +855,31 @@ class BinanceAdapter(Adapter):
         if isinstance(payload, dict):
             message = payload
         event_type = message.get("e")
-        timestamp = self._stream_timestamp(message.get("E"))
+        if event_type == "listenKeyExpired":
+            return
+        if event_type == "error":
+            logger.error(
+                "Binance %s user stream reported SDK error %r: %s",
+                product.value,
+                message.get("type"),
+                message.get("m", ""),
+            )
+            return
+        supported_event_types = (
+            {"executionReport", "outboundAccountPosition", "balanceUpdate"}
+            if product == BinanceProduct.SPOT
+            else {"ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE", "ALGO_UPDATE"}
+        )
+        if not isinstance(event_type, str) or event_type not in supported_event_types:
+            logger.debug(
+                "Ignoring Binance %s non-account stream payload with event type %r",
+                product.value,
+                event_type,
+            )
+            return
 
         try:
+            timestamp = self._stream_timestamp(message.get("E"))
             if product == BinanceProduct.SPOT:
                 if event_type == "executionReport":
                     await self._handle_order_update(product, message, timestamp)
@@ -868,8 +895,6 @@ class BinanceAdapter(Adapter):
                                 logger.warning("Ignoring malformed Binance Spot balance entry")
                 elif event_type == "balanceUpdate":
                     self._schedule_balance_refresh(product)
-                elif event_type != "listenKeyExpired":
-                    logger.debug("Ignoring Binance Spot stream event %r", event_type)
                 return
 
             if event_type == "ACCOUNT_UPDATE":
@@ -919,9 +944,6 @@ class BinanceAdapter(Adapter):
                     conditional=True,
                 )
                 return
-
-            if event_type != "listenKeyExpired":
-                logger.debug("Ignoring Binance %s stream event %r", product.value, event_type)
         except PlatformError:
             logger.exception(
                 "Could not translate Binance %s account-stream event %r",
@@ -1808,8 +1830,15 @@ class BinanceAdapter(Adapter):
         self,
         product: BinanceProduct,
         request: Callable[[], Awaitable[object]],
+        *,
+        map_timeout: bool = False,
     ) -> object:
-        return await self._dispatch_request(product, self._require_client(), request)
+        return await self._dispatch_request(
+            product,
+            self._require_client(),
+            request,
+            map_timeout=map_timeout,
+        )
 
     async def _run_market_data_request(
         self,
@@ -1825,17 +1854,26 @@ class BinanceAdapter(Adapter):
         client = self._client
         if client is None:
             raise PlatformConnectionError("Binance adapter is not connected")
-        return await self._dispatch_request(product, client, request)
+        return await self._dispatch_request(
+            product,
+            client,
+            request,
+            map_timeout=True,
+        )
 
     async def _dispatch_request(
         self,
         product: BinanceProduct,
         client: AsyncClient,
         request: Callable[[], Awaitable[object]],
+        *,
+        map_timeout: bool = False,
     ) -> object:
         try:
             response = await request()
-        except TimeoutError:
+        except TimeoutError as exc:
+            if map_timeout:
+                raise map_binance_error(exc, product=product) from exc
             raise
         except (
             BinanceAPIException,
@@ -2923,6 +2961,7 @@ class BinanceAdapter(Adapter):
             response = await self._run_order_request(
                 product,
                 getattr(client, method_name),
+                map_timeout=True,
             )
             if not isinstance(response, list):
                 raise PlatformError(
