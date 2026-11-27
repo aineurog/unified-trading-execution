@@ -151,6 +151,14 @@ def build_place_order_payload(
                 "Binance Spot order placement cannot target a position_id"
             )
         position_side = _position_side_from_id(order.position_id, product, symbol)
+    if order.reduce_only and position_side == "LONG" and order.side is not OrderSide.SELL:
+        raise InvalidOrderError(
+            "Binance reduce_only orders targeting a LONG hedge leg must use SELL"
+        )
+    if order.reduce_only and position_side == "SHORT" and order.side is not OrderSide.BUY:
+        raise InvalidOrderError(
+            "Binance reduce_only orders targeting a SHORT hedge leg must use BUY"
+        )
     if product == BinanceProduct.SPOT and order.reduce_only:
         raise UnsupportedOrderTypeError("Binance Spot does not support reduce_only orders")
 

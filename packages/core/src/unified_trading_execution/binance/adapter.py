@@ -1281,17 +1281,32 @@ class BinanceAdapter(Adapter):
             # python-binance has no public COIN-M algo wrapper; the documented
             # /dapi/v1/algoOrder endpoint is reached through the SDK's own
             # signed futures-coin transport.
-            response = await self._coin_m_algo_request("post", "algoOrder", payload)
+            submit = self._coin_m_algo_request("post", "algoOrder", payload)
         else:
             method_names = {
                 BinanceProduct.SPOT: "create_order",
                 BinanceProduct.USD_M: "futures_create_order",
                 BinanceProduct.COIN_M: "futures_coin_create_order",
             }
-            response = await self._run_order_request(
+            submit = self._run_order_request(
                 product,
                 lambda: getattr(client, method_names[product])(**payload),
             )
+        try:
+            response = await submit
+        except InvalidOrderError as exc:
+            if (
+                product in _FUTURES_PRODUCTS
+                and order.position_id is None
+                and self._is_position_side_rejection(exc)
+            ):
+                raise InvalidOrderError(
+                    f"Binance rejected the {product.value} order for {symbol} because "
+                    "positionSide does not match the account mode. If the account is in "
+                    "Hedge Mode, set position_id to "
+                    f"'{product.value}:{symbol}:LONG' or '{product.value}:{symbol}:SHORT'."
+                ) from exc
+            raise
         response_entry = _order_response(response)
         try:
             result = parse_order_result(
@@ -3466,6 +3481,17 @@ class BinanceAdapter(Adapter):
     def _is_binance_error_code(error: PlatformError, code: int) -> bool:
         platform_error = error.platform_error
         return isinstance(platform_error, dict) and platform_error.get("code") == code
+
+    @staticmethod
+    def _is_position_side_rejection(error: InvalidOrderError) -> bool:
+        cause = error.__cause__
+        if cause is None:
+            return False
+        code = str(getattr(cause, "code", ""))
+        if code == "-4061":
+            return True
+        message = str(getattr(cause, "message", cause)).lower()
+        return code == "-1102" and ("positionside" in message or "position side" in message)
 
     @staticmethod
     def _is_ambiguous_config_error(error: PlatformError) -> bool:
