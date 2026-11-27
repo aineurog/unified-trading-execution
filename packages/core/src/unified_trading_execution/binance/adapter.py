@@ -778,7 +778,12 @@ class BinanceAdapter(Adapter):
                             raise PlatformError(
                                 f"Binance {product.value} user stream payload is not an object"
                             )
-                        if payload.get("e") == "listenKeyExpired":
+                        event = payload.get("event")
+                        if isinstance(event, dict):
+                            payload_event_type = event.get("e")
+                        else:
+                            payload_event_type = payload.get("e")
+                        if payload_event_type == "listenKeyExpired":
                             break
                         await self._handle_user_stream_message(product, payload)
 
@@ -850,9 +855,31 @@ class BinanceAdapter(Adapter):
         if isinstance(payload, dict):
             message = payload
         event_type = message.get("e")
-        timestamp = self._stream_timestamp(message.get("E"))
+        if event_type == "listenKeyExpired":
+            return
+        if event_type == "error":
+            logger.error(
+                "Binance %s user stream reported SDK error %r: %s",
+                product.value,
+                message.get("type"),
+                message.get("m", ""),
+            )
+            return
+        supported_event_types = (
+            {"executionReport", "outboundAccountPosition", "balanceUpdate"}
+            if product == BinanceProduct.SPOT
+            else {"ACCOUNT_UPDATE", "ORDER_TRADE_UPDATE", "ALGO_UPDATE"}
+        )
+        if not isinstance(event_type, str) or event_type not in supported_event_types:
+            logger.debug(
+                "Ignoring Binance %s non-account stream payload with event type %r",
+                product.value,
+                event_type,
+            )
+            return
 
         try:
+            timestamp = self._stream_timestamp(message.get("E"))
             if product == BinanceProduct.SPOT:
                 if event_type == "executionReport":
                     await self._handle_order_update(product, message, timestamp)
@@ -868,8 +895,6 @@ class BinanceAdapter(Adapter):
                                 logger.warning("Ignoring malformed Binance Spot balance entry")
                 elif event_type == "balanceUpdate":
                     self._schedule_balance_refresh(product)
-                elif event_type != "listenKeyExpired":
-                    logger.debug("Ignoring Binance Spot stream event %r", event_type)
                 return
 
             if event_type == "ACCOUNT_UPDATE":
@@ -919,9 +944,6 @@ class BinanceAdapter(Adapter):
                     conditional=True,
                 )
                 return
-
-            if event_type != "listenKeyExpired":
-                logger.debug("Ignoring Binance %s stream event %r", product.value, event_type)
         except PlatformError:
             logger.exception(
                 "Could not translate Binance %s account-stream event %r",
@@ -1281,17 +1303,32 @@ class BinanceAdapter(Adapter):
             # python-binance has no public COIN-M algo wrapper; the documented
             # /dapi/v1/algoOrder endpoint is reached through the SDK's own
             # signed futures-coin transport.
-            response = await self._coin_m_algo_request("post", "algoOrder", payload)
+            submit = self._coin_m_algo_request("post", "algoOrder", payload)
         else:
             method_names = {
                 BinanceProduct.SPOT: "create_order",
                 BinanceProduct.USD_M: "futures_create_order",
                 BinanceProduct.COIN_M: "futures_coin_create_order",
             }
-            response = await self._run_order_request(
+            submit = self._run_order_request(
                 product,
                 lambda: getattr(client, method_names[product])(**payload),
             )
+        try:
+            response = await submit
+        except InvalidOrderError as exc:
+            if (
+                product in _FUTURES_PRODUCTS
+                and order.position_id is None
+                and self._is_position_side_rejection(exc)
+            ):
+                raise InvalidOrderError(
+                    f"Binance rejected the {product.value} order for {symbol} because "
+                    "positionSide does not match the account mode. If the account is in "
+                    "Hedge Mode, set position_id to "
+                    f"'{product.value}:{symbol}:LONG' or '{product.value}:{symbol}:SHORT'."
+                ) from exc
+            raise
         response_entry = _order_response(response)
         try:
             result = parse_order_result(
@@ -1793,8 +1830,15 @@ class BinanceAdapter(Adapter):
         self,
         product: BinanceProduct,
         request: Callable[[], Awaitable[object]],
+        *,
+        map_timeout: bool = False,
     ) -> object:
-        return await self._dispatch_request(product, self._require_client(), request)
+        return await self._dispatch_request(
+            product,
+            self._require_client(),
+            request,
+            map_timeout=map_timeout,
+        )
 
     async def _run_market_data_request(
         self,
@@ -1810,17 +1854,26 @@ class BinanceAdapter(Adapter):
         client = self._client
         if client is None:
             raise PlatformConnectionError("Binance adapter is not connected")
-        return await self._dispatch_request(product, client, request)
+        return await self._dispatch_request(
+            product,
+            client,
+            request,
+            map_timeout=True,
+        )
 
     async def _dispatch_request(
         self,
         product: BinanceProduct,
         client: AsyncClient,
         request: Callable[[], Awaitable[object]],
+        *,
+        map_timeout: bool = False,
     ) -> object:
         try:
             response = await request()
-        except TimeoutError:
+        except TimeoutError as exc:
+            if map_timeout:
+                raise map_binance_error(exc, product=product) from exc
             raise
         except (
             BinanceAPIException,
@@ -2908,6 +2961,7 @@ class BinanceAdapter(Adapter):
             response = await self._run_order_request(
                 product,
                 getattr(client, method_name),
+                map_timeout=True,
             )
             if not isinstance(response, list):
                 raise PlatformError(
@@ -3466,6 +3520,17 @@ class BinanceAdapter(Adapter):
     def _is_binance_error_code(error: PlatformError, code: int) -> bool:
         platform_error = error.platform_error
         return isinstance(platform_error, dict) and platform_error.get("code") == code
+
+    @staticmethod
+    def _is_position_side_rejection(error: InvalidOrderError) -> bool:
+        cause = error.__cause__
+        if cause is None:
+            return False
+        code = str(getattr(cause, "code", ""))
+        if code == "-4061":
+            return True
+        message = str(getattr(cause, "message", cause)).lower()
+        return code == "-1102" and ("positionside" in message or "position side" in message)
 
     @staticmethod
     def _is_ambiguous_config_error(error: PlatformError) -> bool:

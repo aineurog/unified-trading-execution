@@ -287,6 +287,18 @@ async def test_factory_transport_failure_is_mapped_to_connection_error(
     assert adapter._client is None
 
 
+async def test_fetch_positions_timeout_is_mapped_to_connection_error(
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+) -> None:
+    adapter._connected = True
+    adapter._client = binance_client_mock
+    binance_client_mock.futures_position_information.side_effect = TimeoutError()
+
+    with pytest.raises(PlatformConnectionError, match="Binance request timed out"):
+        await adapter.fetch_positions()
+
+
 async def test_cancelled_startup_closes_client_created_by_sdk_factory(
     adapter: BinanceAdapter,
     binance_client_mock: AsyncMock,

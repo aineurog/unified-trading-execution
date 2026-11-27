@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, call
 
 import pytest
+from binance.exceptions import BinanceAPIException
 from uuid_extensions import uuid7
 
 from unified_trading_execution.binance import BinanceAdapter
@@ -91,10 +93,11 @@ def _order(
 ) -> UnifiedOrder:
     time_in_force = kwargs.pop("time_in_force", TimeInForce.GTC)
     quantity = kwargs.pop("quantity", Decimal("0.001"))
+    side = kwargs.pop("side", OrderSide.BUY)
     return UnifiedOrder(
         instrument=_instrument(product),
         order_type=order_type,
-        side=OrderSide.BUY,
+        side=side,
         quantity=quantity,
         time_in_force=time_in_force,
         client_order_id="test-order-1",
@@ -280,29 +283,56 @@ def test_position_id_rejects_mismatched_or_malformed_ids(
 
 
 @pytest.mark.parametrize(
-    ("position_id", "expected_reduce_only"),
+    ("position_id", "side", "expected_reduce_only"),
     [
         # Hedge legs: side + positionSide already encode the close — the
         # venue rejects reduceOnly alongside them (-1106).
-        ("usd_m:BTCUSDT:LONG", False),
-        ("usd_m:BTCUSDT:SHORT", False),
+        ("usd_m:BTCUSDT:LONG", OrderSide.SELL, False),
+        ("usd_m:BTCUSDT:SHORT", OrderSide.BUY, False),
         # One-way BOTH leg keeps reduceOnly.
-        ("usd_m:BTCUSDT:BOTH", True),
+        ("usd_m:BTCUSDT:BOTH", OrderSide.BUY, True),
     ],
 )
 def test_reduce_only_omitted_for_hedge_position_sides(
-    position_id: str, expected_reduce_only: bool
+    position_id: str, side: OrderSide, expected_reduce_only: bool
 ) -> None:
     order = _order(
         BinanceProduct.USD_M,
         OrderType.MARKET,
         position_id=position_id,
+        side=side,
         reduce_only=True,
     )
     payload, _ = build_place_order_payload(
         order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
     )
     assert ("reduceOnly" in payload) is expected_reduce_only
+
+
+@pytest.mark.parametrize(
+    ("position_id", "side", "expected_close_side"),
+    [
+        ("usd_m:BTCUSDT:LONG", OrderSide.BUY, "SELL"),
+        ("usd_m:BTCUSDT:SHORT", OrderSide.SELL, "BUY"),
+    ],
+)
+def test_reduce_only_rejects_order_side_that_would_increase_hedge_leg(
+    position_id: str,
+    side: OrderSide,
+    expected_close_side: str,
+) -> None:
+    order = _order(
+        BinanceProduct.USD_M,
+        OrderType.MARKET,
+        position_id=position_id,
+        side=side,
+        reduce_only=True,
+    )
+
+    with pytest.raises(InvalidOrderError, match=expected_close_side):
+        build_place_order_payload(
+            order, product=BinanceProduct.USD_M, symbol="BTCUSDT", client_order_id="ute-123"
+        )
 
 
 def test_reduce_only_still_sent_without_position_id() -> None:
@@ -312,6 +342,38 @@ def test_reduce_only_still_sent_without_position_id() -> None:
     )
     assert payload["reduceOnly"] == "true"
     assert "positionSide" not in payload
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        (-4061, "Order's position side does not match user's setting."),
+        (-1102, "Mandatory parameter 'positionSide' was not sent."),
+    ],
+)
+async def test_hedge_mode_position_side_rejection_explains_position_id(
+    code: int,
+    message: str,
+    adapter: BinanceAdapter,
+    binance_client_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _prepare_market_placement(
+        adapter,
+        binance_client_mock,
+        monkeypatch,
+        BinanceProduct.USD_M,
+        "futures_create_order",
+        "futures_position_information",
+    )
+    binance_client_mock.futures_create_order.side_effect = BinanceAPIException(
+        SimpleNamespace(text=message),
+        400,
+        f'{{"code": {code}, "msg": "{message}"}}',
+    )
+
+    with pytest.raises(InvalidOrderError, match="set position_id"):
+        await adapter.place_order(_order(BinanceProduct.USD_M, OrderType.MARKET))
 
 
 def test_build_modify_payload_contains_only_supported_fields() -> None:
@@ -1421,7 +1483,9 @@ async def test_place_order_with_attachments_protects_resulting_leg(
 
     assert result.status is OrderStatus.FILLED
     attach.assert_awaited_once()
-    args, kwargs = attach.await_args
+    await_args = attach.await_args
+    assert await_args is not None
+    args, kwargs = await_args
     assert args[1] == position_id
     assert kwargs["take_profit"] == _TP
     assert kwargs["stop_loss"] == _SL
@@ -1495,7 +1559,9 @@ async def test_place_order_attachments_use_explicit_position_id(
 
     assert result.status is OrderStatus.FILLED
     attach.assert_awaited_once()
-    args, kwargs = attach.await_args
+    await_args = attach.await_args
+    assert await_args is not None
+    args, kwargs = await_args
     assert args[1] == position_id
     assert kwargs["take_profit"] == _TP
     assert kwargs["stop_loss"] == _SL

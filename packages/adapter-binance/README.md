@@ -130,6 +130,16 @@ live open-order snapshots.
 Valid client order IDs are sent to Binance unchanged; IDs outside Binance's
 length or character constraints are rejected instead of being rewritten.
 
+In Futures Hedge Mode, every order must target a leg with `position_id`, for
+example `usd_m:BTCUSDT:LONG` or `coin_m:BTCUSD_PERP:SHORT`. The adapter maps
+that leg to Binance's `positionSide`; `side` remains the order direction.
+For reduce-only hedge closes, a LONG leg must use `SELL` and a SHORT leg must
+use `BUY`. The adapter validates that direction and omits Binance's
+`reduceOnly` parameter for LONG/SHORT legs; one-way (`BOTH`) orders retain the
+parameter. When Binance reports a position-side mismatch for an order without
+`position_id`, the adapter raises an actionable error explaining how to target
+a hedge leg.
+
 When a filled placement response omits its average fill price, the adapter
 queries the order by its Binance order ID and requires the query response to
 provide the average.
